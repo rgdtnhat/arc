@@ -1,0 +1,123 @@
+# Tessera 🎟️
+
+**Trustless pay-per-use commerce for AI agents, settled on [Arc](https://docs.arc.io) in USDC.**
+
+> A *tessera* was a small token in ancient Rome that granted its bearer entry, a
+> seat, or a ration. Tessera is the digital equivalent for the agent economy: an
+> autonomous agent pays a tiny USDC toll and receives a verifiable token of
+> access — no account, no credit card, no human in the loop.
+
+Built for the [Arc Hackathon](https://www.encodeclub.com/my-programmes/arc-hackathon)
+— **Agentic Economy** track.
+
+---
+
+## The problem
+
+AI agents are starting to consume paid services on their own — data feeds, APIs,
+compute, premium content. But there is no clean way for an agent to **pay a
+stranger's service, per call, without a human first setting up an account and a
+credit card.** And trust runs both ways:
+
+- A **service** can't tell whether an unknown agent will actually pay.
+- An **agent** can't tell whether a service it has never met will actually
+  deliver what it charged for.
+
+Without solving *both* sides, agents can only transact with a hand-curated list
+of pre-approved, pre-funded vendors. That is not an economy.
+
+## The idea
+
+Tessera is an **HTTP-402 payment handshake settled by an on-chain escrow on
+Arc**:
+
+1. **Quote** — An agent hits a paid endpoint and gets back `402 Payment
+   Required` plus a signed price quote in USDC.
+2. **Decide** — The agent's decision engine autonomously answers *is this worth
+   it?* from its remaining budget, the value of the task, and the provider's
+   **on-chain reputation**. No human approves the spend.
+3. **Escrow** — The agent locks a nano-sized USDC payment into the Tessera
+   escrow contract on Arc (sub-second settlement, USDC is the gas token too).
+4. **Deliver & settle** — The provider returns the data. A verifier checks it
+   against the promised SLA:
+   - ✅ good response → escrow **releases** to the provider, reputation ↑
+   - ❌ failure / timeout → the agent **auto-claims a refund**, reputation ↓
+
+The unique core is step 4. Most "agent payment" demos stop at *"agent sends
+USDC."* Tessera adds **programmable escrow + SLA-based auto-refund + on-chain
+reputation**, which is exactly what makes it safe for an agent to buy from a
+service it has never met — the real unlock for agent-to-agent commerce.
+
+## Why Arc
+
+- **USDC is the gas token** — the agent funds one asset and uses it for both the
+  toll *and* the fees. No native-gas bootstrapping problem for a bot.
+- **Sub-second finality** — a per-call toll settles fast enough to sit inside a
+  request/response cycle.
+- **EVM + Circle stack** — standard Solidity/viem, Circle Wallets for agent
+  wallets, Paymaster for gasless UX.
+
+## Architecture
+
+```
+                         ┌────────────────────────────┐
+                         │   Arc testnet (chainId 5042002) │
+   ┌──────────┐          │  ┌──────────────────────────┐  │
+   │  Agent   │  open    │  │   TesseraEscrow.sol       │  │
+   │ runtime  │─────────▶│  │  • escrow USDC per call   │  │
+   │ (viem)   │  settle/ │  │  • SLA deadline + refund  │  │
+   │          │  refund  │  │  • provider reputation    │  │
+   │ decision │◀─────────│  └──────────────────────────┘  │
+   │  engine  │          │        ▲  USDC (0x3600…0000)     │
+   └────┬─────┘          └────────┼───────────────────────┘
+        │ HTTP 402 handshake      │ release / refund
+        ▼                         │
+   ┌──────────────────────────────┴──┐
+   │  Provider services (mock)        │
+   │  weather · finance · news(fails) │
+   └──────────────────────────────────┘
+```
+
+## Repo layout
+
+| Path          | What it is                                                        |
+|---------------|-------------------------------------------------------------------|
+| `contracts/`  | `TesseraEscrow` + `MockUSDC`, Hardhat + viem tests                 |
+| `agent/`      | Agent runtime: 402 handshake, hybrid decision engine, settle/refund |
+| `providers/`  | Mock priced services that speak the Tessera 402 protocol          |
+| `dashboard/`  | Live demo dashboard (balances, reputation, tx feed)               |
+| `shared/`     | Chain config, ABIs, protocol types shared across packages         |
+
+## The 402 protocol (Tessera flavor)
+
+A paid request/response looks like:
+
+```http
+GET /weather?city=Lisbon
+→ 402 Payment Required
+  X-Tessera-Provider: 0xProvider…
+  X-Tessera-Price:    2500        # 0.0025 USDC (6 decimals)
+  X-Tessera-Quote:    0xabc…      # keccak256(provider,price,resource,nonce)
+  X-Tessera-Deadline: 30          # seconds the provider has to deliver
+
+GET /weather?city=Lisbon
+  X-Tessera-Payment: 42           # on-chain paymentId proving escrow is funded
+→ 200 OK   { "tempC": 21, … }
+```
+
+## Status
+
+Early build for Checkpoint 1. See `docs/ROADMAP.md` for the plan to a deployed
+MVP.
+
+## Quick start
+
+```bash
+npm install            # installs all workspaces
+npm run test           # compile + run contract tests on a local EVM
+npm run demo           # runs the end-to-end local demo (chain + providers + agent)
+```
+
+## License
+
+MIT

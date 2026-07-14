@@ -1,0 +1,23 @@
+{
+  "name": "tessera",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Trustless pay-per-use commerce for AI agents, settled on Arc in USDC.",
+  "workspaces": [
+    "shared",
+    "contracts",
+    "providers",
+    "agent",
+    "dashboard"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspace contracts",
+    "compile": "npm run compile --workspace contracts",
+    "demo": "npm run demo --workspace agent"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}

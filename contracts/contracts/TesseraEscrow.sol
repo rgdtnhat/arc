@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/// @notice Minimal ERC-20 surface used by the escrow (Arc USDC).
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+/**
+ * @title TesseraEscrow
+ * @notice Per-call escrow that lets an AI agent pay a service it has never met,
+ *         with an SLA deadline and automatic refund, plus on-chain reputation.
+ *
+ * Lifecycle of one payment:
+ *
+ *   open()      agent escrows USDC, referencing a signed quote and a deadline
+ *   fulfill()   provider marks the resource delivered (records a response hash)
+ *   settle()    agent confirms the SLA was met  -> funds released to provider
+ *   refund()    agent rejects, OR anyone calls after the deadline with no
+ *               fulfillment -> funds returned to the agent
+ *
+ * Reputation is updated on every terminal transition so agents can price the
+ * risk of an unknown provider before spending.
+ */
+contract TesseraEscrow {
+    enum Status {
+        None,
+        Escrowed,
+        Fulfilled,
+        Settled,
+        Refunded
+    }
+
+    struct Payment {
+        address agent;
+        address provider;
+        uint256 amount; // USDC base units (6 decimals)
+        uint64 deadline; // unix seconds by which provider must fulfill
+        bytes32 quoteHash; // binds the off-chain price quote
+        bytes32 responseHash; // set on fulfill; commitment to the delivered payload
+        Status status;
+    }
+
+    struct Reputation {
+        uint128 fulfilled; // settled deliveries
+        uint128 failed; // refunds charged against the provider
+        uint256 earned; // total USDC released to the provider
+    }
+
+    IERC20 public immutable usdc;
+
+    uint256 public nextPaymentId = 1;
+    mapping(uint256 => Payment) public payments;
+    mapping(address => Reputation) public reputationOf;
+
+    event PaymentOpened(
+        uint256 indexed paymentId,
+        address indexed agent,
+        address indexed provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash
+    );
+    event PaymentFulfilled(uint256 indexed paymentId, bytes32 responseHash);
+    event PaymentSettled(uint256 indexed paymentId, address indexed provider, uint256 amount);
+    event PaymentRefunded(uint256 indexed paymentId, address indexed agent, uint256 amount, bool slaBreach);
+
+    error NotAgent();
+    error NotProvider();
+    error BadState(Status have, Status want);
+    error ZeroAmount();
+    error DeadlinePassed();
+    error DeadlineNotReached();
+    error TransferFailed();
+
+    constructor(address usdc_) {
+        require(usdc_ != address(0), "usdc=0");
+        usdc = IERC20(usdc_);
+    }
+
+    /**
+     * @notice Agent escrows `amount` USDC for `provider`, committing to a quote.
+     * @dev Agent must have approved this contract for `amount` USDC first.
+     * @param deadline unix seconds; provider must fulfill before this.
+     * @return paymentId identifier the agent hands to the provider off-chain.
+     */
+    function open(
+        address provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash
+    ) external returns (uint256 paymentId) {
+        if (amount == 0) revert ZeroAmount();
+        if (deadline <= block.timestamp) revert DeadlinePassed();
+
+        if (!usdc.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
+
+        paymentId = nextPaymentId++;
+        payments[paymentId] = Payment({
+            agent: msg.sender,
+            provider: provider,
+            amount: amount,
+            deadline: deadline,
+            quoteHash: quoteHash,
+            responseHash: bytes32(0),
+            status: Status.Escrowed
+        });
+
+        emit PaymentOpened(paymentId, msg.sender, provider, amount, deadline, quoteHash);
+    }
+
+    /**
+     * @notice Provider records delivery of the resource before the deadline.
+     * @param responseHash commitment (e.g. keccak256 of the response body).
+     */
+    function fulfill(uint256 paymentId, bytes32 responseHash) external {
+        Payment storage p = payments[paymentId];
+        if (msg.sender != p.provider) revert NotProvider();
+        if (p.status != Status.Escrowed) revert BadState(p.status, Status.Escrowed);
+        if (block.timestamp > p.deadline) revert DeadlinePassed();
+
+        p.responseHash = responseHash;
+        p.status = Status.Fulfilled;
+        emit PaymentFulfilled(paymentId, responseHash);
+    }
+
+    /**
+     * @notice Agent confirms the SLA was met; releases escrow to the provider.
+     */
+    function settle(uint256 paymentId) external {
+        Payment storage p = payments[paymentId];
+        if (msg.sender != p.agent) revert NotAgent();
+        if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+
+        p.status = Status.Settled;
+
+        Reputation storage r = reputationOf[p.provider];
+        r.fulfilled += 1;
+        r.earned += p.amount;
+
+        if (!usdc.transfer(p.provider, p.amount)) revert TransferFailed();
+        emit PaymentSettled(paymentId, p.provider, p.amount);
+    }
+
+    /**
+     * @notice Return escrow to the agent. Two paths:
+     *         - agent rejects a fulfilled-but-bad response (SLA breach), or
+     *         - anyone reclaims after the deadline if the provider never
+     *           fulfilled (also an SLA breach).
+     *         Either way the provider's `failed` count increments.
+     */
+    function refund(uint256 paymentId) external {
+        Payment storage p = payments[paymentId];
+
+        bool agentReject = msg.sender == p.agent && p.status == Status.Fulfilled;
+        bool timedOut = p.status == Status.Escrowed && block.timestamp > p.deadline;
+
+        if (!agentReject && !timedOut) {
+            if (p.status != Status.Escrowed && p.status != Status.Fulfilled) {
+                revert BadState(p.status, Status.Escrowed);
+            }
+            // Escrowed but before deadline, or a non-agent caller trying to reject.
+            if (p.status == Status.Fulfilled) revert NotAgent();
+            revert DeadlineNotReached();
+        }
+
+        p.status = Status.Refunded;
+        reputationOf[p.provider].failed += 1;
+
+        if (!usdc.transfer(p.agent, p.amount)) revert TransferFailed();
+        emit PaymentRefunded(paymentId, p.agent, p.amount, true);
+    }
+
+    /// @notice Convenience view returning a provider's reputation triple.
+    function reputation(address provider)
+        external
+        view
+        returns (uint128 fulfilled, uint128 failed, uint256 earned)
+    {
+        Reputation storage r = reputationOf[provider];
+        return (r.fulfilled, r.failed, r.earned);
+    }
+
+    /// @notice Full payment record (structs aren't auto-exposed with enums cleanly in some tooling).
+    function getPayment(uint256 paymentId)
+        external
+        view
+        returns (
+            address agent,
+            address provider,
+            uint256 amount,
+            uint64 deadline,
+            bytes32 quoteHash,
+            bytes32 responseHash,
+            Status status
+        )
+    {
+        Payment storage p = payments[paymentId];
+        return (p.agent, p.provider, p.amount, p.deadline, p.quoteHash, p.responseHash, p.status);
+    }
+}
