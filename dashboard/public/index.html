@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tessera — agentic payments on Arc</title>
+    <style>
+      :root {
+        --bg: #0a0e17;
+        --panel: #121826;
+        --panel-2: #0e1421;
+        --line: #1f2937;
+        --text: #e6edf6;
+        --muted: #8695ab;
+        --accent: #3a7bff; /* USDC/Circle blue */
+        --good: #34d399;
+        --bad: #f87171;
+        --warn: #fbbf24;
+        --skip: #64748b;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: radial-gradient(1200px 600px at 80% -10%, #12203f 0%, var(--bg) 55%);
+        color: var(--text);
+        -webkit-font-smoothing: antialiased;
+      }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 22px 60px; }
+      header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+      .logo { font-size: 30px; }
+      h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
+      .tag { font-size: 12px; color: var(--muted); }
+      .pill {
+        font-size: 11px; padding: 3px 9px; border-radius: 999px;
+        background: #172035; border: 1px solid var(--line); color: var(--muted);
+      }
+      .pill.blue { color: #cfe0ff; border-color: #24447f; background: #10203f; }
+      .task {
+        margin: 18px 0 22px; padding: 16px 18px; border: 1px solid var(--line);
+        border-radius: 14px; background: linear-gradient(180deg, var(--panel), var(--panel-2));
+        display: flex; justify-content: space-between; gap: 16px; align-items: center; flex-wrap: wrap;
+      }
+      .task .goal { font-size: 15px; }
+      .task .goal b { color: #fff; }
+      .btn {
+        border: 1px solid #24447f; background: #12233f; color: #cfe0ff;
+        padding: 9px 16px; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 13px;
+      }
+      .btn:hover { background: #163057; }
+      .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+      .grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 18px; }
+      @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+      .card {
+        border: 1px solid var(--line); border-radius: 14px; background: var(--panel);
+        padding: 16px 18px;
+      }
+      .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 12px; }
+      .wallet { display: flex; align-items: baseline; gap: 10px; }
+      .balance { font-size: 34px; font-weight: 700; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+      .balance .u { font-size: 15px; color: var(--muted); font-weight: 600; margin-left: 4px; }
+      .bar { height: 8px; border-radius: 6px; background: #1b2536; margin: 14px 0 6px; overflow: hidden; }
+      .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), #6aa2ff); transition: width .5s ease; }
+      .kv { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+      .prov { display: flex; flex-direction: column; gap: 10px; }
+      .prov .row {
+        display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+        border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2);
+      }
+      .prov .name { font-weight: 600; }
+      .prov .addr { font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; }
+      .prov .rep { margin-left: auto; text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
+      .rep .f { color: var(--good); } .rep .x { color: var(--bad); }
+      .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+      .dot.reliable { background: var(--good); } .dot.bad-data, .dot.no-fulfill { background: var(--warn); }
+      table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+      th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); font-size: 13px; vertical-align: middle; }
+      th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+      td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      .badge { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
+      .badge.settled { background: #0c2c1e; border: 1px solid #14532d; color: var(--good); }
+      .badge.refunded { color: var(--warn); background: #2c230c; border: 1px solid #533a14; }
+      .badge.skipped { color: var(--skip); background: #1a2130; border: 1px solid #2a3444; }
+      .badge.error { color: var(--bad); background: #2c0c0c; border: 1px solid #531414; }
+      .log { margin-top: 18px; }
+      .log .line { display: flex; gap: 10px; padding: 6px 4px; border-bottom: 1px solid #141c2b; font-size: 12.5px; }
+      .log .t { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+      .log .src { flex: none; width: 90px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .log .msg { flex: 1; }
+      .lv-settle .msg { color: var(--good); }
+      .lv-refund .msg { color: var(--warn); }
+      .lv-pay .msg { color: #9dc0ff; }
+      .lv-decide .msg { color: #d7c6ff; }
+      .lv-skip .msg { color: var(--muted); }
+      .foot { margin-top: 22px; font-size: 12px; color: var(--muted); display: flex; gap: 18px; flex-wrap: wrap; }
+      .mono { font-family: ui-monospace, monospace; }
+      .live { display: inline-flex; align-items: center; gap: 6px; }
+      .live .dot { background: var(--good); animation: pulse 1.4s infinite; }
+      @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <span class="logo">🎟️</span>
+        <h1>Tessera</h1>
+        <span class="tag">trustless pay-per-use commerce for AI agents · settled on Arc in USDC</span>
+        <span style="flex:1"></span>
+        <span class="pill blue" id="brainPill">brain: —</span>
+        <span class="pill" id="chainPill">chain: —</span>
+        <span class="pill live"><span class="dot"></span> live</span>
+      </header>
+
+      <div class="task">
+        <div class="goal">Agent task: <b id="goal">—</b></div>
+        <div style="display:flex;gap:14px;align-items:center">
+          <div class="kv" style="flex-direction:column;text-align:right">
+            <span>budget <b id="budget" style="color:#fff">—</b> · spent <b id="spent" style="color:#fff">—</b></span>
+            <span id="summary">—</span>
+          </div>
+          <button class="btn" id="runBtn">Run again ↻</button>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <h2>Agent wallet</h2>
+          <div class="wallet">
+            <span class="balance" id="agentBal">—<span class="u">USDC</span></span>
+          </div>
+          <div class="bar"><span id="balBar" style="width:100%"></span></div>
+          <div class="kv"><span class="mono" id="agentAddr">—</span><span id="balDelta"></span></div>
+        </div>
+
+        <div class="card">
+          <h2>Marketplace providers · on-chain reputation</h2>
+          <div class="prov" id="providers"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:18px">
+        <h2>Purchase ledger</h2>
+        <table>
+          <thead>
+            <tr><th>Service</th><th>Provider</th><th class="num">Price</th><th>Outcome</th><th>Why</th><th>Payment</th></tr>
+          </thead>
+          <tbody id="ledger"></tbody>
+        </table>
+      </div>
+
+      <div class="card log">
+        <h2>Autonomous activity — agent ⇄ providers ⇄ Arc</h2>
+        <div id="log"></div>
+      </div>
+
+      <div class="foot">
+        <span>escrow <span class="mono" id="escrowLink">—</span></span>
+        <span id="note"></span>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const short = (a) => (a ? a.slice(0, 6) + "…" + a.slice(-4) : "—");
+      const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
+      const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+      async function tick() {
+        let s;
+        try { s = await (await fetch("/api/state")).json(); } catch { return; }
+
+        $("brainPill").textContent = "brain: " + s.meta.brain;
+        $("chainPill").textContent = s.meta.chain;
+        $("goal").textContent = s.task.goal;
+        $("budget").textContent = s.task.budgetUsdc + " USDC";
+        $("spent").textContent = s.summary.spentUsdc + " USDC";
+        $("summary").textContent =
+          `${s.summary.settled} settled · ${s.summary.refunded} refunded · ${s.summary.skipped} skipped`;
+
+        $("agentBal").innerHTML = (+s.agent.balanceUsdc).toFixed(4) + '<span class="u">USDC</span>';
+        $("agentAddr").textContent = s.agent.address;
+        const start = +s.agent.startBalanceUsdc || 1;
+        $("balBar").style.width = Math.max(0, Math.min(100, (100 * +s.agent.balanceUsdc) / start)) + "%";
+        const delta = +s.agent.balanceUsdc - start;
+        $("balDelta").textContent = (delta >= 0 ? "+" : "") + delta.toFixed(4) + " vs start";
+        $("balDelta").style.color = delta < 0 ? "var(--muted)" : "var(--good)";
+
+        $("providers").innerHTML = s.providers
+          .map(
+            (p) => `
+          <div class="row">
+            <span class="dot ${p.behavior}"></span>
+            <div>
+              <div class="name">${esc(p.name)}</div>
+              <div class="addr">${short(p.address)} · ${p.behavior}</div>
+            </div>
+            <div class="rep">
+              <span class="f">${p.reputation.fulfilled}✓</span>
+              <span class="x">${p.reputation.failed}✗</span><br/>
+              <span style="color:var(--muted)">earned ${p.reputation.earnedUsdc}</span>
+            </div>
+          </div>`
+          )
+          .join("");
+
+        $("ledger").innerHTML = s.ledger.length
+          ? s.ledger
+              .map(
+                (e) => `<tr>
+              <td>${esc(e.name)}</td>
+              <td class="mono" style="font-size:11px;color:var(--muted)">${short(e.provider)}</td>
+              <td class="num">${e.priceUsdc}</td>
+              <td><span class="badge ${e.status}">${e.status}</span></td>
+              <td style="color:var(--muted)">${esc(e.reason)}</td>
+              <td class="mono" style="font-size:11px">${e.paymentId ? "#" + e.paymentId : "—"}</td>
+            </tr>`
+              )
+              .join("")
+          : `<tr><td colspan="6" style="color:var(--muted)">No purchases yet…</td></tr>`;
+
+        $("log").innerHTML = s.events
+          .slice(-40)
+          .reverse()
+          .map(
+            (e) => `<div class="line lv-${e.level}">
+              <span class="t">${fmtTime(e.ts)}</span>
+              <span class="src">${e.source === "agent" ? "agent" : esc(e.resource || "provider")}</span>
+              <span class="msg">${esc(e.message)}</span>
+            </div>`
+          )
+          .join("");
+
+        $("escrowLink").textContent = s.meta.escrowAddress;
+        $("note").textContent = s.meta.note || "";
+        $("runBtn").disabled = s.running;
+        $("runBtn").textContent = s.running ? "Running…" : "Run again ↻";
+      }
+
+      $("runBtn").addEventListener("click", async () => {
+        $("runBtn").disabled = true;
+        await fetch("/api/run", { method: "POST" }).catch(() => {});
+      });
+
+      tick();
+      setInterval(tick, 800);
+    </script>
+  </body>
+</html>

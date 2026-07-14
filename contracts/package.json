@@ -8,6 +8,7 @@
     "precompile": "node scripts/seed-compiler.cjs",
     "pretest": "node scripts/seed-compiler.cjs",
     "compile": "hardhat compile",
+    "postcompile": "node scripts/export-abi.cjs",
     "test": "hardhat test",
     "deploy:local": "hardhat run scripts/deploy.ts",
     "deploy:arc": "hardhat run scripts/deploy.ts --network arcTestnet"

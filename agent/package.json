@@ -1,0 +1,22 @@
+{
+  "name": "@tessera/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/agent.ts",
+  "scripts": {
+    "demo": "tsx src/demo.ts",
+    "run:arc": "tsx src/run-arc.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "@tessera/providers": "*",
+    "@tessera/shared": "*",
+    "express": "^4.21.2",
+    "viem": "^2.55.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.0"
+  }
+}
