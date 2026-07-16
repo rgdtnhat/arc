@@ -183,6 +183,11 @@ export function passesQuality(resource: string, body: unknown): { ok: boolean; r
       return typeof b.stance === "string" && Array.isArray(b.drivers)
         ? { ok: true, reason: "analysis with stance + drivers" }
         : { ok: false, reason: "missing stance/drivers" };
+    case "subscription:fx":
+    case "subscription:news":
+      return b.renewed === true
+        ? { ok: true, reason: "renewal receipt issued" }
+        : { ok: false, reason: "no renewal receipt" };
     default:
       return { ok: true, reason: "no specific quality rule" };
   }

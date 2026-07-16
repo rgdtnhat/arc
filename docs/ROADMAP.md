@@ -17,6 +17,11 @@ Tessera against the Arc Hackathon checkpoints.
 - **Contacts & personal trust memory**: the agent's own cross-run experience
   with providers feeds its decisions (three strikes → stop buying).
 - **Wallet activity**: balance sparkline + readable event history.
+- **Payment requests**: provider-issued invoices; the agent pays trusted
+  billers via the escrow rail, declines providers that burned it, and
+  escalates over-cap amounts to the guardian.
+- **Tests + CI**: 17 contract tests, 17 agent unit tests (decision engine,
+  guardian queue, memory), and the full E2E scenario on every push.
 - Offline-capable Hardhat toolchain (seeds solc from npm so it builds in
   locked-down environments).
 - The Tessera 402 protocol + three provider services (one deliberately flaky).

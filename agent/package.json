@@ -6,7 +6,8 @@
   "main": "src/agent.ts",
   "scripts": {
     "demo": "tsx src/demo.ts",
-    "run:arc": "tsx src/run-arc.ts"
+    "run:arc": "tsx src/run-arc.ts",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.68.0",

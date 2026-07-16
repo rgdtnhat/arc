@@ -126,6 +126,39 @@ export function createProviderApp(config: ProviderConfig): Express {
     }
   }
 
+  // --- Payment requests (invoices) -------------------------------------------
+  // Providers publish invoices; paying one is just buying the referenced
+  // resource through the normal 402 escrow flow. Fulfillment marks it paid.
+  const invoiceStatus = new Map<string, "pending" | "paid">();
+  for (const svc of CATALOG) {
+    if (svc.invoice && addressOf.has(svc.resource)) {
+      invoiceStatus.set(svc.resource, "pending");
+    }
+  }
+
+  app.get("/invoices", (_req: Request, res: Response) => {
+    const invoices = CATALOG.filter((s) => s.invoice && invoiceStatus.has(s.resource)).map(
+      (s) => ({
+        invoiceId: s.resource,
+        resource: s.resource,
+        name: s.name,
+        provider: addressOf.get(s.resource)!,
+        amount: s.price.toString(),
+        amountUsdc: formatUsdc(s.price),
+        memo: s.invoice!.memo,
+        status: invoiceStatus.get(s.resource)!,
+      })
+    );
+    res.json({ invoices });
+  });
+
+  const markInvoicePaid = (resource: string) => {
+    if (invoiceStatus.get(resource) === "pending") {
+      invoiceStatus.set(resource, "paid");
+      emit({ kind: "serve", resource, detail: "invoice settled — receipt issued" });
+    }
+  };
+
   // The best voucher seen per tab, so the provider can settle in one claim.
   const bestVoucher = new Map<string, { cum: bigint; sig: Hex; resource: string }>();
 
@@ -332,6 +365,7 @@ export function createProviderApp(config: ProviderConfig): Express {
         detail: svc.behavior === "bad-data" ? `fulfilled with degraded data` : `fulfilled ${paymentId}`,
         txHash,
       });
+      markInvoicePaid(svc.resource);
       res.set(HEADERS.quote, rHash).json(body);
     } catch (err) {
       res.status(500).json({ error: "fulfillment failed", detail: String(err) });

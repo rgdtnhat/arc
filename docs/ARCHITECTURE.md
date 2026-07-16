@@ -135,6 +135,20 @@ agent*. Each personal refund costs 0.15 trust (capped at 0.45) — after three
 strikes the provider falls below the buy floor and the agent stops dealing
 with it. Persisted to `.tessera-memory.json` across runs.
 
+## Payment requests (the billing inbox)
+
+Providers publish invoices at `GET /invoices`; paying one is just buying the
+referenced resource through the normal 402 escrow flow, so every guarantee
+(escrow, SLA gate, refund, reputation) applies to inbound billing too. The
+agent's verdict logic in `processInvoices()`:
+
+1. **Decline** if its personal memory says the provider burned it before.
+2. **Decline** if combined trust (reputation + stake − memory penalty) is
+   below the floor, or the amount exceeds the invoice budget.
+3. **Escalate to the guardian** if the amount is over the policy cap.
+4. Otherwise **pay autonomously**; the provider marks the invoice paid when it
+   fulfills the receipt on-chain.
+
 ## Running locally vs on Arc
 
 - **Local**: `npm run demo` spins up a Hardhat node, deploys `MockUSDC` +

@@ -71,6 +71,10 @@ And a wallet-grade safety layer (inspired by consumer wallets like LOBSTR):
   loses personal trust (−0.15 per refund) until the agent stops buying from it.
 - **Wallet activity** — a live balance sparkline and a readable event feed of
   every escrow, voucher, settle, refund, and slash.
+- **Payment requests (billing inbox)** — providers issue invoices; the agent
+  autonomously pays the ones from providers it trusts (through the same escrow
+  rail), **declines** the ones from providers that burned it, and escalates
+  over-cap amounts to the guardian.
 
 ## Why Arc
 
@@ -138,9 +142,13 @@ MVP.
 
 ```bash
 npm install            # installs all workspaces
-npm run test           # compile + run contract tests on a local EVM
-npm run demo           # runs the end-to-end local demo (chain + providers + agent)
+npm run test           # 17 contract tests + 17 agent unit tests
+npm run demo           # end-to-end local demo (chain + providers + agent + dashboard)
+npm run e2e            # the same scenario headless, one-shot (used in CI)
 ```
+
+CI runs all of the above on every push (`.github/workflows/ci.yml`), including
+the full agentic flow end to end.
 
 ## License
 

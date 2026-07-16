@@ -12,9 +12,10 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "test": "npm run test --workspace contracts",
+    "test": "npm run test --workspace contracts && npm run test --workspace agent",
     "compile": "npm run compile --workspace contracts",
-    "demo": "npm run demo --workspace agent"
+    "demo": "npm run demo --workspace agent",
+    "e2e": "TESSERA_ONCE=1 tsx agent/src/demo.ts"
   },
   "license": "MIT",
   "engines": {

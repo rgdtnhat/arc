@@ -11,6 +11,7 @@ import {
   decideByLlm,
   decideByRules,
   passesQuality,
+  trustScore,
   type AgentTask,
   type Decision,
   type OfferedService,
@@ -442,6 +443,83 @@ export class TesseraAgent {
     return { data, spent: cum, tabId };
   }
 
+  /**
+   * Payment requests: fetch provider-issued invoices and autonomously decide
+   * each one — pay (through the normal escrow flow), decline from personal
+   * memory, or escalate to the guardian if over the policy cap.
+   */
+  readonly invoiceVerdicts: { invoiceId: string; verdict: "paid" | "declined"; reason: string }[] = [];
+
+  async processInvoices(budget: bigint): Promise<void> {
+    let invoices: Array<{
+      invoiceId: string;
+      resource: string;
+      name: string;
+      amount: string;
+      amountUsdc: string;
+      memo: string;
+      status: string;
+    }>;
+    try {
+      const res = await fetch(`${this.cfg.providersBaseUrl}/invoices`);
+      invoices = ((await res.json()) as { invoices: typeof invoices }).invoices;
+    } catch {
+      return; // no billing inbox — nothing to do
+    }
+    const pending = invoices.filter((i) => i.status === "pending");
+    if (pending.length === 0) return;
+    this.emit({ level: "info", message: `Billing inbox: ${pending.length} payment request(s)` });
+
+    const services = await this.discover();
+    let remaining = budget;
+
+    for (const inv of pending) {
+      const svc = services.find((s) => s.resource === inv.resource);
+      if (!svc) continue;
+      const amount = BigInt(inv.amount);
+      const penalty = this.cfg.memory?.penalty(svc.provider) ?? 0;
+      const trust = Math.max(0, trustScore(svc.reputation, svc.stakeUsdc) - penalty);
+
+      const decline = (reason: string) => {
+        this.invoiceVerdicts.push({ invoiceId: inv.invoiceId, verdict: "declined", reason });
+        this.emit({ level: "decide", resource: inv.resource, message: `DECLINE invoice "${inv.memo}" — ${reason}` });
+      };
+
+      if (penalty > 0) {
+        decline(`provider burned this agent before (personal trust −${penalty.toFixed(2)})`);
+        continue;
+      }
+      if (trust < 0.34) {
+        decline(`trust ${trust.toFixed(2)} below floor`);
+        continue;
+      }
+      if (amount > remaining) {
+        decline(`amount ${inv.amountUsdc} exceeds invoice budget`);
+        continue;
+      }
+      if (this.cfg.policy && amount > this.cfg.policy.autoApproveMax) {
+        const approved = await this.escalate(svc, { buy: true, reason: `invoice: ${inv.memo}`, trust });
+        if (!approved) {
+          decline("guardian declined (over policy cap)");
+          continue;
+        }
+      }
+
+      this.emit({ level: "decide", resource: inv.resource, message: `PAY invoice "${inv.memo}" (${inv.amountUsdc} USDC) — trust ${trust.toFixed(2)}` });
+      const entry = await this.purchase(svc, { buy: true, reason: `invoice: ${inv.memo}`, trust });
+      this.ledger.push(entry);
+      if (entry.status === "settled" || entry.status === "refunded") {
+        this.cfg.memory?.record(svc.provider, svc.name, entry.status);
+      }
+      if (entry.status === "settled") {
+        remaining -= amount;
+        this.invoiceVerdicts.push({ invoiceId: inv.invoiceId, verdict: "paid", reason: inv.memo });
+      } else {
+        this.invoiceVerdicts.push({ invoiceId: inv.invoiceId, verdict: "declined", reason: entry.reason });
+      }
+    }
+  }
+
   /** Compose everything the agent bought into the final deliverable. */
   briefing(streamData?: unknown[]): string[] {
     const lines: string[] = [];
@@ -461,6 +539,8 @@ export class TesseraAgent {
         lines.push(
           `Analysis (${d.subject}): ${d.stance}, confidence ${Math.round(Number(d.confidence) * 100)}% — ${(d.drivers as string[]).join(", ")}`
         );
+      } else if (e.resource === "subscription:fx") {
+        lines.push(`Subscription: ${d.plan} renewed until ${d.until}`);
       }
     }
     const refunded = this.ledger.filter((e) => e.status === "refunded");

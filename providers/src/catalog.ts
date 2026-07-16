@@ -23,6 +23,8 @@ export interface ServiceDef {
   slaSeconds: number;
   /** "escrow" = one escrow per call (default); "tab" = nanopayments via TesseraTab vouchers. */
   billing?: "escrow" | "tab";
+  /** If set, the provider publishes a payment request (invoice) for this service. */
+  invoice?: { memo: string };
   behavior: Behavior;
   /** Produces the response body for a given query. */
   respond: (query: Record<string, string>) => unknown;
@@ -80,6 +82,33 @@ export const CATALOG: ServiceDef[] = [
     // quality check fails and it reclaims the escrow.
     behavior: "bad-data",
     respond: () => ({ headlines: [], note: "service degraded" }),
+  },
+  {
+    resource: "subscription:fx",
+    path: "/subscription/fx",
+    name: "ParityDesk — FX Pro subscription",
+    tags: ["subscription"],
+    price: usdc("0.004"),
+    slaSeconds: 30,
+    behavior: "reliable",
+    invoice: { memo: "Monthly FX Pro data subscription renewal" },
+    respond: () => ({
+      renewed: true,
+      plan: "FX Pro",
+      until: new Date(Date.now() + 30 * 86400_000).toISOString().slice(0, 10),
+      source: "ParityDesk",
+    }),
+  },
+  {
+    resource: "subscription:news",
+    path: "/subscription/news",
+    name: "WireScoop — news digest subscription",
+    tags: ["subscription"],
+    price: usdc("0.0035"),
+    slaSeconds: 30,
+    behavior: "bad-data",
+    invoice: { memo: "News digest subscription renewal" },
+    respond: () => ({ renewed: false, note: "service degraded" }),
   },
   {
     resource: "alpha:report",

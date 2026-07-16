@@ -51,11 +51,15 @@ async function main() {
     "news:headlines": DEV_KEYS.news,
     "ticker:stream": DEV_KEYS.ticker,
     "alpha:report": DEV_KEYS.alpha,
+    // Subscriptions bill from the same on-chain identities as the base services,
+    // so reputation, stake, and the agent's memory carry over.
+    "subscription:fx": DEV_KEYS.fx,
+    "subscription:news": DEV_KEYS.news,
   };
 
   // Providers bond stake — skin in the game the escrow can slash on SLA breach.
   console.log("🔒 Providers bonding stake (0.05 USDC each)…");
-  for (const key of Object.values(providerKeys)) {
+  for (const key of new Set(Object.values(providerKeys))) {
     await stakeProvider(deployment, key, usdc("0.05"));
   }
 
@@ -129,13 +133,14 @@ async function main() {
       .catch(() => {});
   };
 
-  /** The full autonomous scenario: escrow purchases, then a nanopay stream. */
+  /** The full autonomous scenario: purchases, nanopay stream, then billing inbox. */
   async function runScenario() {
     await agent.run(DEMO_TASK);
     const stream = await agent.streamTicks("ticker:stream", 6);
     if (stream) {
       streamSummary = { ticks: stream.data.length, spentUsdc: formatUsdc(stream.spent) };
     }
+    await agent.processInvoices(usdc("0.01"));
     briefingLines = agent.briefing(stream?.data);
     pushEvent({
       source: "agent",
@@ -225,6 +230,15 @@ async function main() {
       policy: { autoApproveMaxUsdc: formatUsdc(policy.autoApproveMax), autoApprove: policy.autoApprove },
       contacts: memory.list(),
       balanceHistory,
+      invoices: await fetch(`http://127.0.0.1:${PROVIDERS_PORT}/invoices`)
+        .then((r) => r.json())
+        .then((j: any) =>
+          (j.invoices ?? []).map((inv: any) => ({
+            ...inv,
+            agentVerdict: agent.invoiceVerdicts.find((v) => v.invoiceId === inv.invoiceId) ?? null,
+          }))
+        )
+        .catch(() => []),
       summary: {
         settled: settled.length,
         refunded: refunded.length,

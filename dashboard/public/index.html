@@ -164,6 +164,10 @@
             One on-chain deposit → many off-chain signed vouchers (zero gas per tick) →
             one on-chain settlement; the remainder returns to the agent.
           </p>
+          <h2 style="margin-top:16px">Payment requests — the agent's billing inbox</h2>
+          <div id="invoices" style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">
+            <span style="color:var(--muted)">No invoices…</span>
+          </div>
           <h2 style="margin-top:16px">Contacts — the agent's own memory</h2>
           <div id="contacts" style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">
             <span style="color:var(--muted)">No dealings yet…</span>
@@ -283,6 +287,29 @@
           </div>`
           )
           .join("");
+
+        // Payment requests — provider invoices + the agent's verdict on each.
+        const invoices = s.invoices || [];
+        $("invoices").innerHTML = invoices.length
+          ? invoices
+              .map((inv) => {
+                const v = inv.agentVerdict;
+                const badge = v
+                  ? v.verdict === "paid"
+                    ? '<span class="badge settled">paid</span>'
+                    : '<span class="badge refunded">declined</span>'
+                  : '<span class="badge skipped">pending</span>';
+                return `
+            <div style="display:flex;gap:8px;align-items:center">
+              <span>🧾</span>
+              <span style="flex:1">${esc(inv.memo)} <span style="color:var(--muted)">· ${inv.amountUsdc} USDC</span>
+                ${v && v.verdict === "declined" ? `<br/><span style="color:var(--warn);font-size:11.5px">${esc(v.reason)}</span>` : ""}
+              </span>
+              ${badge}
+            </div>`;
+              })
+              .join("")
+          : '<span style="color:var(--muted)">No invoices…</span>';
 
         // Contacts — the agent's personal memory of providers.
         const contacts = s.contacts || [];
