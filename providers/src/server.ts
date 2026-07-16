@@ -27,6 +27,16 @@ for (const svc of CATALOG) {
   if (key) providerKeys[svc.resource] = key;
 }
 
+// Keep the server alive across transient RPC failures (e.g. public-RPC rate
+// limits during a readContract in a request handler). One bad request should
+// return an error, not crash the whole provider process.
+process.on("unhandledRejection", (reason) => {
+  console.error(`[provider] unhandledRejection (ignored): ${String(reason).slice(0, 200)}`);
+});
+process.on("uncaughtException", (err) => {
+  console.error(`[provider] uncaughtException (ignored): ${String(err).slice(0, 200)}`);
+});
+
 const app = createProviderApp({
   chain: arcTestnet,
   rpcUrl,

@@ -53,11 +53,15 @@ export class TesseraClient {
     this.escrow = cfg.escrowAddress;
     this.usdc = cfg.usdcAddress;
     this.tab = cfg.tabAddress;
-    this.public = createPublicClient({ chain: cfg.chain, transport: http(cfg.rpcUrl) });
+    this.public = createPublicClient({
+      chain: cfg.chain,
+      transport: http(cfg.rpcUrl, { retryCount: 8, retryDelay: 4000 }),
+      pollingInterval: 8000,
+    });
     this.wallet = createWalletClient({
       account: cfg.account,
       chain: cfg.chain,
-      transport: http(cfg.rpcUrl),
+      transport: http(cfg.rpcUrl, { retryCount: 8, retryDelay: 4000 }),
     });
   }
 

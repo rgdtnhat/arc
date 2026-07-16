@@ -55,6 +55,8 @@ async function main() {
 
   // Nanopay stream (needs TESSERA_TAB_ADDRESS + a tab-billed provider).
   if (process.env.TESSERA_TAB_ADDRESS) {
+    const paceMs = Number(process.env.TESSERA_PACE_MS ?? 0);
+    if (paceMs > 0) await new Promise((r) => setTimeout(r, paceMs));
     const stream = await agent.streamTicks("ticker:stream", 6);
     console.log("\n─── Briefing ───");
     for (const line of agent.briefing(stream?.data)) console.log(`  ${line}`);

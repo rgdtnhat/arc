@@ -109,7 +109,11 @@ export class TesseraAgent {
 
     // Satisfy each need with the best affordable, most-trusted matching service.
     // Tab-billed (streaming) services are bought via streamTicks(), not here.
+    // On rate-limited public RPCs, pace on-chain actions (TESSERA_PACE_MS).
+    const paceMs = Number(process.env.TESSERA_PACE_MS ?? 0);
+    let needIndex = 0;
     for (const need of task.needs) {
+      if (paceMs > 0 && needIndex++ > 0) await sleep(paceMs);
       const candidates = services
         .filter((s) => s.tags.includes(need.tag) && s.billing !== "tab")
         .sort((a, b) => (a.price === b.price ? 0 : a.price < b.price ? -1 : 1));

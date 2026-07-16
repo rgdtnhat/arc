@@ -53,7 +53,8 @@ export function createProviderApp(config: ProviderConfig): Express {
 
   const publicClient = createPublicClient({
     chain: config.chain,
-    transport: http(config.rpcUrl),
+    transport: http(config.rpcUrl, { retryCount: 8, retryDelay: 4000 }),
+    pollingInterval: 8000,
   });
 
   // Resolve each service's provider wallet.
@@ -66,7 +67,7 @@ export function createProviderApp(config: ProviderConfig): Express {
     addressOf.set(svc.resource, account.address);
     wallets.set(
       svc.resource,
-      createWalletClient({ account, chain: config.chain, transport: http(config.rpcUrl) })
+      createWalletClient({ account, chain: config.chain, transport: http(config.rpcUrl, { retryCount: 8, retryDelay: 4000 }) })
     );
   }
 
