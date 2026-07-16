@@ -13,8 +13,10 @@ import {
   DEV_KEYS,
   deployLocal,
   localChain,
+  stakeProvider,
   startLocalNode,
 } from "./local.js";
+import { usdc } from "@tessera/shared";
 
 const PROVIDERS_PORT = 8788;
 const DASHBOARD_PORT = 8787;
@@ -33,17 +35,26 @@ async function main() {
   process.on("SIGTERM", cleanup);
 
   const agentAccount = privateKeyToAccount(DEV_KEYS.agent);
-  console.log("📦 Deploying MockUSDC + TesseraEscrow…");
-  const { usdcAddress, escrowAddress } = await deployLocal(agentAccount.address);
+  console.log("📦 Deploying MockUSDC + TesseraEscrow + TesseraTab…");
+  const deployment = await deployLocal(agentAccount.address);
+  const { usdcAddress, escrowAddress, tabAddress } = deployment;
   console.log(`   USDC:   ${usdcAddress}`);
   console.log(`   Escrow: ${escrowAddress}`);
+  console.log(`   Tab:    ${tabAddress}`);
 
   // Wire providers with one wallet per service.
   const providerKeys: Record<string, Hex> = {
     "weather:current": DEV_KEYS.weather,
     "fx:quote": DEV_KEYS.fx,
     "news:headlines": DEV_KEYS.news,
+    "ticker:stream": DEV_KEYS.ticker,
   };
+
+  // Providers bond stake — skin in the game the escrow can slash on SLA breach.
+  console.log("🔒 Providers bonding stake (0.05 USDC each)…");
+  for (const key of Object.values(providerKeys)) {
+    await stakeProvider(deployment, key, usdc("0.05"));
+  }
 
   const events: UiEvent[] = [];
   const pushEvent = (e: UiEvent) => {
@@ -58,6 +69,7 @@ async function main() {
     chain: localChain,
     rpcUrl: "http://127.0.0.1:8545",
     escrowAddress,
+    tabAddress,
     providerKeys,
     onEvent: (e) => pushEvent({ ...e, source: "provider", ts: Date.now(), level: e.kind }),
   });
@@ -70,6 +82,7 @@ async function main() {
     account: agentAccount,
     escrowAddress,
     usdcAddress,
+    tabAddress,
   });
 
   const agent = new TesseraAgent({
@@ -84,6 +97,24 @@ async function main() {
   const startBalance = await client.usdcBalance();
   let running = false;
   let ledgerRef: LedgerEntry[] = agent.ledger;
+  let briefingLines: string[] = [];
+  let streamSummary: { ticks: number; spentUsdc: string } | null = null;
+
+  /** The full autonomous scenario: escrow purchases, then a nanopay stream. */
+  async function runScenario() {
+    await agent.run(DEMO_TASK);
+    const stream = await agent.streamTicks("ticker:stream", 6);
+    if (stream) {
+      streamSummary = { ticks: stream.data.length, spentUsdc: formatUsdc(stream.spent) };
+    }
+    briefingLines = agent.briefing(stream?.data);
+    pushEvent({
+      source: "agent",
+      ts: Date.now(),
+      level: "done",
+      message: `Briefing ready: ${briefingLines.length} line(s)`,
+    } as UiEvent);
+  }
 
   // --- Dashboard server ------------------------------------------------------
   const app = express();
@@ -100,16 +131,19 @@ async function main() {
     const providers = await Promise.all(
       CATALOG.map(async (s) => {
         const address = providerAddrs[s.resource] as Hex;
-        const [balance, rep] = await Promise.all([
+        const [balance, rep, stake] = await Promise.all([
           client.usdcBalance(address),
           client.reputation(address),
+          client.stakeOf(address),
         ]);
         return {
           resource: s.resource,
           name: s.name,
           address,
           behavior: s.behavior,
+          billing: s.billing ?? "escrow",
           balanceUsdc: formatUsdc(balance),
+          stakeUsdc: formatUsdc(stake),
           reputation: {
             fulfilled: Number(rep.fulfilled),
             failed: Number(rep.failed),
@@ -156,6 +190,8 @@ async function main() {
         txHash: (e as any).txHash,
       })),
       running,
+      briefing: briefingLines,
+      stream: streamSummary,
       summary: {
         settled: settled.length,
         refunded: refunded.length,
@@ -171,10 +207,11 @@ async function main() {
       return;
     }
     ledgerRef.length = 0;
+    briefingLines = [];
+    streamSummary = null;
     running = true;
     res.json({ started: true });
-    agent
-      .run(DEMO_TASK)
+    runScenario()
       .catch((e) => pushEvent({ source: "agent", ts: Date.now(), level: "info", message: `error: ${e}` } as UiEvent))
       .finally(() => {
         running = false;
@@ -185,12 +222,17 @@ async function main() {
   // cleanly without binding the long-lived dashboard server.
   if (process.env.TESSERA_ONCE === "1") {
     running = true;
-    await agent.run(DEMO_TASK);
+    await runScenario();
     running = false;
     console.log("\n─── Ledger ───");
     for (const e of ledgerRef) {
       console.log(`  ${e.status.toUpperCase().padEnd(9)} ${e.name} — ${formatUsdc(e.price)} USDC — ${e.reason}`);
     }
+    if (streamSummary) {
+      console.log(`  STREAMED  ${streamSummary.ticks} ticks — ${streamSummary.spentUsdc} USDC via nanopay tab`);
+    }
+    console.log("\n─── Briefing ───");
+    for (const line of briefingLines) console.log(`  ${line}`);
     console.log("\n✅ Scenario complete (one-shot mode). Exiting.");
     node?.kill();
     process.exit(0);
@@ -201,7 +243,7 @@ async function main() {
 
   // Kick off the scenario automatically.
   running = true;
-  await agent.run(DEMO_TASK);
+  await runScenario();
   running = false;
 
   console.log("\n✅ Scenario complete. Dashboard stays up (Ctrl-C to exit).");

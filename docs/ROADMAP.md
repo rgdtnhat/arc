@@ -6,6 +6,12 @@ Tessera against the Arc Hackathon checkpoints.
 
 - `TesseraEscrow` contract: escrow, SLA deadline, agent reject, timeout refund,
   on-chain reputation — with a passing test suite.
+- **Nanopayments**: `TesseraTab` payment-channel tabs — one deposit, off-chain
+  signed vouchers per micro-call (zero gas), one settlement claim.
+- **Provider staking & slashing**: bonded USDC compensates agents on SLA
+  breaches; stake feeds the agent's trust score.
+- **Mission briefing**: the agent assembles its purchases into the final
+  deliverable, shown on the dashboard.
 - Offline-capable Hardhat toolchain (seeds solc from npm so it builds in
   locked-down environments).
 - The Tessera 402 protocol + three provider services (one deliberately flaky).
@@ -29,10 +35,6 @@ Tessera against the Arc Hackathon checkpoints.
 
 - **Real providers.** Wrap an actual data/API vendor behind the 402 middleware;
   ship the middleware as a drop-in package so any HTTP service can charge agents.
-- **Streaming / nanopayments.** Micro-metered calls with a running escrow channel
-  instead of one escrow per request.
-- **Reputation staking.** Providers post a bond; repeated SLA failures slash it,
-  strengthening the trust signal beyond a simple counter.
 - **Discovery registry.** An on-chain catalog so agents discover providers
   without a trusted index.
 - **Dispute arbitration.** An optional third-party verifier for subjective SLAs

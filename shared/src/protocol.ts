@@ -18,6 +18,16 @@ export const HEADERS = {
   resource: "x-tessera-resource",
   /** Agent → provider: the on-chain paymentId proving escrow is funded. */
   payment: "x-tessera-payment",
+
+  // --- Nanopayments (tab / payment-channel billing) -------------------------
+  /** Agent → provider: the on-chain tabId opened in TesseraTab. */
+  tab: "x-tessera-tab",
+  /** Agent → provider: cumulative USDC (base units) authorized so far. */
+  voucher: "x-tessera-voucher",
+  /** Agent → provider: agent's signature over voucherHash(tabId, cumulative). */
+  voucherSig: "x-tessera-voucher-sig",
+  /** Provider → agent (on 402): "escrow" (default) or "tab". */
+  billing: "x-tessera-billing",
 } as const;
 
 /** What an agent parses out of a 402 response. */

@@ -2,8 +2,11 @@ import express, { type Express, type Request, type Response } from "express";
 import {
   createPublicClient,
   createWalletClient,
+  encodePacked,
   http,
   getAddress,
+  keccak256,
+  recoverMessageAddress,
   type Chain,
   type Hex,
 } from "viem";
@@ -11,6 +14,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import {
   HEADERS,
   tesseraEscrowAbi,
+  tesseraTabAbi,
   formatUsdc,
   PaymentStatus,
 } from "@tessera/shared";
@@ -21,6 +25,8 @@ export interface ProviderConfig {
   chain: Chain;
   rpcUrl: string;
   escrowAddress: Hex;
+  /** TesseraTab contract for nanopayment (tab) billing. Optional. */
+  tabAddress?: Hex;
   /** Private key per resource id — lets each service have its own reputation. */
   providerKeys: Record<string, Hex>;
   /** Optional sink for demo telemetry. */
@@ -28,7 +34,7 @@ export interface ProviderConfig {
 }
 
 export interface ProviderEvent {
-  kind: "quote" | "verify" | "fulfill" | "reject" | "serve";
+  kind: "quote" | "verify" | "fulfill" | "reject" | "serve" | "tab";
   resource: string;
   detail: string;
   txHash?: string;
@@ -70,17 +76,25 @@ export function createProviderApp(config: ProviderConfig): Express {
 
   const emit = (e: ProviderEvent) => config.onEvent?.(e);
 
-  // Discovery: what an agent can buy, with live on-chain reputation.
+  // Discovery: what an agent can buy, with live on-chain reputation + stake.
   app.get("/catalog", async (_req: Request, res: Response) => {
     const items = await Promise.all(
       CATALOG.filter((s) => addressOf.has(s.resource)).map(async (s) => {
         const provider = addressOf.get(s.resource)!;
-        const [fulfilled, failed, earned] = (await publicClient.readContract({
-          address: config.escrowAddress,
-          abi: tesseraEscrowAbi,
-          functionName: "reputation",
-          args: [provider],
-        })) as [bigint, bigint, bigint];
+        const [[fulfilled, failed, earned], stake] = await Promise.all([
+          publicClient.readContract({
+            address: config.escrowAddress,
+            abi: tesseraEscrowAbi,
+            functionName: "reputation",
+            args: [provider],
+          }) as Promise<[bigint, bigint, bigint]>,
+          publicClient.readContract({
+            address: config.escrowAddress,
+            abi: tesseraEscrowAbi,
+            functionName: "stakeOf",
+            args: [provider],
+          }) as Promise<bigint>,
+        ]);
         return {
           resource: s.resource,
           name: s.name,
@@ -89,7 +103,9 @@ export function createProviderApp(config: ProviderConfig): Express {
           price: s.price.toString(),
           priceUsdc: formatUsdc(s.price),
           slaSeconds: s.slaSeconds,
+          billing: s.billing ?? "escrow",
           provider,
+          stakeUsdc: formatUsdc(stake),
           reputation: {
             fulfilled: Number(fulfilled),
             failed: Number(failed),
@@ -103,8 +119,127 @@ export function createProviderApp(config: ProviderConfig): Express {
 
   for (const svc of CATALOG) {
     if (!addressOf.has(svc.resource)) continue;
-    app.get(svc.path, (req, res) => handlePaid(svc, req, res));
+    if (svc.billing === "tab") {
+      app.get(svc.path, (req, res) => handleTab(svc, req, res));
+    } else {
+      app.get(svc.path, (req, res) => handlePaid(svc, req, res));
+    }
   }
+
+  // The best voucher seen per tab, so the provider can settle in one claim.
+  const bestVoucher = new Map<string, { cum: bigint; sig: Hex; resource: string }>();
+
+  /** Nanopayments: verify an off-chain voucher, then serve — zero gas per call. */
+  async function handleTab(svc: ServiceDef, req: Request, res: Response) {
+    const provider = addressOf.get(svc.resource)!;
+    if (!config.tabAddress) {
+      res.status(501).json({ error: "tab billing not configured" });
+      return;
+    }
+
+    const tabId = req.header(HEADERS.tab);
+    const voucher = req.header(HEADERS.voucher);
+    const sig = req.header(HEADERS.voucherSig) as Hex | undefined;
+
+    // Unpaid: advertise tab billing terms.
+    if (!tabId || !voucher || !sig) {
+      res
+        .status(402)
+        .set({
+          [HEADERS.provider]: provider,
+          [HEADERS.price]: svc.price.toString(),
+          [HEADERS.billing]: "tab",
+          [HEADERS.resource]: svc.resource,
+        })
+        .json({
+          error: "payment required",
+          billing: "tab",
+          resource: svc.resource,
+          pricePerCall: formatUsdc(svc.price),
+          how: "openTab() on TesseraTab, then send x-tessera-tab / x-tessera-voucher / x-tessera-voucher-sig per call",
+        });
+      return;
+    }
+
+    // Verify the voucher: on-chain tab state + off-chain signature.
+    const cum = BigInt(voucher);
+    const tab = (await publicClient.readContract({
+      address: config.tabAddress,
+      abi: tesseraTabAbi,
+      functionName: "tabs",
+      args: [BigInt(tabId)],
+    })) as [Hex, Hex, bigint, bigint, bigint, boolean];
+    const [tabAgent, tabProvider, deposit, claimed, , closed] = tab;
+
+    const prev = bestVoucher.get(tabId)?.cum ?? claimed;
+    const hash = keccak256(
+      encodePacked(
+        ["address", "uint256", "uint256"],
+        [config.tabAddress, BigInt(tabId), cum]
+      )
+    );
+    let signer: Hex | undefined;
+    try {
+      signer = await recoverMessageAddress({ message: { raw: hash }, signature: sig });
+    } catch {
+      signer = undefined;
+    }
+
+    const ok =
+      !closed &&
+      getAddress(tabProvider) === getAddress(provider) &&
+      cum <= deposit &&
+      cum - prev >= svc.price &&
+      signer !== undefined &&
+      getAddress(signer) === getAddress(tabAgent);
+
+    if (!ok) {
+      emit({ kind: "tab", resource: svc.resource, detail: `rejected voucher on tab #${tabId}` });
+      res.status(402).json({ error: "invalid voucher" });
+      return;
+    }
+
+    bestVoucher.set(tabId, { cum, sig, resource: svc.resource });
+    const body = svc.respond(req.query as Record<string, string>);
+    emit({
+      kind: "tab",
+      resource: svc.resource,
+      detail: `tick served — voucher now ${formatUsdc(cum)} USDC (off-chain, no gas)`,
+    });
+    res.json(body);
+  }
+
+  /** Agent asks the provider to settle its tab: one on-chain claim for N calls. */
+  app.post("/tab/:tabId/close", async (req: Request, res: Response) => {
+    const tabId = req.params.tabId;
+    const best = bestVoucher.get(tabId);
+    if (!config.tabAddress || !best) {
+      res.status(404).json({ error: "no vouchers for this tab" });
+      return;
+    }
+    try {
+      const wallet = wallets.get(best.resource)!;
+      const txHash = await wallet.writeContract({
+        address: config.tabAddress,
+        abi: tesseraTabAbi,
+        functionName: "closeTab",
+        args: [BigInt(tabId), best.cum, best.sig],
+        chain: config.chain,
+        account: wallet.account!,
+      });
+      await publicClient.waitForTransactionReceipt({ hash: txHash });
+      bestVoucher.delete(tabId);
+      emit({
+        kind: "tab",
+        resource: best.resource,
+        detail: `tab #${tabId} settled on-chain for ${formatUsdc(best.cum)} USDC (1 tx for many ticks)`,
+        txHash,
+      });
+      res.json({ settled: best.cum.toString(), txHash });
+    } catch (err) {
+      res.status(500).json({ error: "close failed", detail: String(err) });
+    }
+  });
 
   async function handlePaid(svc: ServiceDef, req: Request, res: Response) {
     const provider = addressOf.get(svc.resource)!;

@@ -30,8 +30,12 @@ async function main() {
   const escrow = await hre.viem.deployContract("TesseraEscrow", [usdcAddress]);
   console.log(`Deployed TesseraEscrow at ${escrow.address}`);
 
+  const tab = await hre.viem.deployContract("TesseraTab", [usdcAddress]);
+  console.log(`Deployed TesseraTab at ${tab.address}`);
+
   console.log("\nAdd to your .env:");
   console.log(`TESSERA_ESCROW_ADDRESS=${escrow.address}`);
+  console.log(`TESSERA_TAB_ADDRESS=${tab.address}`);
   if (net !== "arcTestnet") console.log(`ARC_USDC_ADDRESS=${usdcAddress}`);
 
   console.log(

@@ -18,6 +18,7 @@ function readArtifact(name) {
 }
 
 const escrow = readArtifact("TesseraEscrow");
+const tab = readArtifact("TesseraTab");
 const usdc = readArtifact("MockUSDC");
 
 const outDir = path.resolve(root, "..", "shared", "src");
@@ -26,6 +27,7 @@ fs.mkdirSync(outDir, { recursive: true });
 const abiTs =
   `// AUTO-GENERATED from contracts/artifacts by scripts/export-abi.cjs. Do not edit.\n` +
   `export const tesseraEscrowAbi = ${JSON.stringify(escrow.abi)} as const;\n\n` +
+  `export const tesseraTabAbi = ${JSON.stringify(tab.abi)} as const;\n\n` +
   `export const mockUsdcAbi = ${JSON.stringify(usdc.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 
@@ -33,6 +35,7 @@ fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 const bytecodeTs =
   `// AUTO-GENERATED from contracts/artifacts by scripts/export-abi.cjs. Do not edit.\n` +
   `export const tesseraEscrowBytecode = "${escrow.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraTabBytecode = "${tab.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const mockUsdcBytecode = "${usdc.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);
 

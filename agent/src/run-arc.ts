@@ -34,6 +34,7 @@ async function main() {
     account,
     escrowAddress: escrow,
     usdcAddress: ARC_USDC_ADDRESS,
+    tabAddress: process.env.TESSERA_TAB_ADDRESS as Hex | undefined,
   });
 
   const balance = await client.usdcBalance();
@@ -51,6 +52,13 @@ async function main() {
   });
 
   await agent.run(DEMO_TASK);
+
+  // Nanopay stream (needs TESSERA_TAB_ADDRESS + a tab-billed provider).
+  if (process.env.TESSERA_TAB_ADDRESS) {
+    const stream = await agent.streamTicks("ticker:stream", 6);
+    console.log("\n─── Briefing ───");
+    for (const line of agent.briefing(stream?.data)) console.log(`  ${line}`);
+  }
 }
 
 main().catch((e) => {

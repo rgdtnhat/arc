@@ -11,9 +11,11 @@ import {
 } from "viem";
 import {
   tesseraEscrowAbi,
+  tesseraTabAbi,
   erc20Abi,
   PaymentStatus,
 } from "@tessera/shared";
+import { encodePacked, keccak256 } from "viem";
 
 export interface TesseraClientConfig {
   chain: Chain;
@@ -21,6 +23,8 @@ export interface TesseraClientConfig {
   account: Account;
   escrowAddress: Hex;
   usdcAddress: Hex;
+  /** TesseraTab contract for nanopayment sessions. Optional. */
+  tabAddress?: Hex;
 }
 
 export interface PaymentRecord {
@@ -40,6 +44,7 @@ export class TesseraClient {
   readonly account: Account;
   readonly escrow: Hex;
   readonly usdc: Hex;
+  readonly tab?: Hex;
   private readonly chain: Chain;
 
   constructor(cfg: TesseraClientConfig) {
@@ -47,6 +52,7 @@ export class TesseraClient {
     this.account = cfg.account;
     this.escrow = cfg.escrowAddress;
     this.usdc = cfg.usdcAddress;
+    this.tab = cfg.tabAddress;
     this.public = createPublicClient({ chain: cfg.chain, transport: http(cfg.rpcUrl) });
     this.wallet = createWalletClient({
       account: cfg.account,
@@ -71,23 +77,81 @@ export class TesseraClient {
     }) as Promise<bigint>;
   }
 
-  async ensureApproval(min: bigint): Promise<void> {
+  async ensureApproval(min: bigint, spender: Hex = this.escrow): Promise<void> {
     const allowance = (await this.public.readContract({
       address: this.usdc,
       abi: erc20Abi,
       functionName: "allowance",
-      args: [this.account.address, this.escrow],
+      args: [this.account.address, spender],
     })) as bigint;
     if (allowance >= min) return;
     const hash = await this.wallet.writeContract({
       address: this.usdc,
       abi: erc20Abi,
       functionName: "approve",
-      args: [this.escrow, maxUint256],
+      args: [spender, maxUint256],
       chain: this.chain,
       account: this.account,
     });
     await this.public.waitForTransactionReceipt({ hash });
+  }
+
+  // --- Nanopayments (TesseraTab) ---------------------------------------------
+
+  /** Open a tab with a provider: escrow `deposit` once, stream calls off-chain. */
+  async openTab(
+    provider: Hex,
+    deposit: bigint,
+    durationSeconds: number
+  ): Promise<{ tabId: bigint; txHash: Hex }> {
+    if (!this.tab) throw new Error("tabAddress not configured");
+    await this.ensureApproval(deposit, this.tab);
+    const { result, request } = await this.public.simulateContract({
+      address: this.tab,
+      abi: tesseraTabAbi,
+      functionName: "openTab",
+      args: [provider, deposit, BigInt(durationSeconds)],
+      account: this.account,
+    });
+    const txHash = await this.wallet.writeContract(request);
+    await this.public.waitForTransactionReceipt({ hash: txHash });
+    return { tabId: result as bigint, txHash };
+  }
+
+  /** Sign a voucher for `cumulative` USDC on a tab — off-chain, free, instant. */
+  async signVoucher(tabId: bigint, cumulative: bigint): Promise<Hex> {
+    if (!this.tab) throw new Error("tabAddress not configured");
+    const hash = keccak256(
+      encodePacked(["address", "uint256", "uint256"], [this.tab, tabId, cumulative])
+    );
+    return this.wallet.signMessage({
+      account: this.account,
+      message: { raw: hash },
+    });
+  }
+
+  /** Reclaim an expired tab's unclaimed funds. */
+  async reclaimTab(tabId: bigint): Promise<Hex> {
+    if (!this.tab) throw new Error("tabAddress not configured");
+    const hash = await this.wallet.writeContract({
+      address: this.tab,
+      abi: tesseraTabAbi,
+      functionName: "reclaim",
+      args: [tabId],
+      chain: this.chain,
+      account: this.account,
+    });
+    await this.public.waitForTransactionReceipt({ hash });
+    return hash;
+  }
+
+  async stakeOf(provider: Hex): Promise<bigint> {
+    return this.public.readContract({
+      address: this.escrow,
+      abi: tesseraEscrowAbi,
+      functionName: "stakeOf",
+      args: [provider],
+    }) as Promise<bigint>;
   }
 
   /** Escrow `amount` for `provider`; returns the on-chain paymentId + tx hash. */

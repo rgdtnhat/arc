@@ -17,10 +17,12 @@ export interface ServiceDef {
   name: string;
   /** Category the agent matches against its task. */
   tags: string[];
-  /** Price per call in USDC base units (6 decimals). */
+  /** Price per call (or per tick for tab billing), USDC base units (6 decimals). */
   price: bigint;
   /** SLA window in seconds the provider commits to. */
   slaSeconds: number;
+  /** "escrow" = one escrow per call (default); "tab" = nanopayments via TesseraTab vouchers. */
+  billing?: "escrow" | "tab";
   behavior: Behavior;
   /** Produces the response body for a given query. */
   respond: (query: Record<string, string>) => unknown;
@@ -78,6 +80,28 @@ export const CATALOG: ServiceDef[] = [
     // quality check fails and it reclaims the escrow.
     behavior: "bad-data",
     respond: () => ({ headlines: [], note: "service degraded" }),
+  },
+  {
+    resource: "ticker:stream",
+    path: "/ticker",
+    name: "PulseWire — live USDC/EUR ticks",
+    tags: ["ticker", "stream", "realtime", "price"],
+    price: usdc("0.0002"), // per tick — a true nanopayment
+    slaSeconds: 30,
+    billing: "tab",
+    behavior: "reliable",
+    respond: (q) => {
+      const n = Number(q.n ?? 0);
+      const base = 0.9214;
+      const wobble = Math.sin(n * 1.7) * 0.0008 + (hash(String(n)) % 100) / 1_000_000;
+      return {
+        pair: "USDC/EUR",
+        tick: n,
+        price: Number((base + wobble).toFixed(6)),
+        ts: Date.now(),
+        source: "PulseWire",
+      };
+    },
   },
 ];
 

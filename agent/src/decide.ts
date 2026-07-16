@@ -22,7 +22,11 @@ export interface OfferedService {
   path: string;
   price: bigint;
   slaSeconds: number;
+  /** "escrow" = one escrow per call; "tab" = nanopayments via vouchers. */
+  billing: "escrow" | "tab";
   provider: `0x${string}`;
+  /** USDC the provider has bonded — slashed on SLA breaches. */
+  stakeUsdc: string;
   reputation: { fulfilled: number; failed: number; earnedUsdc: string };
 }
 
@@ -34,12 +38,20 @@ export interface Decision {
   matchedNeed?: Need;
 }
 
-/** Trust score: neutral 0.5 for an unseen provider, rising with a clean record. */
-export function trustScore(rep: { fulfilled: number; failed: number }): number {
+/**
+ * Trust score: neutral 0.5 for an unseen provider, rising with a clean record.
+ * A provider that has bonded stake gets a bonus — it loses real money on an
+ * SLA breach, so an unknown-but-staked provider is safer than an unknown one.
+ */
+export function trustScore(
+  rep: { fulfilled: number; failed: number },
+  stakeUsdc?: string
+): number {
   const total = rep.fulfilled + rep.failed;
-  if (total === 0) return 0.5;
-  // Laplace-smoothed success rate.
-  return (rep.fulfilled + 1) / (total + 2);
+  // Laplace-smoothed success rate; 0.5 when unseen.
+  const record = total === 0 ? 0.5 : (rep.fulfilled + 1) / (total + 2);
+  const stakeBonus = Number(stakeUsdc ?? 0) > 0 ? 0.1 : 0;
+  return Math.min(1, record + stakeBonus);
 }
 
 /**
@@ -52,7 +64,7 @@ export function decideByRules(
   remainingBudget: bigint
 ): Decision {
   const need = task.needs.find((n) => svc.tags.includes(n.tag));
-  const trust = trustScore(svc.reputation);
+  const trust = trustScore(svc.reputation, svc.stakeUsdc);
 
   if (!need) {
     return { buy: false, reason: "irrelevant to the task", trust };

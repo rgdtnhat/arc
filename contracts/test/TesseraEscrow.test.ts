@@ -131,6 +131,56 @@ describe("TesseraEscrow", () => {
     await expect(providerEscrow.write.settle([1n])).to.be.rejected;
   });
 
+  it("slashes a staked provider on SLA breach and compensates the agent", async () => {
+    const { agent, provider, usdc, escrow, agentEscrow, providerEscrow } =
+      await loadFixture(deployFixture);
+
+    // Provider bonds 0.1 USDC of stake.
+    const STAKE = 100_000n;
+    await usdc.write.mint([provider.account.address, STAKE]);
+    const providerUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, {
+      client: { wallet: provider },
+    });
+    await providerUsdc.write.approve([escrow.address, STAKE]);
+    await providerEscrow.write.stake([STAKE]);
+    expect(await escrow.read.stakeOf([provider.account.address])).to.equal(STAKE);
+
+    // Breach: fulfilled but the agent rejects.
+    const deadline = await futureDeadline();
+    await agentEscrow.write.open([provider.account.address, PRICE, deadline, quoteHash]);
+    await providerEscrow.write.fulfill([1n, responseHash]);
+    await agentEscrow.write.refund([1n]);
+
+    // Agent got the refund PLUS 20% of the payment slashed from the stake.
+    const slash = (PRICE * 2000n) / 10000n;
+    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT + slash);
+    expect(await escrow.read.stakeOf([provider.account.address])).to.equal(STAKE - slash);
+  });
+
+  it("lets a provider stake and unstake", async () => {
+    const { provider, usdc, escrow, providerEscrow } = await loadFixture(deployFixture);
+    const STAKE = 50_000n;
+    await usdc.write.mint([provider.account.address, STAKE]);
+    const providerUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, {
+      client: { wallet: provider },
+    });
+    await providerUsdc.write.approve([escrow.address, STAKE]);
+    await providerEscrow.write.stake([STAKE]);
+    await providerEscrow.write.unstake([STAKE]);
+    expect(await escrow.read.stakeOf([provider.account.address])).to.equal(0n);
+    expect(await usdc.read.balanceOf([provider.account.address])).to.equal(STAKE);
+  });
+
+  it("refunds without slash when the provider has no stake", async () => {
+    const { agent, provider, usdc, agentEscrow, providerEscrow } =
+      await loadFixture(deployFixture);
+    const deadline = await futureDeadline();
+    await agentEscrow.write.open([provider.account.address, PRICE, deadline, quoteHash]);
+    await providerEscrow.write.fulfill([1n, responseHash]);
+    await agentEscrow.write.refund([1n]);
+    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT);
+  });
+
   it("exposes payment state via getPayment", async () => {
     const { agent, provider, agentEscrow, escrow } = await loadFixture(deployFixture);
     const deadline = await futureDeadline();

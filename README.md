@@ -48,6 +48,18 @@ USDC."* Tessera adds **programmable escrow + SLA-based auto-refund + on-chain
 reputation**, which is exactly what makes it safe for an agent to buy from a
 service it has never met — the real unlock for agent-to-agent commerce.
 
+Two more primitives round out the trust layer:
+
+- **Nanopayments (`TesseraTab`)** — for per-tick streams, an agent opens a
+  *tab*: one on-chain deposit, then each micro-call is paid with an off-chain
+  signed voucher (zero gas, cumulative and replay-safe). The provider settles
+  the whole stream in a single on-chain claim; the remainder returns to the
+  agent, who can also reclaim everything if the provider disappears.
+- **Provider staking & slashing** — providers bond USDC in the escrow as skin
+  in the game. On an SLA breach the agent gets its refund **plus compensation
+  slashed from the provider's stake**, and agents price stake into their trust
+  score, so bonded strangers are safer to buy from than unbonded ones.
+
 ## Why Arc
 
 - **USDC is the gas token** — the agent funds one asset and uses it for both the

@@ -38,6 +38,34 @@ Refunded  ◀───────────────┘                   
 Reputation (`fulfilled`, `failed`, `earned`) is public, so an agent can price the
 risk of an unknown provider *before* it spends — see `trustScore()` in the agent.
 
+### Staking & slashing
+
+Providers can bond USDC via `stake()`. On any SLA breach (`refund()`), 20% of the
+payment (`SLASH_BPS`) is slashed from the provider's stake and paid to the agent
+as compensation on top of the refund. Agents add a trust bonus for staked
+providers — a stranger with money at risk is a safer counterparty.
+
+## Nanopayments: TesseraTab
+
+Per-call escrow is wrong for high-frequency micro-calls (a price tick isn't worth
+a transaction). `TesseraTab` is a payment-channel-style tab:
+
+```
+openTab(provider, deposit, duration)      1 on-chain tx
+  ├─ call 1: voucher(cum=0.0002) signed   off-chain, no gas
+  ├─ call 2: voucher(cum=0.0004) signed   off-chain, no gas
+  ├─ ... N calls ...
+closeTab(tabId, bestVoucher)              1 on-chain tx: provider paid,
+                                          remainder returned to the agent
+reclaim(tabId)                            agent recovers funds after expiry
+                                          if the provider never settles
+```
+
+Vouchers are EIP-191 signatures over `(tabContract, tabId, cumulativeAmount)` —
+monotonic and bound to the contract, so they can't be replayed. The provider
+verifies each voucher off-chain in the request path (`recoverMessageAddress`)
+and needs only the single best voucher to settle everything.
+
 ## The 402 handshake
 
 ```

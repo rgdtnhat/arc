@@ -140,6 +140,23 @@
         </div>
       </div>
 
+      <div class="grid" style="margin-top:18px">
+        <div class="card">
+          <h2>Mission briefing — what the agent bought, assembled</h2>
+          <div id="briefing" style="display:flex;flex-direction:column;gap:8px;font-size:13.5px">
+            <span style="color:var(--muted)">Waiting for the agent…</span>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Nanopayments — tab session (TesseraTab)</h2>
+          <div id="stream" style="font-size:13.5px;color:var(--muted)">No stream yet…</div>
+          <p style="font-size:12px;color:var(--muted);margin:10px 0 0">
+            One on-chain deposit → many off-chain signed vouchers (zero gas per tick) →
+            one on-chain settlement; the remainder returns to the agent.
+          </p>
+        </div>
+      </div>
+
       <div class="card" style="margin-top:18px">
         <h2>Purchase ledger</h2>
         <table>
@@ -194,12 +211,12 @@
             <span class="dot ${p.behavior}"></span>
             <div>
               <div class="name">${esc(p.name)}</div>
-              <div class="addr">${short(p.address)} · ${p.behavior}</div>
+              <div class="addr">${short(p.address)} · ${p.behavior}${p.billing === "tab" ? " · ⚡nanopay" : ""}</div>
             </div>
             <div class="rep">
               <span class="f">${p.reputation.fulfilled}✓</span>
               <span class="x">${p.reputation.failed}✗</span><br/>
-              <span style="color:var(--muted)">earned ${p.reputation.earnedUsdc}</span>
+              <span style="color:var(--muted)">earned ${p.reputation.earnedUsdc} · 🔒 stake ${p.stakeUsdc}</span>
             </div>
           </div>`
           )
@@ -231,6 +248,21 @@
             </div>`
           )
           .join("");
+
+        $("briefing").innerHTML =
+          s.briefing && s.briefing.length
+            ? s.briefing
+                .map(
+                  (l) =>
+                    `<div style="padding:7px 10px;border:1px solid var(--line);border-radius:9px;background:var(--panel-2);${l.startsWith("⚠") ? "color:var(--warn)" : ""}">${esc(l)}</div>`
+                )
+                .join("")
+            : '<span style="color:var(--muted)">Waiting for the agent…</span>';
+
+        $("stream").innerHTML = s.stream
+          ? `<div style="color:var(--text)">⚡ <b>${s.stream.ticks}</b> micro-calls streamed for <b>${s.stream.spentUsdc} USDC</b> total<br/>
+             <span style="color:var(--muted);font-size:12px">${s.stream.ticks} signed vouchers off-chain · 2 transactions on-chain</span></div>`
+          : '<span style="color:var(--muted)">No stream yet…</span>';
 
         $("escrowLink").textContent = s.meta.escrowAddress;
         $("note").textContent = s.meta.note || "";

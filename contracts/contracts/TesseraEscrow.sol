@@ -50,9 +50,15 @@ contract TesseraEscrow {
 
     IERC20 public immutable usdc;
 
+    /// @notice On an SLA breach, this share of the payment is slashed from the
+    ///         provider's stake and paid to the agent as compensation (if staked).
+    uint256 public constant SLASH_BPS = 2_000; // 20%
+
     uint256 public nextPaymentId = 1;
     mapping(uint256 => Payment) public payments;
     mapping(address => Reputation) public reputationOf;
+    /// @notice USDC a provider has bonded as skin-in-the-game.
+    mapping(address => uint256) public stakeOf;
 
     event PaymentOpened(
         uint256 indexed paymentId,
@@ -65,6 +71,9 @@ contract TesseraEscrow {
     event PaymentFulfilled(uint256 indexed paymentId, bytes32 responseHash);
     event PaymentSettled(uint256 indexed paymentId, address indexed provider, uint256 amount);
     event PaymentRefunded(uint256 indexed paymentId, address indexed agent, uint256 amount, bool slaBreach);
+    event Staked(address indexed provider, uint256 amount, uint256 total);
+    event Unstaked(address indexed provider, uint256 amount, uint256 total);
+    event Slashed(address indexed provider, uint256 indexed paymentId, uint256 amount, address indexed to);
 
     error NotAgent();
     error NotProvider();
@@ -168,8 +177,37 @@ contract TesseraEscrow {
         p.status = Status.Refunded;
         reputationOf[p.provider].failed += 1;
 
-        if (!usdc.transfer(p.agent, p.amount)) revert TransferFailed();
+        // SLA breach: compensate the agent from the provider's stake (if any).
+        uint256 slashAmount = (p.amount * SLASH_BPS) / 10_000;
+        uint256 staked = stakeOf[p.provider];
+        if (slashAmount > staked) slashAmount = staked;
+        if (slashAmount > 0) {
+            stakeOf[p.provider] = staked - slashAmount;
+            emit Slashed(p.provider, paymentId, slashAmount, p.agent);
+        }
+
+        if (!usdc.transfer(p.agent, p.amount + slashAmount)) revert TransferFailed();
         emit PaymentRefunded(paymentId, p.agent, p.amount, true);
+    }
+
+    /**
+     * @notice Provider bonds USDC as skin-in-the-game. A staked provider is a
+     *         stronger trust signal for agents; stake is slashed on SLA breaches.
+     */
+    function stake(uint256 amount) external {
+        if (amount == 0) revert ZeroAmount();
+        if (!usdc.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
+        stakeOf[msg.sender] += amount;
+        emit Staked(msg.sender, amount, stakeOf[msg.sender]);
+    }
+
+    /// @notice Withdraw bonded stake.
+    function unstake(uint256 amount) external {
+        uint256 staked = stakeOf[msg.sender];
+        require(amount > 0 && amount <= staked, "bad amount");
+        stakeOf[msg.sender] = staked - amount;
+        if (!usdc.transfer(msg.sender, amount)) revert TransferFailed();
+        emit Unstaked(msg.sender, amount, stakeOf[msg.sender]);
     }
 
     /// @notice Convenience view returning a provider's reputation triple.

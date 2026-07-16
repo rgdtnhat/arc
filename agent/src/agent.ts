@@ -78,7 +78,9 @@ export class TesseraAgent {
       path: s.path,
       price: BigInt(s.price),
       slaSeconds: s.slaSeconds,
+      billing: s.billing ?? "escrow",
       provider: s.provider,
+      stakeUsdc: s.stakeUsdc ?? "0",
       reputation: s.reputation,
     }));
   }
@@ -97,9 +99,10 @@ export class TesseraAgent {
     let remaining = task.budget;
 
     // Satisfy each need with the best affordable, most-trusted matching service.
+    // Tab-billed (streaming) services are bought via streamTicks(), not here.
     for (const need of task.needs) {
       const candidates = services
-        .filter((s) => s.tags.includes(need.tag))
+        .filter((s) => s.tags.includes(need.tag) && s.billing !== "tab")
         .sort((a, b) => (a.price === b.price ? 0 : a.price < b.price ? -1 : 1));
 
       if (candidates.length === 0) {
@@ -273,6 +276,118 @@ export class TesseraAgent {
       txHash: refundTx,
     });
     return entry;
+  }
+
+  /**
+   * Nanopayments: stream `ticks` micro-calls from a tab-billed service.
+   * One on-chain deposit, one off-chain voucher per call (no gas), one on-chain
+   * settlement at the end. Returns the collected ticks.
+   */
+  async streamTicks(
+    resource: string,
+    ticks: number,
+    depositMultiple = 2n
+  ): Promise<{ data: unknown[]; spent: bigint; tabId?: bigint } | null> {
+    const services = await this.discover();
+    const svc = services.find((s) => s.resource === resource && s.billing === "tab");
+    if (!svc) {
+      this.emit({ level: "skip", resource, message: `No tab-billed service for "${resource}"` });
+      return null;
+    }
+
+    const deposit = svc.price * BigInt(ticks) * depositMultiple;
+    this.emit({
+      level: "decide",
+      resource,
+      message: `OPEN TAB with ${svc.name} — deposit ${formatUsdc(deposit)} USDC for ~${ticks} ticks @ ${formatUsdc(svc.price)}/tick`,
+    });
+
+    const { tabId, txHash } = await this.cfg.client.openTab(svc.provider, deposit, 3600);
+    this.emit({
+      level: "pay",
+      resource,
+      message: `Tab #${tabId} funded with ${formatUsdc(deposit)} USDC (single escrow tx)`,
+      txHash,
+    });
+
+    const data: unknown[] = [];
+    let cum = 0n;
+    for (let i = 0; i < ticks; i++) {
+      cum += svc.price;
+      const sig = await this.cfg.client.signVoucher(tabId, cum);
+      const res = await fetch(`${this.cfg.providersBaseUrl}${svc.path}?n=${i}`, {
+        headers: {
+          [HEADERS.tab]: tabId.toString(),
+          [HEADERS.voucher]: cum.toString(),
+          [HEADERS.voucherSig]: sig,
+        },
+      });
+      if (res.status !== 200) {
+        this.emit({ level: "skip", resource, message: `Tick ${i} rejected — stopping stream` });
+        break;
+      }
+      const body = await res.json();
+      data.push(body);
+      this.emit({
+        level: "pay",
+        resource,
+        message: `Tick ${i + 1}/${ticks} — voucher ${formatUsdc(cum)} USDC signed off-chain (no gas)`,
+      });
+    }
+
+    // Ask the provider to settle: one claim() for the whole stream, remainder back.
+    const closeRes = await fetch(`${this.cfg.providersBaseUrl}/tab/${tabId}/close`, {
+      method: "POST",
+    });
+    if (closeRes.ok) {
+      const closed = (await closeRes.json()) as { settled: string; txHash: string };
+      this.emit({
+        level: "settle",
+        resource,
+        message: `Tab #${tabId} closed — ${formatUsdc(BigInt(closed.settled))} USDC to provider, ${formatUsdc(deposit - BigInt(closed.settled))} USDC returned`,
+        txHash: closed.txHash as `0x${string}`,
+      });
+    } else {
+      this.emit({
+        level: "refund",
+        resource,
+        message: `Provider didn't settle tab #${tabId} — will reclaim after expiry`,
+      });
+    }
+
+    return { data, spent: cum, tabId };
+  }
+
+  /** Compose everything the agent bought into the final deliverable. */
+  briefing(streamData?: unknown[]): string[] {
+    const lines: string[] = [];
+    for (const e of this.ledger) {
+      if (e.status !== "settled" || !e.data) continue;
+      const d = e.data as Record<string, unknown>;
+      if (e.resource === "weather:current") {
+        lines.push(
+          `Weather in ${d.city}: ${d.tempC}°C, ${d.condition}, humidity ${d.humidity}%`
+        );
+      } else if (e.resource === "fx:quote") {
+        lines.push(`FX ${d.pair}: ${d.rate} (spread ${d.spread})`);
+      } else if (e.resource === "news:headlines") {
+        const h = (d.headlines as string[]) ?? [];
+        lines.push(`Headlines: ${h.slice(0, 3).join(" · ")}`);
+      }
+    }
+    const refunded = this.ledger.filter((e) => e.status === "refunded");
+    for (const e of refunded) {
+      lines.push(`⚠ ${e.name}: not included — ${e.reason} (USDC reclaimed)`);
+    }
+    if (streamData && streamData.length > 0) {
+      const ticks = streamData as Array<Record<string, unknown>>;
+      const last = ticks[ticks.length - 1];
+      const first = ticks[0];
+      lines.push(
+        `Live ${last.pair}: ${last.price} after ${ticks.length} streamed ticks (opened at ${first.price})`
+      );
+    }
+    return lines;
   }
 
   private async fetchQuote(svc: OfferedService): Promise<Quote | null> {

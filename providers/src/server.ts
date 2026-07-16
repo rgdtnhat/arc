@@ -31,6 +31,7 @@ const app = createProviderApp({
   chain: arcTestnet,
   rpcUrl,
   escrowAddress,
+  tabAddress: process.env.TESSERA_TAB_ADDRESS as Hex | undefined,
   providerKeys,
   onEvent: (e) => console.log(`[provider:${e.resource}] ${e.kind} — ${e.detail}`),
 });

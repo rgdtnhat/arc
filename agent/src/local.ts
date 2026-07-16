@@ -12,6 +12,8 @@ import { privateKeyToAccount } from "viem/accounts";
 import {
   tesseraEscrowAbi,
   tesseraEscrowBytecode,
+  tesseraTabAbi,
+  tesseraTabBytecode,
   mockUsdcAbi,
   mockUsdcBytecode,
   usdc,
@@ -27,6 +29,7 @@ export const DEV_KEYS = {
   weather: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
   fx: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
   news: "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
+  ticker: "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba",
 } as const satisfies Record<string, Hex>;
 
 export const localChain = defineChain({
@@ -69,9 +72,10 @@ export async function startLocalNode(): Promise<ChildProcess | null> {
 export interface LocalDeployment {
   usdcAddress: Hex;
   escrowAddress: Hex;
+  tabAddress: Hex;
 }
 
-/** Deploy MockUSDC + TesseraEscrow and mint USDC to the agent. */
+/** Deploy MockUSDC + TesseraEscrow + TesseraTab and mint USDC to the agent. */
 export async function deployLocal(agentAddress: Hex, mint = usdc("1")): Promise<LocalDeployment> {
   const deployer = privateKeyToAccount(DEV_KEYS.deployer);
   const wallet = createWalletClient({ account: deployer, chain: localChain, transport: http() });
@@ -94,6 +98,15 @@ export async function deployLocal(agentAddress: Hex, mint = usdc("1")): Promise<
   });
   const escrowAddress = (await pub.waitForTransactionReceipt({ hash: escrowHash })).contractAddress!;
 
+  const tabHash = await wallet.deployContract({
+    abi: tesseraTabAbi,
+    bytecode: tesseraTabBytecode,
+    args: [usdcAddress],
+    account: deployer,
+    chain: localChain,
+  });
+  const tabAddress = (await pub.waitForTransactionReceipt({ hash: tabHash })).contractAddress!;
+
   const mintHash = await wallet.writeContract({
     address: usdcAddress,
     abi: mockUsdcAbi,
@@ -104,5 +117,46 @@ export async function deployLocal(agentAddress: Hex, mint = usdc("1")): Promise<
   });
   await pub.waitForTransactionReceipt({ hash: mintHash });
 
-  return { usdcAddress, escrowAddress };
+  return { usdcAddress, escrowAddress, tabAddress };
+}
+
+/** Fund a provider with USDC and bond it as stake in the escrow. */
+export async function stakeProvider(
+  deployment: LocalDeployment,
+  providerKey: Hex,
+  amount: bigint
+): Promise<void> {
+  const account = privateKeyToAccount(providerKey);
+  const wallet = createWalletClient({ account, chain: localChain, transport: http() });
+  const pub = createPublicClient({ chain: localChain, transport: http() });
+
+  const mintHash = await wallet.writeContract({
+    address: deployment.usdcAddress,
+    abi: mockUsdcAbi,
+    functionName: "mint",
+    args: [account.address, amount],
+    account,
+    chain: localChain,
+  });
+  await pub.waitForTransactionReceipt({ hash: mintHash });
+
+  const approveHash = await wallet.writeContract({
+    address: deployment.usdcAddress,
+    abi: mockUsdcAbi,
+    functionName: "approve",
+    args: [deployment.escrowAddress, amount],
+    account,
+    chain: localChain,
+  });
+  await pub.waitForTransactionReceipt({ hash: approveHash });
+
+  const stakeHash = await wallet.writeContract({
+    address: deployment.escrowAddress,
+    abi: tesseraEscrowAbi,
+    functionName: "stake",
+    args: [amount],
+    account,
+    chain: localChain,
+  });
+  await pub.waitForTransactionReceipt({ hash: stakeHash });
 }
