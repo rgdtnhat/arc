@@ -94,6 +94,7 @@
       .lv-pay .msg { color: #9dc0ff; }
       .lv-decide .msg { color: #d7c6ff; }
       .lv-skip .msg { color: var(--muted); }
+      .lv-guardian .msg { color: var(--warn); font-weight: 600; }
       .foot { margin-top: 22px; font-size: 12px; color: var(--muted); display: flex; gap: 18px; flex-wrap: wrap; }
       .mono { font-family: ui-monospace, monospace; }
       .live { display: inline-flex; align-items: center; gap: 6px; }
@@ -109,6 +110,7 @@
         <span class="tag">trustless pay-per-use commerce for AI agents · settled on Arc in USDC</span>
         <span style="flex:1"></span>
         <span class="pill blue" id="brainPill">brain: —</span>
+        <span class="pill" id="policyPill" title="Spends above this per-call cap require guardian approval">🛡 —</span>
         <span class="pill" id="chainPill">chain: —</span>
         <span class="pill live"><span class="dot"></span> live</span>
       </header>
@@ -132,12 +134,20 @@
           </div>
           <div class="bar"><span id="balBar" style="width:100%"></span></div>
           <div class="kv"><span class="mono" id="agentAddr">—</span><span id="balDelta"></span></div>
+          <svg id="spark" viewBox="0 0 300 56" preserveAspectRatio="none"
+               style="width:100%;height:56px;margin-top:12px;display:block"></svg>
+          <div class="kv"><span>balance over session</span><span id="sparkRange"></span></div>
         </div>
 
         <div class="card">
           <h2>Marketplace providers · on-chain reputation</h2>
           <div class="prov" id="providers"></div>
         </div>
+      </div>
+
+      <div class="card" id="approvalsCard" style="margin-top:18px;display:none;border-color:#533a14">
+        <h2 style="color:var(--warn)">🛡 Guardian approvals — agent is asking to exceed its policy cap</h2>
+        <div id="approvals" style="display:flex;flex-direction:column;gap:10px"></div>
       </div>
 
       <div class="grid" style="margin-top:18px">
@@ -154,6 +164,10 @@
             One on-chain deposit → many off-chain signed vouchers (zero gas per tick) →
             one on-chain settlement; the remainder returns to the agent.
           </p>
+          <h2 style="margin-top:16px">Contacts — the agent's own memory</h2>
+          <div id="contacts" style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">
+            <span style="color:var(--muted)">No dealings yet…</span>
+          </div>
         </div>
       </div>
 
@@ -249,6 +263,57 @@
           )
           .join("");
 
+        if (s.policy) {
+          $("policyPill").textContent = `🛡 auto ≤ ${s.policy.autoApproveMaxUsdc} USDC`;
+        }
+
+        // Guardian approval queue — the human co-signer UI.
+        const approvals = s.approvals || [];
+        $("approvalsCard").style.display = approvals.length ? "block" : "none";
+        $("approvals").innerHTML = approvals
+          .map(
+            (a) => `
+          <div style="display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid #533a14;border-radius:11px;background:#1c170c">
+            <div style="flex:1">
+              <b>${esc(a.name)}</b> wants <b style="color:var(--warn)">${a.priceUsdc} USDC</b>
+              <div style="color:var(--muted);font-size:12px">${esc(a.reason)} · provider ${short(a.provider)}</div>
+            </div>
+            <button class="btn" style="border-color:#14532d;background:#0c2c1e;color:var(--good)" onclick="verdict(${a.id},'approve')">Approve ✓</button>
+            <button class="btn" style="border-color:#531414;background:#2c0c0c;color:var(--bad)" onclick="verdict(${a.id},'reject')">Reject ✗</button>
+          </div>`
+          )
+          .join("");
+
+        // Contacts — the agent's personal memory of providers.
+        const contacts = s.contacts || [];
+        $("contacts").innerHTML = contacts.length
+          ? contacts
+              .map(
+                (c) => `
+            <div style="display:flex;gap:8px;align-items:center">
+              <span>${c.refunded > 0 ? "🚫" : "🤝"}</span>
+              <span style="flex:1">${esc(c.name)}</span>
+              <span style="color:var(--muted)">${c.settled}✓ ${c.refunded}✗ of ${c.dealings}</span>
+            </div>`
+              )
+              .join("")
+          : '<span style="color:var(--muted)">No dealings yet…</span>';
+
+        // Balance sparkline (single series — the card title names it).
+        const hist = s.balanceHistory || [];
+        if (hist.length > 1) {
+          const vals = hist.map((h) => +h.balance);
+          const min = Math.min(...vals), max = Math.max(...vals);
+          const pad = (max - min) * 0.15 || 0.0001;
+          const y = (v) => 52 - ((v - (min - pad)) / (max + pad - (min - pad))) * 48;
+          const x = (i) => (i / (vals.length - 1)) * 296 + 2;
+          const d = vals.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+          $("spark").innerHTML =
+            `<path d="${d}" fill="none" stroke="#3a7bff" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>` +
+            `<circle cx="${x(vals.length - 1).toFixed(1)}" cy="${y(vals[vals.length - 1]).toFixed(1)}" r="3.5" fill="#3a7bff" stroke="var(--panel)" stroke-width="2"/>`;
+          $("sparkRange").textContent = `${min.toFixed(4)} – ${max.toFixed(4)}`;
+        }
+
         $("briefing").innerHTML =
           s.briefing && s.briefing.length
             ? s.briefing
@@ -269,6 +334,11 @@
         $("runBtn").disabled = s.running;
         $("runBtn").textContent = s.running ? "Running…" : "Run again ↻";
       }
+
+      window.verdict = async (id, v) => {
+        await fetch(`/api/approvals/${id}/${v}`, { method: "POST" }).catch(() => {});
+        tick();
+      };
 
       $("runBtn").addEventListener("click", async () => {
         $("runBtn").disabled = true;

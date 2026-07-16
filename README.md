@@ -60,6 +60,18 @@ Two more primitives round out the trust layer:
   slashed from the provider's stake**, and agents price stake into their trust
   score, so bonded strangers are safer to buy from than unbonded ones.
 
+And a wallet-grade safety layer (inspired by consumer wallets like LOBSTR):
+
+- **Guardian approvals (policy sandbox)** — spends at or below the policy cap
+  are fully autonomous; anything above **pauses the agent and escalates to a
+  human co-signer** on the dashboard (Approve/Reject). Autonomy inside a
+  sandbox, not a blank check.
+- **Contacts & personal trust memory** — beyond global on-chain reputation, the
+  agent remembers *its own* dealings across runs; a provider that burned it
+  loses personal trust (−0.15 per refund) until the agent stops buying from it.
+- **Wallet activity** — a live balance sparkline and a readable event feed of
+  every escrow, voucher, settle, refund, and slash.
+
 ## Why Arc
 
 - **USDC is the gas token** — the agent funds one asset and uses it for both the

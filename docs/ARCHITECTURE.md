@@ -114,6 +114,27 @@ After delivery the agent checks two things before releasing escrow:
    headlines). The demo's flaky provider returns empty headlines, fails this
    gate, and the agent reclaims its USDC — enforced by the contract, not trust.
 
+## The guardian (policy sandbox)
+
+`agent/src/policy.ts` implements a wallet-style co-signer, inspired by
+multisig vaults in consumer wallets:
+
+- A `SpendingPolicy` sets `autoApproveMax` — the per-call ceiling for full
+  autonomy — plus optional provider blocklists.
+- A purchase above the cap **pauses the agent** and enqueues an
+  `ApprovalRequest`; the dashboard renders Approve/Reject buttons and posts the
+  verdict to `/api/approvals/:id/:verdict`. Timeout counts as rejection.
+- The policy is enforced *outside* the decision engine: even an LLM-driven
+  brain cannot exceed it.
+
+## Personal trust memory
+
+`agent/src/memory.ts` is the agent's address book. Global on-chain reputation
+says how a provider treated *everyone*; memory says how it treated *this
+agent*. Each personal refund costs 0.15 trust (capped at 0.45) — after three
+strikes the provider falls below the buy floor and the agent stops dealing
+with it. Persisted to `.tessera-memory.json` across runs.
+
 ## Running locally vs on Arc
 
 - **Local**: `npm run demo` spins up a Hardhat node, deploys `MockUSDC` +

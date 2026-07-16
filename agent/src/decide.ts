@@ -61,10 +61,12 @@ export function trustScore(
 export function decideByRules(
   task: AgentTask,
   svc: OfferedService,
-  remainingBudget: bigint
+  remainingBudget: bigint,
+  /** Personal trust penalty from the agent's own memory of this provider. */
+  personalPenalty = 0
 ): Decision {
   const need = task.needs.find((n) => svc.tags.includes(n.tag));
-  const trust = trustScore(svc.reputation, svc.stakeUsdc);
+  const trust = Math.max(0, trustScore(svc.reputation, svc.stakeUsdc) - personalPenalty);
 
   if (!need) {
     return { buy: false, reason: "irrelevant to the task", trust };
@@ -111,9 +113,10 @@ export async function decideByLlm(
   task: AgentTask,
   svc: OfferedService,
   remainingBudget: bigint,
-  apiKey: string
+  apiKey: string,
+  personalPenalty = 0
 ): Promise<Decision> {
-  const guardrail = decideByRules(task, svc, remainingBudget);
+  const guardrail = decideByRules(task, svc, remainingBudget, personalPenalty);
   // If the rules already forbid the purchase, don't even ask — it's non-negotiable.
   if (!guardrail.buy) return guardrail;
 
@@ -176,6 +179,10 @@ export function passesQuality(resource: string, body: unknown): { ok: boolean; r
       return Array.isArray(b.headlines) && b.headlines.length > 0
         ? { ok: true, reason: `${(b.headlines as unknown[]).length} headlines` }
         : { ok: false, reason: "no headlines delivered" };
+    case "alpha:report":
+      return typeof b.stance === "string" && Array.isArray(b.drivers)
+        ? { ok: true, reason: "analysis with stance + drivers" }
+        : { ok: false, reason: "missing stance/drivers" };
     default:
       return { ok: true, reason: "no specific quality rule" };
   }

@@ -12,6 +12,11 @@ Tessera against the Arc Hackathon checkpoints.
   breaches; stake feeds the agent's trust score.
 - **Mission briefing**: the agent assembles its purchases into the final
   deliverable, shown on the dashboard.
+- **Guardian approvals**: a wallet-vault-style policy sandbox — spends above a
+  per-call cap pause the agent for a human Approve/Reject on the dashboard.
+- **Contacts & personal trust memory**: the agent's own cross-run experience
+  with providers feeds its decisions (three strikes → stop buying).
+- **Wallet activity**: balance sparkline + readable event history.
 - Offline-capable Hardhat toolchain (seeds solc from npm so it builds in
   locked-down environments).
 - The Tessera 402 protocol + three provider services (one deliberately flaky).

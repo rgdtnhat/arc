@@ -15,6 +15,8 @@ import {
   type Decision,
   type OfferedService,
 } from "./decide.js";
+import { ApprovalQueue, type SpendingPolicy } from "./policy.js";
+import type { TrustMemory } from "./memory.js";
 
 export type Brain = "rules" | "llm";
 
@@ -24,6 +26,10 @@ export interface AgentConfig {
   brain?: Brain;
   anthropicApiKey?: string;
   explorer?: boolean; // link tx hashes to Arcscan in events
+  /** Safety sandbox: spends above the cap escalate to a guardian. */
+  policy?: SpendingPolicy;
+  /** Personal cross-run memory of providers (address book + trust penalty). */
+  memory?: TrustMemory;
   onEvent?: (e: AgentEvent) => void;
 }
 
@@ -43,7 +49,7 @@ export interface LedgerEntry {
 
 export interface AgentEvent {
   ts: number;
-  level: "info" | "decide" | "pay" | "settle" | "refund" | "skip" | "done";
+  level: "info" | "decide" | "pay" | "settle" | "refund" | "skip" | "done" | "guardian";
   resource?: string;
   message: string;
   txHash?: string;
@@ -53,6 +59,8 @@ export interface AgentEvent {
 export class TesseraAgent {
   private readonly cfg: AgentConfig;
   readonly ledger: LedgerEntry[] = [];
+  /** Guardian approval queue (populated when a policy escalates a spend). */
+  readonly approvals = new ApprovalQueue();
 
   constructor(cfg: AgentConfig) {
     this.cfg = cfg;
@@ -133,22 +141,58 @@ export class TesseraAgent {
           continue;
         }
 
+        // Safety sandbox: above the policy cap, a guardian must co-sign.
+        if (this.cfg.policy && svc.price > this.cfg.policy.autoApproveMax) {
+          const approved = await this.escalate(svc, decision);
+          if (!approved) {
+            this.emit({
+              level: "guardian",
+              resource: svc.resource,
+              message: `Guardian declined ${svc.name} (${formatUsdc(svc.price)} USDC) — not buying`,
+            });
+            this.ledger.push({
+              resource: svc.resource,
+              name: svc.name,
+              provider: svc.provider,
+              price: svc.price,
+              status: "skipped",
+              reason: "guardian declined (over policy cap)",
+              txs: {},
+            });
+            continue;
+          }
+          this.emit({
+            level: "guardian",
+            resource: svc.resource,
+            message: `Guardian approved ${svc.name} (${formatUsdc(svc.price)} USDC)`,
+          });
+        }
+
         let entry: LedgerEntry;
         try {
           entry = await this.purchase(svc, decision);
         } catch (err) {
+          const ve = err as { metaMessages?: string[]; shortMessage?: string; message?: string };
+          const reason =
+            ve.metaMessages?.find((m) => m.trim().startsWith("Error:"))?.trim() ??
+            ve.shortMessage ??
+            ve.message?.split("\n")[0] ??
+            String(err);
           entry = {
             resource: svc.resource,
             name: svc.name,
             provider: svc.provider,
             price: svc.price,
             status: "error",
-            reason: (err as Error).message?.split("\n")[0] ?? String(err),
+            reason,
             txs: {},
           };
           this.emit({ level: "skip", resource: svc.resource, message: `Purchase failed: ${entry.reason}` });
         }
         this.ledger.push(entry);
+        if (entry.status === "settled" || entry.status === "refunded") {
+          this.cfg.memory?.record(svc.provider, svc.name, entry.status);
+        }
         if (entry.status === "settled") {
           remaining -= svc.price;
           satisfied = true;
@@ -175,10 +219,46 @@ export class TesseraAgent {
     svc: OfferedService,
     remaining: bigint
   ): Promise<Decision> {
-    if (this.cfg.brain === "llm" && this.cfg.anthropicApiKey) {
-      return decideByLlm(task, svc, remaining, this.cfg.anthropicApiKey);
+    // Hard policy checks come before any reasoning.
+    if (this.cfg.policy?.blockedProviders?.some((p) => p.toLowerCase() === svc.provider.toLowerCase())) {
+      return { buy: false, reason: "provider is blocked by policy", trust: 0 };
     }
-    return decideByRules(task, svc, remaining);
+    const penalty = this.cfg.memory?.penalty(svc.provider) ?? 0;
+    if (penalty > 0) {
+      this.emit({
+        level: "decide",
+        resource: svc.resource,
+        message: `Memory: ${svc.name} burned this agent before — personal trust penalty −${penalty.toFixed(2)}`,
+      });
+    }
+    if (this.cfg.brain === "llm" && this.cfg.anthropicApiKey) {
+      return decideByLlm(task, svc, remaining, this.cfg.anthropicApiKey, penalty);
+    }
+    return decideByRules(task, svc, remaining, penalty);
+  }
+
+  /** Ask the guardian to co-sign an over-cap spend. */
+  private async escalate(svc: OfferedService, decision: Decision): Promise<boolean> {
+    const policy = this.cfg.policy!;
+    this.emit({
+      level: "guardian",
+      resource: svc.resource,
+      message: `ESCALATED: ${svc.name} costs ${formatUsdc(svc.price)} USDC (> ${formatUsdc(policy.autoApproveMax)} cap) — awaiting guardian`,
+    });
+    if (policy.autoApprove) {
+      await new Promise((r) => setTimeout(r, 400)); // brief, visible pause
+      return true;
+    }
+    return this.approvals.request(
+      {
+        resource: svc.resource,
+        name: svc.name,
+        provider: svc.provider,
+        priceUsdc: formatUsdc(svc.price),
+        reason: decision.reason,
+      },
+      policy.approvalTimeoutMs ?? 60_000
+    );
   }
 
   /** The 402 handshake: quote -> escrow -> deliver -> verify -> settle/refund. */
@@ -200,9 +280,13 @@ export class TesseraAgent {
       return entry;
     }
 
-    // 2) Escrow the payment on Arc. The deadline is relative to chain time.
+    // 2) Escrow the payment on Arc. Chain time and wall time can skew either
+    //    way (fast-mined blocks run ahead; idle local chains fall behind), so
+    //    anchor the deadline to whichever clock is further ahead.
     await this.cfg.client.ensureApproval(quote.price);
-    const deadline = (await this.cfg.client.chainTime()) + BigInt(quote.deadlineSeconds);
+    const chainNow = await this.cfg.client.chainTime();
+    const wallNow = BigInt(Math.floor(Date.now() / 1000));
+    const deadline = (chainNow > wallNow ? chainNow : wallNow) + BigInt(quote.deadlineSeconds);
     const { paymentId, txHash: openTx } = await this.cfg.client.open(
       quote.provider,
       quote.price,
@@ -373,6 +457,10 @@ export class TesseraAgent {
       } else if (e.resource === "news:headlines") {
         const h = (d.headlines as string[]) ?? [];
         lines.push(`Headlines: ${h.slice(0, 3).join(" · ")}`);
+      } else if (e.resource === "alpha:report") {
+        lines.push(
+          `Analysis (${d.subject}): ${d.stance}, confidence ${Math.round(Number(d.confidence) * 100)}% — ${(d.drivers as string[]).join(", ")}`
+        );
       }
     }
     const refunded = this.ledger.filter((e) => e.status === "refunded");

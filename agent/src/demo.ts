@@ -8,7 +8,9 @@ import { createProviderApp, type ProviderEvent } from "@tessera/providers";
 import { CATALOG } from "@tessera/providers/catalog";
 import { TesseraClient } from "./client.js";
 import { TesseraAgent, type AgentEvent, type LedgerEntry } from "./agent.js";
-import { DEMO_TASK } from "./scenario.js";
+import { TrustMemory } from "./memory.js";
+import { describePolicy } from "./policy.js";
+import { DEMO_TASK, DEMO_POLICY } from "./scenario.js";
 import {
   DEV_KEYS,
   deployLocal,
@@ -48,6 +50,7 @@ async function main() {
     "fx:quote": DEV_KEYS.fx,
     "news:headlines": DEV_KEYS.news,
     "ticker:stream": DEV_KEYS.ticker,
+    "alpha:report": DEV_KEYS.alpha,
   };
 
   // Providers bond stake — skin in the game the escrow can slash on SLA breach.
@@ -57,12 +60,15 @@ async function main() {
   }
 
   const events: UiEvent[] = [];
+  // Set after the client exists; called on every event to build the balance timeline.
+  let onEventPushed: () => void = () => {};
   const pushEvent = (e: UiEvent) => {
     events.push(e);
     if (events.length > 200) events.shift();
     const tag = e.source === "agent" ? "agent" : `provider:${(e as any).resource}`;
     const link = (e as any).txUrl ? ` ${(e as any).txUrl}` : "";
     console.log(`  [${tag}] ${(e as any).message ?? (e as any).detail}${link}`);
+    onEventPushed();
   };
 
   const providerApp = createProviderApp({
@@ -85,20 +91,43 @@ async function main() {
     tabAddress,
   });
 
+  // Guardian policy: one-shot/CI runs auto-approve so they don't block on a human.
+  const policy = {
+    ...DEMO_POLICY,
+    autoApprove: process.env.TESSERA_ONCE === "1" || process.env.TESSERA_AUTO_APPROVE === "1",
+  };
+  const memory = new TrustMemory(
+    path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-memory.json")
+  );
+
   const agent = new TesseraAgent({
     client,
     providersBaseUrl: `http://127.0.0.1:${PROVIDERS_PORT}`,
     brain,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
     explorer: false,
+    policy,
+    memory,
     onEvent: (e) => pushEvent({ ...e, source: "agent" }),
   });
+  console.log(`🛡  Guardian policy: ${describePolicy(policy)}${policy.autoApprove ? " (auto-approve mode)" : ""}`);
 
   const startBalance = await client.usdcBalance();
   let running = false;
   let ledgerRef: LedgerEntry[] = agent.ledger;
   let briefingLines: string[] = [];
   let streamSummary: { ticks: number; spentUsdc: string } | null = null;
+  // Wallet-style balance timeline for the dashboard sparkline.
+  const balanceHistory: { ts: number; balance: string }[] = [];
+  onEventPushed = () => {
+    client
+      .usdcBalance()
+      .then((b) => {
+        balanceHistory.push({ ts: Date.now(), balance: formatUsdc(b) });
+        if (balanceHistory.length > 300) balanceHistory.shift();
+      })
+      .catch(() => {});
+  };
 
   /** The full autonomous scenario: escrow purchases, then a nanopay stream. */
   async function runScenario() {
@@ -192,6 +221,10 @@ async function main() {
       running,
       briefing: briefingLines,
       stream: streamSummary,
+      approvals: agent.approvals.list(),
+      policy: { autoApproveMaxUsdc: formatUsdc(policy.autoApproveMax), autoApprove: policy.autoApprove },
+      contacts: memory.list(),
+      balanceHistory,
       summary: {
         settled: settled.length,
         refunded: refunded.length,
@@ -199,6 +232,14 @@ async function main() {
         spentUsdc: formatUsdc(settled.reduce((a, e) => a + e.price, 0n)),
       },
     });
+  });
+
+  // Guardian verdicts from the dashboard (the human co-signer).
+  app.post("/api/approvals/:id/:verdict", (req, res) => {
+    const id = Number(req.params.id);
+    const approved = req.params.verdict === "approve";
+    const ok = agent.approvals.resolve(id, approved);
+    res.status(ok ? 200 : 404).json({ ok });
   });
 
   app.post("/api/run", async (_req, res) => {

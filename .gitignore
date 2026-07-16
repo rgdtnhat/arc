@@ -11,3 +11,4 @@ typechain-types/
 !.env.example
 .DS_Store
 deployments/local.json
+.tessera-memory.json

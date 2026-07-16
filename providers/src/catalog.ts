@@ -82,6 +82,24 @@ export const CATALOG: ServiceDef[] = [
     respond: () => ({ headlines: [], note: "service degraded" }),
   },
   {
+    resource: "alpha:report",
+    path: "/alpha",
+    name: "AlphaSignal — premium market analysis",
+    tags: ["analysis", "premium", "alpha", "research"],
+    // Deliberately priced above the demo policy's auto-approve cap, so buying
+    // it requires the guardian's co-signature (LOBSTR-Vault-style escalation).
+    price: usdc("0.008"),
+    slaSeconds: 30,
+    behavior: "reliable",
+    respond: (q) => ({
+      subject: q.subject ?? "EUR macro",
+      stance: "cautiously bullish",
+      confidence: 0.72,
+      drivers: ["ECB pause priced in", "EURUSD momentum", "energy costs easing"],
+      source: "AlphaSignal",
+    }),
+  },
+  {
     resource: "ticker:stream",
     path: "/ticker",
     name: "PulseWire — live USDC/EUR ticks",

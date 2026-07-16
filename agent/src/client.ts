@@ -61,9 +61,16 @@ export class TesseraClient {
     });
   }
 
-  /** Current chain time (seconds). Deadlines must be relative to this, not to
-   *  the agent's wall clock, which can lag the chain when blocks mine quickly. */
+  /** Time the NEXT block will see (seconds). Prefer the pending block: on dev
+   *  chains the node's clock keeps ticking while no blocks mine, so `latest`
+   *  can be far behind (or ahead of) both the last block and the wall clock. */
   async chainTime(): Promise<bigint> {
+    try {
+      const pending = await this.public.getBlock({ blockTag: "pending" });
+      if (pending?.timestamp) return pending.timestamp;
+    } catch {
+      // node may not expose a pending block — fall through
+    }
     const block = await this.public.getBlock({ blockTag: "latest" });
     return block.timestamp;
   }
