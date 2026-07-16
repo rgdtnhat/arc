@@ -150,6 +150,25 @@ npm run e2e            # the same scenario headless, one-shot (used in CI)
 CI runs all of the above on every push (`.github/workflows/ci.yml`), including
 the full agentic flow end to end.
 
+## Deploy to Arc testnet (one command)
+
+```bash
+npm run bootstrap:arc
+```
+
+The bootstrap generates deployer/agent/provider keys into `.env` (gitignored),
+prints the deployer address and waits while you fund it at
+[faucet.circle.com](https://faucet.circle.com) (network: **Arc Testnet** — USDC
+is the gas token, so one funding covers everything), then deploys
+`TesseraEscrow` + `TesseraTab`, funds the agent and provider wallets, bonds the
+provider's stake, and writes addresses to `.env` and `deployments/arc.json`.
+Then run the two sides:
+
+```bash
+node --env-file=.env --import tsx providers/src/server.ts   # terminal 1
+node --env-file=.env --import tsx agent/src/run-arc.ts      # terminal 2
+```
+
 ## License
 
 MIT

@@ -32,9 +32,13 @@ Tessera against the Arc Hackathon checkpoints.
 
 ## 🎯 Checkpoint 3 (Final MVP on Arc)
 
-- [ ] Deploy `TesseraEscrow` to Arc testnet and pin the address in the demo.
-- [ ] Fund an agent wallet from `faucet.circle.com` and run the scenario against
-      Arc, with Arcscan links in the dashboard.
+- [x] One-command deploy tooling: `npm run bootstrap:arc` (keygen → faucet
+      wait → deploy escrow+tab → fund agent/provider → bond stake → persist
+      addresses). Validated end to end against a local chain.
+- [ ] Run the bootstrap against live Arc testnet (needs a network that can
+      reach `rpc.testnet.arc.network` + one faucet visit) and pin the
+      addresses in `deployments/arc.json`.
+- [ ] Run the scenario against Arc with Arcscan links in the dashboard.
 - [ ] Swap the demo's local keys for **Circle Developer-Controlled Wallets** so
       the agent and providers use managed wallets.
 - [ ] Add **Paymaster** so the agent's very first call is gasless (removes the
