@@ -291,7 +291,12 @@ export class TesseraAgent {
     await this.cfg.client.ensureApproval(quote.price);
     const chainNow = await this.cfg.client.chainTime();
     const wallNow = BigInt(Math.floor(Date.now() / 1000));
-    const deadline = (chainNow > wallNow ? chainNow : wallNow) + BigInt(quote.deadlineSeconds);
+    // Floor the on-chain deadline so a short provider SLA plus public-RPC
+    // confirmation latency can't make open() revert with DeadlinePassed before
+    // the escrow is even created. (Runtime tuning for the rate-limited testnet.)
+    const minDeadlineSeconds = Number(process.env.TESSERA_MIN_DEADLINE_SECONDS ?? 60);
+    const deadlineSeconds = BigInt(Math.max(quote.deadlineSeconds, minDeadlineSeconds));
+    const deadline = (chainNow > wallNow ? chainNow : wallNow) + deadlineSeconds;
     const { paymentId, txHash: openTx } = await this.cfg.client.open(
       quote.provider,
       quote.price,
@@ -401,7 +406,11 @@ export class TesseraAgent {
 
     const data: unknown[] = [];
     let cum = 0n;
+    // Space out ticks: the provider verifies each voucher with one on-chain read,
+    // and a rapid burst trips the public RPC's per-window eth_call limit.
+    const tickPaceMs = Number(process.env.TESSERA_TICK_PACE_MS ?? 0);
     for (let i = 0; i < ticks; i++) {
+      if (tickPaceMs > 0 && i > 0) await sleep(tickPaceMs);
       cum += svc.price;
       const sig = await this.cfg.client.signVoucher(tabId, cum);
       const res = await fetch(`${this.cfg.providersBaseUrl}${svc.path}?n=${i}`, {

@@ -78,24 +78,43 @@ export function createProviderApp(config: ProviderConfig): Express {
   const emit = (e: ProviderEvent) => config.onEvent?.(e);
 
   // Discovery: what an agent can buy, with live on-chain reputation + stake.
+  // All services here can share a provider wallet, so read each provider's
+  // on-chain state ONCE (not once per service) to avoid bursting the RPC's
+  // per-window eth_call limit, and fall back to the last-known value on a
+  // transient failure so discovery never hangs.
+  const repCache = new Map<Hex, { rep: [bigint, bigint, bigint]; stake: bigint }>();
+  const readProviderState = async (provider: Hex) => {
+    try {
+      const [rep, stake] = await Promise.all([
+        publicClient.readContract({
+          address: config.escrowAddress,
+          abi: tesseraEscrowAbi,
+          functionName: "reputation",
+          args: [provider],
+        }) as Promise<[bigint, bigint, bigint]>,
+        publicClient.readContract({
+          address: config.escrowAddress,
+          abi: tesseraEscrowAbi,
+          functionName: "stakeOf",
+          args: [provider],
+        }) as Promise<bigint>,
+      ]);
+      const state = { rep, stake };
+      repCache.set(provider, state);
+      return state;
+    } catch {
+      return repCache.get(provider) ?? { rep: [0n, 0n, 0n] as [bigint, bigint, bigint], stake: 0n };
+    }
+  };
+
   app.get("/catalog", async (_req: Request, res: Response) => {
-    const items = await Promise.all(
-      CATALOG.filter((s) => addressOf.has(s.resource)).map(async (s) => {
+    const uniqueProviders = [...new Set(CATALOG.filter((s) => addressOf.has(s.resource)).map((s) => addressOf.get(s.resource)!))];
+    const stateByProvider = new Map<Hex, { rep: [bigint, bigint, bigint]; stake: bigint }>();
+    for (const p of uniqueProviders) stateByProvider.set(p, await readProviderState(p));
+    const items =
+      CATALOG.filter((s) => addressOf.has(s.resource)).map((s) => {
         const provider = addressOf.get(s.resource)!;
-        const [[fulfilled, failed, earned], stake] = await Promise.all([
-          publicClient.readContract({
-            address: config.escrowAddress,
-            abi: tesseraEscrowAbi,
-            functionName: "reputation",
-            args: [provider],
-          }) as Promise<[bigint, bigint, bigint]>,
-          publicClient.readContract({
-            address: config.escrowAddress,
-            abi: tesseraEscrowAbi,
-            functionName: "stakeOf",
-            args: [provider],
-          }) as Promise<bigint>,
-        ]);
+        const { rep: [fulfilled, failed, earned], stake } = stateByProvider.get(provider)!;
         return {
           resource: s.resource,
           name: s.name,
@@ -113,8 +132,7 @@ export function createProviderApp(config: ProviderConfig): Express {
             earnedUsdc: formatUsdc(earned),
           },
         };
-      })
-    );
+      });
     res.json({ services: items });
   });
 
@@ -197,12 +215,20 @@ export function createProviderApp(config: ProviderConfig): Express {
 
     // Verify the voucher: on-chain tab state + off-chain signature.
     const cum = BigInt(voucher);
-    const tab = (await publicClient.readContract({
-      address: config.tabAddress,
-      abi: tesseraTabAbi,
-      functionName: "tabs",
-      args: [BigInt(tabId)],
-    })) as [Hex, Hex, bigint, bigint, bigint, boolean];
+    let tab: [Hex, Hex, bigint, bigint, bigint, boolean];
+    try {
+      tab = (await publicClient.readContract({
+        address: config.tabAddress,
+        abi: tesseraTabAbi,
+        functionName: "tabs",
+        args: [BigInt(tabId)],
+      })) as [Hex, Hex, bigint, bigint, bigint, boolean];
+    } catch (err) {
+      // Never leave the request hanging on a transient RPC failure — the agent's
+      // fetch would otherwise time out. Signal retryable and let it re-send.
+      res.status(503).json({ error: "tab read failed", detail: String(err).slice(0, 120) });
+      return;
+    }
     const [tabAgent, tabProvider, deposit, claimed, , closed] = tab;
 
     const prev = bestVoucher.get(tabId)?.cum ?? claimed;
