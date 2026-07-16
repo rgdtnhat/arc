@@ -1,0 +1,10 @@
+{
+  "chainId": 5042002,
+  "rpc": "https://rpc.testnet.arc.network",
+  "usdc": "0x3600000000000000000000000000000000000000",
+  "tesseraEscrow": "0x159b15b0f052d2db65e6798c84f6bbaa00de03b0",
+  "tesseraTab": "0x88b238909525b8b0efadf249988422ffd1521243",
+  "agent": "0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4",
+  "provider": "0xa5b42b3Ebe7FDB187c956D310f868960015d2988",
+  "deployedAt": "2026-07-16T14:41:54.375Z"
+}
