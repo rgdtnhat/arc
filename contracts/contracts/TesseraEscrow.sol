@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {ReentrancyGuard} from "./ReentrancyGuard.sol";
+
 /// @notice Minimal ERC-20 surface used by the escrow (Arc USDC).
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -23,7 +25,7 @@ interface IERC20 {
  * Reputation is updated on every terminal transition so agents can price the
  * risk of an unknown provider before spending.
  */
-contract TesseraEscrow {
+contract TesseraEscrow is ReentrancyGuard {
     enum Status {
         None,
         Escrowed,
@@ -108,7 +110,7 @@ contract TesseraEscrow {
         uint256 amount,
         uint64 deadline,
         bytes32 quoteHash
-    ) external returns (uint256 paymentId) {
+    ) external nonReentrant returns (uint256 paymentId) {
         if (amount == 0) revert ZeroAmount();
         if (deadline <= block.timestamp) revert DeadlinePassed();
 
@@ -148,7 +150,7 @@ contract TesseraEscrow {
     /**
      * @notice Agent confirms the SLA was met; releases escrow to the provider.
      */
-    function settle(uint256 paymentId) external {
+    function settle(uint256 paymentId) external nonReentrant {
         Payment storage p = payments[paymentId];
         if (msg.sender != p.agent) revert NotAgent();
         if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
@@ -171,7 +173,7 @@ contract TesseraEscrow {
      *         forever. The agent can still `settle` (fast path) or `refund`
      *         (reject) any time before this window closes.
      */
-    function providerClaim(uint256 paymentId) external {
+    function providerClaim(uint256 paymentId) external nonReentrant {
         Payment storage p = payments[paymentId];
         if (msg.sender != p.provider) revert NotProvider();
         if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
@@ -194,7 +196,7 @@ contract TesseraEscrow {
      *           fulfilled (also an SLA breach).
      *         Either way the provider's `failed` count increments.
      */
-    function refund(uint256 paymentId) external {
+    function refund(uint256 paymentId) external nonReentrant {
         Payment storage p = payments[paymentId];
 
         bool agentReject = msg.sender == p.agent && p.status == Status.Fulfilled;
@@ -229,7 +231,7 @@ contract TesseraEscrow {
      * @notice Provider bonds USDC as skin-in-the-game. A staked provider is a
      *         stronger trust signal for agents; stake is slashed on SLA breaches.
      */
-    function stake(uint256 amount) external {
+    function stake(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (!usdc.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
         stakeOf[msg.sender] += amount;
@@ -237,7 +239,7 @@ contract TesseraEscrow {
     }
 
     /// @notice Withdraw bonded stake.
-    function unstake(uint256 amount) external {
+    function unstake(uint256 amount) external nonReentrant {
         uint256 staked = stakeOf[msg.sender];
         require(amount > 0 && amount <= staked, "bad amount");
         stakeOf[msg.sender] = staked - amount;

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {ReentrancyGuard} from "./ReentrancyGuard.sol";
+
 interface IERC20_ {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
@@ -24,7 +26,7 @@ interface IERC20_ {
  *   claim()/closeTab()  provider redeems best voucher, remainder -> agent
  *   reclaim()  agent recovers unclaimed funds after expiry
  */
-contract TesseraTab {
+contract TesseraTab is ReentrancyGuard {
     struct Tab {
         address agent;
         address provider;
@@ -65,6 +67,7 @@ contract TesseraTab {
     /** Agent escrows `deposit` USDC to stream micro-calls to `provider`. */
     function openTab(address provider, uint256 deposit, uint64 duration)
         external
+        nonReentrant
         returns (uint256 tabId)
     {
         if (deposit == 0) revert ZeroDeposit();
@@ -91,7 +94,13 @@ contract TesseraTab {
      * Provider redeems the best voucher seen so far. Can be called repeatedly;
      * pays out only the delta above what was already claimed.
      */
-    function claim(uint256 tabId, uint256 cumulativeAmount, bytes calldata signature) public {
+    function claim(uint256 tabId, uint256 cumulativeAmount, bytes calldata signature) public nonReentrant {
+        _claim(tabId, cumulativeAmount, signature);
+    }
+
+    /// @dev Unguarded core so `closeTab` (itself guarded) can reuse it without
+    ///      tripping the reentrancy guard on a legitimate internal call.
+    function _claim(uint256 tabId, uint256 cumulativeAmount, bytes calldata signature) internal {
         Tab storage t = tabs[tabId];
         if (msg.sender != t.provider) revert NotProvider();
         if (t.closed) revert TabIsClosed();
@@ -106,8 +115,8 @@ contract TesseraTab {
     }
 
     /** Provider settles the final voucher and returns the remainder to the agent. */
-    function closeTab(uint256 tabId, uint256 cumulativeAmount, bytes calldata signature) external {
-        claim(tabId, cumulativeAmount, signature);
+    function closeTab(uint256 tabId, uint256 cumulativeAmount, bytes calldata signature) external nonReentrant {
+        _claim(tabId, cumulativeAmount, signature);
         Tab storage t = tabs[tabId];
         t.closed = true;
         uint256 remainder = t.deposit - t.claimed;
@@ -118,7 +127,7 @@ contract TesseraTab {
     }
 
     /** Agent recovers unclaimed funds if the provider never settles. */
-    function reclaim(uint256 tabId) external {
+    function reclaim(uint256 tabId) external nonReentrant {
         Tab storage t = tabs[tabId];
         if (msg.sender != t.agent) revert NotAgent();
         if (t.closed) revert TabIsClosed();
