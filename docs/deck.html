@@ -1,0 +1,429 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Tessera — pitch deck</title></head><body>
+<style>
+  :root {
+    --ground: #0b1020;
+    --ground-2: #0e1428;
+    --surface: #151d33;
+    --surface-2: #1b2542;
+    --line: #26314f;
+    --ink: #eaeefb;
+    --muted: #8a97b6;
+    --faint: #5d6a8c;
+    --accent: #4d8bff;      /* USDC / Circle blue */
+    --accent-soft: #1b2c52;
+    --good: #34d399;        /* settle */
+    --warn: #f5b544;        /* refund */
+    --bad: #f87171;         /* slash */
+    --shadow: 0 24px 60px -30px rgba(0,0,0,.7);
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --ground: #eef1f8;
+      --ground-2: #e7ebf5;
+      --surface: #ffffff;
+      --surface-2: #f4f6fc;
+      --line: #dbe1ef;
+      --ink: #0d1424;
+      --muted: #56638400;
+      --muted: #566384;
+      --faint: #8593b0;
+      --accent: #2f6be0;
+      --accent-soft: #e5edff;
+      --good: #0f9d6b;
+      --warn: #b9791a;
+      --bad: #d94b4b;
+      --shadow: 0 24px 60px -34px rgba(30,45,90,.35);
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0b1020; --ground-2: #0e1428; --surface: #151d33; --surface-2: #1b2542;
+    --line: #26314f; --ink: #eaeefb; --muted: #8a97b6; --faint: #5d6a8c;
+    --accent: #4d8bff; --accent-soft: #1b2c52; --good: #34d399; --warn: #f5b544; --bad: #f87171;
+    --shadow: 0 24px 60px -30px rgba(0,0,0,.7); color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --ground: #eef1f8; --ground-2: #e7ebf5; --surface: #ffffff; --surface-2: #f4f6fc;
+    --line: #dbe1ef; --ink: #0d1424; --muted: #566384; --faint: #8593b0;
+    --accent: #2f6be0; --accent-soft: #e5edff; --good: #0f9d6b; --warn: #b9791a; --bad: #d94b4b;
+    --shadow: 0 24px 60px -34px rgba(30,45,90,.35); color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  .mono { font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace; }
+
+  /* ---- deck frame ---- */
+  .deck { position: fixed; inset: 0; display: grid; place-items: center; }
+  .stage {
+    position: relative;
+    width: min(100vw, 177.78vh);
+    height: min(56.25vw, 100vh);
+    background:
+      radial-gradient(120% 90% at 88% -20%, var(--accent-soft) 0%, transparent 55%),
+      linear-gradient(180deg, var(--ground-2), var(--ground));
+    overflow: hidden;
+  }
+  .slide {
+    position: absolute; inset: 0;
+    display: none;
+    flex-direction: column;
+    justify-content: center;
+    padding: clamp(28px, 5.2vw, 84px);
+    gap: clamp(14px, 2.2vh, 26px);
+    opacity: 0;
+  }
+  .slide.active { display: flex; animation: rise .5s cubic-bezier(.2,.7,.2,1) both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    .slide.active { animation: none; }
+  }
+
+  .eyebrow {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+    font-size: clamp(11px, 1.15vw, 15px);
+    letter-spacing: .22em; text-transform: uppercase;
+    color: var(--accent);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .eyebrow::before {
+    content: ""; width: clamp(20px, 2.6vw, 40px); height: 2px; background: var(--accent); border-radius: 2px;
+  }
+  h1 {
+    font-size: clamp(34px, 6.6vw, 104px);
+    line-height: .98; letter-spacing: -.03em; font-weight: 800;
+    margin: 0; text-wrap: balance;
+  }
+  h2 {
+    font-size: clamp(26px, 4vw, 60px);
+    line-height: 1.02; letter-spacing: -.025em; font-weight: 800;
+    margin: 0; text-wrap: balance;
+  }
+  .lede { font-size: clamp(15px, 1.9vw, 27px); color: var(--muted); line-height: 1.4; max-width: 26ch; }
+  .big-quote { font-size: clamp(24px, 3.9vw, 58px); line-height: 1.12; letter-spacing: -.02em; font-weight: 750; max-width: 18ch; text-wrap: balance; }
+  .accent { color: var(--accent); }
+  .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  p { margin: 0; }
+
+  .cols { display: grid; grid-template-columns: 1.05fr .95fr; gap: clamp(22px, 3.4vw, 56px); align-items: center; }
+  @media (max-width: 720px) { .cols { grid-template-columns: 1fr; } }
+
+  /* ---- cards / lists ---- */
+  .stack { display: flex; flex-direction: column; gap: clamp(9px, 1.4vh, 16px); }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    padding: clamp(13px, 1.5vw, 20px) clamp(15px, 1.7vw, 22px);
+  }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: clamp(10px, 1.3vw, 16px); }
+  .card .k { font-size: clamp(13px, 1.35vw, 18px); font-weight: 700; letter-spacing: -.01em; display:flex; align-items:center; gap:9px; }
+  .card .v { font-size: clamp(11.5px, 1.12vw, 15px); color: var(--muted); line-height: 1.4; margin-top: 5px; }
+
+  .flow { display: flex; gap: clamp(8px, 1vw, 14px); align-items: stretch; }
+  .flow .step { flex: 1; background: var(--surface); border: 1px solid var(--line); border-radius: 13px; padding: clamp(12px,1.5vw,20px); display: flex; flex-direction: column; gap: 8px; position: relative; }
+  .flow .step .n { font-family: ui-monospace, monospace; font-size: 12px; color: var(--faint); letter-spacing: .1em; }
+  .flow .step .t { font-weight: 750; font-size: clamp(14px, 1.5vw, 21px); letter-spacing: -.01em; }
+  .flow .step .d { font-size: clamp(11px, 1.05vw, 14px); color: var(--muted); line-height: 1.35; }
+  .flow .arrow { align-self: center; color: var(--faint); font-size: 20px; }
+  @media (max-width: 720px) { .flow { flex-direction: column; } .flow .arrow { transform: rotate(90deg); } }
+
+  .pill { font-family: ui-monospace, monospace; font-size: clamp(10px,1vw,13px); font-weight: 700; padding: 4px 10px; border-radius: 999px; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+  .pill.settled { color: var(--good); background: color-mix(in srgb, var(--good) 15%, transparent); border: 1px solid color-mix(in srgb, var(--good) 40%, transparent); }
+  .pill.refunded { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); }
+
+  /* ledger + explorer rows */
+  .ledger { display: flex; flex-direction: column; gap: 8px; }
+  .lrow { display: grid; grid-template-columns: 1fr auto auto; gap: 14px; align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 11px; padding: clamp(9px,1vw,14px) clamp(12px,1.3vw,18px); }
+  .lrow .name { font-weight: 650; font-size: clamp(12px,1.2vw,17px); }
+  .lrow .amt { font-size: clamp(11px,1.05vw,15px); color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .tx { display: flex; align-items: center; gap: clamp(12px,1.4vw,20px); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: clamp(11px,1.2vw,17px) clamp(14px,1.5vw,20px); }
+  .tx .badge { width: 42px; height: 42px; flex: none; border-radius: 10px; display: grid; place-items: center; font-size: 19px; }
+  .tx .lbl { font-weight: 750; font-size: clamp(13px,1.35vw,19px); letter-spacing: -.01em; }
+  .tx .sub { font-size: clamp(10.5px,1vw,13.5px); color: var(--muted); margin-top: 3px; }
+  .tx .hash { margin-left: auto; font-size: clamp(10px,1vw,13px); color: var(--accent); }
+  .b-good { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .b-warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+  .b-accent { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+
+  .stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: clamp(12px,1.5vw,20px); }
+  @media (max-width: 720px) { .stat-row { grid-template-columns: repeat(2,1fr); } }
+  .stat { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: clamp(14px,1.7vw,24px); }
+  .stat .num { font-size: clamp(28px,4vw,54px); font-weight: 800; letter-spacing: -.03em; line-height: 1; font-variant-numeric: tabular-nums; }
+  .stat .cap { font-size: clamp(11px,1.05vw,14px); color: var(--muted); margin-top: 8px; line-height: 1.3; }
+
+  .addr-line { font-size: clamp(11px,1.1vw,15px); color: var(--muted); display:flex; gap: 10px; flex-wrap: wrap; }
+  .addr-line b { color: var(--ink); font-weight: 650; }
+
+  /* ---- mosaic logo (tesserae) ---- */
+  .mosaic { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; width: clamp(38px,4.4vw,64px); aspect-ratio: 1; }
+  .mosaic i { border-radius: 3px; background: var(--surface-2); border: 1px solid var(--line); }
+  .mosaic i.on { background: var(--accent); border-color: transparent; }
+  .mosaic i.g { background: var(--good); border-color: transparent; }
+
+  .brandrow { display: flex; align-items: center; gap: 16px; }
+  .brandrow .name { font-size: clamp(20px,2.4vw,34px); font-weight: 800; letter-spacing: -.02em; }
+
+  /* ---- chrome: nav, progress, counter ---- */
+  .chrome { position: absolute; z-index: 5; }
+  .toprail { top: clamp(18px,2.6vh,30px); left: clamp(28px,5.2vw,84px); right: clamp(28px,5.2vw,84px); display: flex; align-items: center; justify-content: space-between; }
+  .tiles { display: flex; gap: 6px; }
+  .tiles i { width: clamp(14px,1.5vw,22px); height: 6px; border-radius: 3px; background: var(--line); cursor: pointer; transition: background .3s, width .3s; }
+  .tiles i.done { background: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+  .tiles i.cur { background: var(--accent); width: clamp(26px,2.8vw,40px); }
+  .topmeta { font-family: ui-monospace, monospace; font-size: clamp(10px,1vw,13px); color: var(--faint); letter-spacing: .12em; display:flex; align-items:center; gap:14px; }
+  .tbtn { -webkit-appearance:none; appearance:none; background: var(--surface); border: 1px solid var(--line); color: var(--muted); border-radius: 8px; width: 30px; height: 26px; cursor: pointer; font-size: 13px; }
+  .tbtn:hover { color: var(--ink); border-color: var(--accent); }
+  .footrail { bottom: clamp(16px,2.4vh,28px); left: clamp(28px,5.2vw,84px); right: clamp(28px,5.2vw,84px); display: flex; align-items: center; justify-content: space-between; font-family: ui-monospace, monospace; font-size: clamp(9.5px,.95vw,12px); color: var(--faint); letter-spacing: .1em; }
+  .nav { display: flex; gap: 8px; }
+  .nav button { -webkit-appearance:none; appearance:none; background: var(--surface); border: 1px solid var(--line); color: var(--ink); border-radius: 8px; width: 34px; height: 30px; cursor: pointer; font-size: 15px; }
+  .nav button:hover { border-color: var(--accent); color: var(--accent); }
+  .nav button:focus-visible, .tiles i:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .clickzone { position: absolute; top: 0; bottom: 0; width: 22%; z-index: 3; cursor: pointer; }
+  .clickzone.left { left: 0; } .clickzone.right { right: 0; }
+
+  .kbd { font-family: ui-monospace, monospace; background: var(--surface); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; font-size: .82em; color: var(--muted); }
+
+  /* ---- print / PDF export: every slide one page ---- */
+  @media print {
+    @page { size: 1280px 720px; margin: 0; }
+    body { overflow: visible; }
+    .deck, .stage { position: static; width: 1280px; height: auto; }
+    .chrome, .clickzone { display: none !important; }
+    .slide { position: static; display: flex !important; opacity: 1 !important; animation: none; width: 1280px; height: 720px; page-break-after: always; break-after: page; border-bottom: 1px solid var(--line); }
+  }
+</style>
+
+<div class="deck">
+  <div class="stage" id="stage">
+
+    <!-- top chrome -->
+    <div class="chrome toprail">
+      <div class="tiles" id="tiles"></div>
+      <div class="topmeta">
+        <span id="counter">01 / 10</span>
+        <button class="tbtn" id="themeBtn" title="Toggle light / dark" aria-label="Toggle theme">◐</button>
+      </div>
+    </div>
+
+    <!-- ============ SLIDE 1 — TITLE ============ -->
+    <section class="slide active">
+      <div class="eyebrow">Agentic Economy · Arc Hackathon</div>
+      <div class="brandrow">
+        <div class="mosaic" aria-hidden="true">
+          <i class="on"></i><i></i><i class="g"></i>
+          <i></i><i class="on"></i><i></i>
+          <i class="g"></i><i></i><i class="on"></i>
+        </div>
+        <div class="name">Tessera</div>
+      </div>
+      <h1>Money for machines.</h1>
+      <p class="lede" style="max-width:40ch">Trustless pay-per-use commerce for AI agents — settled on <span class="accent">Arc</span> in USDC. The trust layer that lets an agent pay a service it has never met.</p>
+    </section>
+
+    <!-- ============ SLIDE 2 — PROBLEM ============ -->
+    <section class="slide">
+      <div class="eyebrow">The problem</div>
+      <div class="cols">
+        <div>
+          <h2>Agents can't pay strangers.</h2>
+          <p class="lede" style="margin-top:18px; max-width:30ch">An agent can only buy from a service a human already set up an account and a card for.</p>
+        </div>
+        <div class="stack">
+          <div class="card"><div class="k">Trust runs both ways</div><div class="v">The service can't tell the agent will pay. The agent can't tell the service will deliver.</div></div>
+          <div class="card"><div class="k">So: pre-funded vendors only</div><div class="v">Agents are boxed into a hand-curated list of pre-approved suppliers.</div></div>
+          <div class="card"><div class="k accent">That isn't an economy</div><div class="v">Real machine-to-machine commerce needs strangers to transact safely.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SLIDE 3 — INSIGHT ============ -->
+    <section class="slide">
+      <div class="eyebrow">The insight</div>
+      <p class="big-quote">The missing primitive isn't <span class="muted" style="color:var(--faint)">"send USDC."</span><br>It's <span class="accent">escrow + SLA + reputation.</span></p>
+      <p class="lede" style="max-width:44ch">A raw transfer doesn't make a stranger safe to deal with. Programmable escrow — with a delivery guarantee and reputation attached — does.</p>
+    </section>
+
+    <!-- ============ SLIDE 4 — HOW IT WORKS ============ -->
+    <section class="slide">
+      <div class="eyebrow">How it works</div>
+      <h2>402 → decide → escrow → settle or refund</h2>
+      <div class="flow" style="margin-top:8px">
+        <div class="step"><span class="n">01</span><span class="t">Quote</span><span class="d">Agent hits a paid endpoint → <b>HTTP 402</b> + a signed USDC price & SLA.</span></div>
+        <div class="arrow">→</div>
+        <div class="step"><span class="n">02</span><span class="t">Decide</span><span class="d">Rules/LLM engine weighs budget, on-chain reputation, stake & memory.</span></div>
+        <div class="arrow">→</div>
+        <div class="step"><span class="n">03</span><span class="t">Escrow</span><span class="d">Locks a nano USDC payment in <b>TesseraEscrow</b> on Arc.</span></div>
+        <div class="arrow">→</div>
+        <div class="step"><span class="n">04</span><span class="t">Settle / Refund</span><span class="d"><span class="good">Delivered → released.</span> <span class="warn">SLA breach → reclaimed.</span></span></div>
+      </div>
+      <p class="lede" style="max-width:52ch; margin-top:6px">USDC is Arc's <span class="accent">gas token</span>, so the agent funds one asset for the toll and the fees — and sub-second finality lets a payment settle inside the request.</p>
+    </section>
+
+    <!-- ============ SLIDE 5 — DIFFERENTIATORS ============ -->
+    <section class="slide">
+      <div class="eyebrow">What makes it real</div>
+      <div class="row2">
+        <div class="card"><div class="k"><span class="accent">◆</span> Escrow + auto-refund</div><div class="v">Delivery releases funds; an SLA breach reclaims them automatically. Enforced by the contract, not trust.</div></div>
+        <div class="card"><div class="k"><span class="good">◆</span> Provider staking & slashing</div><div class="v">Providers bond USDC; a breach slashes it to compensate the agent. Skin in the game.</div></div>
+        <div class="card"><div class="k"><span class="warn">◆</span> Nanopayment tabs</div><div class="v">One deposit, many zero-gas off-chain vouchers, one settlement. Streams at nano-scale.</div></div>
+        <div class="card"><div class="k"><span class="accent">◆</span> Guardian + trust memory</div><div class="v">Big buys pause for a human co-signer; a provider that burned this agent is declined next time.</div></div>
+      </div>
+    </section>
+
+    <!-- ============ SLIDE 6 — LIVE DEMO ============ -->
+    <section class="slide">
+      <div class="eyebrow">Live demo · one autonomous run</div>
+      <div class="cols" style="grid-template-columns:1.15fr .85fr">
+        <div class="ledger">
+          <div class="lrow"><span class="name">AtmosFeed — weather</span><span class="amt">0.0025</span><span class="pill settled">settled</span></div>
+          <div class="lrow"><span class="name">ParityDesk — FX quote</span><span class="amt">0.0040</span><span class="pill settled">settled</span></div>
+          <div class="lrow"><span class="name">WireScoop — news <span class="bad">(junk)</span></span><span class="amt">0.0030</span><span class="pill refunded">refunded</span></div>
+          <div class="lrow"><span class="name">AlphaSignal — analysis <span class="accent">🛡</span></span><span class="amt">0.0080</span><span class="pill settled">settled</span></div>
+          <div class="lrow"><span class="name">PulseWire — ticker <span class="warn">⚡tab</span></span><span class="amt">6 ticks</span><span class="pill settled">settled</span></div>
+        </div>
+        <div class="stack">
+          <div class="card"><div class="k warn">SLA breach → slash</div><div class="v">News returns junk; agent reclaims USDC and slashes the provider's stake 0.05 → 0.0494.</div></div>
+          <div class="card"><div class="k accent">Guardian pause</div><div class="v">Premium call exceeds policy cap → a human approves before it settles.</div></div>
+          <div class="card"><div class="k">Declined from memory</div><div class="v">An invoice from the provider that failed it → declined, no human asked.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SLIDE 7 — ON-CHAIN PROOF ============ -->
+    <section class="slide">
+      <div class="eyebrow">On-chain proof · Arc testnet · chainId 5042002</div>
+      <div class="stack" style="gap:10px">
+        <div class="tx"><div class="badge b-good">✓</div><div><div class="lbl">Settle — USDC released to provider</div><div class="sub">Verified delivery, escrow released</div></div><div class="hash mono">0x5088d17a…4f86</div></div>
+        <div class="tx"><div class="badge b-warn">↩</div><div><div class="lbl">Refund — SLA breach reclaimed</div><div class="sub">Agent recovered its USDC automatically</div></div><div class="hash mono">0x6c050fb0…58e0</div></div>
+        <div class="tx"><div class="badge b-accent">⚡</div><div><div class="lbl">Tab settle — 6 calls, one transaction</div><div class="sub">Nanopayment stream, remainder returned</div></div><div class="hash mono">0x1f519084…4359</div></div>
+      </div>
+      <div class="addr-line mono" style="margin-top:4px">
+        <span>Escrow <b>0x159b15b0…de03b0</b></span><span>Tab <b>0x88b23890…521243</b></span><span>Reputation <b class="good">10✓</b> / <b class="bad">1✗</b></span>
+      </div>
+    </section>
+
+    <!-- ============ SLIDE 8 — WHY ARC ============ -->
+    <section class="slide">
+      <div class="eyebrow">Why Arc + Circle</div>
+      <div class="cols">
+        <div><h2>Built for money that moves itself.</h2></div>
+        <div class="stack">
+          <div class="card"><div class="k"><span class="accent">USDC is the gas token</span></div><div class="v">The agent funds one asset for both the toll and the fees — no native-gas bootstrap for a bot.</div></div>
+          <div class="card"><div class="k">Sub-second finality</div><div class="v">A per-call payment clears inside the request/response cycle.</div></div>
+          <div class="card"><div class="k">Circle developer stack</div><div class="v">USDC + Circle Wallets today; Paymaster (gasless first call) & Developer-Controlled Wallets next.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SLIDE 9 — TRACTION / QUALITY ============ -->
+    <section class="slide">
+      <div class="eyebrow">Execution &amp; quality</div>
+      <h2 style="max-width:20ch">Quality over surface area — every feature runs end to end.</h2>
+      <div class="stat-row" style="margin-top:10px">
+        <div class="stat"><div class="num">34</div><div class="cap">automated tests<br>(17 contract · 17 agent)</div></div>
+        <div class="stat"><div class="num good">CI</div><div class="cap">full agentic scenario<br>on every push</div></div>
+        <div class="stat"><div class="num">1</div><div class="cap">command to deploy live<br><span class="mono" style="font-size:.85em">bootstrap:arc</span></div></div>
+        <div class="stat"><div class="num accent">Live</div><div class="cap">deployed &amp; transacting<br>on Arc testnet</div></div>
+      </div>
+    </section>
+
+    <!-- ============ SLIDE 10 — VISION / ASK ============ -->
+    <section class="slide">
+      <div class="eyebrow">The vision</div>
+      <h1 style="font-size:clamp(30px,5.4vw,84px)">The settlement rail for agent-to-agent commerce.</h1>
+      <p class="lede" style="max-width:46ch">Escrow, refunds, staking and reputation that make autonomous commerce safe. Next: real providers, a discovery registry, reputation staking.</p>
+      <div class="addr-line mono" style="margin-top:10px"><span class="accent">github.com/rgdtnhat/arc</span><span>·</span><span>live on Arc testnet</span></div>
+    </section>
+
+    <!-- click zones + nav + footer -->
+    <div class="clickzone left" id="zoneL"></div>
+    <div class="clickzone right" id="zoneR"></div>
+
+    <div class="chrome footrail">
+      <span id="footLabel">TESSERA</span>
+      <div class="nav">
+        <button id="prev" aria-label="Previous slide">←</button>
+        <button id="next" aria-label="Next slide">→</button>
+      </div>
+      <span>← → NAVIGATE · <span class="kbd">P</span> PRINT/PDF</span>
+    </div>
+
+  </div>
+</div>
+
+<script>
+  (function () {
+    var slides = Array.prototype.slice.call(document.querySelectorAll(".slide"));
+    var total = slides.length;
+    var i = 0;
+    var labels = ["TESSERA","THE PROBLEM","THE INSIGHT","HOW IT WORKS","DIFFERENTIATORS","LIVE DEMO","ON-CHAIN PROOF","WHY ARC","EXECUTION","THE VISION"];
+
+    var tiles = document.getElementById("tiles");
+    for (var t = 0; t < total; t++) {
+      var b = document.createElement("i");
+      b.setAttribute("tabindex", "0");
+      b.setAttribute("role", "button");
+      b.setAttribute("aria-label", "Go to slide " + (t + 1));
+      (function (idx) {
+        b.addEventListener("click", function () { go(idx); });
+        b.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(idx); } });
+      })(t);
+      tiles.appendChild(b);
+    }
+    var tileEls = Array.prototype.slice.call(tiles.children);
+
+    var counter = document.getElementById("counter");
+    var footLabel = document.getElementById("footLabel");
+
+    function pad(n) { return (n < 10 ? "0" : "") + n; }
+
+    function render() {
+      slides.forEach(function (s, idx) { s.classList.toggle("active", idx === i); });
+      tileEls.forEach(function (el, idx) {
+        el.classList.toggle("cur", idx === i);
+        el.classList.toggle("done", idx < i);
+      });
+      counter.textContent = pad(i + 1) + " / " + pad(total);
+      footLabel.textContent = labels[i] || "TESSERA";
+    }
+    function go(n) { i = Math.max(0, Math.min(total - 1, n)); render(); }
+    function next() { go(i + 1); }
+    function prev() { go(i - 1); }
+
+    document.getElementById("next").addEventListener("click", next);
+    document.getElementById("prev").addEventListener("click", prev);
+    document.getElementById("zoneR").addEventListener("click", next);
+    document.getElementById("zoneL").addEventListener("click", prev);
+
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowRight" || e.key === "PageDown") { next(); }
+      else if (e.key === "ArrowLeft" || e.key === "PageUp") { prev(); }
+      else if (e.key === " ") { e.preventDefault(); next(); }
+      else if (e.key === "Home") { go(0); }
+      else if (e.key === "End") { go(total - 1); }
+      else if (e.key === "p" || e.key === "P") { window.print(); }
+    });
+
+    // theme toggle
+    var root = document.documentElement;
+    document.getElementById("themeBtn").addEventListener("click", function () {
+      var cur = root.getAttribute("data-theme");
+      if (!cur) {
+        cur = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      }
+      root.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
+    });
+
+    render();
+  })();
+</script>
+
+</body></html>
