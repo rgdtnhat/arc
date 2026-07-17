@@ -71,7 +71,7 @@ you say. Total ≈ 3 minutes if you also demo; ≈ 2:30 for slides alone.
 ---
 
 ## Slide 7 — On-chain proof
-**Live on Arc testnet. [4 Arcscan tx thumbnails] Escrow 0x159b… · Tab 0x88b2… · reputation 10✓/1✗**
+**Live on Arc testnet. [3 Arcscan tx thumbnails] Escrow 0x9776… · Tab 0x5d48… · settle · refund · tab-settle**
 
 > "And none of it is faked. Here it is on Arc testnet: the settlement releasing
 > USDC to a provider, the SLA refund reclaiming it, and the tab settling six calls
@@ -91,7 +91,7 @@ you say. Total ≈ 3 minutes if you also demo; ≈ 2:30 for slides alone.
 ---
 
 ## Slide 9 — Traction & quality
-**34 tests · CI on every push · one-command live deploy · offline-capable build**
+**41 tests · CI on every push · one-command live deploy · offline-capable build**
 
 > "On execution: thirty-four automated tests, CI running the full agentic scenario
 > on every push, and a one-command live deploy to Arc. We optimized for quality

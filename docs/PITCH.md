@@ -5,11 +5,11 @@ the real on-chain transactions, and a slide-by-slide deck outline.
 
 Live artifacts to have open while recording:
 - Dashboard: `npm run demo` → http://127.0.0.1:8787
-- Escrow on Arcscan: https://testnet.arcscan.app/address/0x159b15b0f052d2db65e6798c84f6bbaa00de03b0
-- Tab on Arcscan: https://testnet.arcscan.app/address/0x88b238909525b8b0efadf249988422ffd1521243
-- Settle tx: https://testnet.arcscan.app/tx/0x5088d17acba3ff537d199a543fcca7620d175d66f992133eef50cf8e0aca4f86
-- Refund tx: https://testnet.arcscan.app/tx/0x6c050fb0c3f0d2c5b199da58adfca24866d116bad7263f951f91ebfe1b8d58e0
-- Tab settle tx: https://testnet.arcscan.app/tx/0x1f519084cb88b0374edbcf4a9e0b1b1e747fa45884e781ec5d53bce4562c4359
+- Escrow on Arcscan: https://testnet.arcscan.app/address/0x9776498c2a0661a2d3bbb10c5094d16f835a9a7d
+- Tab on Arcscan: https://testnet.arcscan.app/address/0x5d482c70ac56cdc44414a93446709fee17d78c6d
+- Settle tx: https://testnet.arcscan.app/tx/0xbbf5c98b910ae9dc628db118d6d81e18b23399c9f7bc17b4ae1408c52800753f
+- Refund tx: https://testnet.arcscan.app/tx/0xf8a57c18b1940b086e976638184a56ee9dab839e95e67346ecb8a0d4c55518ba
+- Tab settle tx: https://testnet.arcscan.app/tx/0x15c13f79ac158829cc4ff0237cdb855b587a87445a1efa03413c36f297b24f66
 
 ---
 
@@ -89,11 +89,11 @@ Narrate over the real run. Beats:
    approvals + trust memory.
 6. **Live demo** — the dashboard screenshot; annotate settled / refunded / tab /
    guardian / billing inbox. "One autonomous run."
-7. **On-chain proof** — the 4 Arcscan transactions (settle, refund, tab open, tab
-   settle) + contract addresses. Reputation 10✓/1✗. "Deployed and transacting."
+7. **On-chain proof** — the 3 Arcscan transactions (settle, refund, tab settle) +
+   contract addresses. "Deployed and transacting."
 8. **Why Arc / Circle** — USDC gas token, sub-second settlement, Circle Wallets;
    Paymaster + Developer-Controlled Wallets on the roadmap.
-9. **Traction & quality** — 34 tests, CI on every push, one-command live deploy
+9. **Traction & quality** — 41 tests, CI on every push, one-command live deploy
    (`bootstrap:arc`), offline-capable toolchain. Execution > complexity.
 10. **Vision / ask** — from a demo to the settlement rail for agent-to-agent
     commerce: real providers, discovery registry, reputation staking. Repo link.
@@ -106,6 +106,6 @@ Narrate over the real run. Beats:
   native USDC as gas + settlement, live txs; Circle Wallets used, Paymaster next.
 - **Use case & impact** — a real, unsolved problem (agent-to-stranger payments)
   with a credible path to production.
-- **Execution & quality** — 34 tests, CI, one-command deploy, live on-chain proof,
+- **Execution & quality** — 41 tests, CI, one-command deploy, live on-chain proof,
   resilient to public-RPC limits. Quality over complexity.
 - **Presentation** — this kit: a tight demo narrative anchored to real transactions.

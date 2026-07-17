@@ -6,7 +6,7 @@
   "main": "src/agent.ts",
   "scripts": {
     "demo": "tsx src/demo.ts",
-    "run:arc": "tsx src/run-arc.ts",
+    "run:arc": "NODE_USE_ENV_PROXY=1 tsx src/run-arc.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {

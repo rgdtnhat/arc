@@ -45,17 +45,17 @@ Wallets today; Paymaster (gasless first call) and Developer-Controlled Wallets a
 the next integrations.
 
 ## Proof it works (live on Arc testnet, chainId 5042002)
-- TesseraEscrow: `0x159b15b0f052d2db65e6798c84f6bbaa00de03b0`
-- TesseraTab: `0x88b238909525b8b0efadf249988422ffd1521243`
-- Live transactions — settle `0x5088d17a…`, refund `0x6c050fb0…`, tab settle
-  `0x1f519084…` (all on testnet.arcscan.app). On-chain provider reputation: 10✓/1✗.
-- 34 automated tests (17 contract + 17 agent) and CI on every push; one-command
+- TesseraEscrow: `0x9776498c2a0661a2d3bbb10c5094d16f835a9a7d`
+- TesseraTab: `0x5d482c70ac56cdc44414a93446709fee17d78c6d`
+- Live transactions — settle `0xbbf5c98b…`, refund `0xf8a57c18…`, tab settle
+  `0x15c13f79…` (all on testnet.arcscan.app), each status=success.
+- 41 automated tests (21 contract + 20 agent) and CI on every push; one-command
   live deploy via `npm run bootstrap:arc`.
 
 ## Links
 - Repo: https://github.com/rgdtnhat/arc
-- Escrow: https://testnet.arcscan.app/address/0x159b15b0f052d2db65e6798c84f6bbaa00de03b0
-- Tab: https://testnet.arcscan.app/address/0x88b238909525b8b0efadf249988422ffd1521243
+- Escrow: https://testnet.arcscan.app/address/0x9776498c2a0661a2d3bbb10c5094d16f835a9a7d
+- Tab: https://testnet.arcscan.app/address/0x5d482c70ac56cdc44414a93446709fee17d78c6d
 
 ---
 

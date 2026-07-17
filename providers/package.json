@@ -9,7 +9,7 @@
     "./catalog": "./src/catalog.ts"
   },
   "scripts": {
-    "start": "tsx src/server.ts"
+    "start": "NODE_USE_ENV_PROXY=1 tsx src/server.ts"
   },
   "dependencies": {
     "@tessera/shared": "*",

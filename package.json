@@ -16,7 +16,7 @@
     "compile": "npm run compile --workspace contracts",
     "demo": "npm run demo --workspace agent",
     "e2e": "TESSERA_ONCE=1 tsx agent/src/demo.ts",
-    "bootstrap:arc": "tsx scripts/arc-bootstrap.mjs"
+    "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs"
   },
   "license": "MIT",
   "engines": {

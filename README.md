@@ -169,6 +169,10 @@ node --env-file=.env --import tsx providers/src/server.ts   # terminal 1
 node --env-file=.env --import tsx agent/src/run-arc.ts      # terminal 2
 ```
 
+The Arc scripts set `NODE_USE_ENV_PROXY=1` so Node's `fetch` honors an
+`HTTPS_PROXY` (needed in proxied/sandboxed environments; a no-op otherwise). If
+your proxy re-terminates TLS, also export `NODE_EXTRA_CA_CERTS=<ca-bundle>`.
+
 ## License
 
 MIT
