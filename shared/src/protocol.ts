@@ -28,7 +28,47 @@ export const HEADERS = {
   voucherSig: "x-tessera-voucher-sig",
   /** Provider → agent (on 402): "escrow" (default) or "tab". */
   billing: "x-tessera-billing",
+
+  // --- Signed quotes (EIP-712) ---------------------------------------------
+  /** Provider → agent: random 32-byte nonce binding the quote. */
+  quoteNonce: "x-tessera-quote-nonce",
+  /** Provider → agent: unix seconds after which the quote is no longer valid. */
+  quoteExpiry: "x-tessera-quote-expiry",
+  /** Provider → agent: provider's EIP-712 signature over the quote. */
+  quoteSig: "x-tessera-quote-sig",
 } as const;
+
+/**
+ * EIP-712 typed data for a price quote. The provider signs it so the agent can
+ * prove the price, resource and expiry are authentic and untampered before it
+ * escrows any USDC — non-repudiable, and safe over an untrusted transport.
+ */
+export function quoteTypedData(
+  chainId: number,
+  verifyingContract: `0x${string}`,
+  quote: {
+    provider: `0x${string}`;
+    price: bigint;
+    resource: string;
+    nonce: `0x${string}`;
+    expiry: bigint;
+  }
+) {
+  return {
+    domain: { name: "Tessera", version: "1", chainId, verifyingContract },
+    types: {
+      Quote: [
+        { name: "provider", type: "address" },
+        { name: "price", type: "uint256" },
+        { name: "resource", type: "string" },
+        { name: "nonce", type: "bytes32" },
+        { name: "expiry", type: "uint64" },
+      ],
+    },
+    primaryType: "Quote" as const,
+    message: quote,
+  };
+}
 
 /** What an agent parses out of a 402 response. */
 export interface Quote {

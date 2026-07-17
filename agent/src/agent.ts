@@ -1,9 +1,10 @@
-import { keccak256, toHex, type Hex } from "viem";
+import { keccak256, toHex, verifyTypedData, type Hex } from "viem";
 import {
   HEADERS,
   formatUsdc,
   PaymentStatus,
   arcscanTx,
+  quoteTypedData,
   type Quote,
 } from "@tessera/shared";
 import { TesseraClient } from "./client.js";
@@ -580,6 +581,30 @@ export class TesseraAgent {
     const deadline = res.headers.get(HEADERS.deadline);
     const resource = res.headers.get(HEADERS.resource);
     if (!provider || !price || !quoteHash || !deadline || !resource) return null;
+
+    // Verify the provider's EIP-712 signature over the quote before trusting it.
+    const nonce = res.headers.get(HEADERS.quoteNonce) as Hex | null;
+    const expiry = res.headers.get(HEADERS.quoteExpiry);
+    const sig = res.headers.get(HEADERS.quoteSig) as Hex | null;
+    if (nonce && expiry && sig) {
+      if (BigInt(expiry) < BigInt(Math.floor(Date.now() / 1000))) {
+        this.emit({ level: "skip", resource, message: `Quote from ${svc.name} expired — skipping` });
+        return null;
+      }
+      const typed = quoteTypedData(this.cfg.client.public.chain!.id, this.cfg.client.escrow, {
+        provider,
+        price: BigInt(price),
+        resource,
+        nonce,
+        expiry: BigInt(expiry),
+      });
+      const valid = await verifyTypedData({ address: provider, signature: sig, ...typed });
+      if (!valid) {
+        this.emit({ level: "skip", resource, message: `Quote signature from ${svc.name} INVALID — refusing to pay` });
+        return null;
+      }
+    }
+
     return {
       provider,
       price: BigInt(price),

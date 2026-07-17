@@ -17,6 +17,7 @@ import {
   tesseraTabAbi,
   formatUsdc,
   PaymentStatus,
+  quoteTypedData,
 } from "@tessera/shared";
 import { CATALOG, type ServiceDef } from "./catalog.js";
 import { quoteHash, responseHash, randomNonce } from "./quote.js";
@@ -309,13 +310,24 @@ export function createProviderApp(config: ProviderConfig): Express {
     if (!paymentId) {
       const nonce = randomNonce();
       const qh = quoteHash(provider, svc.price, svc.resource, nonce);
+      const expiry = BigInt(Math.floor(Date.now() / 1000) + svc.slaSeconds + 60);
       issued.set(qh, {
         resource: svc.resource,
         price: svc.price,
         provider,
         expiresAt: Date.now() + svc.slaSeconds * 1000 + 60_000,
       });
-      emit({ kind: "quote", resource: svc.resource, detail: `quoted ${formatUsdc(svc.price)} USDC` });
+      // EIP-712 sign the quote so the agent can verify it's authentic.
+      const wallet = wallets.get(svc.resource)!;
+      const typed = quoteTypedData(config.chain.id, config.escrowAddress, {
+        provider,
+        price: svc.price,
+        resource: svc.resource,
+        nonce,
+        expiry,
+      });
+      const quoteSig = await wallet.signTypedData({ account: wallet.account!, ...typed });
+      emit({ kind: "quote", resource: svc.resource, detail: `quoted ${formatUsdc(svc.price)} USDC (signed)` });
       res
         .status(402)
         .set({
@@ -324,6 +336,9 @@ export function createProviderApp(config: ProviderConfig): Express {
           [HEADERS.quote]: qh,
           [HEADERS.deadline]: String(svc.slaSeconds),
           [HEADERS.resource]: svc.resource,
+          [HEADERS.quoteNonce]: nonce,
+          [HEADERS.quoteExpiry]: expiry.toString(),
+          [HEADERS.quoteSig]: quoteSig,
         })
         .json({
           error: "payment required",
