@@ -378,7 +378,19 @@ export function createProviderApp(config: ProviderConfig): Express {
     }
     emit({ kind: "verify", resource: svc.resource, detail: `escrow ${paymentId} verified (${formatUsdc(amount)} USDC)` });
 
-    const body = svc.respond(req.query as Record<string, string>);
+    const query = req.query as Record<string, string>;
+    let body: unknown;
+    if (svc.respondAsync) {
+      try {
+        body = await svc.respondAsync(query);
+        emit({ kind: "serve", resource: svc.resource, detail: "served live upstream data" });
+      } catch {
+        body = svc.respond(query); // network unavailable → graceful fallback
+        emit({ kind: "serve", resource: svc.resource, detail: "upstream unreachable — served fallback" });
+      }
+    } else {
+      body = svc.respond(query);
+    }
     const rHash = responseHash(body);
 
     // "no-fulfill": deliver data but never settle on-chain -> agent times out.

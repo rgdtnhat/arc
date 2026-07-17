@@ -28,6 +28,12 @@ export interface ServiceDef {
   behavior: Behavior;
   /** Produces the response body for a given query. */
   respond: (query: Record<string, string>) => unknown;
+  /**
+   * Optional async responder that fetches a REAL upstream API. If it throws
+   * (e.g. the network is unavailable), the provider falls back to `respond`,
+   * so the demo works offline while the path is genuinely live when it can be.
+   */
+  respondAsync?: (query: Record<string, string>) => Promise<unknown>;
 }
 
 /**
@@ -49,6 +55,48 @@ export const CATALOG: ServiceDef[] = [
       condition: ["clear", "cloudy", "rain", "windy"][hash(q.city ?? "x") % 4],
       humidity: 40 + (hash((q.city ?? "") + "h") % 40),
       source: "AtmosFeed",
+    }),
+  },
+  {
+    resource: "weather:live",
+    path: "/weather/live",
+    name: "AtmosFeed Live — real weather (Open-Meteo)",
+    tags: ["weather", "climate", "forecast", "temperature", "live"],
+    price: usdc("0.003"),
+    slaSeconds: 30,
+    behavior: "reliable",
+    // Charges an agent, in USDC, for a call to a real public weather API.
+    respondAsync: async (q) => {
+      const geo: Record<string, [number, number]> = {
+        lisbon: [38.72, -9.14], london: [51.51, -0.13], lagos: [6.52, 3.38],
+        tokyo: [35.68, 139.76], "new york": [40.71, -74.01],
+      };
+      const city = (q.city ?? "Lisbon").toLowerCase();
+      const [lat, lon] = geo[city] ?? geo["lisbon"];
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,weather_code`;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 6000);
+      try {
+        const r = await fetch(url, { signal: ctrl.signal });
+        if (!r.ok) throw new Error("upstream " + r.status);
+        const j = (await r.json()) as any;
+        return {
+          city: q.city ?? "Lisbon",
+          tempC: j.current?.temperature_2m,
+          humidity: j.current?.relative_humidity_2m,
+          weatherCode: j.current?.weather_code,
+          source: "Open-Meteo (live)",
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    respond: (q) => ({
+      city: q.city ?? "Lisbon",
+      tempC: 20,
+      humidity: 60,
+      note: "offline fallback",
+      source: "AtmosFeed cache",
     }),
   },
   {

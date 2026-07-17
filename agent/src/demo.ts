@@ -47,6 +47,7 @@ async function main() {
   // Wire providers with one wallet per service.
   const providerKeys: Record<string, Hex> = {
     "weather:current": DEV_KEYS.weather,
+    "weather:live": DEV_KEYS.weather,
     "fx:quote": DEV_KEYS.fx,
     "news:headlines": DEV_KEYS.news,
     "ticker:stream": DEV_KEYS.ticker,
