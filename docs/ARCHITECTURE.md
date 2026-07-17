@@ -18,12 +18,18 @@ purchase** settled on Arc. This document walks the pieces and the end-to-end flo
 `TesseraEscrow` is intentionally small. One payment moves through:
 
 ```
-Escrowed ──fulfill──▶ Fulfilled ──settle──▶ Settled     (provider paid, reputation++)
+Escrowed ──fulfill──▶ Fulfilled ──settle / providerClaim──▶ Settled   (provider paid, reputation++)
    │                      │
    │ timeout              │ agent rejects
    ▼                      ▼
-Refunded  ◀───────────────┘                              (agent repaid, reputation--)
+Refunded  ◀───────────────┘                                          (agent repaid, reputation--)
 ```
+
+**Liveness guard.** After a provider fulfills, the agent has a `DISPUTE_WINDOW`
+(1 hour) to `settle` (fast path) or `refund` (reject a bad response). If the
+agent goes offline or refuses to act, the provider can call `providerClaim`
+once that window elapses and collect the escrow it earned in good faith — so a
+delivered payment can never be locked forever by an unresponsive agent.
 
 - `open(provider, amount, deadline, quoteHash)` — the agent pulls USDC into
   escrow (needs a prior ERC-20 approval) and commits to a provider + deadline.

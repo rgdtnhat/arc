@@ -37,6 +37,7 @@ contract TesseraEscrow {
         address provider;
         uint256 amount; // USDC base units (6 decimals)
         uint64 deadline; // unix seconds by which provider must fulfill
+        uint64 fulfilledAt; // unix seconds the provider delivered (starts the dispute window)
         bytes32 quoteHash; // binds the off-chain price quote
         bytes32 responseHash; // set on fulfill; commitment to the delivered payload
         Status status;
@@ -54,6 +55,12 @@ contract TesseraEscrow {
     ///         provider's stake and paid to the agent as compensation (if staked).
     uint256 public constant SLASH_BPS = 2_000; // 20%
 
+    /// @notice After a provider fulfills, the agent has this long to dispute
+    ///         (reject a bad response). Once it elapses with no dispute, the
+    ///         provider can claim the escrow itself — so an offline or
+    ///         griefing agent can never lock a delivered payment forever.
+    uint64 public constant DISPUTE_WINDOW = 1 hours;
+
     uint256 public nextPaymentId = 1;
     mapping(uint256 => Payment) public payments;
     mapping(address => Reputation) public reputationOf;
@@ -70,6 +77,7 @@ contract TesseraEscrow {
     );
     event PaymentFulfilled(uint256 indexed paymentId, bytes32 responseHash);
     event PaymentSettled(uint256 indexed paymentId, address indexed provider, uint256 amount);
+    event PaymentClaimed(uint256 indexed paymentId, address indexed provider, uint256 amount);
     event PaymentRefunded(uint256 indexed paymentId, address indexed agent, uint256 amount, bool slaBreach);
     event Staked(address indexed provider, uint256 amount, uint256 total);
     event Unstaked(address indexed provider, uint256 amount, uint256 total);
@@ -81,6 +89,7 @@ contract TesseraEscrow {
     error ZeroAmount();
     error DeadlinePassed();
     error DeadlineNotReached();
+    error DisputeWindowOpen();
     error TransferFailed();
 
     constructor(address usdc_) {
@@ -111,6 +120,7 @@ contract TesseraEscrow {
             provider: provider,
             amount: amount,
             deadline: deadline,
+            fulfilledAt: 0,
             quoteHash: quoteHash,
             responseHash: bytes32(0),
             status: Status.Escrowed
@@ -130,6 +140,7 @@ contract TesseraEscrow {
         if (block.timestamp > p.deadline) revert DeadlinePassed();
 
         p.responseHash = responseHash;
+        p.fulfilledAt = uint64(block.timestamp);
         p.status = Status.Fulfilled;
         emit PaymentFulfilled(paymentId, responseHash);
     }
@@ -150,6 +161,30 @@ contract TesseraEscrow {
 
         if (!usdc.transfer(p.provider, p.amount)) revert TransferFailed();
         emit PaymentSettled(paymentId, p.provider, p.amount);
+    }
+
+    /**
+     * @notice Provider claims a delivered-but-unsettled payment once the
+     *         agent's dispute window has elapsed. This is the liveness guard:
+     *         a provider that delivered in good faith is paid even if the agent
+     *         goes offline or refuses to act, so escrow can never be locked
+     *         forever. The agent can still `settle` (fast path) or `refund`
+     *         (reject) any time before this window closes.
+     */
+    function providerClaim(uint256 paymentId) external {
+        Payment storage p = payments[paymentId];
+        if (msg.sender != p.provider) revert NotProvider();
+        if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+        if (block.timestamp <= uint256(p.fulfilledAt) + DISPUTE_WINDOW) revert DisputeWindowOpen();
+
+        p.status = Status.Settled;
+
+        Reputation storage r = reputationOf[p.provider];
+        r.fulfilled += 1;
+        r.earned += p.amount;
+
+        if (!usdc.transfer(p.provider, p.amount)) revert TransferFailed();
+        emit PaymentClaimed(paymentId, p.provider, p.amount);
     }
 
     /**

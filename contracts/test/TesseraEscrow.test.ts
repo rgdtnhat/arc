@@ -181,6 +181,61 @@ describe("TesseraEscrow", () => {
     expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT);
   });
 
+  it("lets the provider claim a delivered payment after the dispute window", async () => {
+    const { agent, provider, usdc, escrow, agentEscrow, providerEscrow } =
+      await loadFixture(deployFixture);
+
+    const deadline = await futureDeadline();
+    await agentEscrow.write.open([provider.account.address, PRICE, deadline, quoteHash]);
+    await providerEscrow.write.fulfill([1n, responseHash]);
+
+    // Agent goes silent — never settles or rejects.
+    const DISPUTE_WINDOW = await escrow.read.DISPUTE_WINDOW();
+    await time.increase(Number(DISPUTE_WINDOW) + 1);
+    await providerEscrow.write.providerClaim([1n]);
+
+    expect(await usdc.read.balanceOf([provider.account.address])).to.equal(PRICE);
+    const [fulfilled, failed, earned] = await escrow.read.reputation([provider.account.address]);
+    expect(fulfilled).to.equal(1n);
+    expect(failed).to.equal(0n);
+    expect(earned).to.equal(PRICE);
+  });
+
+  it("blocks a provider claim while the dispute window is still open", async () => {
+    const { provider, agentEscrow, providerEscrow } = await loadFixture(deployFixture);
+    const deadline = await futureDeadline();
+    await agentEscrow.write.open([provider.account.address, PRICE, deadline, quoteHash]);
+    await providerEscrow.write.fulfill([1n, responseHash]);
+
+    await expect(providerEscrow.write.providerClaim([1n])).to.be.rejected; // window open
+  });
+
+  it("only the provider can claim", async () => {
+    const { provider, escrow, agentEscrow, providerEscrow } = await loadFixture(deployFixture);
+    const deadline = await futureDeadline();
+    await agentEscrow.write.open([provider.account.address, PRICE, deadline, quoteHash]);
+    await providerEscrow.write.fulfill([1n, responseHash]);
+    await time.increase(Number(await escrow.read.DISPUTE_WINDOW()) + 1);
+
+    await expect(agentEscrow.write.providerClaim([1n])).to.be.rejected; // agent is not provider
+  });
+
+  it("still lets the agent reject inside the dispute window even after delay", async () => {
+    const { agent, provider, usdc, escrow, agentEscrow, providerEscrow } =
+      await loadFixture(deployFixture);
+    const deadline = await futureDeadline();
+    await agentEscrow.write.open([provider.account.address, PRICE, deadline, quoteHash]);
+    await providerEscrow.write.fulfill([1n, responseHash]);
+
+    // Half the window passes, then the agent rejects — refund still works.
+    await time.increase(Number(await escrow.read.DISPUTE_WINDOW()) / 2);
+    await agentEscrow.write.refund([1n]);
+    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT);
+    // And the provider can no longer claim a refunded payment.
+    await time.increase(Number(await escrow.read.DISPUTE_WINDOW()));
+    await expect(providerEscrow.write.providerClaim([1n])).to.be.rejected;
+  });
+
   it("exposes payment state via getPayment", async () => {
     const { agent, provider, agentEscrow, escrow } = await loadFixture(deployFixture);
     const deadline = await futureDeadline();
