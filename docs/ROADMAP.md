@@ -20,8 +20,16 @@ Tessera against the Arc Hackathon checkpoints.
 - **Payment requests**: provider-issued invoices; the agent pays trusted
   billers via the escrow rail, declines providers that burned it, and
   escalates over-cap amounts to the guardian.
-- **Tests + CI**: 17 contract tests, 17 agent unit tests (decision engine,
-  guardian queue, memory), and the full E2E scenario on every push.
+- **Escrow liveness guard**: `providerClaim` lets a provider collect a
+  delivered payment after a dispute window, so an offline/griefing agent can't
+  lock funds forever.
+- **Reentrancy guards** on all value-moving functions (defense-in-depth).
+- **EIP-712 signed quotes**: providers sign each quote; the agent verifies
+  authenticity + expiry before escrowing (tamper-proof, non-repudiable).
+- **Real-API provider**: a live Open-Meteo-backed service (with offline
+  fallback) — Tessera charges USDC for a genuine service, not only mocks.
+- **Tests + CI**: 21 contract tests, 20 agent unit tests (decision engine,
+  guardian queue, memory, signed quotes), and the full E2E scenario on every push.
 - Offline-capable Hardhat toolchain (seeds solc from npm so it builds in
   locked-down environments).
 - The Tessera 402 protocol + three provider services (one deliberately flaky).
@@ -34,21 +42,22 @@ Tessera against the Arc Hackathon checkpoints.
 
 - [x] One-command deploy tooling: `npm run bootstrap:arc` (keygen → faucet
       wait → deploy escrow+tab → fund agent/provider → bond stake → persist
-      addresses). Validated end to end against a local chain.
-- [ ] Run the bootstrap against live Arc testnet (needs a network that can
-      reach `rpc.testnet.arc.network` + one faucet visit) and pin the
-      addresses in `deployments/arc.json`.
-- [ ] Run the scenario against Arc with Arcscan links in the dashboard.
-- [ ] Swap the demo's local keys for **Circle Developer-Controlled Wallets** so
-      the agent and providers use managed wallets.
-- [ ] Add **Paymaster** so the agent's very first call is gasless (removes the
-      USDC-bootstrap step for a brand-new agent).
-- [ ] 3-minute video: the agent buying, the SLA refund, the on-chain reputation.
+      addresses).
+- [x] Deployed live to Arc testnet and ran a full scenario producing
+      settle / refund / tab-open / tab-settle transactions (see PR + `deployments/arc.json`).
+- [x] Circle Paymaster & Developer-Controlled Wallets integration plan wired to
+      the code seams (`docs/CIRCLE_INTEGRATION.md`) — activated by credentials.
+- [ ] **Redeploy** the current contracts to Arc (they gained `providerClaim` +
+      reentrancy guards since the first deploy) and re-pin `deployments/arc.json`.
+- [ ] Activate Circle DCW + Paymaster with a developer key on live Arc.
+- [ ] 3-minute video: the agent buying, the SLA refund, the on-chain reputation
+      (script + deck ready in `docs/`).
 
 ## 🔭 Beyond the hackathon
 
-- **Real providers.** Wrap an actual data/API vendor behind the 402 middleware;
-  ship the middleware as a drop-in package so any HTTP service can charge agents.
+- **Drop-in middleware package.** Extract the 402 provider layer into
+  `@tessera/pay` so any Express/Hono service charges agents in a few lines
+  (the core already lives in `providers/src/app.ts` — `createProviderApp`).
 - **Discovery registry.** An on-chain catalog so agents discover providers
   without a trusted index.
 - **Dispute arbitration.** An optional third-party verifier for subjective SLAs
