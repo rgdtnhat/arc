@@ -1,0 +1,19 @@
+# One-click deploy of the Tessera live dashboard to Render.
+# In the Render dashboard: New → Blueprint → point at this repo. Render reads
+# this file, builds the Dockerfile, and serves the dashboard at a public URL.
+services:
+  - type: web
+    name: tessera-dashboard
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter # a small paid instance; the local chain needs ~512MB–1GB RAM
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8787"
+      # Optional: set to enable the LLM decision brain in the demo.
+      # - key: ANTHROPIC_API_KEY
+      #   sync: false
+      # - key: AGENT_BRAIN
+      #   value: llm

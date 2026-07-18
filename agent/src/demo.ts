@@ -21,7 +21,9 @@ import {
 import { usdc } from "@tessera/shared";
 
 const PROVIDERS_PORT = 8788;
-const DASHBOARD_PORT = 8787;
+// Cloud hosts inject $PORT; default to 8787 locally. Providers stay internal.
+const DASHBOARD_PORT = Number(process.env.PORT ?? 8787);
+const DASHBOARD_HOST = process.env.HOST ?? "0.0.0.0";
 const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
 
 type UiEvent = (AgentEvent & { source: "agent" }) | (ProviderEvent & { source: "provider"; ts: number; level: string });
@@ -294,8 +296,8 @@ async function main() {
     process.exit(0);
   }
 
-  await new Promise<void>((r) => app.listen(DASHBOARD_PORT, r));
-  console.log(`\n🎟  Tessera dashboard: http://127.0.0.1:${DASHBOARD_PORT}\n`);
+  await new Promise<void>((r) => app.listen(DASHBOARD_PORT, DASHBOARD_HOST, r));
+  console.log(`\n🎟  Tessera dashboard listening on ${DASHBOARD_HOST}:${DASHBOARD_PORT}\n`);
 
   // Kick off the scenario automatically.
   running = true;

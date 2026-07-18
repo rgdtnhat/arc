@@ -173,6 +173,16 @@ The Arc scripts set `NODE_USE_ENV_PROXY=1` so Node's `fetch` honors an
 `HTTPS_PROXY` (needed in proxied/sandboxed environments; a no-op otherwise). If
 your proxy re-terminates TLS, also export `NODE_EXTRA_CA_CERTS=<ca-bundle>`.
 
+## Deploy the live dashboard
+
+A `Dockerfile` runs the whole demo (local chain + contracts + agent + dashboard)
+in one container on `$PORT`. One-click on Render via `render.yaml`, or any Docker
+host — see [`docs/DEPLOY.md`](docs/DEPLOY.md).
+
+```bash
+docker build -t tessera-demo . && docker run -p 8787:8787 tessera-demo
+```
+
 ## License
 
 MIT
