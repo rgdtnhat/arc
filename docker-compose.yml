@@ -1,0 +1,37 @@
+# Self-host the Tessera dashboard on your own server + domain.
+#
+#   1. Point your domain's DNS A record at this server's public IP.
+#   2. SITE_ADDRESS=tessera.example.com docker compose up -d --build
+#
+# Caddy terminates TLS (auto Let's Encrypt) and proxies to the app; the app
+# itself stays internal. See docs/SELF_HOST.md for the full walkthrough.
+services:
+  tessera:
+    build: .
+    environment:
+      - PORT=8787
+      # Optional LLM brain:
+      # - AGENT_BRAIN=llm
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    expose:
+      - "8787"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    depends_on:
+      - tessera
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - SITE_ADDRESS=${SITE_ADDRESS:?Set SITE_ADDRESS to your domain, e.g. tessera.example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

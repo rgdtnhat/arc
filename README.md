@@ -176,12 +176,16 @@ your proxy re-terminates TLS, also export `NODE_EXTRA_CA_CERTS=<ca-bundle>`.
 ## Deploy the live dashboard
 
 A `Dockerfile` runs the whole demo (local chain + contracts + agent + dashboard)
-in one container on `$PORT`. One-click on Render via `render.yaml`, or any Docker
-host — see [`docs/DEPLOY.md`](docs/DEPLOY.md).
+in one container on `$PORT`.
 
-```bash
-docker build -t tessera-demo . && docker run -p 8787:8787 tessera-demo
-```
+- **Your own server + domain** (HTTPS via Caddy) — one command; see
+  [`docs/SELF_HOST.md`](docs/SELF_HOST.md):
+  ```bash
+  SITE_ADDRESS=tessera.example.com docker compose up -d --build
+  ```
+- **Managed host** (Render one-click via `render.yaml`, Railway, Fly) — see
+  [`docs/DEPLOY.md`](docs/DEPLOY.md).
+- **Local:** `docker build -t tessera-demo . && docker run -p 8787:8787 tessera-demo`
 
 ## License
 
