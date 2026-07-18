@@ -93,7 +93,7 @@ you say. Total ≈ 3 minutes if you also demo; ≈ 2:30 for slides alone.
 ## Slide 9 — Traction & quality
 **41 tests · CI on every push · one-command live deploy · offline-capable build**
 
-> "On execution: thirty-four automated tests, CI running the full agentic scenario
+> "On execution: forty-one automated tests, CI running the full agentic scenario
 > on every push, and a one-command live deploy to Arc. We optimized for quality
 > over surface area — every feature you saw is tested and runs end to end."
 
