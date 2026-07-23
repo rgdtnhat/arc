@@ -339,6 +339,9 @@ export class TesseraAgent {
     try {
       const res = await fetch(`${this.cfg.providersBaseUrl}${quote.url}`, {
         headers: { [HEADERS.payment]: paymentId.toString() },
+        // Never hang forever on a stuck provider — time out and let the escrow's
+        // SLA deadline drive a refund instead.
+        signal: AbortSignal.timeout(30_000),
       });
       body = await res.json();
     } catch (err) {

@@ -72,6 +72,19 @@ export function createProviderApp(config: ProviderConfig): Express {
     );
   }
 
+  // Serialize on-chain WRITES per provider wallet. Multiple agents can hit the
+  // same provider at once; without this, concurrent writeContract calls reuse
+  // the wallet's nonce and all but one fail (and hang waiting for a receipt).
+  // Signing a quote sends no tx, so it stays concurrent — only txs are queued.
+  const writeChains = new Map<string, Promise<unknown>>();
+  function withWallet<T>(providerAddr: Hex, fn: () => Promise<T>): Promise<T> {
+    const key = providerAddr.toLowerCase();
+    const prev = writeChains.get(key) ?? Promise.resolve();
+    const next = prev.then(fn, fn); // run regardless of the previous outcome
+    writeChains.set(key, next.catch(() => {})); // don't leak rejections on the chain
+    return next;
+  }
+
   // quoteHash -> issued quote, so we can validate the on-chain payment references
   // a quote we actually handed out.
   const issued = new Map<string, IssuedQuote>();
@@ -280,15 +293,19 @@ export function createProviderApp(config: ProviderConfig): Express {
     }
     try {
       const wallet = wallets.get(best.resource)!;
-      const txHash = await wallet.writeContract({
-        address: config.tabAddress,
-        abi: tesseraTabAbi,
-        functionName: "closeTab",
-        args: [BigInt(tabId), best.cum, best.sig],
-        chain: config.chain,
-        account: wallet.account!,
+      const provider = addressOf.get(best.resource)!;
+      const txHash = await withWallet(provider, async () => {
+        const h = await wallet.writeContract({
+          address: config.tabAddress!,
+          abi: tesseraTabAbi,
+          functionName: "closeTab",
+          args: [BigInt(tabId), best.cum, best.sig],
+          chain: config.chain,
+          account: wallet.account!,
+        });
+        await publicClient.waitForTransactionReceipt({ hash: h });
+        return h;
       });
-      await publicClient.waitForTransactionReceipt({ hash: txHash });
       bestVoucher.delete(tabId);
       emit({
         kind: "tab",
@@ -404,15 +421,18 @@ export function createProviderApp(config: ProviderConfig): Express {
     // "bad-data" the body itself is junk, so the agent's quality gate rejects it.
     try {
       const wallet = wallets.get(svc.resource)!;
-      const txHash = await wallet.writeContract({
-        address: config.escrowAddress,
-        abi: tesseraEscrowAbi,
-        functionName: "fulfill",
-        args: [BigInt(paymentId), rHash],
-        chain: config.chain,
-        account: wallet.account!,
+      const txHash = await withWallet(provider, async () => {
+        const h = await wallet.writeContract({
+          address: config.escrowAddress,
+          abi: tesseraEscrowAbi,
+          functionName: "fulfill",
+          args: [BigInt(paymentId), rHash],
+          chain: config.chain,
+          account: wallet.account!,
+        });
+        await publicClient.waitForTransactionReceipt({ hash: h });
+        return h;
       });
-      await publicClient.waitForTransactionReceipt({ hash: txHash });
       emit({
         kind: "fulfill",
         resource: svc.resource,

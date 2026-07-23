@@ -121,6 +121,20 @@ export async function deployLocal(agentAddress: Hex, mint = usdc("1")): Promise<
   return { usdcAddress, escrowAddress, tabAddress };
 }
 
+/**
+ * Send native ETH to an address on the local chain. On Hardhat, gas is paid in
+ * ETH (unlike Arc, where USDC is the gas token), so freshly-generated fleet
+ * wallets need ETH before they can transact.
+ */
+export async function fundEth(to: Hex, amountWei = 10n ** 18n): Promise<Hex> {
+  const deployer = privateKeyToAccount(DEV_KEYS.deployer);
+  const wallet = createWalletClient({ account: deployer, chain: localChain, transport: http() });
+  const pub = createPublicClient({ chain: localChain, transport: http() });
+  const hash = await wallet.sendTransaction({ account: deployer, chain: localChain, to, value: amountWei });
+  await pub.waitForTransactionReceipt({ hash });
+  return hash;
+}
+
 /** Mint MockUSDC to an address — the local-chain stand-in for a testnet faucet. */
 export async function mintUsdc(
   deployment: LocalDeployment,

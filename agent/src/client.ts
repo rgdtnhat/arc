@@ -3,10 +3,12 @@ import {
   createWalletClient,
   http,
   maxUint256,
+  parseEventLogs,
   type Account,
   type Chain,
   type Hex,
   type PublicClient,
+  type TransactionReceipt,
   type WalletClient,
 } from "viem";
 import {
@@ -117,7 +119,7 @@ export class TesseraClient {
   ): Promise<{ tabId: bigint; txHash: Hex }> {
     if (!this.tab) throw new Error("tabAddress not configured");
     await this.ensureApproval(deposit, this.tab);
-    const { result, request } = await this.public.simulateContract({
+    const { request } = await this.public.simulateContract({
       address: this.tab,
       abi: tesseraTabAbi,
       functionName: "openTab",
@@ -125,8 +127,13 @@ export class TesseraClient {
       account: this.account,
     });
     const txHash = await this.wallet.writeContract(request);
-    await this.public.waitForTransactionReceipt({ hash: txHash });
-    return { tabId: result as bigint, txHash };
+    const receipt = await this.public.waitForTransactionReceipt({ hash: txHash });
+    // Read the real tabId from the emitted TabOpened event — the simulated
+    // return value is speculative and collides under concurrent opens.
+    const logs = parseEventLogs({ abi: tesseraTabAbi, eventName: "TabOpened", logs: receipt.logs });
+    const tabId = (logs[0]?.args as { tabId?: bigint })?.tabId;
+    if (tabId === undefined) throw new Error("openTab: TabOpened event not found in receipt");
+    return { tabId, txHash };
   }
 
   /** Sign a voucher for `cumulative` USDC on a tab — off-chain, free, instant. */
@@ -172,7 +179,7 @@ export class TesseraClient {
     deadline: bigint,
     quoteHash: Hex
   ): Promise<{ paymentId: bigint; txHash: Hex }> {
-    const { result, request } = await this.public.simulateContract({
+    const { request } = await this.public.simulateContract({
       address: this.escrow,
       abi: tesseraEscrowAbi,
       functionName: "open",
@@ -180,8 +187,23 @@ export class TesseraClient {
       account: this.account,
     });
     const txHash = await this.wallet.writeContract(request);
-    await this.public.waitForTransactionReceipt({ hash: txHash });
-    return { paymentId: result as bigint, txHash };
+    const receipt = await this.public.waitForTransactionReceipt({ hash: txHash });
+    // Read the REAL paymentId from the emitted PaymentOpened event. The simulated
+    // return value is speculative: under concurrent opens (e.g. a fleet), two
+    // agents would both predict the same next id but get different ids on-chain.
+    const paymentId = this.paymentIdFromReceipt(receipt);
+    return { paymentId, txHash };
+  }
+
+  /** Extract this agent's paymentId from an open() receipt's PaymentOpened event. */
+  private paymentIdFromReceipt(receipt: TransactionReceipt): bigint {
+    const logs = parseEventLogs({ abi: tesseraEscrowAbi, eventName: "PaymentOpened", logs: receipt.logs });
+    const mine = logs.find(
+      (l) => (l.args as { agent?: Hex }).agent?.toLowerCase() === this.account.address.toLowerCase()
+    ) ?? logs[0];
+    const paymentId = (mine?.args as { paymentId?: bigint })?.paymentId;
+    if (paymentId === undefined) throw new Error("open: PaymentOpened event not found in receipt");
+    return paymentId;
   }
 
   async settle(paymentId: bigint): Promise<Hex> {

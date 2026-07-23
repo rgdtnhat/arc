@@ -92,6 +92,23 @@ downstream), and `CIRCLE_PAYMASTER_URL` enables **Paymaster** gasless-first-call
 sponsorship. Both default to today's working path. See
 [`docs/CIRCLE_INTEGRATION.md`](docs/CIRCLE_INTEGRATION.md).
 
+## Parallel multi-agent fleet
+
+Many agents, each with **its own wallet**, transacting **concurrently** against a
+shared marketplace of providers (each with their own wallet). Run it:
+
+```bash
+FLEET_SIZE=4 npm run fleet   # 4 agents buy in parallel, distinct wallets
+```
+
+Each agent has separate keys, budget, nonce stream, and trust memory, so they
+run at once without stepping on each other (`agent/src/fleet.ts`). Building this
+surfaced two real concurrency bugs, now fixed: providers **serialize on-chain
+writes per wallet** (concurrent `fulfill`s no longer collide on the nonce), and
+the client reads the **real `paymentId`/`tabId` from the transaction receipt's
+event** instead of the speculative `simulateContract` return (which collided
+across simultaneous `open()`s).
+
 ## Why Arc
 
 - **USDC is the gas token** — the agent funds one asset and uses it for both the
@@ -160,6 +177,7 @@ MVP.
 npm install            # installs all workspaces
 npm run test           # 21 contract tests + 43 agent unit tests
 npm run demo           # end-to-end local demo (chain + providers + agent + dashboard)
+npm run fleet          # N agents transacting in parallel, each with its own wallet
 npm run e2e            # the same scenario headless, one-shot (used in CI)
 ```
 
