@@ -2,8 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Tessera — agentic payments on Arc</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <meta name="theme-color" content="#0a0e17" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Tessera" />
+    <link rel="apple-touch-icon" href="icon-192.png" />
     <style>
       :root {
         --bg: #0a0e17;
@@ -18,6 +24,18 @@
         --warn: #fbbf24;
         --skip: #64748b;
       }
+      /* Light theme (applied when the selector resolves to light). */
+      :root[data-theme="light"] {
+        --bg: #eef2fa; --panel: #ffffff; --panel-2: #f6f8fd; --line: #e2e8f0;
+        --text: #0d1424; --muted: #55637d; --accent: #2f6be0;
+        --good: #0f9d6b; --bad: #d94b4b; --warn: #b9791a; --skip: #64748b;
+      }
+      :root[data-theme="light"] body { background: radial-gradient(1200px 600px at 80% -10%, #dbe6ff 0%, var(--bg) 55%); }
+      :root[data-theme="light"] .btn { background: #eaf1ff; color: #1b4ea0; border-color: #b8ceff; }
+      :root[data-theme="light"] .btn:hover { background: #dce8ff; }
+      :root[data-theme="light"] .pill { background: #eef2f9; }
+      :root[data-theme="light"] .pill.blue { background: #e5edff; color: #2f6be0; border-color: #bcd3ff; }
+
       * { box-sizing: border-box; }
       body {
         margin: 0;
@@ -25,6 +43,20 @@
         background: radial-gradient(1200px 600px at 80% -10%, #12203f 0%, var(--bg) 55%);
         color: var(--text);
         -webkit-font-smoothing: antialiased;
+        /* Make everything easy to select & copy. */
+        -webkit-user-select: text;
+        user-select: text;
+      }
+      /* One-click select for addresses, hashes, and other monospace values. */
+      .mono, .addr, code, [id$="Addr"], [class*="hash"] {
+        -webkit-user-select: all;
+        user-select: all;
+        cursor: text;
+      }
+      .btn, .pill { -webkit-user-select: none; user-select: none; }
+      .themesel {
+        background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+        border-radius: 8px; padding: 5px 8px; font-size: 12px; cursor: pointer; margin-left: 8px;
       }
       a { color: var(--accent); text-decoration: none; }
       a:hover { text-decoration: underline; }
@@ -44,7 +76,7 @@
         display: flex; justify-content: space-between; gap: 16px; align-items: center; flex-wrap: wrap;
       }
       .task .goal { font-size: 15px; }
-      .task .goal b { color: #fff; }
+      .task .goal b { color: var(--text); }
       .btn {
         border: 1px solid #24447f; background: #12233f; color: #cfe0ff;
         padding: 9px 16px; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 13px;
@@ -114,13 +146,19 @@
         <span class="pill" id="chainPill">chain: —</span>
         <span class="pill live"><span class="dot"></span> live</span>
         <button class="btn" id="walletBtn" style="margin-left:10px">Connect Wallet</button>
+        <button class="btn" id="adminBtn" style="margin-left:8px">Admin</button>
+        <select class="themesel" id="themeSel" title="Theme" aria-label="Theme">
+          <option value="system">◐ System</option>
+          <option value="light">☀ Light</option>
+          <option value="dark">☾ Dark</option>
+        </select>
       </header>
 
       <div class="task">
         <div class="goal">Agent task: <b id="goal">—</b></div>
         <div style="display:flex;gap:14px;align-items:center">
           <div class="kv" style="flex-direction:column;text-align:right">
-            <span>budget <b id="budget" style="color:#fff">—</b> · spent <b id="spent" style="color:#fff">—</b></span>
+            <span>budget <b id="budget" style="color:var(--text)">—</b> · spent <b id="spent" style="color:var(--text)">—</b></span>
             <span id="summary">—</span>
           </div>
           <button class="btn" id="runBtn">Run again ↻</button>
@@ -258,6 +296,35 @@
 
     <script>
       const $ = (id) => document.getElementById(id);
+
+      // Register the service worker so the dashboard is an installable PWA.
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+      }
+
+      // --- Theme: System / Light / Dark (persisted) ---
+      const themeSel = $("themeSel");
+      function applyTheme() {
+        const pref = localStorage.getItem("tessera_theme") || "system";
+        themeSel.value = pref;
+        const resolved =
+          pref === "system"
+            ? window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : pref;
+        document.documentElement.setAttribute("data-theme", resolved);
+      }
+      themeSel.addEventListener("change", () => {
+        localStorage.setItem("tessera_theme", themeSel.value);
+        applyTheme();
+      });
+      if (window.matchMedia) {
+        window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+          if ((localStorage.getItem("tessera_theme") || "system") === "system") applyTheme();
+        });
+      }
+      applyTheme();
       const short = (a) => (a ? a.slice(0, 6) + "…" + a.slice(-4) : "—");
       const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
@@ -476,13 +543,13 @@
       }
 
       window.verdict = async (id, v) => {
-        await fetch(`/api/approvals/${id}/${v}`, { method: "POST" }).catch(() => {});
+        await postAuthed(`/api/approvals/${id}/${v}`).catch(() => {});
         tick();
       };
 
       $("runBtn").addEventListener("click", async () => {
         $("runBtn").disabled = true;
-        await fetch("/api/run", { method: "POST" }).catch(() => {});
+        await postAuthed("/api/run").catch(() => {});
       });
 
       $("faucetBtn").addEventListener("click", async () => {
@@ -491,7 +558,7 @@
         btn.textContent = "Requesting…";
         const msg = $("faucetMsg");
         try {
-          const r = await (await fetch("/api/faucet", { method: "POST" })).json();
+          const r = await (await postAuthed("/api/faucet")).json();
           msg.style.display = "block";
           msg.textContent = r.message || (r.ok ? "Testnet USDC requested." : "Faucet request failed.");
           msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
@@ -505,6 +572,76 @@
           tick();
         }
       });
+
+      // --- Auth token (shared by Web3 wallet + admin login) ---
+      const authToken = () => localStorage.getItem("tessera_token");
+      const authHeaders = () => {
+        const t = authToken();
+        return t ? { Authorization: "Bearer " + t } : {};
+      };
+      // POST wrapper that attaches the token and flags the need to sign in on 401.
+      async function postAuthed(url, opts = {}) {
+        const res = await fetch(url, { method: "POST", ...opts, headers: { ...(opts.headers || {}), ...authHeaders() } });
+        if (res.status === 401) {
+          alert("Please sign in first — Connect Wallet or use the Admin button — to perform actions.");
+        }
+        return res;
+      }
+
+      // --- Admin login (id + password) ---
+      let adminId = null;
+      function setAdmin(id) {
+        adminId = id;
+        const b = $("adminBtn");
+        b.textContent = id ? `Admin: ${id} ⚙` : "Admin";
+        b.style.borderColor = id ? "var(--good)" : "";
+        b.style.color = id ? "var(--good)" : "";
+      }
+      async function adminFlow() {
+        if (adminId) {
+          const choice = prompt("Admin — type 'password' to change password, or 'logout' to sign out:", "");
+          if (choice === "logout") {
+            await postAuthed("/api/admin/logout").catch(() => {});
+            localStorage.removeItem("tessera_token");
+            setAdmin(null);
+            return;
+          }
+          if (choice === "password") {
+            const current = prompt("Current password:");
+            const next = prompt("New password (min 8 chars):");
+            if (!current || !next) return;
+            const r = await (await postAuthed("/api/admin/change-password", {
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ current, next }),
+            })).json();
+            alert(r.ok ? "Password changed." : "Failed: " + r.error);
+          }
+          return;
+        }
+        const id = prompt("Admin id:", "admin");
+        const password = prompt("Password:");
+        if (!id || !password) return;
+        const r = await (await fetch("/api/admin/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id, password }),
+        })).json();
+        if (r.ok) {
+          localStorage.setItem("tessera_token", r.token);
+          setAdmin(r.id);
+        } else {
+          alert("Login failed: " + r.error);
+        }
+      }
+      $("adminBtn").addEventListener("click", adminFlow);
+      (async () => {
+        const t = authToken();
+        if (!t) return;
+        try {
+          const me = await (await fetch("/api/admin/me", { headers: { authorization: "Bearer " + t } })).json();
+          if (me.id) setAdmin(me.id);
+        } catch {}
+      })();
 
       // --- Web3 wallet login (Sign-In-With-Ethereum) ---
       function setWallet(addr) {
@@ -574,7 +711,7 @@
           btn.disabled = true;
           try {
             const r = await (
-              await fetch(`/api/lending/${btn.dataset.lend}?asset=${asset}&amount=${btn.dataset.amount}`, { method: "POST" })
+              await postAuthed(`/api/lending/${btn.dataset.lend}?asset=${asset}&amount=${btn.dataset.amount}`)
             ).json();
             msg.style.display = "block";
             msg.textContent = r.ok ? `${btn.dataset.lend} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;

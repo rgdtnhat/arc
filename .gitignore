@@ -12,3 +12,4 @@ typechain-types/
 .DS_Store
 deployments/local.json
 .tessera-memory.json
+.tessera-admin.json

@@ -31,6 +31,7 @@ import {
 import { usdc } from "@tessera/shared";
 import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
+import { AdminAuth } from "./auth.js";
 import type { Faucet } from "./circle/faucet.js";
 
 const PROVIDERS_PORT = 8788;
@@ -353,6 +354,38 @@ async function main() {
     res.json({ address: s?.address ?? null });
   });
 
+  // --- Admin login (credentials from env → gitignored scrypt hash) ----------
+  const admin = process.env.ADMIN_PASSWORD
+    ? new AdminAuth(
+        path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-admin.json"),
+        { id: process.env.ADMIN_ID ?? "admin", password: process.env.ADMIN_PASSWORD }
+      )
+    : null;
+  const bearer = (req: express.Request) => (req.headers.authorization ?? "").replace(/^Bearer /, "");
+  const isAuthed = (req: express.Request) => {
+    const t = bearer(req);
+    return !!admin?.session(t) || authSessions.has(t);
+  };
+  // Gate for state-changing endpoints: a signed-in Web3 wallet OR the admin.
+  const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (isAuthed(req)) return next();
+    res.status(401).json({ ok: false, error: "authentication required — connect a wallet or sign in as admin" });
+  };
+
+  app.post("/api/admin/login", (req, res) => {
+    if (!admin) { res.status(503).json({ ok: false, error: "admin login not configured (set ADMIN_PASSWORD)" }); return; }
+    const token = admin.login(String(req.body?.id ?? ""), String(req.body?.password ?? ""));
+    if (!token) { res.status(401).json({ ok: false, error: "invalid credentials" }); return; }
+    res.json({ ok: true, token, id: req.body.id });
+  });
+  app.post("/api/admin/change-password", (req, res) => {
+    if (!admin) { res.status(503).json({ ok: false, error: "admin not configured" }); return; }
+    const r = admin.changePassword(bearer(req), String(req.body?.current ?? ""), String(req.body?.next ?? ""));
+    res.status(r.ok ? 200 : 400).json(r);
+  });
+  app.get("/api/admin/me", (req, res) => res.json({ id: admin?.session(bearer(req))?.id ?? null }));
+  app.post("/api/admin/logout", (req, res) => { admin?.logout(bearer(req)); res.json({ ok: true }); });
+
   const providerAddrs = Object.fromEntries(
     CATALOG.map((s) => [s.resource, privateKeyToAccount(providerKeys[s.resource]).address])
   );
@@ -454,7 +487,7 @@ async function main() {
   }
 
   // Agent-driven lending actions from the dashboard.
-  app.post("/api/lending/:action", async (req, res) => {
+  app.post("/api/lending/:action", requireAuth, async (req, res) => {
     if (!poolClient || !poolDeployment) {
       res.status(404).json({ ok: false, error: "lending not available (live mode has no pool deployed)" });
       return;
@@ -577,7 +610,7 @@ async function main() {
   });
 
   // Faucet: drip testnet USDC to the agent (local mint here; Circle faucet on Arc).
-  app.post("/api/faucet", async (_req, res) => {
+  app.post("/api/faucet", requireAuth, async (_req, res) => {
     try {
       const result = await treasury.requestFaucet();
       if (chainCache) chainCache.at = 0; // force a background refresh after the drip
@@ -589,14 +622,14 @@ async function main() {
   });
 
   // Guardian verdicts from the dashboard (the human co-signer).
-  app.post("/api/approvals/:id/:verdict", (req, res) => {
+  app.post("/api/approvals/:id/:verdict", requireAuth, (req, res) => {
     const id = Number(req.params.id);
     const approved = req.params.verdict === "approve";
     const ok = agent.approvals.resolve(id, approved);
     res.status(ok ? 200 : 404).json({ ok });
   });
 
-  app.post("/api/run", async (_req, res) => {
+  app.post("/api/run", requireAuth, async (_req, res) => {
     if (running) {
       res.status(409).json({ error: "already running" });
       return;
