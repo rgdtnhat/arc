@@ -164,6 +164,15 @@
         <div class="kv" id="faucetMsg" style="margin-top:10px;display:none"></div>
       </div>
 
+      <div class="card" id="liveCard" style="margin-top:18px;display:none;border-color:#3a2a2a">
+        <h2 style="color:#ff6b6b">🔴 Live on Arc testnet — real on-chain deployment</h2>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
+          The panels above run on a throwaway in-container chain. These are the real contracts and
+          wallets deployed on <b>Arc testnet</b> (chainId <span id="liveChain">—</span>). Tap any to open Arcscan.
+        </div>
+        <div id="liveRows" style="display:flex;flex-direction:column;gap:8px;font-size:12.5px"></div>
+      </div>
+
       <div class="card" id="approvalsCard" style="margin-top:18px;display:none;border-color:#533a14">
         <h2 style="color:var(--warn)">🛡 Guardian approvals — agent is asking to exceed its policy cap</h2>
         <div id="approvals" style="display:flex;flex-direction:column;gap:10px"></div>
@@ -392,6 +401,26 @@
           $("trHealth").textContent = tr.healthy ? "healthy ✓" : "LOW ⚠";
           $("trHealth").style.color = tr.healthy ? "var(--good)" : "var(--warn)";
           if (tr.faucetUrl) $("faucetLink").href = tr.faucetUrl;
+        }
+
+        // Live Arc testnet deployment (from deployments/arc.json).
+        const live = s.live;
+        if (live && live.agent) {
+          $("liveCard").style.display = "block";
+          $("liveChain").textContent = live.chainId;
+          const ex = live.explorer || "https://testnet.arcscan.app";
+          const liveRow = (label, addr, tag) =>
+            `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+               <span style="color:var(--muted)">${label}${tag ? ` <span style="opacity:.7">${tag}</span>` : ""}</span>
+               <a class="mono" href="${ex}/address/${addr}" target="_blank" rel="noopener"
+                  style="color:var(--accent);text-decoration:none">${short(addr)} ↗</a>
+             </div>`;
+          $("liveRows").innerHTML =
+            liveRow("Agent wallet", live.agent, "") +
+            liveRow("Provider wallet", live.provider, "") +
+            liveRow("TesseraEscrow", live.tesseraEscrow, "contract") +
+            liveRow("TesseraTab", live.tesseraTab, "contract") +
+            liveRow("USDC", live.usdc, "gas token");
         }
       }
 

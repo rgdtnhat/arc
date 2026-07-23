@@ -1,5 +1,6 @@
 import express from "express";
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
 import type { Hex } from "viem";
@@ -28,6 +29,19 @@ const PROVIDERS_PORT = 8788;
 const DASHBOARD_PORT = Number(process.env.PORT ?? 8787);
 const DASHBOARD_HOST = process.env.HOST ?? "0.0.0.0";
 const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
+
+// The real Arc testnet deployment (contracts + wallets), if one has been
+// recorded. Shown on the dashboard alongside the local demo so it's clear which
+// addresses are live on-chain vs. the throwaway in-container chain.
+const liveDeployment = (() => {
+  try {
+    const p = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../deployments/arc.json");
+    const d = JSON.parse(readFileSync(p, "utf8"));
+    return { ...d, explorer: "https://testnet.arcscan.app" };
+  } catch {
+    return null;
+  }
+})();
 
 type UiEvent = (AgentEvent & { source: "agent" }) | (ProviderEvent & { source: "provider"; ts: number; level: string });
 
@@ -270,6 +284,7 @@ async function main() {
       policy: { autoApproveMaxUsdc: formatUsdc(policy.autoApproveMax), autoApprove: policy.autoApprove },
       contacts: memory.list(),
       treasury: { ...treasurySnapshot, settlement, faucetUrl: "https://faucet.circle.com/" },
+      live: liveDeployment,
       balanceHistory,
       invoices: await fetch(`http://127.0.0.1:${PROVIDERS_PORT}/invoices`)
         .then((r) => r.json())
