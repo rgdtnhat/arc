@@ -17,6 +17,9 @@ services:
       - AGENT_PRIVATE_KEY=${AGENT_PRIVATE_KEY:-}
       - PROVIDER_PRIVATE_KEY=${PROVIDER_PRIVATE_KEY:-}
       - ARC_RPC_URL=${ARC_RPC_URL:-}
+      # Dashboard admin login (secret — set in a .env next to this file). Blank = disabled.
+      - ADMIN_ID=${ADMIN_ID:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       # Optional LLM brain:
       # - AGENT_BRAIN=llm
       # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
