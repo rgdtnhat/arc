@@ -19,6 +19,7 @@ import {
 } from "./decide.js";
 import { ApprovalQueue, type SpendingPolicy } from "./policy.js";
 import type { TrustMemory } from "./memory.js";
+import { createTesseraActions, type TesseraActionKit } from "./agentkit.js";
 
 export type Brain = "rules" | "llm";
 
@@ -66,6 +67,18 @@ export class TesseraAgent {
 
   constructor(cfg: AgentConfig) {
     this.cfg = cfg;
+  }
+
+  /**
+   * The agent's Agent Stack surface: its wallet, USDC-payment, and on-chain
+   * actions exposed as typed tools bound to this agent's client. A model brain
+   * can enumerate `.manifest()` and `.invoke()`; the deterministic flow uses the
+   * same client underneath.
+   */
+  actionKit(): TesseraActionKit {
+    return createTesseraActions(this.cfg.client, {
+      providersBaseUrl: this.cfg.providersBaseUrl,
+    });
   }
 
   private emit(e: Omit<AgentEvent, "ts">) {

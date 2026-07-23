@@ -1,77 +1,96 @@
-# Circle integration — Paymaster & Developer-Controlled Wallets
+# Circle integration — Agent Stack, Wallets (DCW) & Paymaster
 
-Tessera runs on Arc with **USDC as gas + settlement** and Circle Wallets today.
-Two further Circle products slot into the existing seams with no protocol change;
-this document is the concrete integration plan (endpoints, code seams, env), so
-the work is a wiring exercise, not a redesign.
+Tessera runs on Arc with **USDC as gas + settlement**. On top of that it wires
+three Circle building blocks as **real code seams** (not just prose), each
+defaulting to the working path today and activated by a Circle developer key:
 
-> Status: **integration-ready.** Both need a Circle developer key and live Arc
-> access to exercise, so they are wired at the seams below and activated by
-> credentials rather than left as a rewrite.
+| Circle product | Where it lives | Status |
+|---|---|---|
+| **Agent Stack** (agent → wallet, USDC, on-chain actions) | `agent/src/agentkit.ts` | **Live** — used in the demo, `/api/actions`, and unit-tested |
+| **Wallets / Developer-Controlled Wallets** | `agent/src/wallet.ts`, `agent/src/circle/dcw.ts` | Wired seam — `WALLET_MODE=circle` |
+| **Paymaster** (gasless first call) | `agent/src/circle/paymaster.ts` | Wired seam — `CIRCLE_PAYMASTER_URL` |
 
-## 1. Developer-Controlled Wallets (replace raw keys)
+## 1. Agent Stack — the agent's action surface
 
-Today the agent and providers sign with private keys from `.env`
-(`AGENT_PRIVATE_KEY`, `PROVIDER_PRIVATE_KEY`). Circle **Developer-Controlled
-Wallets** (DCW) hold the keys in Circle's infrastructure and expose a signing
-API — more production-credible, and the path to per-user agent wallets.
-
-**The seam already exists.** `TesseraClient` takes a viem `Account`:
+Circle's Agent Stack is about giving an autonomous agent a set of **typed
+actions/tools** that connect it to a wallet, USDC payments, and on-chain
+operations. Tessera exposes exactly that: `createTesseraActions(client)` returns
+a registry bound to the agent's `TesseraClient`.
 
 ```ts
-// agent/src/client.ts
-new TesseraClient({ chain, rpcUrl, account, escrowAddress, usdcAddress, tabAddress })
+const kit = agent.actionKit();
+kit.manifest();                 // enumerable tools (MCP / tool-use shape)
+await kit.invoke("usdc_balance");
+await kit.invoke("escrow_payment", { provider, amount, deadline, quoteHash });
 ```
 
-So DCW integration is: produce a viem-compatible `Account` whose `signMessage` /
-`signTypedData` / `signTransaction` call Circle instead of a local key. viem's
-`toAccount({ address, signMessage, signTypedData, signTransaction })` is exactly
-this adapter — nothing downstream (escrow, tab vouchers, signed quotes) changes.
+Actions (each with a JSON-schema input and a `read | payment | onchain` kind):
 
-Flow:
-1. `POST /v1/w3s/developerWalletSets` → create a wallet set (once).
-2. `POST /v1/w3s/developer/wallets` with `blockchains: ["ARC-SEPOLIA"]` → create
-   the agent and provider wallets; store the returned wallet ids.
-3. Sign via `POST /v1/w3s/developer/sign/{message|typedData|transaction}` using
-   the wallet id + entity-secret ciphertext.
-4. Wrap those calls in `toAccount(...)` and pass the result as `account`.
+| Action | Kind | Reaches |
+|---|---|---|
+| `usdc_balance` | read | the agent's **wallet** |
+| `discover_services`, `get_reputation`, `get_stake` | read | marketplace + on-chain state |
+| `escrow_payment`, `settle_payment`, `refund_payment` | payment | **USDC payments** on Arc |
+| `open_tab`, `sign_voucher`, `reclaim_tab` | payment / onchain | **nanopayments** |
 
-Env: `CIRCLE_API_KEY`, `CIRCLE_ENTITY_SECRET`, `CIRCLE_WALLET_SET_ID`,
-`AGENT_WALLET_ID`, `PROVIDER_WALLET_ID`. Add a `WALLET_MODE=key|circle` switch in
-`agent/src/run-arc.ts` and `providers/src/server.ts` that builds either a
-`privateKeyToAccount` (today) or a Circle-backed `toAccount` (new). No other
-file changes.
+A model brain can enumerate the manifest and drive the agent as tool-use; the
+deterministic brain calls the same client underneath. See it live:
 
-## 2. Paymaster (gasless first call)
+- `AGENT_STACK=1 npm run run:arc` prints the manifest and runs a live
+  `usdc_balance()` through the kit.
+- The dashboard serves the manifest at `GET /api/actions` and lists it in
+  `/api/state` (`meta.agentStack`).
 
-On Arc, USDC is the gas token — elegant, but a **brand-new agent with a zero
-balance can't send its very first transaction** (it has no USDC for gas). Circle
-**Paymaster** sponsors that first transaction, so an agent can bootstrap from
-nothing and start earning.
+## 2. Developer-Controlled Wallets (replace raw keys)
 
-Where it plugs in: the agent's first on-chain write is `open()` (or the USDC
-`approve` before it) in `TesseraClient`. With an ERC-4337 smart-account agent
-wallet, those writes become UserOperations whose `paymasterAndData` points at
-Circle's Paymaster; the bundler submits them gas-sponsored.
+Today the agent signs with a private key from `.env`. Circle **DCW** holds the
+key in Circle's infrastructure and signs over an API. The seam is a single
+construction point:
 
-Integration points:
-- Give the agent a smart-account wallet (Circle Modular Wallets / DCW smart
-  account) instead of an EOA.
-- Route `ensureApproval` + `open` through the account's UserOperation path with
-  Circle's Paymaster as sponsor for the first N operations.
-- Everything else (escrow lifecycle, reputation, tabs) is unchanged — it only
-  cares that the calls land on-chain.
+```ts
+// agent/src/wallet.ts
+const account = buildAccount({ mode: "key" | "circle", privateKey, role: "AGENT" });
+```
 
-Env: `CIRCLE_PAYMASTER_URL` (bundler/paymaster endpoint), `CIRCLE_API_KEY`.
+`mode:"circle"` builds a viem `Account` via `createDcwAccount(...)` whose
+`signMessage` / `signTypedData` / `signTransaction` call Circle's
+`w3s/developer/sign/*` endpoints (`agent/src/circle/dcw.ts`). Nothing downstream
+changes — escrow, tab vouchers, and EIP-712 quotes verify by **address**, not by
+how the signature was produced. `run-arc.ts` reads `WALLET_MODE` and switches
+custody with no other edits.
+
+Env: `WALLET_MODE=circle`, `CIRCLE_API_KEY`, `CIRCLE_ENTITY_SECRET`,
+`AGENT_WALLET_ID`, `AGENT_ADDRESS` (and `CIRCLE_API_BASE_URL` to override the
+host). The adapter's request shaping is unit-tested with an injected `fetch`
+(`agent/test/wallet.test.ts`), so it's exercised without a live key.
+
+## 3. Paymaster (gasless first call)
+
+On Arc, USDC is the gas token — but a brand-new agent with a zero balance can't
+send its very first transaction. Circle **Paymaster** sponsors that first
+operation so an agent can bootstrap from nothing.
+
+`agent/src/circle/paymaster.ts` is the configuration seam the runtime consults:
+`paymasterFromEnv()` detects whether a Paymaster is wired, `describeGasMode()`
+reports the active gas mode (shown at startup and in the dashboard), and
+`shouldSponsor(pm, opIndex)` gates the first N operations. Full sponsorship
+routes the first `approve` + `open` through an ERC-4337 UserOperation with
+Circle's Paymaster as sponsor (requires a smart-account wallet + bundler
+endpoint); without it the agent pays gas in USDC as today.
+
+Env: `CIRCLE_PAYMASTER_URL`, `CIRCLE_API_KEY`, `CIRCLE_PAYMASTER_SPONSOR_N`.
 
 ## Why this is low-risk
 
 Tessera was built with these seams in mind:
+
 - **Signing is abstracted** behind a viem `Account`, so DCW is an adapter.
 - **The protocol is signer-agnostic** — escrow, vouchers, and EIP-712 quotes
   verify signatures by address, not by how they were produced.
 - **The first-call bootstrap** is isolated to `ensureApproval` + `open`, so
   Paymaster sponsorship is a localized change.
+- **The action surface wraps one client**, so Agent Stack tools and the
+  deterministic flow never diverge.
 
-The result: no contract changes, no protocol changes — only the wallet/account
-construction differs.
+No contract changes, no protocol changes — only wallet/account construction and
+the action layer differ, and all three default to the working path.

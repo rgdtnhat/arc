@@ -93,7 +93,7 @@ Narrate over the real run. Beats:
    contract addresses. "Deployed and transacting."
 8. **Why Arc / Circle** — USDC gas token, sub-second settlement, Circle Wallets;
    Paymaster + Developer-Controlled Wallets on the roadmap.
-9. **Traction & quality** — 41 tests, CI on every push, one-command live deploy
+9. **Traction & quality** — 56 tests, CI on every push, one-command live deploy
    (`bootstrap:arc`), offline-capable toolchain. Execution > complexity.
 10. **Vision / ask** — from a demo to the settlement rail for agent-to-agent
     commerce: real providers, discovery registry, reputation staking. Repo link.
@@ -106,6 +106,6 @@ Narrate over the real run. Beats:
   native USDC as gas + settlement, live txs; Circle Wallets used, Paymaster next.
 - **Use case & impact** — a real, unsolved problem (agent-to-stranger payments)
   with a credible path to production.
-- **Execution & quality** — 41 tests, CI, one-command deploy, live on-chain proof,
+- **Execution & quality** — 56 tests, CI, one-command deploy, live on-chain proof,
   resilient to public-RPC limits. Quality over complexity.
 - **Presentation** — this kit: a tight demo narrative anchored to real transactions.

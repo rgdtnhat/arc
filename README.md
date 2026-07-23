@@ -76,6 +76,22 @@ And a wallet-grade safety layer (inspired by consumer wallets like LOBSTR):
   rail), **declines** the ones from providers that burned it, and escalates
   over-cap amounts to the guardian.
 
+## Circle Agent Stack
+
+The agent reaches its **wallet, USDC payments, and on-chain actions** through a
+typed **Agent Stack** action layer (`agent/src/agentkit.ts`) rather than ad-hoc
+calls — tools like `usdc_balance`, `escrow_payment`, `settle_payment`,
+`refund_payment`, `open_tab`, and `sign_voucher`, each with a JSON-schema input
+(MCP / tool-use shape). An LLM brain can enumerate and call them; the
+deterministic brain uses the same client underneath. Run `AGENT_STACK=1 npm run
+run:arc` to print the manifest, or hit `GET /api/actions` on the dashboard.
+
+**Circle Wallets & Paymaster** are wired as real seams too: `WALLET_MODE=circle`
+swaps raw keys for a Circle **Developer-Controlled Wallet** (signer-identical
+downstream), and `CIRCLE_PAYMASTER_URL` enables **Paymaster** gasless-first-call
+sponsorship. Both default to today's working path. See
+[`docs/CIRCLE_INTEGRATION.md`](docs/CIRCLE_INTEGRATION.md).
+
 ## Why Arc
 
 - **USDC is the gas token** — the agent funds one asset and uses it for both the
@@ -111,7 +127,7 @@ And a wallet-grade safety layer (inspired by consumer wallets like LOBSTR):
 | Path          | What it is                                                        |
 |---------------|-------------------------------------------------------------------|
 | `contracts/`  | `TesseraEscrow` + `MockUSDC`, Hardhat + viem tests                 |
-| `agent/`      | Agent runtime: 402 handshake, hybrid decision engine, settle/refund |
+| `agent/`      | Agent runtime: 402 handshake, hybrid decision engine, settle/refund, Agent Stack action layer, Circle wallet/Paymaster seams |
 | `providers/`  | Mock priced services that speak the Tessera 402 protocol          |
 | `dashboard/`  | Live demo dashboard (balances, reputation, tx feed)               |
 | `shared/`     | Chain config, ABIs, protocol types shared across packages         |
@@ -142,7 +158,7 @@ MVP.
 
 ```bash
 npm install            # installs all workspaces
-npm run test           # 17 contract tests + 17 agent unit tests
+npm run test           # 21 contract tests + 35 agent unit tests
 npm run demo           # end-to-end local demo (chain + providers + agent + dashboard)
 npm run e2e            # the same scenario headless, one-shot (used in CI)
 ```

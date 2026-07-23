@@ -199,6 +199,8 @@ async function main() {
         escrowAddress,
         usdcAddress,
         note: "Local demo. Deploy to Arc testnet (chainId 5042002) with run:arc.",
+        agentStack: agent.actionKit().manifest().map((a) => a.name),
+        walletMode: (process.env.WALLET_MODE as string) ?? "key",
       },
       task: { goal: DEMO_TASK.goal, budgetUsdc: formatUsdc(DEMO_TASK.budget) },
       agent: {
@@ -249,6 +251,12 @@ async function main() {
         spentUsdc: formatUsdc(settled.reduce((a, e) => a + e.price, 0n)),
       },
     });
+  });
+
+  // Agent Stack: the agent's wallet + USDC-payment + on-chain actions as a
+  // typed tool manifest (MCP / Circle Agent Stack shape).
+  app.get("/api/actions", (_req, res) => {
+    res.json({ actions: agent.actionKit().manifest() });
   });
 
   // Guardian verdicts from the dashboard (the human co-signer).

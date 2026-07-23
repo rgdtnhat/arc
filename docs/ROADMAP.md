@@ -28,7 +28,7 @@ Tessera against the Arc Hackathon checkpoints.
   authenticity + expiry before escrowing (tamper-proof, non-repudiable).
 - **Real-API provider**: a live Open-Meteo-backed service (with offline
   fallback) — Tessera charges USDC for a genuine service, not only mocks.
-- **Tests + CI**: 21 contract tests, 20 agent unit tests (decision engine,
+- **Tests + CI**: 21 contract tests, 35 agent unit tests (decision engine,
   guardian queue, memory, signed quotes), and the full E2E scenario on every push.
 - Offline-capable Hardhat toolchain (seeds solc from npm so it builds in
   locked-down environments).

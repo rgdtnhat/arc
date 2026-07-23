@@ -1,9 +1,10 @@
-import { privateKeyToAccount } from "viem/accounts";
 import type { Hex } from "viem";
 import { arcTestnet, ARC_USDC_ADDRESS, formatUsdc } from "@tessera/shared";
 import { TesseraClient } from "./client.js";
 import { TesseraAgent } from "./agent.js";
 import { DEMO_TASK } from "./scenario.js";
+import { buildAccount, type WalletMode } from "./wallet.js";
+import { paymasterFromEnv, describeGasMode } from "./circle/paymaster.js";
 
 /**
  * Run the agent against a Tessera deployment on Arc testnet.
@@ -22,12 +23,17 @@ async function main() {
   const providersUrl = process.env.PROVIDERS_URL ?? "http://127.0.0.1:8788";
   const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
 
-  if (!key || !escrow) {
+  const walletMode = (process.env.WALLET_MODE as WalletMode | undefined) ?? "key";
+  if (!escrow || (walletMode === "key" && !key)) {
     console.error("Set AGENT_PRIVATE_KEY and TESSERA_ESCROW_ADDRESS (see .env.example).");
     process.exit(1);
   }
 
-  const account = privateKeyToAccount(key);
+  // Wallet custody seam: raw key today, or a Circle Developer-Controlled Wallet
+  // when WALLET_MODE=circle (signer-identical downstream).
+  const account = buildAccount({ mode: walletMode, privateKey: key, role: "AGENT" });
+  const paymaster = paymasterFromEnv();
+  console.log(`Wallet mode: ${walletMode} · Gas: ${describeGasMode(paymaster)}`);
   const client = new TesseraClient({
     chain: arcTestnet,
     rpcUrl,
@@ -50,6 +56,17 @@ async function main() {
     onEvent: (e) =>
       console.log(`  [agent] ${e.message}${e.txUrl ? " " + e.txUrl : ""}`),
   });
+
+  // Agent Stack: the agent reaches its wallet + on-chain actions through a typed
+  // tool surface. Print the manifest and drive a live read through it to prove
+  // the wiring (opt in with AGENT_STACK=1).
+  if (process.env.AGENT_STACK === "1") {
+    const kit = agent.actionKit();
+    console.log(`\n🧰 Agent Stack — ${kit.actions.length} actions:`);
+    for (const a of kit.manifest()) console.log(`   • ${a.name} [${a.kind}] — ${a.description}`);
+    const bal = await kit.invoke<{ usdc: string }>("usdc_balance");
+    console.log(`   ↳ usdc_balance() = ${bal.usdc} USDC\n`);
+  }
 
   await agent.run(DEMO_TASK);
 
