@@ -20,6 +20,8 @@ function readArtifact(name) {
 const escrow = readArtifact("TesseraEscrow");
 const tab = readArtifact("TesseraTab");
 const usdc = readArtifact("MockUSDC");
+const pool = readArtifact("TesseraPool");
+const mockToken = readArtifact("MockToken");
 
 const outDir = path.resolve(root, "..", "shared", "src");
 fs.mkdirSync(outDir, { recursive: true });
@@ -28,7 +30,9 @@ const abiTs =
   `// AUTO-GENERATED from contracts/artifacts by scripts/export-abi.cjs. Do not edit.\n` +
   `export const tesseraEscrowAbi = ${JSON.stringify(escrow.abi)} as const;\n\n` +
   `export const tesseraTabAbi = ${JSON.stringify(tab.abi)} as const;\n\n` +
-  `export const mockUsdcAbi = ${JSON.stringify(usdc.abi)} as const;\n`;
+  `export const mockUsdcAbi = ${JSON.stringify(usdc.abi)} as const;\n\n` +
+  `export const tesseraPoolAbi = ${JSON.stringify(pool.abi)} as const;\n\n` +
+  `export const mockTokenAbi = ${JSON.stringify(mockToken.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 
 // Bytecode is only needed to deploy the mock locally from a plain viem script.
@@ -36,7 +40,9 @@ const bytecodeTs =
   `// AUTO-GENERATED from contracts/artifacts by scripts/export-abi.cjs. Do not edit.\n` +
   `export const tesseraEscrowBytecode = "${escrow.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const tesseraTabBytecode = "${tab.bytecode}" as \`0x\${string}\`;\n\n` +
-  `export const mockUsdcBytecode = "${usdc.bytecode}" as \`0x\${string}\`;\n`;
+  `export const mockUsdcBytecode = "${usdc.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraPoolBytecode = "${pool.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const mockTokenBytecode = "${mockToken.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);
 
 console.log("[export-abi] wrote shared/src/abi.ts and shared/src/bytecode.ts");

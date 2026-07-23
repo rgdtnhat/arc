@@ -92,6 +92,16 @@ downstream), and `CIRCLE_PAYMASTER_URL` enables **Paymaster** gasless-first-call
 sponsorship. Both default to today's working path. See
 [`docs/CIRCLE_INTEGRATION.md`](docs/CIRCLE_INTEGRATION.md).
 
+## Lending & borrowing (Blend-inspired)
+
+`TesseraPool` is an isolated money market on Arc, modelled on
+[Blend](https://www.blend.capital/) (Stellar): **reserves** with per-asset
+**collateral / liability factors**, **utilization-driven interest** (a kinked
+rate curve), **health-factor liquidations**, and a **protocol take-rate** that
+accrues to the app-owner treasury. Agents put idle USDC to work (supply → yield)
+or open a credit line (borrow against collateral) to fund their pay-per-call
+operations. See [`docs/LENDING.md`](docs/LENDING.md). *(Unaudited testnet code.)*
+
 ## Parallel multi-agent fleet
 
 Many agents, each with **its own wallet**, transacting **concurrently** against a
@@ -143,7 +153,7 @@ across simultaneous `open()`s).
 
 | Path          | What it is                                                        |
 |---------------|-------------------------------------------------------------------|
-| `contracts/`  | `TesseraEscrow` + `MockUSDC`, Hardhat + viem tests                 |
+| `contracts/`  | `TesseraEscrow`, `TesseraTab`, `TesseraPool` (lending), `MockUSDC`, Hardhat + viem tests |
 | `agent/`      | Agent runtime: 402 handshake, hybrid decision engine, settle/refund, Agent Stack action layer, Circle wallet/Paymaster/faucet seams, treasury workflow |
 | `providers/`  | Mock priced services that speak the Tessera 402 protocol          |
 | `dashboard/`  | Live demo dashboard (balances, reputation, tx feed)               |
@@ -175,7 +185,7 @@ MVP.
 
 ```bash
 npm install            # installs all workspaces
-npm run test           # 21 contract tests + 43 agent unit tests
+npm run test           # 28 contract tests + 46 agent unit tests
 npm run demo           # end-to-end local demo (chain + providers + agent + dashboard)
 npm run fleet          # N agents transacting in parallel, each with its own wallet
 npm run e2e            # the same scenario headless, one-shot (used in CI)

@@ -9,6 +9,8 @@ const config: HardhatUserConfig = {
     version: "0.8.24",
     settings: {
       optimizer: { enabled: true, runs: 200 },
+      // TesseraPool's multi-return views need the IR pipeline (stack too deep otherwise).
+      viaIR: true,
     },
   },
   networks: {
