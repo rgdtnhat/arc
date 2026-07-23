@@ -14,9 +14,7 @@
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspace contracts && npm run test --workspace agent",
     "compile": "npm run compile --workspace contracts",
-    "demo": "npm run demo --workspace agent",
-    "fleet": "tsx agent/src/run-fleet.ts",
-    "e2e": "TESSERA_ONCE=1 tsx agent/src/demo.ts",
+    "demo": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx agent/src/demo.ts",
     "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs",
     "pool:arc": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/pool-arc.mjs"
   },

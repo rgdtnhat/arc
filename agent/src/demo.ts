@@ -17,18 +17,14 @@ import { TesseraAgent, type AgentEvent, type LedgerEntry } from "./agent.js";
 import { TrustMemory } from "./memory.js";
 import { describePolicy } from "./policy.js";
 import { DEMO_TASK, DEMO_POLICY } from "./scenario.js";
-import {
-  DEV_KEYS,
-  deployLocal,
-  deployPool,
-  localChain,
-  mintToken,
-  mintUsdc,
-  stakeProvider,
-  startLocalNode,
-  type PoolDeployment,
-} from "./local.js";
 import { usdc } from "@tessera/shared";
+
+/** Reference to the TesseraPool deployment on Arc (from deployments/arc.json). */
+interface PoolDeploymentRef {
+  poolAddress: Hex;
+  wbtcAddress: Hex;
+  usdcAddress: Hex;
+}
 import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
 import { AdminAuth } from "./auth.js";
@@ -65,105 +61,47 @@ process.on("uncaughtException", (err) => {
 });
 
 async function main() {
-  // LIVE mode runs the scenario on Arc testnet (real USDC, real contracts). It
-  // engages when a recorded deployment + agent/provider keys are present, unless
-  // forced with TESSERA_LIVE=1/0. Otherwise it's the local in-container demo.
-  const canLive = !!liveDeployment && !!process.env.AGENT_PRIVATE_KEY && !!process.env.PROVIDER_PRIVATE_KEY;
-  const live = process.env.TESSERA_LIVE === "1" ? canLive : process.env.TESSERA_LIVE === "0" ? false : canLive;
-  if (process.env.TESSERA_LIVE === "1" && !canLive) {
-    console.error("⚠  TESSERA_LIVE=1 but missing deployments/arc.json or AGENT_/PROVIDER_PRIVATE_KEY — running the local demo instead.");
+  // Arc testnet ONLY. Requires a recorded deployment (deployments/arc.json) and
+  // the agent + provider keys in the environment — there is no local fallback.
+  if (!liveDeployment) {
+    console.error("No deployments/arc.json found — deploy to Arc first (npm run bootstrap:arc + npm run pool:arc).");
+    process.exit(1);
   }
-  // Pace on-chain actions in live mode so the public RPC's burst limit can't break a run.
-  if (live) {
-    process.env.TESSERA_PACE_MS ??= "12000";
-    process.env.TESSERA_TICK_PACE_MS ??= "4000";
-    process.env.TESSERA_MIN_DEADLINE_SECONDS ??= "90";
+  if (!process.env.AGENT_PRIVATE_KEY || !process.env.PROVIDER_PRIVATE_KEY) {
+    console.error("Set AGENT_PRIVATE_KEY and PROVIDER_PRIVATE_KEY (Arc testnet) in .env.");
+    process.exit(1);
   }
+  // Pace on-chain actions so the public RPC's burst limit can't break a run.
+  process.env.TESSERA_PACE_MS ??= "12000";
+  process.env.TESSERA_TICK_PACE_MS ??= "4000";
+  process.env.TESSERA_MIN_DEADLINE_SECONDS ??= "90";
 
-  let node: ChildProcess | null = null;
-  let chain: Chain;
-  let rpcUrl: string;
-  let usdcAddress: Hex, escrowAddress: Hex, tabAddress: Hex;
-  let agentAccount: Account;
-  let faucet: Faucet;
-  let chainLabel: string;
-  let poolDeployment: PoolDeployment | null = null; // TesseraPool (local demo only)
+  const live = true; // this build runs on Arc testnet only
+  const node: ChildProcess | null = null;
+  const chain: Chain = arcTestnet;
+  const rpcUrl = process.env.ARC_RPC_URL ?? "https://rpc.testnet.arc.network";
+  const usdcAddress = ARC_USDC_ADDRESS;
+  const escrowAddress = liveDeployment.tesseraEscrow as Hex;
+  const tabAddress = liveDeployment.tesseraTab as Hex;
+  const chainLabel = `Arc testnet (${liveDeployment.chainId})`;
+  const agentAccount: Account = buildAccount({
+    mode: (process.env.WALLET_MODE as WalletMode) ?? "key",
+    privateKey: process.env.AGENT_PRIVATE_KEY as Hex,
+    role: "AGENT",
+  });
+  const provKey = process.env.PROVIDER_PRIVATE_KEY as Hex;
   const providerKeys: Record<string, Hex> = {};
-
-  if (live) {
-    chain = arcTestnet;
-    rpcUrl = process.env.ARC_RPC_URL ?? "https://rpc.testnet.arc.network";
-    usdcAddress = ARC_USDC_ADDRESS;
-    escrowAddress = liveDeployment!.tesseraEscrow as Hex;
-    tabAddress = liveDeployment!.tesseraTab as Hex;
-    chainLabel = `Arc testnet (${liveDeployment!.chainId})`;
-    agentAccount = buildAccount({
-      mode: (process.env.WALLET_MODE as WalletMode) ?? "key",
-      privateKey: process.env.AGENT_PRIVATE_KEY as Hex,
-      role: "AGENT",
-    });
-    const provKey = process.env.PROVIDER_PRIVATE_KEY as Hex;
-    for (const s of CATALOG) {
-      const specific = process.env[`PROVIDER_KEY_${s.resource.replace(/[:.]/g, "_").toUpperCase()}`] as Hex | undefined;
-      providerKeys[s.resource] = specific ?? provKey;
-    }
-    faucet = faucetFromEnv();
-    // Lending pool, if one has been deployed to Arc (deployments/arc.json).
-    if (liveDeployment!.tesseraPool && liveDeployment!.poolCollateral) {
-      poolDeployment = {
-        poolAddress: liveDeployment!.tesseraPool as Hex,
-        wbtcAddress: liveDeployment!.poolCollateral as Hex,
-        usdcAddress,
-      };
-    }
-    console.log(`🔴 LIVE on ${chainLabel} — agent ${agentAccount.address}`);
-    console.log(`   escrow ${escrowAddress} · tab ${tabAddress}`);
-  } else {
-    console.log("⛓  Starting local Arc-like chain (Hardhat node)…");
-    node = await startLocalNode();
-    chain = localChain;
-    rpcUrl = "http://127.0.0.1:8545";
-    chainLabel = "Hardhat Local (31337)";
-    agentAccount = privateKeyToAccount(DEV_KEYS.agent);
-    console.log("📦 Deploying MockUSDC + TesseraEscrow + TesseraTab…");
-    const deployment = await deployLocal(agentAccount.address);
-    usdcAddress = deployment.usdcAddress;
-    escrowAddress = deployment.escrowAddress;
-    tabAddress = deployment.tabAddress;
-    console.log(`   USDC:   ${usdcAddress}`);
-    console.log(`   Escrow: ${escrowAddress}`);
-    console.log(`   Tab:    ${tabAddress}`);
-    Object.assign(providerKeys, {
-      "weather:current": DEV_KEYS.weather,
-      "weather:live": DEV_KEYS.weather,
-      "fx:quote": DEV_KEYS.fx,
-      "news:headlines": DEV_KEYS.news,
-      "ticker:stream": DEV_KEYS.ticker,
-      "alpha:report": DEV_KEYS.alpha,
-      // Subscriptions bill from the same on-chain identities as the base services.
-      "subscription:fx": DEV_KEYS.fx,
-      "subscription:news": DEV_KEYS.news,
-    });
-    console.log("🔒 Providers bonding stake (0.05 USDC each)…");
-    for (const key of new Set(Object.values(providerKeys))) {
-      await stakeProvider(deployment, key, usdc("0.05"));
-    }
-    // Lending: deploy TesseraPool (USDC + wBTC reserves, seeded liquidity) and
-    // give the agent 0.5 wBTC ($15k) of collateral to borrow against.
-    console.log("🏦 Deploying TesseraPool (lending) + seeding liquidity…");
-    poolDeployment = await deployPool(usdcAddress, privateKeyToAccount(DEV_KEYS.deployer).address, usdc("100"));
-    await mintToken(poolDeployment.wbtcAddress, agentAccount.address, 50_000_000n); // 0.5 wBTC (8dp)
-    console.log(`   Pool: ${poolDeployment.poolAddress} · wBTC: ${poolDeployment.wbtcAddress}`);
-    // Local faucet: the deployer mints MockUSDC straight to the agent, so the
-    // dashboard's "Get testnet USDC" button drips real balance end to end.
-    faucet = {
-      kind: "mock",
-      async request(address) {
-        const txHash = await mintUsdc(deployment, address, usdc("0.05"));
-        return { ok: true, address, amountUsdc: "0.05", txHash, message: "Minted 0.05 test USDC (local faucet)" };
-      },
-    };
+  for (const s of CATALOG) {
+    const specific = process.env[`PROVIDER_KEY_${s.resource.replace(/[:.]/g, "_").toUpperCase()}`] as Hex | undefined;
+    providerKeys[s.resource] = specific ?? provKey;
   }
+  const faucet: Faucet = faucetFromEnv();
+  const poolDeployment: PoolDeploymentRef | null =
+    liveDeployment.tesseraPool && liveDeployment.poolCollateral
+      ? { poolAddress: liveDeployment.tesseraPool as Hex, wbtcAddress: liveDeployment.poolCollateral as Hex, usdcAddress }
+      : null;
+  console.log(`🔴 LIVE on ${chainLabel} — agent ${agentAccount.address}`);
+  console.log(`   escrow ${escrowAddress} · tab ${tabAddress}${poolDeployment ? ` · pool ${poolDeployment.poolAddress}` : ""}`);
 
   const cleanup = () => {
     node?.kill();
@@ -240,22 +178,8 @@ async function main() {
   });
   console.log(`🛡  Guardian policy: ${describePolicy(policy)}${policy.autoApprove ? " (auto-approve mode)" : ""}`);
 
-  // Lending pre-flight (LOCAL demo only — in live mode the agent's Arc position
-  // is opened once by the deploy script, not re-borrowed on every restart).
-  if (poolClient && poolDeployment && !live) {
-    try {
-      await poolClient.supply(poolDeployment.wbtcAddress, 50_000_000n); // 0.5 wBTC
-      await poolClient.borrow(usdcAddress, usdc("5")); // credit line
-      pushEvent({
-        source: "agent",
-        ts: Date.now(),
-        level: "info",
-        message: "Lending: supplied 0.5 wBTC collateral, drew a 5 USDC credit line on TesseraPool",
-      } as UiEvent);
-    } catch (e) {
-      console.error(`[lending] pre-flight failed: ${String(e).slice(0, 120)}`);
-    }
-  }
+  // The agent's Arc lending position is opened once by the deploy script
+  // (npm run pool:arc), not re-borrowed on every dashboard restart.
 
   const startBalance = await client.usdcBalance();
   let running = false;
@@ -311,8 +235,41 @@ async function main() {
     fileURLToPath(new URL(".", import.meta.url)),
     "../../dashboard/public"
   );
+  // Behind Caddy/TLS: trust the proxy so req.ip is the real client IP.
+  app.set("trust proxy", true);
+  app.disable("x-powered-by");
+
+  // Security headers on every response (strict CSP — the dashboard script is an
+  // external file so inline scripts are forbidden; styles stay inline).
+  app.use((_req, res, next) => {
+    res.setHeader(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+        "img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'self'; " +
+        "manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+    );
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=(), usb=()");
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    next();
+  });
+
   app.use(express.static(dashboardDir));
-  app.use(express.json());
+  app.use(express.json({ limit: "64kb" }));
+
+  // Brute-force protection on the login endpoints: lock an IP out for 15 min
+  // after 5 failed attempts.
+  const loginFails = new Map<string, { count: number; until: number }>();
+  const lockedOut = (ip: string) => (loginFails.get(ip)?.until ?? 0) > Date.now();
+  const noteFail = (ip: string) => {
+    const a = loginFails.get(ip) ?? { count: 0, until: 0 };
+    a.count += 1;
+    if (a.count >= 5) { a.until = Date.now() + 15 * 60_000; a.count = 0; }
+    loginFails.set(ip, a);
+  };
+  const clearFails = (ip: string) => loginFails.delete(ip);
 
   // --- Web3 wallet login (Sign-In-With-Ethereum, EIP-4361) ------------------
   const authNonces = new Map<string, number>(); // nonce -> expiry ms
@@ -348,10 +305,16 @@ async function main() {
     authSessions.set(token, { address, at: Date.now() });
     res.json({ ok: true, token, address });
   });
+  const WEB3_TTL = 12 * 60 * 60 * 1000; // 12h
+  const web3Session = (token: string) => {
+    const s = authSessions.get(token);
+    if (!s) return null;
+    if (Date.now() - s.at > WEB3_TTL) { authSessions.delete(token); return null; }
+    return s;
+  };
   app.get("/api/auth/me", (req, res) => {
     const token = (req.headers.authorization ?? "").replace(/^Bearer /, "");
-    const s = authSessions.get(token);
-    res.json({ address: s?.address ?? null });
+    res.json({ address: web3Session(token)?.address ?? null });
   });
 
   // --- Admin login (credentials from env → gitignored scrypt hash) ----------
@@ -364,7 +327,7 @@ async function main() {
   const bearer = (req: express.Request) => (req.headers.authorization ?? "").replace(/^Bearer /, "");
   const isAuthed = (req: express.Request) => {
     const t = bearer(req);
-    return !!admin?.session(t) || authSessions.has(t);
+    return !!admin?.session(t) || !!web3Session(t);
   };
   // Gate for state-changing endpoints: a signed-in Web3 wallet OR the admin.
   const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -374,8 +337,11 @@ async function main() {
 
   app.post("/api/admin/login", (req, res) => {
     if (!admin) { res.status(503).json({ ok: false, error: "admin login not configured (set ADMIN_PASSWORD)" }); return; }
+    const ip = req.ip ?? "unknown";
+    if (lockedOut(ip)) { res.status(429).json({ ok: false, error: "too many attempts — locked out for 15 minutes" }); return; }
     const token = admin.login(String(req.body?.id ?? ""), String(req.body?.password ?? ""));
-    if (!token) { res.status(401).json({ ok: false, error: "invalid credentials" }); return; }
+    if (!token) { noteFail(ip); res.status(401).json({ ok: false, error: "invalid credentials" }); return; }
+    clearFails(ip);
     res.json({ ok: true, token, id: req.body.id });
   });
   app.post("/api/admin/change-password", (req, res) => {

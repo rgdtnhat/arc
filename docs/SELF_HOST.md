@@ -8,7 +8,7 @@ Let's Encrypt TLS certificate automatically.
 
 - A **Linux VPS with root/sudo** and a public IP (DigitalOcean, Hetzner, Linode,
   AWS EC2, a home server with ports 80/443 forwarded — anything you control).
-  **~1 GB RAM** minimum: the container runs an in-process EVM (the local chain).
+  **~512 MB RAM** is plenty — the app is a Node server talking to Arc (no local EVM).
 - **Docker + Docker Compose** installed (`curl -fsSL https://get.docker.com | sh`).
 - A **domain** whose DNS you can edit.
 
@@ -61,41 +61,36 @@ and point an existing nginx server block at `http://127.0.0.1:8787`, then
 `certbot --nginx -d tessera.example.com` for TLS. Caddy is simpler, but either
 works.
 
-## What's hosted
+## Required environment (Arc testnet only)
 
-By default, a full autonomous run against a fresh local chain inside the
-container: escrow settlements, an SLA-breach refund with a stake slash, the
-guardian approval card, the nanopayment tab session, the billing inbox, and the
-mission briefing. The "Run again" button replays it — free, instant, replayable.
-The dashboard also shows your real Arc testnet deployment (`deployments/arc.json`)
-in a "Live on Arc testnet" card with Arcscan links.
-
-## Run live on Arc testnet (optional)
-
-To make the dashboard actually transact on Arc testnet (real USDC) instead of the
-local demo, give the container your deployment's keys. **These are testnet-only
-keys — never put mainnet/real-fund keys on a server.** Create a `.env` next to
-`docker-compose.yml` on the server:
+The dashboard runs **live on Arc testnet only** — there is no local demo chain.
+It reads the committed `deployments/arc.json` and **requires** your keys. Create
+a `.env` next to `docker-compose.yml` on the server (gitignored — never commit;
+**testnet-only keys, never mainnet/real-fund keys on a server**):
 
 ```bash
 SITE_ADDRESS=tesra.xyz, www.tesra.xyz
-TESSERA_LIVE=1
-AGENT_PRIVATE_KEY=0x...        # your Arc agent key
-PROVIDER_PRIVATE_KEY=0x...     # your Arc provider key
+AGENT_PRIVATE_KEY=0x...          # your Arc agent key
+PROVIDER_PRIVATE_KEY=0x...       # your Arc provider key
+ADMIN_ID=admin                   # dashboard admin login
+ADMIN_PASSWORD=change-me         # secret; enables the Admin button
 # ARC_RPC_URL=https://rpc.testnet.arc.network   # optional override
 ```
 
-Then `docker compose up -d --build`. The committed `deployments/arc.json` supplies
-the contract addresses, so live mode activates automatically when the keys are
-present. In live mode:
+Then `docker compose up -d --build`. What's hosted:
 
-- The dashboard reads real on-chain balances/reputation (reads are paced +
-  cached so the public RPC's rate limit doesn't break it).
-- It does **not** auto-run on restart — press **"Run live on Arc"** to spend real
-  testnet USDC on a scenario. Keep the agent funded at
-  [faucet.circle.com](https://faucet.circle.com/) (or the in-dashboard button).
+- The dashboard reads real on-chain balances / reputation / lending position
+  from Arc (reads are paced + cached so the public RPC's rate limit can't break
+  it). Escrow, tab, and pool all point at your live contracts.
+- It does **not** auto-run on restart — sign in (Admin or Connect Wallet), then
+  press **"Run live on Arc"** to spend real testnet USDC. Keep the agent funded
+  at [faucet.circle.com](https://faucet.circle.com/).
+- **Security:** all state-changing actions require sign-in; strict CSP + security
+  headers; admin login is brute-force-locked; sessions expire (12h). See
+  [`docs/SECURITY.md`](SECURITY.md).
 
-Set `TESSERA_LIVE=0` (or omit the keys) to go back to the free local demo.
+If `AGENT_PRIVATE_KEY` / `PROVIDER_PRIVATE_KEY` are missing, the app exits with a
+clear message rather than falling back to anything insecure.
 
 ## Just the static deck on shared hosting?
 

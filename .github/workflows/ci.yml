@@ -23,8 +23,5 @@ jobs:
       - name: Contract tests (Hardhat)
         run: npm test --workspace contracts
 
-      - name: Agent unit tests (decision engine, guardian, memory)
+      - name: Agent unit tests (decision engine, guardian, memory, agentkit, wallet, treasury, fleet)
         run: npm test --workspace agent
-
-      - name: End-to-end demo (local chain, full agentic flow, one-shot)
-        run: TESSERA_ONCE=1 AGENT_BRAIN=rules npx tsx agent/src/demo.ts

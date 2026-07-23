@@ -6,7 +6,6 @@
   "main": "src/agent.ts",
   "scripts": {
     "demo": "tsx src/demo.ts",
-    "fleet": "tsx src/run-fleet.ts",
     "run:arc": "NODE_USE_ENV_PROXY=1 tsx src/run-arc.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },

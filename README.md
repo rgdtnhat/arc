@@ -112,22 +112,15 @@ prompts an injected wallet (MetaMask/WalletConnect) to sign a nonce-bound
 message, which the server verifies (`/api/auth/*`) — single-use nonces, no
 passwords. Your address then shows in the header.
 
-## Parallel multi-agent fleet
+## Multi-agent concurrency
 
-Many agents, each with **its own wallet**, transacting **concurrently** against a
-shared marketplace of providers (each with their own wallet). Run it:
-
-```bash
-FLEET_SIZE=4 npm run fleet   # 4 agents buy in parallel, distinct wallets
-```
-
-Each agent has separate keys, budget, nonce stream, and trust memory, so they
-run at once without stepping on each other (`agent/src/fleet.ts`). Building this
-surfaced two real concurrency bugs, now fixed: providers **serialize on-chain
-writes per wallet** (concurrent `fulfill`s no longer collide on the nonce), and
-the client reads the **real `paymentId`/`tabId` from the transaction receipt's
-event** instead of the speculative `simulateContract` return (which collided
-across simultaneous `open()`s).
+`agent/src/fleet.ts` runs many agents concurrently, each with **its own wallet**,
+budget, nonce stream, and trust memory (`runFleet`, unit-tested). It surfaced two
+real concurrency bugs, now fixed: providers **serialize on-chain writes per
+wallet** (concurrent `fulfill`s no longer collide on the nonce), and the client
+reads the **real `paymentId`/`tabId` from the transaction receipt's event**
+instead of the speculative `simulateContract` return (which collided across
+simultaneous `open()`s).
 
 ## Why Arc
 
@@ -196,27 +189,28 @@ MVP.
 ```bash
 npm install            # installs all workspaces
 npm run test           # 28 contract tests + 47 agent unit tests
-npm run demo           # end-to-end local demo (chain + providers + agent + dashboard)
-npm run fleet          # N agents transacting in parallel, each with its own wallet
-npm run e2e            # the same scenario headless, one-shot (used in CI)
 ```
 
-CI runs all of the above on every push (`.github/workflows/ci.yml`), including
-the full agentic flow end to end.
+CI runs the tests on every push (`.github/workflows/ci.yml`).
+
+**The dashboard runs live on Arc testnet only** — there is no local demo chain
+or public dev keys. Deploy to Arc (below), then `npm run demo` reads
+`deployments/arc.json` + your `.env` keys and serves the dashboard against Arc.
 
 ## Deploy to Arc testnet (one command)
 
 ```bash
-npm run bootstrap:arc
+npm run bootstrap:arc   # deploys escrow + tab, funds agent/provider, writes .env + deployments/arc.json
+npm run pool:arc        # deploys the lending pool + opens the agent's position
+npm run demo            # serves the dashboard live on Arc (needs AGENT_/PROVIDER_PRIVATE_KEY in .env)
 ```
 
 The bootstrap generates deployer/agent/provider keys into `.env` (gitignored),
 prints the deployer address and waits while you fund it at
 [faucet.circle.com](https://faucet.circle.com) (network: **Arc Testnet** — USDC
-is the gas token, so one funding covers everything), then deploys
-`TesseraEscrow` + `TesseraTab`, funds the agent and provider wallets, bonds the
-provider's stake, and writes addresses to `.env` and `deployments/arc.json`.
-Then run the two sides:
+is the gas token), then deploys `TesseraEscrow` + `TesseraTab`, funds the agent
+and provider wallets, bonds the provider's stake, and writes addresses to `.env`
+and `deployments/arc.json`. You can also run the two sides headless:
 
 ```bash
 node --env-file=.env --import tsx providers/src/server.ts   # terminal 1
@@ -229,17 +223,20 @@ your proxy re-terminates TLS, also export `NODE_EXTRA_CA_CERTS=<ca-bundle>`.
 
 ## Deploy the live dashboard
 
-A `Dockerfile` runs the whole demo (local chain + contracts + agent + dashboard)
-in one container on `$PORT`.
+A `Dockerfile` serves the dashboard **live on Arc testnet** on `$PORT`. It reads
+`deployments/arc.json` (committed) and needs `AGENT_PRIVATE_KEY` +
+`PROVIDER_PRIVATE_KEY` (and an `ADMIN_PASSWORD` for login) in the environment —
+provide them via a gitignored `.env` next to `docker-compose.yml`. It also
+installs as a **PWA** and ships as a **multi-arch** image (see
+[`docs/PACKAGING.md`](docs/PACKAGING.md)).
 
-- **Your own server + domain** (HTTPS via Caddy) — one command; see
+- **Your own server + domain** (HTTPS via Caddy) — see
   [`docs/SELF_HOST.md`](docs/SELF_HOST.md):
   ```bash
   SITE_ADDRESS=tessera.example.com docker compose up -d --build
   ```
-- **Managed host** (Render one-click via `render.yaml`, Railway, Fly) — see
+- **Managed host** (Render via `render.yaml`, Railway, Fly) — see
   [`docs/DEPLOY.md`](docs/DEPLOY.md).
-- **Local:** `docker build -t tessera-demo . && docker run -p 8787:8787 tessera-demo`
 
 ## License
 

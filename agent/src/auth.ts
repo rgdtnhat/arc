@@ -18,6 +18,8 @@ interface AdminStore {
 export class AdminAuth {
   private store: AdminStore;
   private readonly sessions = new Map<string, { id: string; at: number }>();
+  /** Sessions expire after this long (12h). */
+  private readonly ttlMs = 12 * 60 * 60 * 1000;
 
   constructor(private readonly file: string, seed: { id: string; password: string }) {
     if (existsSync(file)) {
@@ -65,7 +67,12 @@ export class AdminAuth {
   session(token?: string): { id: string } | null {
     if (!token) return null;
     const s = this.sessions.get(token);
-    return s ? { id: s.id } : null;
+    if (!s) return null;
+    if (Date.now() - s.at > this.ttlMs) {
+      this.sessions.delete(token);
+      return null;
+    }
+    return { id: s.id };
   }
 
   logout(token?: string) {

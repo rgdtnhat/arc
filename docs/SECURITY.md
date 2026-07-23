@@ -30,6 +30,23 @@ guard in `agent/src/demo.ts`.
   add reserves, set prices, and set the treasury. Keep it in an HSM / DCW for
   production.
 
+## Hardening added (highest-level dashboard security)
+
+- **Arc-only runtime.** The app no longer runs a local Hardhat chain with public
+  dev keys — it requires the real Arc deployment + `AGENT_/PROVIDER_PRIVATE_KEY`
+  and exits otherwise. No well-known private keys anywhere in the running app.
+- **Strict Content-Security-Policy.** The dashboard script is an external file
+  (`app.js`), so the CSP forbids inline scripts: `script-src 'self'`,
+  `frame-ancestors 'none'`, `object-src 'none'`, `base-uri 'self'`,
+  `connect-src 'self'`. Plus `X-Frame-Options: DENY`, `X-Content-Type-Options:
+  nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy` (camera/mic/geo
+  off), and `Strict-Transport-Security` (HSTS).
+- **Brute-force lockout.** 5 failed admin logins from an IP → 15-minute lockout
+  (429). `trust proxy` is set so the real client IP is used behind Caddy.
+- **Session expiry.** Admin and Web3 sessions expire after 12h.
+- **Bounded JSON bodies** (64 KB) and `x-powered-by` disabled.
+- **Auth required** on every state-changing endpoint (see Finding 1).
+
 ## What was checked and found clean
 
 - **No reentrancy / share-inflation** in `TesseraPool`: internal asset
