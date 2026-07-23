@@ -121,6 +121,27 @@ export async function deployLocal(agentAddress: Hex, mint = usdc("1")): Promise<
   return { usdcAddress, escrowAddress, tabAddress };
 }
 
+/** Mint MockUSDC to an address — the local-chain stand-in for a testnet faucet. */
+export async function mintUsdc(
+  deployment: LocalDeployment,
+  to: Hex,
+  amount: bigint
+): Promise<Hex> {
+  const deployer = privateKeyToAccount(DEV_KEYS.deployer);
+  const wallet = createWalletClient({ account: deployer, chain: localChain, transport: http() });
+  const pub = createPublicClient({ chain: localChain, transport: http() });
+  const hash = await wallet.writeContract({
+    address: deployment.usdcAddress,
+    abi: mockUsdcAbi,
+    functionName: "mint",
+    args: [to, amount],
+    account: deployer,
+    chain: localChain,
+  });
+  await pub.waitForTransactionReceipt({ hash });
+  return hash;
+}
+
 /** Fund a provider with USDC and bond it as stake in the escrow. */
 export async function stakeProvider(
   deployment: LocalDeployment,

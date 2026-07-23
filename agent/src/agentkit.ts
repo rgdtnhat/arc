@@ -1,6 +1,8 @@
 import type { Hex } from "viem";
 import { formatUsdc } from "@tessera/shared";
 import type { TesseraClient } from "./client.js";
+import type { Faucet } from "./circle/faucet.js";
+import type { TesseraTreasury } from "./treasury.js";
 
 /**
  * Agent Stack action layer.
@@ -38,6 +40,10 @@ export interface ActionKitOptions {
   providersBaseUrl?: string;
   /** Injectable fetch for tests / proxied environments. */
   fetchImpl?: typeof fetch;
+  /** Testnet faucet — enables the `request_faucet` action. */
+  faucet?: Faucet;
+  /** Treasury workflow — enables `treasury_snapshot` / `treasury_topup`. */
+  treasury?: TesseraTreasury;
 }
 
 /** A dispatchable registry of Tessera agent actions. */
@@ -230,6 +236,37 @@ export function createTesseraActions(
       handler: async (input: { tabId: string }) => ({ txHash: await client.reclaimTab(BigInt(input.tabId)) }),
     },
   ];
+
+  if (opts.faucet) {
+    actions.push({
+      name: "request_faucet",
+      description: "Request testnet USDC for the agent's own wallet from the faucet (Circle API, or manual instructions).",
+      kind: "onchain",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => opts.faucet!.request(client.account.address),
+    });
+  }
+
+  if (opts.treasury) {
+    actions.push({
+      name: "treasury_snapshot",
+      description: "Snapshot the agent's treasury: USDC balance, low-water mark, health, and runway.",
+      kind: "read",
+      inputSchema: {
+        type: "object",
+        properties: { referenceCallPrice: { type: "string", description: "optional USDC base units per call, for runway" } },
+      },
+      handler: async (input: { referenceCallPrice?: string }) =>
+        opts.treasury!.snapshot(input.referenceCallPrice ? BigInt(input.referenceCallPrice) : undefined),
+    });
+    actions.push({
+      name: "treasury_topup",
+      description: "Top up the agent's wallet from the faucet if its balance is below the treasury low-water mark.",
+      kind: "onchain",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => (await opts.treasury!.topUpIfLow()) ?? { ok: true, skipped: true, message: "balance healthy — no top-up needed" },
+    });
+  }
 
   return new TesseraActionKit(actions);
 }

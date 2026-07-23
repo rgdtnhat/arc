@@ -1,0 +1,110 @@
+import type { Hex } from "viem";
+
+/**
+ * Testnet USDC faucet.
+ *
+ * On Arc, USDC is the gas token, so an agent needs testnet USDC to do anything.
+ * This wraps getting it two ways:
+ *  - **Circle Faucet API** (`POST /v1/faucet/drips`) when a Circle API key is
+ *    configured — a real programmatic drip the agent can call autonomously.
+ *  - **Manual** otherwise — returns the public faucet URL + the address to
+ *    paste, so a human can top the agent up at https://faucet.circle.com/.
+ *
+ * The demo also plugs a local MockUSDC minter behind this same interface, so the
+ * dashboard's "Get testnet USDC" button works end to end on the local chain.
+ */
+export const CIRCLE_FAUCET_URL = "https://faucet.circle.com/";
+export const CIRCLE_FAUCET_API = "https://api.circle.com/v1/faucet/drips";
+
+export interface FaucetResult {
+  ok: boolean;
+  /** True when no programmatic drip is available — a human must use the web faucet. */
+  manual?: boolean;
+  address: Hex;
+  /** Web faucet URL to open when manual. */
+  url?: string;
+  txHash?: string;
+  amountUsdc?: string;
+  message: string;
+}
+
+export interface Faucet {
+  readonly kind: string;
+  request(address: Hex): Promise<FaucetResult>;
+}
+
+export interface CircleFaucetConfig {
+  /** Drip endpoint; defaults to Circle's when an API key is present. */
+  apiUrl?: string;
+  apiKey?: string;
+  /** Circle blockchain id, e.g. "ARC-SEPOLIA". */
+  blockchain?: string;
+  fetchImpl?: typeof fetch;
+}
+
+/** Faucet for Arc testnet USDC via Circle (API drip, or manual instructions). */
+export class CircleFaucet implements Faucet {
+  readonly kind = "circle";
+  constructor(private readonly cfg: CircleFaucetConfig = {}) {}
+
+  async request(address: Hex): Promise<FaucetResult> {
+    const apiUrl = this.cfg.apiUrl ?? (this.cfg.apiKey ? CIRCLE_FAUCET_API : undefined);
+    if (!apiUrl) {
+      return {
+        ok: false,
+        manual: true,
+        address,
+        url: CIRCLE_FAUCET_URL,
+        message: `Open ${CIRCLE_FAUCET_URL}, pick Arc Testnet + USDC, and paste ${address}`,
+      };
+    }
+    const doFetch = this.cfg.fetchImpl ?? fetch;
+    try {
+      const res = await doFetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(this.cfg.apiKey ? { Authorization: `Bearer ${this.cfg.apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          address,
+          blockchain: this.cfg.blockchain ?? "ARC-SEPOLIA",
+          native: true,
+          usdc: true,
+        }),
+      });
+      if (!res.ok) {
+        return {
+          ok: false,
+          address,
+          url: CIRCLE_FAUCET_URL,
+          message: `Circle faucet API returned HTTP ${res.status} — fall back to ${CIRCLE_FAUCET_URL}`,
+        };
+      }
+      const json = (await res.json().catch(() => ({}))) as { txHash?: string; data?: { txHash?: string } };
+      return {
+        ok: true,
+        address,
+        txHash: json.txHash ?? json.data?.txHash,
+        message: "Requested testnet USDC from the Circle faucet API",
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        address,
+        url: CIRCLE_FAUCET_URL,
+        message: `Circle faucet request failed (${String(err).slice(0, 80)}) — use ${CIRCLE_FAUCET_URL}`,
+      };
+    }
+  }
+}
+
+/** Build a CircleFaucet from env (uses Circle's API when CIRCLE_API_KEY is set). */
+export function faucetFromEnv(): CircleFaucet {
+  const apiKey = process.env.CIRCLE_API_KEY;
+  return new CircleFaucet({
+    apiUrl: process.env.CIRCLE_FAUCET_API_URL,
+    apiKey,
+    blockchain: process.env.CIRCLE_FAUCET_BLOCKCHAIN ?? "ARC-SEPOLIA",
+  });
+}

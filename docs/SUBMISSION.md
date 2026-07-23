@@ -49,7 +49,7 @@ the next integrations.
 - TesseraTab: `0x5d482c70ac56cdc44414a93446709fee17d78c6d`
 - Live transactions — settle `0xbbf5c98b…`, refund `0xf8a57c18…`, tab settle
   `0x15c13f79…` (all on testnet.arcscan.app), each status=success.
-- 56 automated tests (21 contract + 35 agent) and CI on every push; one-command
+- 64 automated tests (21 contract + 43 agent) and CI on every push; one-command
   live deploy via `npm run bootstrap:arc`.
 
 ## Links

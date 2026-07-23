@@ -5,6 +5,9 @@ import { TesseraAgent } from "./agent.js";
 import { DEMO_TASK } from "./scenario.js";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { paymasterFromEnv, describeGasMode } from "./circle/paymaster.js";
+import { faucetFromEnv } from "./circle/faucet.js";
+import { TesseraTreasury } from "./treasury.js";
+import { usdc } from "@tessera/shared";
 
 /**
  * Run the agent against a Tessera deployment on Arc testnet.
@@ -47,12 +50,26 @@ async function main() {
   console.log(`Agent ${account.address} on Arc testnet`);
   console.log(`USDC balance: ${formatUsdc(balance)}\n`);
 
+  // Treasury + faucet: a fresh agent with a low balance auto-requests testnet
+  // USDC from Circle's faucet (programmatic drip with CIRCLE_API_KEY, else a
+  // link to faucet.circle.com to fund this address).
+  const faucet = faucetFromEnv();
+  const treasury = new TesseraTreasury({
+    client,
+    lowWaterMark: usdc(process.env.TESSERA_TREASURY_LOW ?? "0.02"),
+    faucet,
+    onEvent: (m) => console.log(`  [treasury] ${m}`),
+  });
+  await treasury.topUpIfLow();
+
   const agent = new TesseraAgent({
     client,
     providersBaseUrl: providersUrl,
     brain,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
     explorer: true, // link tx hashes to Arcscan
+    faucet,
+    treasury,
     onEvent: (e) =>
       console.log(`  [agent] ${e.message}${e.txUrl ? " " + e.txUrl : ""}`),
   });

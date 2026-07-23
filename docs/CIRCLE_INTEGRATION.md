@@ -80,6 +80,39 @@ endpoint); without it the agent pays gas in USDC as today.
 
 Env: `CIRCLE_PAYMASTER_URL`, `CIRCLE_API_KEY`, `CIRCLE_PAYMASTER_SPONSOR_N`.
 
+## 4. App Kits — treasury & faucet workflow
+
+Circle **App Kits** are prebuilt payment/liquidity/**treasury** workflows. Tessera
+ships an App-Kit-style **treasury workflow** (`agent/src/treasury.ts`) that
+manages the agent's USDC working capital rather than a single payment:
+
+- **Runway snapshot** — balance vs. a low-water mark, health, and estimated
+  calls of runway (`treasury.snapshot()`; `GET /api/treasury`).
+- **Auto-refill** — when the balance drops below the low-water mark the agent
+  **requests testnet USDC from the faucet on its own** (`topUpIfLow()`), run as a
+  pre-flight before each scenario and on a fresh-agent `run:arc`.
+- **Settlement accounting** — opening vs. current balance, spent, reclaimed, and
+  net position over a run (`TesseraTreasury.settlement()`).
+
+### Faucet (`agent/src/circle/faucet.ts`)
+
+Getting the testnet USDC an agent needs, two ways behind one interface:
+
+- **Circle Faucet API** — with a Circle API key, `CircleFaucet` POSTs to
+  `https://api.circle.com/v1/faucet/drips` (`{ address, blockchain: "ARC-SEPOLIA",
+  usdc: true }`) so the agent drips **autonomously**.
+- **Manual** — without a key it returns the public faucet URL + the agent's
+  address to paste at **https://faucet.circle.com/**. The dashboard's **"Get
+  testnet USDC"** button and a `faucet.circle.com` link expose both to a human.
+
+In the local demo a MockUSDC minter sits behind the same `Faucet` interface, so
+the dashboard button drips real balance on-chain end to end. The treasury/faucet
+capabilities are also exposed as Agent Stack actions (`treasury_snapshot`,
+`treasury_topup`, `request_faucet`).
+
+Env: `CIRCLE_API_KEY`, `CIRCLE_FAUCET_BLOCKCHAIN` (default `ARC-SEPOLIA`),
+`CIRCLE_FAUCET_API_URL` (override), `TESSERA_TREASURY_LOW` (low-water mark).
+
 ## Why this is low-risk
 
 Tessera was built with these seams in mind:

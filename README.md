@@ -127,7 +127,7 @@ sponsorship. Both default to today's working path. See
 | Path          | What it is                                                        |
 |---------------|-------------------------------------------------------------------|
 | `contracts/`  | `TesseraEscrow` + `MockUSDC`, Hardhat + viem tests                 |
-| `agent/`      | Agent runtime: 402 handshake, hybrid decision engine, settle/refund, Agent Stack action layer, Circle wallet/Paymaster seams |
+| `agent/`      | Agent runtime: 402 handshake, hybrid decision engine, settle/refund, Agent Stack action layer, Circle wallet/Paymaster/faucet seams, treasury workflow |
 | `providers/`  | Mock priced services that speak the Tessera 402 protocol          |
 | `dashboard/`  | Live demo dashboard (balances, reputation, tx feed)               |
 | `shared/`     | Chain config, ABIs, protocol types shared across packages         |
@@ -158,7 +158,7 @@ MVP.
 
 ```bash
 npm install            # installs all workspaces
-npm run test           # 21 contract tests + 35 agent unit tests
+npm run test           # 21 contract tests + 43 agent unit tests
 npm run demo           # end-to-end local demo (chain + providers + agent + dashboard)
 npm run e2e            # the same scenario headless, one-shot (used in CI)
 ```

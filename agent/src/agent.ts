@@ -20,6 +20,8 @@ import {
 import { ApprovalQueue, type SpendingPolicy } from "./policy.js";
 import type { TrustMemory } from "./memory.js";
 import { createTesseraActions, type TesseraActionKit } from "./agentkit.js";
+import type { Faucet } from "./circle/faucet.js";
+import type { TesseraTreasury } from "./treasury.js";
 
 export type Brain = "rules" | "llm";
 
@@ -33,6 +35,10 @@ export interface AgentConfig {
   policy?: SpendingPolicy;
   /** Personal cross-run memory of providers (address book + trust penalty). */
   memory?: TrustMemory;
+  /** Testnet faucet, exposed as an Agent Stack `request_faucet` action. */
+  faucet?: Faucet;
+  /** Treasury workflow, exposed as `treasury_snapshot` / `treasury_topup`. */
+  treasury?: TesseraTreasury;
   onEvent?: (e: AgentEvent) => void;
 }
 
@@ -78,6 +84,8 @@ export class TesseraAgent {
   actionKit(): TesseraActionKit {
     return createTesseraActions(this.cfg.client, {
       providersBaseUrl: this.cfg.providersBaseUrl,
+      faucet: this.cfg.faucet,
+      treasury: this.cfg.treasury,
     });
   }
 

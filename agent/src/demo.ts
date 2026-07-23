@@ -15,10 +15,13 @@ import {
   DEV_KEYS,
   deployLocal,
   localChain,
+  mintUsdc,
   stakeProvider,
   startLocalNode,
 } from "./local.js";
 import { usdc } from "@tessera/shared";
+import { TesseraTreasury } from "./treasury.js";
+import type { Faucet } from "./circle/faucet.js";
 
 const PROVIDERS_PORT = 8788;
 // Cloud hosts inject $PORT; default to 8787 locally. Providers stay internal.
@@ -107,6 +110,24 @@ async function main() {
     path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-memory.json")
   );
 
+  // Local faucet: the on-chain stand-in for faucet.circle.com. On this MockUSDC
+  // chain the deployer mints straight to the agent, so the dashboard's "Get
+  // testnet USDC" button drips real balance end to end. On Arc testnet this is a
+  // CircleFaucet (Circle Faucet API with a key, else a link to faucet.circle.com).
+  const localFaucet: Faucet = {
+    kind: "mock",
+    async request(address) {
+      const txHash = await mintUsdc(deployment, address, usdc("0.05"));
+      return { ok: true, address, amountUsdc: "0.05", txHash, message: "Minted 0.05 test USDC (local faucet)" };
+    },
+  };
+  const treasury = new TesseraTreasury({
+    client,
+    lowWaterMark: usdc("0.02"),
+    faucet: localFaucet,
+    onEvent: (message) => pushEvent({ source: "agent", ts: Date.now(), level: "info", message } as UiEvent),
+  });
+
   const agent = new TesseraAgent({
     client,
     providersBaseUrl: `http://127.0.0.1:${PROVIDERS_PORT}`,
@@ -115,6 +136,8 @@ async function main() {
     explorer: false,
     policy,
     memory,
+    faucet: localFaucet,
+    treasury,
     onEvent: (e) => pushEvent({ ...e, source: "agent" }),
   });
   console.log(`🛡  Guardian policy: ${describePolicy(policy)}${policy.autoApprove ? " (auto-approve mode)" : ""}`);
@@ -138,6 +161,16 @@ async function main() {
 
   /** The full autonomous scenario: purchases, nanopay stream, then billing inbox. */
   async function runScenario() {
+    // Treasury pre-flight: check runway and auto-refill from the faucet if low.
+    const pre = await treasury.snapshot(usdc("0.004"));
+    pushEvent({
+      source: "agent",
+      ts: Date.now(),
+      level: "info",
+      message: `Treasury: ${pre.balanceUsdc} USDC (${pre.runwayCalls ?? "?"} calls runway) — ${pre.healthy ? "healthy" : "LOW"}`,
+    } as UiEvent);
+    await treasury.topUpIfLow();
+
     await agent.run(DEMO_TASK);
     const stream = await agent.streamTicks("ticker:stream", 6);
     if (stream) {
@@ -192,6 +225,8 @@ async function main() {
     const agentBalance = await client.usdcBalance();
     const settled = ledgerRef.filter((e) => e.status === "settled");
     const refunded = ledgerRef.filter((e) => e.status === "refunded");
+    const treasurySnapshot = await treasury.snapshot(usdc("0.004"));
+    const settlement = TesseraTreasury.settlement(ledgerRef, startBalance, agentBalance);
     res.json({
       meta: {
         brain,
@@ -234,6 +269,7 @@ async function main() {
       approvals: agent.approvals.list(),
       policy: { autoApproveMaxUsdc: formatUsdc(policy.autoApproveMax), autoApprove: policy.autoApprove },
       contacts: memory.list(),
+      treasury: { ...treasurySnapshot, settlement, faucetUrl: "https://faucet.circle.com/" },
       balanceHistory,
       invoices: await fetch(`http://127.0.0.1:${PROVIDERS_PORT}/invoices`)
         .then((r) => r.json())
@@ -257,6 +293,22 @@ async function main() {
   // typed tool manifest (MCP / Circle Agent Stack shape).
   app.get("/api/actions", (_req, res) => {
     res.json({ actions: agent.actionKit().manifest() });
+  });
+
+  // Treasury workflow snapshot: balance, low-water mark, health, runway.
+  app.get("/api/treasury", async (_req, res) => {
+    res.json(await treasury.snapshot(usdc("0.004")));
+  });
+
+  // Faucet: drip testnet USDC to the agent (local mint here; Circle faucet on Arc).
+  app.post("/api/faucet", async (_req, res) => {
+    try {
+      const result = await treasury.requestFaucet();
+      onEventPushed();
+      res.status(result.ok ? 200 : 502).json(result);
+    } catch (e) {
+      res.status(500).json({ ok: false, message: String(e) });
+    }
   });
 
   // Guardian verdicts from the dashboard (the human co-signer).
