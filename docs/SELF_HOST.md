@@ -63,11 +63,39 @@ works.
 
 ## What's hosted
 
-A full autonomous run against a fresh local chain inside the container: escrow
-settlements, an SLA-breach refund with a stake slash, the guardian approval
-card, the nanopayment tab session, the billing inbox, and the mission briefing.
-The "Run again" button replays it. Your real contracts stay live on Arc testnet
-(`deployments/arc.json`).
+By default, a full autonomous run against a fresh local chain inside the
+container: escrow settlements, an SLA-breach refund with a stake slash, the
+guardian approval card, the nanopayment tab session, the billing inbox, and the
+mission briefing. The "Run again" button replays it — free, instant, replayable.
+The dashboard also shows your real Arc testnet deployment (`deployments/arc.json`)
+in a "Live on Arc testnet" card with Arcscan links.
+
+## Run live on Arc testnet (optional)
+
+To make the dashboard actually transact on Arc testnet (real USDC) instead of the
+local demo, give the container your deployment's keys. **These are testnet-only
+keys — never put mainnet/real-fund keys on a server.** Create a `.env` next to
+`docker-compose.yml` on the server:
+
+```bash
+SITE_ADDRESS=tesra.xyz, www.tesra.xyz
+TESSERA_LIVE=1
+AGENT_PRIVATE_KEY=0x...        # your Arc agent key
+PROVIDER_PRIVATE_KEY=0x...     # your Arc provider key
+# ARC_RPC_URL=https://rpc.testnet.arc.network   # optional override
+```
+
+Then `docker compose up -d --build`. The committed `deployments/arc.json` supplies
+the contract addresses, so live mode activates automatically when the keys are
+present. In live mode:
+
+- The dashboard reads real on-chain balances/reputation (reads are paced +
+  cached so the public RPC's rate limit doesn't break it).
+- It does **not** auto-run on restart — press **"Run live on Arc"** to spend real
+  testnet USDC on a scenario. Keep the agent funded at
+  [faucet.circle.com](https://faucet.circle.com/) (or the in-dashboard button).
+
+Set `TESSERA_LIVE=0` (or omit the keys) to go back to the free local demo.
 
 ## Just the static deck on shared hosting?
 

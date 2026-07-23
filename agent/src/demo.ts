@@ -1,10 +1,13 @@
 import express from "express";
 import path from "node:path";
 import { readFileSync } from "node:fs";
+import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
-import type { Hex } from "viem";
-import { formatUsdc } from "@tessera/shared";
+import type { Hex, Chain, Account } from "viem";
+import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS } from "@tessera/shared";
+import { buildAccount, type WalletMode } from "./wallet.js";
+import { faucetFromEnv } from "./circle/faucet.js";
 import { createProviderApp, type ProviderEvent } from "@tessera/providers";
 import { CATALOG } from "@tessera/providers/catalog";
 import { TesseraClient } from "./client.js";
@@ -45,43 +48,107 @@ const liveDeployment = (() => {
 
 type UiEvent = (AgentEvent & { source: "agent" }) | (ProviderEvent & { source: "provider"; ts: number; level: string });
 
+// Keep the long-lived dashboard alive across transient RPC failures (public-RPC
+// rate limits during a live-mode read shouldn't crash the whole server).
+process.on("unhandledRejection", (reason) => {
+  console.error(`[demo] unhandledRejection (ignored): ${String(reason).slice(0, 200)}`);
+});
+process.on("uncaughtException", (err) => {
+  console.error(`[demo] uncaughtException (ignored): ${String(err).slice(0, 200)}`);
+});
+
 async function main() {
-  console.log("⛓  Starting local Arc-like chain (Hardhat node)…");
-  const node = await startLocalNode();
+  // LIVE mode runs the scenario on Arc testnet (real USDC, real contracts). It
+  // engages when a recorded deployment + agent/provider keys are present, unless
+  // forced with TESSERA_LIVE=1/0. Otherwise it's the local in-container demo.
+  const canLive = !!liveDeployment && !!process.env.AGENT_PRIVATE_KEY && !!process.env.PROVIDER_PRIVATE_KEY;
+  const live = process.env.TESSERA_LIVE === "1" ? canLive : process.env.TESSERA_LIVE === "0" ? false : canLive;
+  if (process.env.TESSERA_LIVE === "1" && !canLive) {
+    console.error("⚠  TESSERA_LIVE=1 but missing deployments/arc.json or AGENT_/PROVIDER_PRIVATE_KEY — running the local demo instead.");
+  }
+  // Pace on-chain actions in live mode so the public RPC's burst limit can't break a run.
+  if (live) {
+    process.env.TESSERA_PACE_MS ??= "12000";
+    process.env.TESSERA_TICK_PACE_MS ??= "4000";
+    process.env.TESSERA_MIN_DEADLINE_SECONDS ??= "90";
+  }
+
+  let node: ChildProcess | null = null;
+  let chain: Chain;
+  let rpcUrl: string;
+  let usdcAddress: Hex, escrowAddress: Hex, tabAddress: Hex;
+  let agentAccount: Account;
+  let faucet: Faucet;
+  let chainLabel: string;
+  const providerKeys: Record<string, Hex> = {};
+
+  if (live) {
+    chain = arcTestnet;
+    rpcUrl = process.env.ARC_RPC_URL ?? "https://rpc.testnet.arc.network";
+    usdcAddress = ARC_USDC_ADDRESS;
+    escrowAddress = liveDeployment!.tesseraEscrow as Hex;
+    tabAddress = liveDeployment!.tesseraTab as Hex;
+    chainLabel = `Arc testnet (${liveDeployment!.chainId})`;
+    agentAccount = buildAccount({
+      mode: (process.env.WALLET_MODE as WalletMode) ?? "key",
+      privateKey: process.env.AGENT_PRIVATE_KEY as Hex,
+      role: "AGENT",
+    });
+    const provKey = process.env.PROVIDER_PRIVATE_KEY as Hex;
+    for (const s of CATALOG) {
+      const specific = process.env[`PROVIDER_KEY_${s.resource.replace(/[:.]/g, "_").toUpperCase()}`] as Hex | undefined;
+      providerKeys[s.resource] = specific ?? provKey;
+    }
+    faucet = faucetFromEnv();
+    console.log(`🔴 LIVE on ${chainLabel} — agent ${agentAccount.address}`);
+    console.log(`   escrow ${escrowAddress} · tab ${tabAddress}`);
+  } else {
+    console.log("⛓  Starting local Arc-like chain (Hardhat node)…");
+    node = await startLocalNode();
+    chain = localChain;
+    rpcUrl = "http://127.0.0.1:8545";
+    chainLabel = "Hardhat Local (31337)";
+    agentAccount = privateKeyToAccount(DEV_KEYS.agent);
+    console.log("📦 Deploying MockUSDC + TesseraEscrow + TesseraTab…");
+    const deployment = await deployLocal(agentAccount.address);
+    usdcAddress = deployment.usdcAddress;
+    escrowAddress = deployment.escrowAddress;
+    tabAddress = deployment.tabAddress;
+    console.log(`   USDC:   ${usdcAddress}`);
+    console.log(`   Escrow: ${escrowAddress}`);
+    console.log(`   Tab:    ${tabAddress}`);
+    Object.assign(providerKeys, {
+      "weather:current": DEV_KEYS.weather,
+      "weather:live": DEV_KEYS.weather,
+      "fx:quote": DEV_KEYS.fx,
+      "news:headlines": DEV_KEYS.news,
+      "ticker:stream": DEV_KEYS.ticker,
+      "alpha:report": DEV_KEYS.alpha,
+      // Subscriptions bill from the same on-chain identities as the base services.
+      "subscription:fx": DEV_KEYS.fx,
+      "subscription:news": DEV_KEYS.news,
+    });
+    console.log("🔒 Providers bonding stake (0.05 USDC each)…");
+    for (const key of new Set(Object.values(providerKeys))) {
+      await stakeProvider(deployment, key, usdc("0.05"));
+    }
+    // Local faucet: the deployer mints MockUSDC straight to the agent, so the
+    // dashboard's "Get testnet USDC" button drips real balance end to end.
+    faucet = {
+      kind: "mock",
+      async request(address) {
+        const txHash = await mintUsdc(deployment, address, usdc("0.05"));
+        return { ok: true, address, amountUsdc: "0.05", txHash, message: "Minted 0.05 test USDC (local faucet)" };
+      },
+    };
+  }
+
   const cleanup = () => {
     node?.kill();
     process.exit(0);
   };
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
-
-  const agentAccount = privateKeyToAccount(DEV_KEYS.agent);
-  console.log("📦 Deploying MockUSDC + TesseraEscrow + TesseraTab…");
-  const deployment = await deployLocal(agentAccount.address);
-  const { usdcAddress, escrowAddress, tabAddress } = deployment;
-  console.log(`   USDC:   ${usdcAddress}`);
-  console.log(`   Escrow: ${escrowAddress}`);
-  console.log(`   Tab:    ${tabAddress}`);
-
-  // Wire providers with one wallet per service.
-  const providerKeys: Record<string, Hex> = {
-    "weather:current": DEV_KEYS.weather,
-    "weather:live": DEV_KEYS.weather,
-    "fx:quote": DEV_KEYS.fx,
-    "news:headlines": DEV_KEYS.news,
-    "ticker:stream": DEV_KEYS.ticker,
-    "alpha:report": DEV_KEYS.alpha,
-    // Subscriptions bill from the same on-chain identities as the base services,
-    // so reputation, stake, and the agent's memory carry over.
-    "subscription:fx": DEV_KEYS.fx,
-    "subscription:news": DEV_KEYS.news,
-  };
-
-  // Providers bond stake — skin in the game the escrow can slash on SLA breach.
-  console.log("🔒 Providers bonding stake (0.05 USDC each)…");
-  for (const key of new Set(Object.values(providerKeys))) {
-    await stakeProvider(deployment, key, usdc("0.05"));
-  }
 
   const events: UiEvent[] = [];
   // Set after the client exists; called on every event to build the balance timeline.
@@ -96,8 +163,8 @@ async function main() {
   };
 
   const providerApp = createProviderApp({
-    chain: localChain,
-    rpcUrl: "http://127.0.0.1:8545",
+    chain,
+    rpcUrl,
     escrowAddress,
     tabAddress,
     providerKeys,
@@ -107,8 +174,8 @@ async function main() {
   console.log(`🛒 Providers marketplace on http://127.0.0.1:${PROVIDERS_PORT}`);
 
   const client = new TesseraClient({
-    chain: localChain,
-    rpcUrl: "http://127.0.0.1:8545",
+    chain,
+    rpcUrl,
     account: agentAccount,
     escrowAddress,
     usdcAddress,
@@ -124,21 +191,10 @@ async function main() {
     path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-memory.json")
   );
 
-  // Local faucet: the on-chain stand-in for faucet.circle.com. On this MockUSDC
-  // chain the deployer mints straight to the agent, so the dashboard's "Get
-  // testnet USDC" button drips real balance end to end. On Arc testnet this is a
-  // CircleFaucet (Circle Faucet API with a key, else a link to faucet.circle.com).
-  const localFaucet: Faucet = {
-    kind: "mock",
-    async request(address) {
-      const txHash = await mintUsdc(deployment, address, usdc("0.05"));
-      return { ok: true, address, amountUsdc: "0.05", txHash, message: "Minted 0.05 test USDC (local faucet)" };
-    },
-  };
   const treasury = new TesseraTreasury({
     client,
     lowWaterMark: usdc("0.02"),
-    faucet: localFaucet,
+    faucet,
     onEvent: (message) => pushEvent({ source: "agent", ts: Date.now(), level: "info", message } as UiEvent),
   });
 
@@ -147,10 +203,10 @@ async function main() {
     providersBaseUrl: `http://127.0.0.1:${PROVIDERS_PORT}`,
     brain,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-    explorer: false,
+    explorer: live, // link tx hashes to Arcscan when running on Arc
     policy,
     memory,
-    faucet: localFaucet,
+    faucet,
     treasury,
     onEvent: (e) => pushEvent({ ...e, source: "agent" }),
   });
@@ -161,6 +217,9 @@ async function main() {
   let ledgerRef: LedgerEntry[] = agent.ledger;
   let briefingLines: string[] = [];
   let streamSummary: { ticks: number; spentUsdc: string } | null = null;
+  // Cache of on-chain reads for /api/state (see readChainState). Invalidated
+  // after a run or a faucet drip so balances refresh promptly.
+  let chainCache: { at: number; providers: any[]; agentBalance: bigint } | null = null;
   // Wallet-style balance timeline for the dashboard sparkline.
   const balanceHistory: { ts: number; balance: string }[] = [];
   onEventPushed = () => {
@@ -192,6 +251,7 @@ async function main() {
     }
     await agent.processInvoices(usdc("0.01"));
     briefingLines = agent.briefing(stream?.data);
+    if (chainCache) chainCache.at = 0; // force a background refresh after the run
     pushEvent({
       source: "agent",
       ts: Date.now(),
@@ -208,46 +268,96 @@ async function main() {
   );
   app.use(express.static(dashboardDir));
 
-  app.get("/api/state", async (_req, res) => {
-    const providerAddrs = Object.fromEntries(
-      CATALOG.map((s) => [s.resource, privateKeyToAccount(providerKeys[s.resource]).address])
-    );
-    const providers = await Promise.all(
-      CATALOG.map(async (s) => {
-        const address = providerAddrs[s.resource] as Hex;
-        const [balance, rep, stake] = await Promise.all([
-          client.usdcBalance(address),
-          client.reputation(address),
-          client.stakeOf(address),
-        ]);
-        return {
-          resource: s.resource,
-          name: s.name,
-          address,
-          behavior: s.behavior,
-          billing: s.billing ?? "escrow",
-          balanceUsdc: formatUsdc(balance),
-          stakeUsdc: formatUsdc(stake),
-          reputation: {
-            fulfilled: Number(rep.fulfilled),
-            failed: Number(rep.failed),
-            earnedUsdc: formatUsdc(rep.earned),
-          },
-        };
-      })
-    );
+  const providerAddrs = Object.fromEntries(
+    CATALOG.map((s) => [s.resource, privateKeyToAccount(providerKeys[s.resource]).address])
+  );
+  // On-chain reads are cached, PACED, and refreshed in the background so a
+  // fast-polling dashboard never hammers the rate-limited public Arc RPC (which
+  // 429s after only a few calls). Requests always return instantly from cache.
+  const READ_TTL = live ? 20_000 : 800;
+  const READ_PACE = live ? 1_200 : 0; // ms between individual RPC calls
+  const POLL_MS = live ? 6_000 : 800;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  let refreshing = false;
+
+  async function refreshChain() {
+    // Services often share one on-chain wallet (all of them in live mode), so
+    // read each unique address once, sequentially, with a pace between calls.
+    const uniqueAddrs = [...new Set(Object.values(providerAddrs))] as Hex[];
+    const byAddr = new Map<string, { balance: bigint; rep: any; stake: bigint }>();
+    for (const addr of uniqueAddrs) {
+      const balance = await client.usdcBalance(addr);
+      if (READ_PACE) await sleep(READ_PACE);
+      const rep = await client.reputation(addr);
+      if (READ_PACE) await sleep(READ_PACE);
+      const stake = await client.stakeOf(addr);
+      if (READ_PACE) await sleep(READ_PACE);
+      byAddr.set(addr.toLowerCase(), { balance, rep, stake });
+    }
+    const providers = CATALOG.map((s) => {
+      const address = providerAddrs[s.resource] as Hex;
+      const { balance, rep, stake } = byAddr.get(address.toLowerCase())!;
+      return {
+        resource: s.resource,
+        name: s.name,
+        address,
+        behavior: s.behavior,
+        billing: s.billing ?? "escrow",
+        balanceUsdc: formatUsdc(balance),
+        stakeUsdc: formatUsdc(stake),
+        reputation: {
+          fulfilled: Number(rep.fulfilled),
+          failed: Number(rep.failed),
+          earnedUsdc: formatUsdc(rep.earned),
+        },
+      };
+    });
     const agentBalance = await client.usdcBalance();
+    chainCache = { at: Date.now(), providers, agentBalance };
+  }
+
+  // Ensure fresh-ish data without ever blocking a request: serve the cache and
+  // kick off a background refresh when it's stale.
+  function ensureChain() {
+    const stale = !chainCache || Date.now() - chainCache.at > READ_TTL;
+    if (stale && !refreshing) {
+      refreshing = true;
+      refreshChain()
+        .catch((err) => console.error(`[demo] chain refresh failed: ${String(err).slice(0, 120)}`))
+        .finally(() => (refreshing = false));
+    }
+    return chainCache ?? { at: 0, providers: [] as any[], agentBalance: 0n };
+  }
+
+  // Prime the cache once at startup (best-effort) so the first paint has data.
+  await refreshChain().catch(() => {});
+
+  app.get("/api/state", async (_req, res) => {
+    const { providers, agentBalance } = ensureChain();
     const settled = ledgerRef.filter((e) => e.status === "settled");
     const refunded = ledgerRef.filter((e) => e.status === "refunded");
-    const treasurySnapshot = await treasury.snapshot(usdc("0.004"));
+    // Derive the treasury snapshot from the balance we already read (no extra RPC call).
+    const lowWater = usdc("0.02");
+    const treasurySnapshot = {
+      address: agentAccount.address,
+      balance: agentBalance.toString(),
+      balanceUsdc: formatUsdc(agentBalance),
+      lowWaterUsdc: formatUsdc(lowWater),
+      healthy: agentBalance >= lowWater,
+      runwayCalls: Number(agentBalance / usdc("0.004")),
+    };
     const settlement = TesseraTreasury.settlement(ledgerRef, startBalance, agentBalance);
     res.json({
       meta: {
         brain,
-        chain: "Hardhat Local (31337)",
+        chain: chainLabel,
+        mode: live ? "live" : "local",
+        pollMs: POLL_MS,
         escrowAddress,
         usdcAddress,
-        note: "Local demo. Deploy to Arc testnet (chainId 5042002) with run:arc.",
+        note: live
+          ? "🔴 LIVE on Arc testnet — 'Run again' spends real testnet USDC. Fund the agent at faucet.circle.com."
+          : "Local demo on an in-container chain. Set TESSERA_LIVE=1 (with keys) to run on Arc testnet.",
         agentStack: agent.actionKit().manifest().map((a) => a.name),
         walletMode: (process.env.WALLET_MODE as string) ?? "key",
       },
@@ -312,13 +422,18 @@ async function main() {
 
   // Treasury workflow snapshot: balance, low-water mark, health, runway.
   app.get("/api/treasury", async (_req, res) => {
-    res.json(await treasury.snapshot(usdc("0.004")));
+    try {
+      res.json(await treasury.snapshot(usdc("0.004")));
+    } catch (e) {
+      res.status(200).json({ error: "rpc busy", message: String(e).slice(0, 120) });
+    }
   });
 
   // Faucet: drip testnet USDC to the agent (local mint here; Circle faucet on Arc).
   app.post("/api/faucet", async (_req, res) => {
     try {
       const result = await treasury.requestFaucet();
+      if (chainCache) chainCache.at = 0; // force a background refresh after the drip
       onEventPushed();
       res.status(result.ok ? 200 : 502).json(result);
     } catch (e) {
@@ -374,7 +489,12 @@ async function main() {
   await new Promise<void>((r) => app.listen(DASHBOARD_PORT, DASHBOARD_HOST, r));
   console.log(`\n🎟  Tessera dashboard listening on ${DASHBOARD_HOST}:${DASHBOARD_PORT}\n`);
 
-  // Kick off the scenario automatically.
+  // In live mode, don't auto-spend real USDC on every restart — wait for a human
+  // to press "Run again". The local demo runs once automatically for instant show.
+  if (live) {
+    console.log("🔴 LIVE mode: dashboard up with on-chain state. Press \"Run again\" (or POST /api/run) to run a real scenario on Arc.");
+    return;
+  }
   running = true;
   await runScenario();
   running = false;

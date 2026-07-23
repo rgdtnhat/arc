@@ -10,6 +10,13 @@ services:
     build: .
     environment:
       - PORT=8787
+      # Live mode: run the scenario on Arc testnet (real USDC) instead of the
+      # local demo chain. Set these in a .env file next to this compose file.
+      # Leave empty (default) to keep the free, replayable local demo.
+      - TESSERA_LIVE=${TESSERA_LIVE:-}
+      - AGENT_PRIVATE_KEY=${AGENT_PRIVATE_KEY:-}
+      - PROVIDER_PRIVATE_KEY=${PROVIDER_PRIVATE_KEY:-}
+      - ARC_RPC_URL=${ARC_RPC_URL:-}
       # Optional LLM brain:
       # - AGENT_BRAIN=llm
       # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}

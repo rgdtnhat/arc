@@ -386,8 +386,12 @@
 
         $("escrowLink").textContent = s.meta.escrowAddress;
         $("note").textContent = s.meta.note || "";
+        schedulePoll(s.meta.pollMs || 800);
+        const liveMode = s.meta.mode === "live";
+        $("chainPill").style.background = liveMode ? "rgba(255,107,107,.15)" : "";
+        $("chainPill").style.color = liveMode ? "#ff6b6b" : "";
         $("runBtn").disabled = s.running;
-        $("runBtn").textContent = s.running ? "Running…" : "Run again ↻";
+        $("runBtn").textContent = s.running ? "Running…" : liveMode ? "Run live on Arc ↻" : "Run again ↻";
 
         // Treasury & faucet workflow.
         const tr = s.treasury;
@@ -455,8 +459,18 @@
         }
       });
 
-      tick();
-      setInterval(tick, 800);
+      // Poll interval is driven by the server (slower in live mode to spare the
+      // rate-limited public RPC). Re-schedule when the advertised cadence changes.
+      let curPoll = 0;
+      let pollTimer = null;
+      function schedulePoll(ms) {
+        if (ms === curPoll) return;
+        curPoll = ms;
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(tick, ms);
+      }
+      (async () => { await tick(); })();
+      schedulePoll(800);
     </script>
   </body>
 </html>
