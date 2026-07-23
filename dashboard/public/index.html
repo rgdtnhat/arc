@@ -164,6 +164,37 @@
         <div class="kv" id="faucetMsg" style="margin-top:10px;display:none"></div>
       </div>
 
+      <div class="card" id="lendingCard" style="margin-top:18px;display:none">
+        <h2>🏦 Lending &amp; borrowing — TesseraPool (Blend-inspired)</h2>
+        <div style="display:flex;flex-wrap:wrap;gap:26px;align-items:flex-start;justify-content:space-between">
+          <div style="flex:1;min-width:250px">
+            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">USDC reserve</div>
+            <div style="display:flex;gap:22px;flex-wrap:wrap">
+              <div><div style="font-size:11px;color:var(--muted)">Liquidity</div><div id="lnCash" style="font-size:16px;font-weight:700">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Utilization</div><div id="lnUtil" style="font-size:16px;font-weight:700">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Borrow APR</div><div id="lnBorrowApr" style="font-size:16px;font-weight:700;color:var(--warn)">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Supply APR</div><div id="lnSupplyApr" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
+            </div>
+          </div>
+          <div style="flex:1;min-width:250px">
+            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Agent position</div>
+            <div style="display:flex;gap:22px;flex-wrap:wrap">
+              <div><div style="font-size:11px;color:var(--muted)">Supplied</div><div id="lnSupplied" style="font-size:16px;font-weight:700">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Borrowed</div><div id="lnBorrowed" style="font-size:16px;font-weight:700">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Limit</div><div id="lnLimit" style="font-size:16px;font-weight:700">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Health</div><div id="lnHealth" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:16px">
+          <button class="btn" data-lend="supply" data-asset="usdc" data-amount="10000000">Supply 10 USDC</button>
+          <button class="btn" data-lend="withdraw" data-asset="usdc" data-amount="10000000">Withdraw 10 USDC</button>
+          <button class="btn" data-lend="borrow" data-asset="usdc" data-amount="2000000">Borrow 2 USDC</button>
+          <button class="btn" data-lend="repay" data-asset="usdc" data-amount="2000000">Repay 2 USDC</button>
+        </div>
+        <div class="kv" id="lendingMsg" style="margin-top:10px;display:none"></div>
+      </div>
+
       <div class="card" id="liveCard" style="margin-top:18px;display:none;border-color:#3a2a2a">
         <h2 style="color:#ff6b6b">🔴 Live on Arc testnet — real on-chain deployment</h2>
         <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
@@ -407,6 +438,21 @@
           if (tr.faucetUrl) $("faucetLink").href = tr.faucetUrl;
         }
 
+        // Lending & borrowing (TesseraPool).
+        const ln = s.lending;
+        if (ln) {
+          $("lendingCard").style.display = "block";
+          $("lnCash").textContent = ln.usdcReserve.cashUsdc + " USDC";
+          $("lnUtil").textContent = ln.usdcReserve.utilizationPct + "%";
+          $("lnBorrowApr").textContent = ln.usdcReserve.borrowApr + "%";
+          $("lnSupplyApr").textContent = ln.usdcReserve.supplyApr + "%";
+          $("lnSupplied").textContent = "$" + ln.account.suppliedUsd;
+          $("lnBorrowed").textContent = "$" + ln.account.borrowedUsd;
+          $("lnLimit").textContent = "$" + ln.account.borrowLimitUsd;
+          $("lnHealth").textContent = ln.account.healthFactor;
+          window.__lendingAssets = ln.assets;
+        }
+
         // Live Arc testnet deployment (from deployments/arc.json).
         const live = s.live;
         if (live && live.agent) {
@@ -457,6 +503,32 @@
           btn.textContent = "Get testnet USDC ⛽";
           tick();
         }
+      });
+
+      // Lending action buttons (supply / withdraw / borrow / repay).
+      document.querySelectorAll("[data-lend]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const assets = window.__lendingAssets;
+          if (!assets) return;
+          const asset = assets[btn.dataset.asset];
+          const msg = $("lendingMsg");
+          btn.disabled = true;
+          try {
+            const r = await (
+              await fetch(`/api/lending/${btn.dataset.lend}?asset=${asset}&amount=${btn.dataset.amount}`, { method: "POST" })
+            ).json();
+            msg.style.display = "block";
+            msg.textContent = r.ok ? `${btn.dataset.lend} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;
+            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
+          } catch {
+            msg.style.display = "block";
+            msg.textContent = "request failed";
+            msg.style.color = "var(--warn)";
+          } finally {
+            btn.disabled = false;
+            tick();
+          }
+        });
       });
 
       // Poll interval is driven by the server (slower in live mode to spare the

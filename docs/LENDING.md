@@ -56,13 +56,23 @@ supplyBalance(asset, user) / borrowBalance(asset, user)
 
 Run the suite: `npm test` (7 pool tests in `contracts/test/TesseraPool.test.ts`).
 
+## Agent integration (live in the demo)
+
+The dashboard demo deploys `TesseraPool` on the local chain (USDC + wBTC reserves,
+100 USDC seeded), gives the agent 0.5 wBTC ($15k) of collateral, and runs a
+**lending pre-flight**: the agent supplies its collateral and draws a small USDC
+credit line against it. The dashboard's **Lending & borrowing** panel shows the
+USDC reserve (liquidity, utilization, borrow/supply APR) and the agent's live
+position (supplied, borrowed, limit, health factor), with **Supply / Withdraw /
+Borrow / Repay** buttons that execute on-chain. The agent reaches the pool through
+Agent Stack actions: `pool_supply`, `pool_withdraw`, `pool_borrow`, `pool_repay`,
+`pool_account`, `pool_reserve` (`agent/src/pool.ts`, `agent/src/agentkit.ts`).
+
 ## Roadmap
 
 - A dedicated **backstop module** (first-loss LP capital that earns the take-rate),
   closer to Blend's full design.
 - **Reactive interest rates** (Blend adjusts the curve toward target utilization
   over time) rather than a fixed kink.
-- Agent integration: an autonomous **treasury agent** that supplies idle USDC for
-  yield and draws a credit line to smooth its pay-per-call spending, plus a
-  dashboard lending panel. The `TesseraPool` ABI is already exported to
-  `@tessera/shared` for this.
+- **Deploy TesseraPool to Arc testnet** (currently local-demo only) and expose the
+  lending panel in live mode.

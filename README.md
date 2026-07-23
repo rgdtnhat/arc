@@ -185,7 +185,7 @@ MVP.
 
 ```bash
 npm install            # installs all workspaces
-npm run test           # 28 contract tests + 46 agent unit tests
+npm run test           # 28 contract tests + 47 agent unit tests
 npm run demo           # end-to-end local demo (chain + providers + agent + dashboard)
 npm run fleet          # N agents transacting in parallel, each with its own wallet
 npm run e2e            # the same scenario headless, one-shot (used in CI)

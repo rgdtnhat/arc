@@ -16,6 +16,10 @@ import {
   tesseraTabBytecode,
   mockUsdcAbi,
   mockUsdcBytecode,
+  tesseraPoolAbi,
+  tesseraPoolBytecode,
+  mockTokenAbi,
+  mockTokenBytecode,
   usdc,
 } from "@tessera/shared";
 
@@ -154,6 +158,81 @@ export async function mintUsdc(
   });
   await pub.waitForTransactionReceipt({ hash });
   return hash;
+}
+
+/** Mint a MockToken (e.g. wBTC collateral) to an address. */
+export async function mintToken(token: Hex, to: Hex, amount: bigint): Promise<void> {
+  const deployer = privateKeyToAccount(DEV_KEYS.deployer);
+  const wallet = createWalletClient({ account: deployer, chain: localChain, transport: http() });
+  const pub = createPublicClient({ chain: localChain, transport: http() });
+  const hash = await wallet.writeContract({
+    address: token,
+    abi: mockTokenAbi,
+    functionName: "mint",
+    args: [to, amount],
+    account: deployer,
+    chain: localChain,
+  });
+  await pub.waitForTransactionReceipt({ hash });
+}
+
+export interface PoolDeployment {
+  poolAddress: Hex;
+  wbtcAddress: Hex;
+  usdcAddress: Hex;
+}
+
+const USD = 10n ** 8n; // price scale
+
+/**
+ * Deploy TesseraPool with a USDC (borrowable) reserve and a wBTC (collateral)
+ * reserve, then seed USDC liquidity so there's something to borrow. `treasury`
+ * receives the protocol reserve fee.
+ */
+export async function deployPool(
+  usdcAddress: Hex,
+  treasury: Hex,
+  seedLiquidity = usdc("100")
+): Promise<PoolDeployment> {
+  const deployer = privateKeyToAccount(DEV_KEYS.deployer);
+  const wallet = createWalletClient({ account: deployer, chain: localChain, transport: http() });
+  const pub = createPublicClient({ chain: localChain, transport: http() });
+  const send = async (address: Hex, abi: any, functionName: string, args: unknown[]) => {
+    const hash = await wallet.writeContract({ address, abi, functionName, args, account: deployer, chain: localChain });
+    await pub.waitForTransactionReceipt({ hash });
+  };
+
+  const wbtcHash = await wallet.deployContract({
+    abi: mockTokenAbi,
+    bytecode: mockTokenBytecode,
+    args: ["Mock BTC", "wBTC", 8],
+    account: deployer,
+    chain: localChain,
+  });
+  const wbtcAddress = (await pub.waitForTransactionReceipt({ hash: wbtcHash })).contractAddress!;
+
+  const poolHash = await wallet.deployContract({
+    abi: tesseraPoolAbi,
+    bytecode: tesseraPoolBytecode,
+    args: [treasury],
+    account: deployer,
+    chain: localChain,
+  });
+  const poolAddress = (await pub.waitForTransactionReceipt({ hash: poolHash })).contractAddress!;
+
+  // USDC: borrowable, 90% collateral / 95% liability factor, 10% reserve fee.
+  await send(poolAddress, tesseraPoolAbi, "addReserve", [usdcAddress, 9000, 9500, 1000, true, 6, USD]);
+  // wBTC: collateral only, 70% CF, priced at $30k.
+  await send(poolAddress, tesseraPoolAbi, "addReserve", [wbtcAddress, 7000, 8000, 1000, false, 8, 30000n * USD]);
+
+  // Seed USDC liquidity so agents can borrow.
+  if (seedLiquidity > 0n) {
+    await send(usdcAddress, mockUsdcAbi, "mint", [deployer.address, seedLiquidity]);
+    await send(usdcAddress, mockUsdcAbi, "approve", [poolAddress, seedLiquidity]);
+    await send(poolAddress, tesseraPoolAbi, "supply", [usdcAddress, seedLiquidity]);
+  }
+
+  return { poolAddress, wbtcAddress, usdcAddress };
 }
 
 /** Fund a provider with USDC and bond it as stake in the escrow. */

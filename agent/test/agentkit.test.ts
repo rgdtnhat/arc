@@ -116,3 +116,27 @@ test("invoking an unknown action throws", async () => {
   const kit = createTesseraActions(client);
   await assert.rejects(() => kit.invoke("nope"), /unknown action: nope/);
 });
+
+test("lending actions appear and dispatch when a pool is provided", async () => {
+  const { client } = fakeClient();
+  const calls: Record<string, unknown[]> = {};
+  const rec = (k: string, ...a: unknown[]) => ((calls[k] ??= []).push(a));
+  const pool = {
+    supply: async (asset: string, amount: bigint) => (rec("supply", asset, amount), "0xsup"),
+    withdraw: async () => "0xwd",
+    borrow: async (asset: string, amount: bigint) => (rec("borrow", asset, amount), "0xbor"),
+    repay: async () => "0xrep",
+    accountData: async () => ({ supplyValue: 1500n, borrowValue: 500n, borrowLimit: 1000n, healthFactor: 2n * 10n ** 18n }),
+    reserveData: async () => ({ cash: 100n, totalBorrows: 50n, utilizationWad: 5n * 10n ** 17n, borrowAprWad: 35n * 10n ** 15n, supplyAprWad: 15n * 10n ** 15n }),
+  } as any;
+  const kit = createTesseraActions(client, { pool });
+  const names = kit.manifest().map((a) => a.name);
+  for (const n of ["pool_supply", "pool_withdraw", "pool_borrow", "pool_repay", "pool_account", "pool_reserve"]) {
+    assert.ok(names.includes(n), `missing ${n}`);
+  }
+  const borrow = await kit.invoke<{ txHash: string }>("pool_borrow", { asset: "0x00000000000000000000000000000000000000bb", amount: "2000000" });
+  assert.equal(borrow.txHash, "0xbor");
+  assert.deepEqual(calls.borrow[0], ["0x00000000000000000000000000000000000000bb", 2000000n]);
+  const acct = await kit.invoke<{ healthFactor: string }>("pool_account");
+  assert.equal(acct.healthFactor, (2n * 10n ** 18n).toString());
+});

@@ -18,13 +18,17 @@ import { DEMO_TASK, DEMO_POLICY } from "./scenario.js";
 import {
   DEV_KEYS,
   deployLocal,
+  deployPool,
   localChain,
+  mintToken,
   mintUsdc,
   stakeProvider,
   startLocalNode,
+  type PoolDeployment,
 } from "./local.js";
 import { usdc } from "@tessera/shared";
 import { TesseraTreasury } from "./treasury.js";
+import { TesseraPoolClient } from "./pool.js";
 import type { Faucet } from "./circle/faucet.js";
 
 const PROVIDERS_PORT = 8788;
@@ -80,6 +84,7 @@ async function main() {
   let agentAccount: Account;
   let faucet: Faucet;
   let chainLabel: string;
+  let poolDeployment: PoolDeployment | null = null; // TesseraPool (local demo only)
   const providerKeys: Record<string, Hex> = {};
 
   if (live) {
@@ -132,6 +137,12 @@ async function main() {
     for (const key of new Set(Object.values(providerKeys))) {
       await stakeProvider(deployment, key, usdc("0.05"));
     }
+    // Lending: deploy TesseraPool (USDC + wBTC reserves, seeded liquidity) and
+    // give the agent 0.5 wBTC ($15k) of collateral to borrow against.
+    console.log("🏦 Deploying TesseraPool (lending) + seeding liquidity…");
+    poolDeployment = await deployPool(usdcAddress, privateKeyToAccount(DEV_KEYS.deployer).address, usdc("100"));
+    await mintToken(poolDeployment.wbtcAddress, agentAccount.address, 50_000_000n); // 0.5 wBTC (8dp)
+    console.log(`   Pool: ${poolDeployment.poolAddress} · wBTC: ${poolDeployment.wbtcAddress}`);
     // Local faucet: the deployer mints MockUSDC straight to the agent, so the
     // dashboard's "Get testnet USDC" button drips real balance end to end.
     faucet = {
@@ -182,6 +193,11 @@ async function main() {
     tabAddress,
   });
 
+  // Lending pool client (local demo only — no pool deployed on Arc yet).
+  const poolClient = poolDeployment
+    ? new TesseraPoolClient({ chain, rpcUrl, account: agentAccount, poolAddress: poolDeployment.poolAddress })
+    : undefined;
+
   // Guardian policy: one-shot/CI runs auto-approve so they don't block on a human.
   const policy = {
     ...DEMO_POLICY,
@@ -208,9 +224,27 @@ async function main() {
     memory,
     faucet,
     treasury,
+    pool: poolClient,
     onEvent: (e) => pushEvent({ ...e, source: "agent" }),
   });
   console.log(`🛡  Guardian policy: ${describePolicy(policy)}${policy.autoApprove ? " (auto-approve mode)" : ""}`);
+
+  // Lending pre-flight: the agent puts its wBTC collateral to work and draws a
+  // small USDC credit line against it — a live position for the lending panel.
+  if (poolClient && poolDeployment) {
+    try {
+      await poolClient.supply(poolDeployment.wbtcAddress, 50_000_000n); // 0.5 wBTC
+      await poolClient.borrow(usdcAddress, usdc("5")); // credit line
+      pushEvent({
+        source: "agent",
+        ts: Date.now(),
+        level: "info",
+        message: "Lending: supplied 0.5 wBTC collateral, drew a 5 USDC credit line on TesseraPool",
+      } as UiEvent);
+    } catch (e) {
+      console.error(`[lending] pre-flight failed: ${String(e).slice(0, 120)}`);
+    }
+  }
 
   const startBalance = await client.usdcBalance();
   let running = false;
@@ -332,6 +366,67 @@ async function main() {
   // Prime the cache once at startup (best-effort) so the first paint has data.
   await refreshChain().catch(() => {});
 
+  // --- Lending (TesseraPool) ------------------------------------------------
+  const fmtApr = (wad: bigint) => ((Number(wad) / 1e18) * 100).toFixed(2);
+  const fmtUsd = (v: bigint) => (Number(v) / 1e8).toFixed(2);
+  async function lendingState() {
+    if (!poolClient || !poolDeployment) return null;
+    try {
+      const [usdcR, acct, borrowedUsdc] = await Promise.all([
+        poolClient.reserveData(usdcAddress),
+        poolClient.accountData(),
+        poolClient.borrowBalance(usdcAddress),
+      ]);
+      const hf = acct.healthFactor;
+      return {
+        poolAddress: poolDeployment.poolAddress,
+        assets: { usdc: usdcAddress, wbtc: poolDeployment.wbtcAddress },
+        usdcReserve: {
+          cashUsdc: formatUsdc(usdcR.cash),
+          borrowsUsdc: formatUsdc(usdcR.totalBorrows),
+          utilizationPct: ((Number(usdcR.utilizationWad) / 1e18) * 100).toFixed(1),
+          borrowApr: fmtApr(usdcR.borrowAprWad),
+          supplyApr: fmtApr(usdcR.supplyAprWad),
+        },
+        account: {
+          suppliedUsd: fmtUsd(acct.supplyValue),
+          borrowedUsd: fmtUsd(acct.borrowValue),
+          borrowLimitUsd: fmtUsd(acct.borrowLimit),
+          borrowedUsdc: formatUsdc(borrowedUsdc),
+          healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
+        },
+      };
+    } catch (e) {
+      console.error(`[lending] read failed: ${String(e).slice(0, 100)}`);
+      return null;
+    }
+  }
+
+  // Agent-driven lending actions from the dashboard.
+  app.post("/api/lending/:action", async (req, res) => {
+    if (!poolClient || !poolDeployment) {
+      res.status(404).json({ ok: false, error: "lending not available (live mode has no pool deployed)" });
+      return;
+    }
+    const asset = (req.query.asset as Hex) ?? usdcAddress;
+    const amount = BigInt((req.query.amount as string) ?? "0");
+    try {
+      const p = poolClient;
+      const a = req.params.action;
+      const txHash =
+        a === "supply" ? await p.supply(asset, amount)
+        : a === "withdraw" ? await p.withdraw(asset, amount)
+        : a === "borrow" ? await p.borrow(asset, amount)
+        : a === "repay" ? await p.repay(asset, amount)
+        : null;
+      if (txHash === null) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
+      if (chainCache) chainCache.at = 0;
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e).slice(0, 200) });
+    }
+  });
+
   app.get("/api/state", async (_req, res) => {
     const { providers, agentBalance } = ensureChain();
     const settled = ledgerRef.filter((e) => e.status === "settled");
@@ -395,6 +490,7 @@ async function main() {
       contacts: memory.list(),
       treasury: { ...treasurySnapshot, settlement, faucetUrl: "https://faucet.circle.com/" },
       live: liveDeployment,
+      lending: await lendingState(),
       balanceHistory,
       invoices: await fetch(`http://127.0.0.1:${PROVIDERS_PORT}/invoices`)
         .then((r) => r.json())

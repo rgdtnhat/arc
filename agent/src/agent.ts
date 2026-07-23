@@ -22,6 +22,7 @@ import type { TrustMemory } from "./memory.js";
 import { createTesseraActions, type TesseraActionKit } from "./agentkit.js";
 import type { Faucet } from "./circle/faucet.js";
 import type { TesseraTreasury } from "./treasury.js";
+import type { TesseraPoolClient } from "./pool.js";
 
 export type Brain = "rules" | "llm";
 
@@ -39,6 +40,8 @@ export interface AgentConfig {
   faucet?: Faucet;
   /** Treasury workflow, exposed as `treasury_snapshot` / `treasury_topup`. */
   treasury?: TesseraTreasury;
+  /** Lending pool client, exposed as pool_supply / pool_borrow / etc. */
+  pool?: TesseraPoolClient;
   onEvent?: (e: AgentEvent) => void;
 }
 
@@ -86,6 +89,7 @@ export class TesseraAgent {
       providersBaseUrl: this.cfg.providersBaseUrl,
       faucet: this.cfg.faucet,
       treasury: this.cfg.treasury,
+      pool: this.cfg.pool,
     });
   }
 

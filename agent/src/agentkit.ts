@@ -3,6 +3,7 @@ import { formatUsdc } from "@tessera/shared";
 import type { TesseraClient } from "./client.js";
 import type { Faucet } from "./circle/faucet.js";
 import type { TesseraTreasury } from "./treasury.js";
+import type { TesseraPoolClient } from "./pool.js";
 
 /**
  * Agent Stack action layer.
@@ -44,6 +45,8 @@ export interface ActionKitOptions {
   faucet?: Faucet;
   /** Treasury workflow — enables `treasury_snapshot` / `treasury_topup`. */
   treasury?: TesseraTreasury;
+  /** Lending pool client — enables pool_supply / pool_borrow / etc. */
+  pool?: TesseraPoolClient;
 }
 
 /** A dispatchable registry of Tessera agent actions. */
@@ -266,6 +269,73 @@ export function createTesseraActions(
       inputSchema: { type: "object", properties: {} },
       handler: async () => (await opts.treasury!.topUpIfLow()) ?? { ok: true, skipped: true, message: "balance healthy — no top-up needed" },
     });
+  }
+
+  if (opts.pool) {
+    const pool = opts.pool;
+    const assetProp = { asset: { type: "string", description: "reserve token address" } };
+    const amtProp = { ...assetProp, amount: { type: "string", description: "base units" } };
+    actions.push(
+      {
+        name: "pool_supply",
+        description: "Supply an asset to the lending pool to earn yield (also usable as collateral).",
+        kind: "payment",
+        inputSchema: { type: "object", properties: amtProp, required: ["asset", "amount"] },
+        handler: async (i: { asset: Hex; amount: string }) => ({ txHash: await pool.supply(i.asset, BigInt(i.amount)) }),
+      },
+      {
+        name: "pool_withdraw",
+        description: "Withdraw supplied assets from the lending pool (blocked if it would make you insolvent).",
+        kind: "payment",
+        inputSchema: { type: "object", properties: amtProp, required: ["asset", "amount"] },
+        handler: async (i: { asset: Hex; amount: string }) => ({ txHash: await pool.withdraw(i.asset, BigInt(i.amount)) }),
+      },
+      {
+        name: "pool_borrow",
+        description: "Borrow a borrowable asset against your supplied collateral (health-checked).",
+        kind: "payment",
+        inputSchema: { type: "object", properties: amtProp, required: ["asset", "amount"] },
+        handler: async (i: { asset: Hex; amount: string }) => ({ txHash: await pool.borrow(i.asset, BigInt(i.amount)) }),
+      },
+      {
+        name: "pool_repay",
+        description: "Repay borrowed assets to the lending pool.",
+        kind: "payment",
+        inputSchema: { type: "object", properties: amtProp, required: ["asset", "amount"] },
+        handler: async (i: { asset: Hex; amount: string }) => ({ txHash: await pool.repay(i.asset, BigInt(i.amount)) }),
+      },
+      {
+        name: "pool_account",
+        description: "Read the agent's lending position: supply/borrow value, borrow limit, and health factor.",
+        kind: "read",
+        inputSchema: { type: "object", properties: {} },
+        handler: async () => {
+          const a = await pool.accountData();
+          return {
+            supplyValueUsd: a.supplyValue.toString(),
+            borrowValueUsd: a.borrowValue.toString(),
+            borrowLimitUsd: a.borrowLimit.toString(),
+            healthFactor: a.healthFactor.toString(),
+          };
+        },
+      },
+      {
+        name: "pool_reserve",
+        description: "Read a reserve's stats: cash, total borrows, utilization, and borrow/supply APR.",
+        kind: "read",
+        inputSchema: { type: "object", properties: assetProp, required: ["asset"] },
+        handler: async (i: { asset: Hex }) => {
+          const r = await pool.reserveData(i.asset);
+          return {
+            cash: r.cash.toString(),
+            totalBorrows: r.totalBorrows.toString(),
+            utilizationWad: r.utilizationWad.toString(),
+            borrowAprWad: r.borrowAprWad.toString(),
+            supplyAprWad: r.supplyAprWad.toString(),
+          };
+        },
+      }
+    );
   }
 
   return new TesseraActionKit(actions);
