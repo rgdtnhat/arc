@@ -1,7 +1,7 @@
 # Tessera — deck speaker notes (exact words)
 
 10 slides, ~15–20s of speech each. Bold = what's on the slide; the quote is what
-you say. Total ≈ 3 minutes if you also demo; ≈ 2:30 for slides alone.
+you say. Total ≈ 3 minutes with the live run; ≈ 2:30 for slides alone.
 
 ---
 
@@ -28,7 +28,7 @@ you say. Total ≈ 3 minutes if you also demo; ≈ 2:30 for slides alone.
 ## Slide 3 — The insight
 **The missing primitive isn't "send USDC." It's escrow + SLA + reputation.**
 
-> "Most agent-payment demos stop at 'the agent sends USDC.' But a raw transfer
+> "Most agent-payment projects stop at 'the agent sends USDC.' But a raw transfer
 > doesn't make a stranger safe to deal with. The missing primitive is programmable
 > escrow, with a service-level guarantee and reputation attached. That's what lets
 > an agent buy from someone it has never met."
@@ -58,7 +58,7 @@ you say. Total ≈ 3 minutes if you also demo; ≈ 2:30 for slides alone.
 
 ---
 
-## Slide 6 — Live demo
+## Slide 6 — Live run
 **[dashboard screenshot] settled · refunded · guardian · tab · billing inbox — one autonomous run**
 
 > "This is one autonomous run. The agent buys weather and FX and settles them. The
@@ -91,16 +91,16 @@ you say. Total ≈ 3 minutes if you also demo; ≈ 2:30 for slides alone.
 ---
 
 ## Slide 9 — Traction & quality
-**64 tests · CI on every push · one-command live deploy · offline-capable build**
+**75 tests · CI on every push · one-command live deploy · offline-capable build**
 
-> "On execution: sixty-four automated tests, CI running the full agentic scenario
+> "On execution: seventy-five automated tests, CI running the full agentic scenario
 > on every push, and a one-command live deploy to Arc. We optimized for quality
 > over surface area — every feature you saw is tested and runs end to end."
 
 ---
 
 ## Slide 10 — Vision / ask
-**From demo to the settlement rail for agent-to-agent commerce. [repo link]**
+**From working prototype to the settlement rail for agent-to-agent commerce. [repo link]**
 
 > "Tessera is the settlement rail for the agent economy — escrow, refunds,
 > staking, and reputation that make autonomous commerce safe. Next is wrapping
@@ -111,8 +111,8 @@ you say. Total ≈ 3 minutes if you also demo; ≈ 2:30 for slides alone.
 
 ### Delivery notes
 - Pace: ~150 words/minute. The quotes above total ~430 words → land near 3 min.
-- If you're also screen-recording the demo, compress slides 4–5 and let the demo
-  (slide 6) carry the mechanics; you can cut slide 5's script to its four labels.
+- If you're also screen-recording the live run, compress slides 4–5 and let that
+  run (slide 6) carry the mechanics; you can cut slide 5's script to its four labels.
 - Memorize the three tx one-liners on slide 7 — that reveal is your strongest
   moment; say it slowly.
 - End on the repo URL held on screen for the final 5 seconds.

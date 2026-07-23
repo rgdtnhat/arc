@@ -26,7 +26,7 @@ interface IERC20 {
  * Agents use it to put idle USDC to work (supply → yield) or to open a credit
  * line (borrow against collateral) to fund their pay-per-call operations.
  *
- * NOTE: unaudited demo code for Arc testnet. Not for production / real funds.
+ * NOTE: unaudited — Arc testnet only. Requires a security audit before mainnet.
  */
 contract TesseraPool is ReentrancyGuard {
     uint256 internal constant WAD = 1e18; // index / rate scale

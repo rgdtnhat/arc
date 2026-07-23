@@ -56,14 +56,14 @@ serve `www`, use `SITE_ADDRESS="example.com, www.example.com"`.
 
 ## Prefer nginx + certbot instead of Caddy?
 
-Run just the app (`docker run -d --restart unless-stopped -p 127.0.0.1:8787:8787 tessera-demo`)
+Run just the app (`docker run -d --restart unless-stopped -p 127.0.0.1:8787:8787 tessera`)
 and point an existing nginx server block at `http://127.0.0.1:8787`, then
 `certbot --nginx -d tessera.example.com` for TLS. Caddy is simpler, but either
 works.
 
 ## Required environment (Arc testnet only)
 
-The dashboard runs **live on Arc testnet only** — there is no local demo chain.
+The dashboard runs **live on Arc testnet only** — there is no local chain.
 It reads the committed `deployments/arc.json` and **requires** your keys. Create
 a `.env` next to `docker-compose.yml` on the server (gitignored — never commit;
 **testnet-only keys, never mainnet/real-fund keys on a server**):

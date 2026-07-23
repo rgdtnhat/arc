@@ -16,7 +16,7 @@ import { TesseraClient } from "./client.js";
 import { TesseraAgent, type AgentEvent, type LedgerEntry } from "./agent.js";
 import { TrustMemory } from "./memory.js";
 import { describePolicy } from "./policy.js";
-import { DEMO_TASK, DEMO_POLICY } from "./scenario.js";
+import { AGENT_TASK, AGENT_POLICY } from "./scenario.js";
 import { usdc } from "@tessera/shared";
 
 /** Reference to the TesseraPool deployment on Arc (from deployments/arc.json). */
@@ -37,7 +37,7 @@ const DASHBOARD_HOST = process.env.HOST ?? "0.0.0.0";
 const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
 
 // The real Arc testnet deployment (contracts + wallets), if one has been
-// recorded. Shown on the dashboard alongside the local demo so it's clear which
+// recorded. Shown on the dashboard so it's clear which contracts/wallets are live.
 // addresses are live on-chain vs. the throwaway in-container chain.
 const liveDeployment = (() => {
   try {
@@ -54,10 +54,10 @@ type UiEvent = (AgentEvent & { source: "agent" }) | (ProviderEvent & { source: "
 // Keep the long-lived dashboard alive across transient RPC failures (public-RPC
 // rate limits during a live-mode read shouldn't crash the whole server).
 process.on("unhandledRejection", (reason) => {
-  console.error(`[demo] unhandledRejection (ignored): ${String(reason).slice(0, 200)}`);
+  console.error(`[dashboard] unhandledRejection (ignored): ${String(reason).slice(0, 200)}`);
 });
 process.on("uncaughtException", (err) => {
-  console.error(`[demo] uncaughtException (ignored): ${String(err).slice(0, 200)}`);
+  console.error(`[dashboard] uncaughtException (ignored): ${String(err).slice(0, 200)}`);
 });
 
 async function main() {
@@ -142,14 +142,14 @@ async function main() {
     tabAddress,
   });
 
-  // Lending pool client (local demo only — no pool deployed on Arc yet).
+  // Lending pool client (present when a pool is recorded in deployments/arc.json).
   const poolClient = poolDeployment
     ? new TesseraPoolClient({ chain, rpcUrl, account: agentAccount, poolAddress: poolDeployment.poolAddress })
     : undefined;
 
   // Guardian policy: one-shot/CI runs auto-approve so they don't block on a human.
   const policy = {
-    ...DEMO_POLICY,
+    ...AGENT_POLICY,
     autoApprove: process.env.TESSERA_ONCE === "1" || process.env.TESSERA_AUTO_APPROVE === "1",
   };
   const memory = new TrustMemory(
@@ -213,7 +213,7 @@ async function main() {
     } as UiEvent);
     await treasury.topUpIfLow();
 
-    await agent.run(DEMO_TASK);
+    await agent.run(AGENT_TASK);
     const stream = await agent.streamTicks("ticker:stream", 6);
     if (stream) {
       streamSummary = { ticks: stream.data.length, spentUsdc: formatUsdc(stream.spent) };
@@ -407,7 +407,7 @@ async function main() {
     if (stale && !refreshing) {
       refreshing = true;
       refreshChain()
-        .catch((err) => console.error(`[demo] chain refresh failed: ${String(err).slice(0, 120)}`))
+        .catch((err) => console.error(`[dashboard] chain refresh failed: ${String(err).slice(0, 120)}`))
         .finally(() => (refreshing = false));
     }
     return chainCache ?? { at: 0, providers: [] as any[], agentBalance: 0n };
@@ -502,11 +502,11 @@ async function main() {
         usdcAddress,
         note: live
           ? "🔴 LIVE on Arc testnet — 'Run again' spends real testnet USDC. Fund the agent at faucet.circle.com."
-          : "Local demo on an in-container chain. Set TESSERA_LIVE=1 (with keys) to run on Arc testnet.",
+          : "Live on Arc testnet.",
         agentStack: agent.actionKit().manifest().map((a) => a.name),
         walletMode: (process.env.WALLET_MODE as string) ?? "key",
       },
-      task: { goal: DEMO_TASK.goal, budgetUsdc: formatUsdc(DEMO_TASK.budget) },
+      task: { goal: AGENT_TASK.goal, budgetUsdc: formatUsdc(AGENT_TASK.budget) },
       agent: {
         address: agentAccount.address,
         balanceUsdc: formatUsdc(agentBalance),
@@ -636,7 +636,7 @@ async function main() {
   console.log(`\n🎟  Tessera dashboard listening on ${DASHBOARD_HOST}:${DASHBOARD_PORT}\n`);
 
   // In live mode, don't auto-spend real USDC on every restart — wait for a human
-  // to press "Run again". The local demo runs once automatically for instant show.
+  // to press "Run" so a restart never silently spends real USDC.
   if (live) {
     console.log("🔴 LIVE mode: dashboard up with on-chain state. Press \"Run again\" (or POST /api/run) to run a real scenario on Arc.");
     return;

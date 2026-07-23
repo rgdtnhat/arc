@@ -10,8 +10,8 @@ import type { Hex } from "viem";
  *  - **Manual** otherwise — returns the public faucet URL + the address to
  *    paste, so a human can top the agent up at https://faucet.circle.com/.
  *
- * The demo also plugs a local MockUSDC minter behind this same interface, so the
- * dashboard's "Get testnet USDC" button works end to end on the local chain.
+ * The dashboard's "Get testnet USDC" button and the treasury's auto-top-up both
+ * go through this interface.
  */
 export const CIRCLE_FAUCET_URL = "https://faucet.circle.com/";
 export const CIRCLE_FAUCET_API = "https://api.circle.com/v1/faucet/drips";

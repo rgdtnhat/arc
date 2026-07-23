@@ -10,13 +10,11 @@ services:
     build: .
     environment:
       - PORT=8787
-      # Live mode: run the scenario on Arc testnet (real USDC) instead of the
-      # local demo chain. Set these in a .env file next to this compose file.
-      # Leave empty (default) to keep the free, replayable local demo.
-      - TESSERA_LIVE=${TESSERA_LIVE:-}
+      # Live on Arc: the agent runs the scenario against the deployed contracts
+      # in real USDC. Set these in a .env file next to this compose file.
       - AGENT_PRIVATE_KEY=${AGENT_PRIVATE_KEY:-}
       - PROVIDER_PRIVATE_KEY=${PROVIDER_PRIVATE_KEY:-}
-      - ARC_RPC_URL=${ARC_RPC_URL:-}
+      - ARC_RPC_URL=${ARC_RPC_URL:-https://rpc.testnet.arc.network}
       # Dashboard admin login (secret — set in a .env next to this file). Blank = disabled.
       - ADMIN_ID=${ADMIN_ID:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}

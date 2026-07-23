@@ -1,7 +1,7 @@
 import { usdc } from "@tessera/shared";
 
 /**
- * A provider's honesty profile — drives the demo's SLA scenarios.
+ * A provider's honesty profile — drives the SLA outcomes (settle vs. refund).
  *  - "reliable":   returns good data and fulfills on-chain  -> agent settles
  *  - "bad-data":   fulfills on-chain but returns junk        -> agent rejects (refund)
  *  - "no-fulfill": returns data but never fulfills on-chain  -> agent times out (refund)
@@ -31,13 +31,13 @@ export interface ServiceDef {
   /**
    * Optional async responder that fetches a REAL upstream API. If it throws
    * (e.g. the network is unavailable), the provider falls back to `respond`,
-   * so the demo works offline while the path is genuinely live when it can be.
+   * so the service degrades gracefully offline while being genuinely live when it can.
    */
   respondAsync?: (query: Record<string, string>) => Promise<unknown>;
 }
 
 /**
- * The demo catalog: three services, one of which (news) is deliberately flaky
+ * The service catalog: services one of which (news) is deliberately flaky
  * so the escrow's SLA refund path is exercised end to end.
  */
 export const CATALOG: ServiceDef[] = [
@@ -125,7 +125,7 @@ export const CATALOG: ServiceDef[] = [
     name: "WireScoop — market headlines",
     tags: ["news", "headlines", "media", "sentiment", "finance"],
     price: usdc("0.003"),
-    slaSeconds: 8, // short window so the demo's timeout path is quick
+    slaSeconds: 8, // short window so the SLA-timeout path resolves quickly
     // Flaky on purpose: it takes payment but returns empty junk, so the agent's
     // quality check fails and it reclaims the escrow.
     behavior: "bad-data",
@@ -163,7 +163,7 @@ export const CATALOG: ServiceDef[] = [
     path: "/alpha",
     name: "AlphaSignal — premium market analysis",
     tags: ["analysis", "premium", "alpha", "research"],
-    // Deliberately priced above the demo policy's auto-approve cap, so buying
+    // Deliberately priced above the default policy's auto-approve cap, so buying
     // it requires the guardian's co-signature (LOBSTR-Vault-style escalation).
     price: usdc("0.008"),
     slaSeconds: 30,
@@ -200,7 +200,7 @@ export const CATALOG: ServiceDef[] = [
   },
 ];
 
-/** Tiny deterministic string hash for stable demo data. */
+/** Tiny deterministic string hash for stable sample data. */
 function hash(s: string): number {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;

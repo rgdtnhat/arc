@@ -6,7 +6,7 @@
 pay-per-call operations — and the protocol takes a fee that accrues to the
 app-owner treasury.
 
-> ⚠️ Unaudited demo code for Arc testnet. Not for production or real funds.
+> ⚠️ Unaudited — Arc testnet only. Requires a security audit before mainnet or real funds.
 
 ## 🔴 Live on Arc testnet
 
@@ -68,9 +68,9 @@ supplyBalance(asset, user) / borrowBalance(asset, user)
 
 Run the suite: `npm test` (7 pool tests in `contracts/test/TesseraPool.test.ts`).
 
-## Agent integration (live in the demo)
+## Agent integration (live on Arc)
 
-The dashboard demo deploys `TesseraPool` on the local chain (USDC + wBTC reserves,
+`npm run pool:arc` deploys `TesseraPool` on Arc (USDC + wBTC reserves,
 100 USDC seeded), gives the agent 0.5 wBTC ($15k) of collateral, and runs a
 **lending pre-flight**: the agent supplies its collateral and draws a small USDC
 credit line against it. The dashboard's **Lending & borrowing** panel shows the

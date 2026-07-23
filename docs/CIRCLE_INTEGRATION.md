@@ -6,7 +6,7 @@ defaulting to the working path today and activated by a Circle developer key:
 
 | Circle product | Where it lives | Status |
 |---|---|---|
-| **Agent Stack** (agent → wallet, USDC, on-chain actions) | `agent/src/agentkit.ts` | **Live** — used in the demo, `/api/actions`, and unit-tested |
+| **Agent Stack** (agent → wallet, USDC, on-chain actions) | `agent/src/agentkit.ts` | **Live** — drives the dashboard run, `/api/actions`, and unit-tested |
 | **Wallets / Developer-Controlled Wallets** | `agent/src/wallet.ts`, `agent/src/circle/dcw.ts` | Wired seam — `WALLET_MODE=circle` |
 | **Paymaster** (gasless first call) | `agent/src/circle/paymaster.ts` | Wired seam — `CIRCLE_PAYMASTER_URL` |
 
@@ -105,10 +105,9 @@ Getting the testnet USDC an agent needs, two ways behind one interface:
   address to paste at **https://faucet.circle.com/**. The dashboard's **"Get
   testnet USDC"** button and a `faucet.circle.com` link expose both to a human.
 
-In the local demo a MockUSDC minter sits behind the same `Faucet` interface, so
-the dashboard button drips real balance on-chain end to end. The treasury/faucet
-capabilities are also exposed as Agent Stack actions (`treasury_snapshot`,
-`treasury_topup`, `request_faucet`).
+On Arc the Circle faucet drips testnet USDC on-chain end to end. The
+treasury/faucet capabilities are also exposed as Agent Stack actions
+(`treasury_snapshot`, `treasury_topup`, `request_faucet`).
 
 Env: `CIRCLE_API_KEY`, `CIRCLE_FAUCET_BLOCKCHAIN` (default `ARC-SEPOLIA`),
 `CIRCLE_FAUCET_API_URL` (override), `TESSERA_TREASURY_LOW` (low-water mark).

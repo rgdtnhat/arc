@@ -19,7 +19,7 @@ approve guardian escalations (bypassing the human-co-signer control).
 a signed-in Web3 wallet), checked server-side via a bearer token. The
 guardian-approval endpoint is admin-only. Read endpoints (`/api/state`,
 `/api/actions`) remain public. See `agent/src/auth.ts` and the `requireAuth`
-guard in `agent/src/demo.ts`.
+guard in `agent/src/dashboard.ts`.
 
 ## Design assumptions (not bugs, but worth stating)
 

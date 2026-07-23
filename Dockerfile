@@ -1,7 +1,8 @@
-# Tessera — live dashboard demo, one self-contained container.
-# Boots a local chain, deploys the contracts, runs the autonomous agent
-# scenario, and serves the dashboard on $PORT. Deploy to any Docker host
-# (Render / Railway / Fly / a VM).
+# Tessera — live dashboard + agent orchestrator, one self-contained container.
+# Runs the autonomous agent against the Tessera contracts on Arc testnet and
+# serves the dashboard on $PORT. Deploy to any Docker host (Render / Railway /
+# Fly / a VM). For mainnet, point ARC_RPC_URL + the deployment addresses at
+# your production chain and supply production wallet keys.
 FROM node:22-bookworm-slim
 
 WORKDIR /app
@@ -22,13 +23,12 @@ RUN npm install --no-audit --no-fund
 # App source.
 COPY . .
 
-# Compile contracts at build time (seeds the offline solc + caches artifacts,
-# so the local chain the demo spawns starts fast and never needs the network).
+# Compile contracts at build time (seeds the offline solc + caches artifacts).
 RUN npm run compile --workspace contracts
 
 ENV NODE_ENV=production
 ENV PORT=8787
 EXPOSE 8787
 
-# Persistent demo: local chain + deploy + providers + agent + dashboard.
-CMD ["npm", "run", "demo"]
+# Providers + agent + dashboard, live against Arc.
+CMD ["npm", "start"]

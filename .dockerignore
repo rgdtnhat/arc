@@ -12,5 +12,5 @@ build
 coverage
 *.log
 .tessera-memory.json
-demo.out
+.tessera-admin.json
 docs/*.png

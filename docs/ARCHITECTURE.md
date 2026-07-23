@@ -117,7 +117,7 @@ After delivery the agent checks two things before releasing escrow:
 1. **Integrity** — `keccak256(body)` equals the on-chain `responseHash` the
    provider committed to.
 2. **Quality** — resource-specific checks (e.g. news must actually contain
-   headlines). The demo's flaky provider returns empty headlines, fails this
+   headlines). The scenario's flaky provider returns empty headlines, fails this
    gate, and the agent reclaims its USDC — enforced by the contract, not trust.
 
 ## The guardian (policy sandbox)
@@ -155,11 +155,14 @@ agent's verdict logic in `processInvoices()`:
 4. Otherwise **pay autonomously**; the provider marks the invoice paid when it
    fulfills the receipt on-chain.
 
-## Running locally vs on Arc
+## Running on Arc
 
-- **Local**: `npm run demo` spins up a Hardhat node, deploys `MockUSDC` +
-  `TesseraEscrow`, funds the agent, starts the providers, and opens the
-  dashboard. Everything is offline (see the compiler note in the root README).
-- **Arc testnet**: deploy with `npm run deploy:arc` (binds the real USDC at
-  `0x3600…0000`), run a providers server, then drive the agent with
+The dashboard and agent run live against Arc only — there is no local chain.
+
+- **One command**: `npm run bootstrap:arc` deploys `TesseraEscrow` + `TesseraTab`
+  (binding the real USDC at `0x3600…0000`), funds the agent/provider wallets, and
+  writes `deployments/arc.json`; `npm start` then serves the dashboard against Arc.
+- **Headless**: run a providers server, then drive the agent with
   `npm run run:arc` using a faucet-funded key.
+- **Mainnet**: point `ARC_RPC_URL` and the deployment addresses at the production
+  chain and supply production wallet keys — the same code path, no config forks.

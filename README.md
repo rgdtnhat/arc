@@ -43,7 +43,7 @@ Arc**:
    - ✅ good response → escrow **releases** to the provider, reputation ↑
    - ❌ failure / timeout → the agent **auto-claims a refund**, reputation ↓
 
-The unique core is step 4. Most "agent payment" demos stop at *"agent sends
+The unique core is step 4. Most "agent payment" projects stop at *"agent sends
 USDC."* Tessera adds **programmable escrow + SLA-based auto-refund + on-chain
 reputation**, which is exactly what makes it safe for an agent to buy from a
 service it has never met — the real unlock for agent-to-agent commerce.
@@ -159,7 +159,7 @@ simultaneous `open()`s).
 | `contracts/`  | `TesseraEscrow`, `TesseraTab`, `TesseraPool` (lending), `MockUSDC`, Hardhat + viem tests |
 | `agent/`      | Agent runtime: 402 handshake, hybrid decision engine, settle/refund, Agent Stack action layer, Circle wallet/Paymaster/faucet seams, treasury workflow |
 | `providers/`  | Mock priced services that speak the Tessera 402 protocol          |
-| `dashboard/`  | Live demo dashboard (balances, reputation, tx feed)               |
+| `dashboard/`  | Live dashboard (balances, reputation, tx feed)                    |
 | `shared/`     | Chain config, ABIs, protocol types shared across packages         |
 
 ## The 402 protocol (Tessera flavor)
@@ -193,8 +193,8 @@ npm run test           # 28 contract tests + 47 agent unit tests
 
 CI runs the tests on every push (`.github/workflows/ci.yml`).
 
-**The dashboard runs live on Arc testnet only** — there is no local demo chain
-or public dev keys. Deploy to Arc (below), then `npm run demo` reads
+**The dashboard runs live on Arc testnet only** — there is no local chain
+or public dev keys. Deploy to Arc (below), then `npm start` reads
 `deployments/arc.json` + your `.env` keys and serves the dashboard against Arc.
 
 ## Deploy to Arc testnet (one command)
@@ -202,7 +202,7 @@ or public dev keys. Deploy to Arc (below), then `npm run demo` reads
 ```bash
 npm run bootstrap:arc   # deploys escrow + tab, funds agent/provider, writes .env + deployments/arc.json
 npm run pool:arc        # deploys the lending pool + opens the agent's position
-npm run demo            # serves the dashboard live on Arc (needs AGENT_/PROVIDER_PRIVATE_KEY in .env)
+npm start               # serves the dashboard live on Arc (needs AGENT_/PROVIDER_PRIVATE_KEY in .env)
 ```
 
 The bootstrap generates deployer/agent/provider keys into `.env` (gitignored),

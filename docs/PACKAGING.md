@@ -26,7 +26,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t <you>/tessera:latest -
 ```
 
 That covers x86-64 servers and arm64 boards (Raspberry Pi 4/5, Jetson, Apple-
-silicon hosts, arm cloud). The app needs ~1 GB RAM (in-process EVM for the demo).
+silicon hosts, arm cloud). The app needs ~512 MB–1 GB RAM.
 The same `docker compose up` from `docs/SELF_HOST.md` runs on either arch.
 
 ## Native app stores — path (needs your developer accounts)

@@ -6,13 +6,20 @@ services:
     name: tessera-dashboard
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter # a small paid instance; the local chain needs ~512MB–1GB RAM
+    plan: starter # a small paid instance; ~512MB–1GB RAM
     healthCheckPath: /
     autoDeploy: true
     envVars:
       - key: PORT
         value: "8787"
-      # Optional: set to enable the LLM decision brain in the demo.
+      # Live on Arc testnet: supply funded wallet keys + the deployed addresses.
+      # - key: AGENT_PRIVATE_KEY
+      #   sync: false
+      # - key: PROVIDER_PRIVATE_KEY
+      #   sync: false
+      # - key: ARC_RPC_URL
+      #   value: https://rpc.testnet.arc.network
+      # Optional: set to enable the LLM decision brain.
       # - key: ANTHROPIC_API_KEY
       #   sync: false
       # - key: AGENT_BRAIN

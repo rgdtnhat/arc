@@ -4,7 +4,7 @@ Everything for the Checkpoint 3 submission: a 3-minute video shot-list timed to
 the real on-chain transactions, and a slide-by-slide deck outline.
 
 Live artifacts to have open while recording:
-- Dashboard: `npm run demo` → http://127.0.0.1:8787
+- Dashboard: `npm start` → http://127.0.0.1:8787
 - Escrow on Arcscan: https://testnet.arcscan.app/address/0x9776498c2a0661a2d3bbb10c5094d16f835a9a7d
 - Tab on Arcscan: https://testnet.arcscan.app/address/0x5d482c70ac56cdc44414a93446709fee17d78c6d
 - Settle tx: https://testnet.arcscan.app/tx/0xbbf5c98b910ae9dc628db118d6d81e18b23399c9f7bc17b4ae1408c52800753f
@@ -36,7 +36,7 @@ cuts tight; the on-chain tx reveals are the payoff — don't rush them.
 
 **On screen:** the README architecture diagram; underline "USDC is the gas token."
 
-### [0:40–1:50] Live demo — the dashboard run (screen capture)
+### [0:40–1:50] Live walkthrough — the dashboard run (screen capture)
 Narrate over the real run. Beats:
 - **(0:40)** "Here's an autonomous agent with a task and a budget. No human in the
   loop." — show task bar + budget.
@@ -87,15 +87,15 @@ Narrate over the real run. Beats:
 5. **The differentiators** — 4 quadrants: programmable escrow & auto-refund ·
    provider staking/slashing · nanopayment tabs (off-chain vouchers) · guardian
    approvals + trust memory.
-6. **Live demo** — the dashboard screenshot; annotate settled / refunded / tab /
+6. **Live run** — the dashboard screenshot; annotate settled / refunded / tab /
    guardian / billing inbox. "One autonomous run."
 7. **On-chain proof** — the 3 Arcscan transactions (settle, refund, tab settle) +
    contract addresses. "Deployed and transacting."
 8. **Why Arc / Circle** — USDC gas token, sub-second settlement, Circle Wallets;
    Paymaster + Developer-Controlled Wallets on the roadmap.
-9. **Traction & quality** — 64 tests, CI on every push, one-command live deploy
+9. **Traction & quality** — 75 tests, CI on every push, one-command live deploy
    (`bootstrap:arc`), offline-capable toolchain. Execution > complexity.
-10. **Vision / ask** — from a demo to the settlement rail for agent-to-agent
+10. **Vision / ask** — from a working prototype to the settlement rail for agent-to-agent
     commerce: real providers, discovery registry, reputation staking. Repo link.
 
 ---
@@ -106,6 +106,6 @@ Narrate over the real run. Beats:
   native USDC as gas + settlement, live txs; Circle Wallets used, Paymaster next.
 - **Use case & impact** — a real, unsolved problem (agent-to-stranger payments)
   with a credible path to production.
-- **Execution & quality** — 64 tests, CI, one-command deploy, live on-chain proof,
+- **Execution & quality** — 75 tests, CI, one-command deploy, live on-chain proof,
   resilient to public-RPC limits. Quality over complexity.
-- **Presentation** — this kit: a tight demo narrative anchored to real transactions.
+- **Presentation** — this kit: a tight narrative anchored to real transactions.

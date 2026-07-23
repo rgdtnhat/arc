@@ -10,7 +10,7 @@ if [ ! -d node_modules ]; then
   npm install --silent >/dev/null 2>&1 || npm install
 fi
 
-# Seed the offline Solidity compiler so `npm test` / `npm run demo` work.
+# Seed the offline Solidity compiler so `npm test` / `npm start` work.
 node contracts/scripts/seed-compiler.cjs || true
 
-echo "[tessera] ready — try: npm test   or   npm run demo"
+echo "[tessera] ready — try: npm test   or   npm start"

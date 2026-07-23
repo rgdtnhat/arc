@@ -14,7 +14,7 @@ export interface SpendingPolicy {
   blockedProviders?: Hex[];
   /** How long to wait for a guardian decision before treating it as rejected. */
   approvalTimeoutMs?: number;
-  /** Demo/CI escape hatch: guardian auto-approves after a short pause. */
+  /** Unattended mode: guardian auto-approves after a short pause. */
   autoApprove?: boolean;
 }
 

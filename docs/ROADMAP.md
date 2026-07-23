@@ -35,7 +35,7 @@ Tessera against the Arc Hackathon checkpoints.
 - The Tessera 402 protocol + three provider services (one deliberately flaky).
 - Autonomous agent: discovery, hybrid rule/LLM decision engine, the full
   quote → escrow → verify → settle/refund loop.
-- Live dashboard and a one-command local demo.
+- Live dashboard and a one-command Arc deploy.
 - Arc testnet deploy + agent runner scripts.
 
 ## 🎯 Checkpoint 3 (Final MVP on Arc)

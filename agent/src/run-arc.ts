@@ -2,7 +2,7 @@ import type { Hex } from "viem";
 import { arcTestnet, ARC_USDC_ADDRESS, formatUsdc } from "@tessera/shared";
 import { TesseraClient } from "./client.js";
 import { TesseraAgent } from "./agent.js";
-import { DEMO_TASK } from "./scenario.js";
+import { AGENT_TASK } from "./scenario.js";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { paymasterFromEnv, describeGasMode } from "./circle/paymaster.js";
 import { faucetFromEnv } from "./circle/faucet.js";
@@ -85,7 +85,7 @@ async function main() {
     console.log(`   ↳ usdc_balance() = ${bal.usdc} USDC\n`);
   }
 
-  await agent.run(DEMO_TASK);
+  await agent.run(AGENT_TASK);
 
   // Nanopay stream (needs TESSERA_TAB_ADDRESS + a tab-billed provider).
   if (process.env.TESSERA_TAB_ADDRESS) {

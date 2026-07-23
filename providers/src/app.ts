@@ -30,7 +30,7 @@ export interface ProviderConfig {
   tabAddress?: Hex;
   /** Private key per resource id — lets each service have its own reputation. */
   providerKeys: Record<string, Hex>;
-  /** Optional sink for demo telemetry. */
+  /** Optional sink for telemetry / dashboard events. */
   onEvent?: (e: ProviderEvent) => void;
 }
 

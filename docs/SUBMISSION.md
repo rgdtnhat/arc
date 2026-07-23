@@ -32,7 +32,7 @@ for a human co-signer), **personal trust memory** (a provider that burned this
 agent is declined next time), and a **billing inbox** for provider-issued invoices.
 
 ## Why it's different
-Most "agent payment" demos stop at *"agent sends USDC."* Tessera's core is
+Most "agent payment" projects stop at *"agent sends USDC."* Tessera's core is
 **programmable escrow + SLA-based auto-refund + on-chain reputation with staked
 skin-in-the-game** — exactly what makes it safe for an agent to transact with a
 service it has never met. That is the unlock for agent-to-agent commerce.
