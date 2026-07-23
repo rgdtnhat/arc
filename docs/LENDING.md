@@ -8,6 +8,18 @@ app-owner treasury.
 
 > ⚠️ Unaudited demo code for Arc testnet. Not for production or real funds.
 
+## 🔴 Live on Arc testnet
+
+| Contract | Address |
+|---|---|
+| **TesseraPool** | [`0x065f1bb38fdc65a1c41e2e888940af713cabca5f`](https://testnet.arcscan.app/address/0x065f1bb38fdc65a1c41e2e888940af713cabca5f) |
+| **wBTC collateral (mock)** | [`0x0ee090b219e93dd70eb3dc152d8c0520f15fcd1f`](https://testnet.arcscan.app/address/0x0ee090b219e93dd70eb3dc152d8c0520f15fcd1f) |
+
+Reserves: real Arc USDC (`0x3600…0000`, borrowable) + a mock wBTC collateral.
+USDC liquidity is seeded and the agent holds a live position (0.5 wBTC supplied,
+a USDC credit line drawn). Deploy/refresh with `npm run pool:arc`; the live
+dashboard reads the position straight from Arc.
+
 ## What it borrows from Blend
 
 | Blend concept | In TesseraPool |
@@ -74,5 +86,3 @@ Agent Stack actions: `pool_supply`, `pool_withdraw`, `pool_borrow`, `pool_repay`
   closer to Blend's full design.
 - **Reactive interest rates** (Blend adjusts the curve toward target utilization
   over time) rather than a fixed kink.
-- **Deploy TesseraPool to Arc testnet** (currently local-demo only) and expose the
-  lending panel in live mode.

@@ -4,7 +4,9 @@ import { readFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
+import { verifyMessage } from "viem";
 import type { Hex, Chain, Account } from "viem";
+import { randomUUID } from "node:crypto";
 import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS } from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { faucetFromEnv } from "./circle/faucet.js";
@@ -105,6 +107,14 @@ async function main() {
       providerKeys[s.resource] = specific ?? provKey;
     }
     faucet = faucetFromEnv();
+    // Lending pool, if one has been deployed to Arc (deployments/arc.json).
+    if (liveDeployment!.tesseraPool && liveDeployment!.poolCollateral) {
+      poolDeployment = {
+        poolAddress: liveDeployment!.tesseraPool as Hex,
+        wbtcAddress: liveDeployment!.poolCollateral as Hex,
+        usdcAddress,
+      };
+    }
     console.log(`🔴 LIVE on ${chainLabel} — agent ${agentAccount.address}`);
     console.log(`   escrow ${escrowAddress} · tab ${tabAddress}`);
   } else {
@@ -229,9 +239,9 @@ async function main() {
   });
   console.log(`🛡  Guardian policy: ${describePolicy(policy)}${policy.autoApprove ? " (auto-approve mode)" : ""}`);
 
-  // Lending pre-flight: the agent puts its wBTC collateral to work and draws a
-  // small USDC credit line against it — a live position for the lending panel.
-  if (poolClient && poolDeployment) {
+  // Lending pre-flight (LOCAL demo only — in live mode the agent's Arc position
+  // is opened once by the deploy script, not re-borrowed on every restart).
+  if (poolClient && poolDeployment && !live) {
     try {
       await poolClient.supply(poolDeployment.wbtcAddress, 50_000_000n); // 0.5 wBTC
       await poolClient.borrow(usdcAddress, usdc("5")); // credit line
@@ -301,6 +311,47 @@ async function main() {
     "../../dashboard/public"
   );
   app.use(express.static(dashboardDir));
+  app.use(express.json());
+
+  // --- Web3 wallet login (Sign-In-With-Ethereum, EIP-4361) ------------------
+  const authNonces = new Map<string, number>(); // nonce -> expiry ms
+  const authSessions = new Map<string, { address: string; at: number }>();
+  app.get("/api/auth/nonce", (_req, res) => {
+    const nonce = randomUUID().replace(/-/g, "");
+    authNonces.set(nonce, Date.now() + 10 * 60_000);
+    res.json({ nonce });
+  });
+  app.post("/api/auth/verify", async (req, res) => {
+    const { address, message, signature, nonce } = req.body ?? {};
+    if (!address || !message || !signature || !nonce) {
+      res.status(400).json({ ok: false, error: "missing fields" });
+      return;
+    }
+    const exp = authNonces.get(nonce);
+    if (!exp || exp < Date.now() || !String(message).includes(nonce)) {
+      res.status(401).json({ ok: false, error: "unknown or expired nonce" });
+      return;
+    }
+    let valid = false;
+    try {
+      valid = await verifyMessage({ address: address as Hex, message, signature: signature as Hex });
+    } catch {
+      valid = false;
+    }
+    if (!valid) {
+      res.status(401).json({ ok: false, error: "invalid signature" });
+      return;
+    }
+    authNonces.delete(nonce);
+    const token = randomUUID();
+    authSessions.set(token, { address, at: Date.now() });
+    res.json({ ok: true, token, address });
+  });
+  app.get("/api/auth/me", (req, res) => {
+    const token = (req.headers.authorization ?? "").replace(/^Bearer /, "");
+    const s = authSessions.get(token);
+    res.json({ address: s?.address ?? null });
+  });
 
   const providerAddrs = Object.fromEntries(
     CATALOG.map((s) => [s.resource, privateKeyToAccount(providerKeys[s.resource]).address])

@@ -113,6 +113,7 @@
         <span class="pill" id="policyPill" title="Spends above this per-call cap require guardian approval">🛡 —</span>
         <span class="pill" id="chainPill">chain: —</span>
         <span class="pill live"><span class="dot"></span> live</span>
+        <button class="btn" id="walletBtn" style="margin-left:10px">Connect Wallet</button>
       </header>
 
       <div class="task">
@@ -504,6 +505,64 @@
           tick();
         }
       });
+
+      // --- Web3 wallet login (Sign-In-With-Ethereum) ---
+      function setWallet(addr) {
+        const btn = $("walletBtn");
+        if (addr) {
+          btn.textContent = addr.slice(0, 6) + "…" + addr.slice(-4) + " ✓";
+          btn.style.borderColor = "var(--good)";
+          btn.style.color = "var(--good)";
+        } else {
+          btn.textContent = "Connect Wallet";
+          btn.style.borderColor = "";
+          btn.style.color = "";
+        }
+      }
+      async function connectWallet() {
+        if (!window.ethereum) {
+          alert("No web3 wallet found. Install MetaMask (or another injected wallet) to sign in.");
+          return;
+        }
+        const btn = $("walletBtn");
+        btn.disabled = true;
+        try {
+          const [address] = await window.ethereum.request({ method: "eth_requestAccounts" });
+          const { nonce } = await (await fetch("/api/auth/nonce")).json();
+          const chainIdHex = await window.ethereum.request({ method: "eth_chainId" });
+          const message =
+            `${location.host} wants you to sign in with your Ethereum account:\n${address}\n\n` +
+            `Sign in to Tessera.\n\nURI: ${location.origin}\nVersion: 1\n` +
+            `Chain ID: ${parseInt(chainIdHex, 16)}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`;
+          const signature = await window.ethereum.request({ method: "personal_sign", params: [message, address] });
+          const r = await (
+            await fetch("/api/auth/verify", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ address, message, signature, nonce }),
+            })
+          ).json();
+          if (r.ok) {
+            localStorage.setItem("tessera_token", r.token);
+            setWallet(r.address);
+          } else {
+            alert("Sign-in failed: " + r.error);
+          }
+        } catch (e) {
+          alert("Wallet connection cancelled or failed.");
+        } finally {
+          btn.disabled = false;
+        }
+      }
+      $("walletBtn").addEventListener("click", connectWallet);
+      (async () => {
+        const t = localStorage.getItem("tessera_token");
+        if (!t) return;
+        try {
+          const me = await (await fetch("/api/auth/me", { headers: { authorization: "Bearer " + t } })).json();
+          if (me.address) setWallet(me.address);
+        } catch {}
+      })();
 
       // Lending action buttons (supply / withdraw / borrow / repay).
       document.querySelectorAll("[data-lend]").forEach((btn) => {

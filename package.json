@@ -17,7 +17,8 @@
     "demo": "npm run demo --workspace agent",
     "fleet": "tsx agent/src/run-fleet.ts",
     "e2e": "TESSERA_ONCE=1 tsx agent/src/demo.ts",
-    "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs"
+    "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs",
+    "pool:arc": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/pool-arc.mjs"
   },
   "license": "MIT",
   "engines": {

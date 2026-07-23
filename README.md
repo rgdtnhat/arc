@@ -100,7 +100,17 @@ sponsorship. Both default to today's working path. See
 rate curve), **health-factor liquidations**, and a **protocol take-rate** that
 accrues to the app-owner treasury. Agents put idle USDC to work (supply → yield)
 or open a credit line (borrow against collateral) to fund their pay-per-call
-operations. See [`docs/LENDING.md`](docs/LENDING.md). *(Unaudited testnet code.)*
+operations. **Live on Arc testnet** (`TesseraPool`
+[`0x065f…ca5f`](https://testnet.arcscan.app/address/0x065f1bb38fdc65a1c41e2e888940af713cabca5f)),
+with a **Lending & borrowing** dashboard panel. See
+[`docs/LENDING.md`](docs/LENDING.md). *(Unaudited testnet code.)*
+
+## Web3 wallet login
+
+The dashboard supports **Sign-In-With-Ethereum** (EIP-4361): "Connect Wallet"
+prompts an injected wallet (MetaMask/WalletConnect) to sign a nonce-bound
+message, which the server verifies (`/api/auth/*`) — single-use nonces, no
+passwords. Your address then shows in the header.
 
 ## Parallel multi-agent fleet
 
