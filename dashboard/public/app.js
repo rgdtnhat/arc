@@ -361,7 +361,7 @@ const $ = (id) => document.getElementById(id);
       }
       async function connectWallet() {
         if (!window.ethereum) {
-          alert("No web3 wallet found. Install MetaMask (or another injected wallet) to sign in.");
+          alert("No browser wallet detected. Please install or enable a Web3 wallet, then try Connect Wallet again.");
           return;
         }
         const btn = $("walletBtn");
