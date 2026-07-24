@@ -16,10 +16,69 @@ enforced. On a public deployment any visitor could drive the agent's wallet or
 approve guardian escalations (bypassing the human-co-signer control).
 
 **Fix:** mutating endpoints now require an authenticated session (admin login or
-a signed-in Web3 wallet), checked server-side via a bearer token. The
-guardian-approval endpoint is admin-only. Read endpoints (`/api/state`,
-`/api/actions`) remain public. See `agent/src/auth.ts` and the `requireAuth`
-guard in `agent/src/dashboard.ts`.
+a signed-in Web3 wallet), checked server-side via a bearer token. Read endpoints
+(`/api/state`, `/api/actions`) remain public. See `agent/src/auth.ts` and the
+`requireAuth` guard in `agent/src/dashboard.ts`.
+
+### 2. Any connected wallet could spend the agent's wallet — MEDIUM → fixed
+
+`requireAuth` accepts **any** wallet that completes SIWE. But the DeFi endpoints
+execute with the **server-side agent key**, so a merely-connected visitor could
+move the operator's funds (lend, deposit to the vault, swap, drip the faucet,
+approve guardian escalations). Nothing could be stolen — outputs return to the
+agent's own custody — but a stranger could churn the operator's balances and
+burn fees/slippage.
+
+**Fix:** a stricter `requireOperator` gate (admin session only) now guards every
+endpoint that spends the agent's wallet: `/api/lending/:action`,
+`/api/vault/:action`, `/api/swap`, `/api/faucet`, `/api/run`, and
+`/api/approvals/:id/:verdict`. Connected wallets keep **full read access** plus
+the public `/api/swap/quote`.
+
+### 3. Vault & swap contract review — no exploitable findings
+
+`TesseraVault` and `TesseraSwap` were reviewed for the usual DeFi failure modes:
+
+| Checked | Result |
+|---|---|
+| Reentrancy | `nonReentrant` on every entry point; shares burned **before** external transfers |
+| First-deposit share inflation | Blocked — `MINIMUM_LIQUIDITY` (1000) dead shares burned on first deposit (Uniswap-style) |
+| Fee on principal | Impossible — the performance fee is charged only on `totalAssets` **growth** since the last checkpoint |
+| Unbounded admin fees | Hard caps in code: performance fee ≤ 30%, swap fee ≤ 5%, app fee share ≤ 100% of the fee, reserve ratio ≥ 10% |
+| Swap paying out more than it holds | Blocked — solvency check requires `balance ≥ amountOut + appFee` before any transfer |
+| Slippage | `minOut` enforced on every swap |
+| Rebalance bricking withdrawals | `_rebalance()` is wrapped in `try/catch`, so a pool hiccup can't block a deposit/withdraw |
+
+## Economic safety model (vault)
+
+The vault is deliberately conservative:
+
+- **Liquid reserve buffer.** `reserveRatioBps` (floor 10%, default **20%**) is
+  always held as idle tokens in the vault, so routine withdrawals never touch the
+  pool. Only the excess earns APR.
+- **Yield split.** Depositors keep **≥ 70%** of all yield by construction
+  (`MAX_PERFORMANCE_FEE = 3000` bps); the default split is **85% user / 15% app**.
+  The fee is minted as shares against the *gain only* — principal is never taxed.
+- **Withdrawal path.** Buffer first, then unwind pool supply, bounded by the
+  pool's free cash. `maxWithdraw(user)` returns exactly what's withdrawable right
+  now, and the UI's **Max** uses it — so the button never proposes an amount that
+  would revert.
+
+### Residual risks (honest limits — these are NOT eliminated)
+
+1. **Pool utilisation risk.** If pool borrowers draw down *all* free cash, the
+   portion of vault funds deployed to the pool is temporarily unwithdrawable
+   until borrowers repay or interest lures new supply. The buffer mitigates this
+   for normal-size withdrawals; it cannot cover a simultaneous full exit. Funds
+   are not lost — they're illiquid.
+2. **Admin-set prices.** Both the pool and the swap desk price from
+   `TesseraPool`'s owner-set oracle. A stale price lets an arbitrageur drain the
+   underpriced side of the **swap inventory**. Wire a live oracle before mainnet.
+3. **Trusted operator key.** The owner can change fees (within caps), prices, the
+   treasury, and can withdraw swap inventory. This is a custodial trust
+   assumption, not a trustless design.
+4. **Unaudited.** No third-party audit has been performed. Do not use with real
+   funds until one has.
 
 ## Design assumptions (not bugs, but worth stating)
 

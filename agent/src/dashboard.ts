@@ -364,6 +364,23 @@ async function main() {
     res.status(401).json({ ok: false, error: "authentication required — connect a wallet or sign in as admin" });
   };
 
+  /**
+   * Stricter gate for endpoints that move the **agent's own funds** (lending,
+   * vault, swap, faucet, run). These execute with the server-side agent wallet,
+   * so a merely-connected visitor wallet must NOT be able to trigger them — only
+   * the operator can. Connected users keep full read access and public quotes.
+   *
+   * Per-user DeFi with a user's own custody belongs client-side (the user signs
+   * in their own wallet); it is deliberately not routed through this server key.
+   */
+  const requireOperator = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (admin?.session(bearer(req))) return next();
+    res.status(403).json({
+      ok: false,
+      error: "operator only — these actions spend the agent's wallet. Sign in as admin.",
+    });
+  };
+
   app.post("/api/admin/login", (req, res) => {
     if (!admin) { res.status(503).json({ ok: false, error: "admin login not configured (set ADMIN_PASSWORD)" }); return; }
     const ip = req.ip ?? "unknown";
@@ -541,7 +558,7 @@ async function main() {
   }
 
   // Agent-driven lending actions from the dashboard.
-  app.post("/api/lending/:action", requireAuth, async (req, res) => {
+  app.post("/api/lending/:action", requireOperator, async (req, res) => {
     if (!poolClient || !poolDeployment) {
       res.status(404).json({ ok: false, error: "lending not available (live mode has no pool deployed)" });
       return;
@@ -599,7 +616,7 @@ async function main() {
     }
   }
 
-  app.post("/api/vault/:action", requireAuth, async (req, res) => {
+  app.post("/api/vault/:action", requireOperator, async (req, res) => {
     if (!vaultClient) { res.status(404).json({ ok: false, error: "vault not deployed" }); return; }
     const amount = BigInt((req.query.amount as string) ?? "0");
     const shares = BigInt((req.query.shares as string) ?? "0");
@@ -632,7 +649,7 @@ async function main() {
     }
   });
 
-  app.post("/api/swap", requireAuth, async (req, res) => {
+  app.post("/api/swap", requireOperator, async (req, res) => {
     if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
     try {
       const tokenIn = req.query.tokenIn as Hex;
@@ -750,7 +767,7 @@ async function main() {
   });
 
   // Faucet: drip testnet USDC to the agent (local mint here; Circle faucet on Arc).
-  app.post("/api/faucet", requireAuth, async (_req, res) => {
+  app.post("/api/faucet", requireOperator, async (_req, res) => {
     try {
       const result = await treasury.requestFaucet();
       if (chainCache) chainCache.at = 0; // force a background refresh after the drip
@@ -762,14 +779,14 @@ async function main() {
   });
 
   // Guardian verdicts from the dashboard (the human co-signer).
-  app.post("/api/approvals/:id/:verdict", requireAuth, (req, res) => {
+  app.post("/api/approvals/:id/:verdict", requireOperator, (req, res) => {
     const id = Number(req.params.id);
     const approved = req.params.verdict === "approve";
     const ok = agent.approvals.resolve(id, approved);
     res.status(ok ? 200 : 404).json({ ok });
   });
 
-  app.post("/api/run", requireAuth, async (_req, res) => {
+  app.post("/api/run", requireOperator, async (_req, res) => {
     if (running) {
       res.status(409).json({ error: "already running" });
       return;

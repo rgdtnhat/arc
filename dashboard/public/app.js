@@ -319,11 +319,18 @@ const $ = (id) => document.getElementById(id);
         const t = authToken();
         return t ? { Authorization: "Bearer " + t } : {};
       };
-      // POST wrapper that attaches the token and flags the need to sign in on 401.
+      // POST wrapper that attaches the token and explains the two auth levels:
+      // 401 = not signed in at all; 403 = signed in, but the action spends the
+      // agent's own wallet and is therefore operator-only.
       async function postAuthed(url, opts = {}) {
         const res = await fetch(url, { method: "POST", ...opts, headers: { ...(opts.headers || {}), ...authHeaders() } });
         if (res.status === 401) {
-          alert("Please sign in first — Connect Wallet or use the Admin button — to perform actions.");
+          alert("Please sign in first — Connect Wallet or use the Admin button.");
+        } else if (res.status === 403) {
+          alert(
+            "This action spends the agent's own wallet, so it's operator-only — sign in with the Admin button.\n\n" +
+              "Connected wallets can view everything and get live quotes."
+          );
         }
         return res;
       }
