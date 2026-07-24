@@ -105,20 +105,15 @@ async function main() {
     ? {
         poolAddress: liveDeployment.tesseraPool as Hex,
         usdcAddress,
-        // Prefer the explicit asset list written by the deploy script; fall back
-        // to USDC + the legacy single collateral for older deployments.
+        // The pool's reserves come from the explicit asset list written by the
+        // deploy script; USDC alone is the fallback for a bare deployment.
         assets:
           Array.isArray(liveDeployment.poolAssets) && liveDeployment.poolAssets.length
             ? (liveDeployment.poolAssets as { symbol: string; address: string }[]).map((a) => ({
                 symbol: a.symbol,
                 address: a.address as Hex,
               }))
-            : [
-                { symbol: "USDC", address: usdcAddress },
-                ...(liveDeployment.poolCollateral
-                  ? [{ symbol: "wBTC", address: liveDeployment.poolCollateral as Hex }]
-                  : []),
-              ],
+            : [{ symbol: "USDC", address: usdcAddress }],
       }
     : null;
   console.log(`🔴 LIVE on ${chainLabel} — agent ${agentAccount.address}`);

@@ -64,12 +64,12 @@ supplyBalance(asset, user) / borrowBalance(asset, user)
 ## Example (from the tests)
 
 - Alice supplies **1,000 USDC** of liquidity → earns the supply APR.
-- Bob supplies **1 wBTC ($30k)** as collateral (70% collateral factor → $21k limit)
+- Bob supplies **1 cirBTC ($30k)** as collateral (70% collateral factor → $21k limit)
   and borrows **USDC** against it.
 - A year passes: Bob's debt grows at the borrow APR, Alice's balance grows at the
   supply APR, and the **treasury accrues its `reserveFactor` cut**.
-- wBTC drops to **$22k** → Bob's health factor falls below 1 → a liquidator repays
-  part of his USDC debt and seizes his wBTC at a **10% bonus**.
+- cirBTC drops to **$22k** → Bob's health factor falls below 1 → a liquidator repays
+  part of his USDC debt and seizes his cirBTC at a **10% bonus**.
 
 Run the suite: `npm test` (7 pool tests in `contracts/test/TesseraPool.test.ts`).
 
