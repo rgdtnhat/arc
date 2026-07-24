@@ -2,7 +2,7 @@
 // reserve, seed USDC liquidity, and open the agent's initial position.
 // Reads keys from .env (DEPLOYER_PRIVATE_KEY, AGENT_PRIVATE_KEY).
 import { readFileSync, writeFileSync } from "node:fs";
-import { createPublicClient, createWalletClient, http, maxUint256 } from "viem";
+import { createPublicClient, createWalletClient, maxUint256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   arcTestnet,
@@ -13,14 +13,15 @@ import {
   mockTokenAbi,
   mockTokenBytecode,
   formatUsdc,
+  pacedHttp,
 } from "@tessera/shared";
 
 const RPC = process.env.ARC_RPC_URL ?? "https://rpc.testnet.arc.network";
 const deployer = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
 const agent = privateKeyToAccount(process.env.AGENT_PRIVATE_KEY);
-const pub = createPublicClient({ chain: arcTestnet, transport: http(RPC, { retryCount: 10, retryDelay: 5000 }) });
-const dWallet = createWalletClient({ account: deployer, chain: arcTestnet, transport: http(RPC, { retryCount: 10, retryDelay: 5000 }) });
-const aWallet = createWalletClient({ account: agent, chain: arcTestnet, transport: http(RPC, { retryCount: 10, retryDelay: 5000 }) });
+const pub = createPublicClient({ chain: arcTestnet, transport: pacedHttp(RPC) });
+const dWallet = createWalletClient({ account: deployer, chain: arcTestnet, transport: pacedHttp(RPC) });
+const aWallet = createWalletClient({ account: agent, chain: arcTestnet, transport: pacedHttp(RPC) });
 
 const USD = 10n ** 8n;
 const pace = (ms = 6000) => new Promise((r) => setTimeout(r, ms));

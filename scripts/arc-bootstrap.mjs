@@ -25,7 +25,6 @@ import {
   createPublicClient,
   createWalletClient,
   defineChain,
-  http,
   formatUnits,
   parseUnits,
 } from "viem";
@@ -36,6 +35,7 @@ import {
   tesseraTabAbi,
   tesseraTabBytecode,
   erc20Abi,
+  pacedHttp,
 } from "../shared/src/index.ts";
 
 const root = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
@@ -52,7 +52,7 @@ const chain = defineChain({
   nativeCurrency: { name: "USDC", symbol: "USDC", decimals: 18 },
   rpcUrls: { default: { http: [RPC] } },
 });
-const pub = createPublicClient({ chain, transport: http(RPC) });
+const pub = createPublicClient({ chain, transport: pacedHttp(RPC) });
 
 // --- .env helpers ------------------------------------------------------------
 function readEnv() {
@@ -104,7 +104,7 @@ async function main() {
   const deployer = privateKeyToAccount(keys.DEPLOYER_PRIVATE_KEY);
   const agent = privateKeyToAccount(keys.AGENT_PRIVATE_KEY);
   const provider = privateKeyToAccount(keys.PROVIDER_PRIVATE_KEY);
-  const wallet = createWalletClient({ account: deployer, chain, transport: http(RPC) });
+  const wallet = createWalletClient({ account: deployer, chain, transport: pacedHttp(RPC) });
 
   console.log(`deployer: ${deployer.address}`);
   console.log(`agent:    ${agent.address}`);
@@ -164,7 +164,7 @@ async function main() {
   const staked = await pub.readContract({ address: escrowAddress, abi: tesseraEscrowAbi, functionName: "stakeOf", args: [provider.address] });
   if (staked < stakeTarget) {
     console.log(`🔒 Provider bonding ${fmt(stakeTarget)} USDC stake…`);
-    const pw = createWalletClient({ account: provider, chain, transport: http(RPC) });
+    const pw = createWalletClient({ account: provider, chain, transport: pacedHttp(RPC) });
     await waitReceipt(
       await pw.writeContract({ address: USDC, abi: erc20Abi, functionName: "approve", args: [escrowAddress, stakeTarget] })
     );

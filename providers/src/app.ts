@@ -3,7 +3,6 @@ import {
   createPublicClient,
   createWalletClient,
   encodePacked,
-  http,
   getAddress,
   keccak256,
   recoverMessageAddress,
@@ -18,6 +17,7 @@ import {
   formatUsdc,
   PaymentStatus,
   quoteTypedData,
+  pacedHttp,
 } from "@tessera/shared";
 import { CATALOG, type ServiceDef } from "./catalog.js";
 import { quoteHash, responseHash, randomNonce } from "./quote.js";
@@ -54,7 +54,7 @@ export function createProviderApp(config: ProviderConfig): Express {
 
   const publicClient = createPublicClient({
     chain: config.chain,
-    transport: http(config.rpcUrl, { retryCount: 8, retryDelay: 4000 }),
+    transport: pacedHttp(config.rpcUrl),
     pollingInterval: 8000,
   });
 
@@ -68,7 +68,7 @@ export function createProviderApp(config: ProviderConfig): Express {
     addressOf.set(svc.resource, account.address);
     wallets.set(
       svc.resource,
-      createWalletClient({ account, chain: config.chain, transport: http(config.rpcUrl, { retryCount: 8, retryDelay: 4000 }) })
+      createWalletClient({ account, chain: config.chain, transport: pacedHttp(config.rpcUrl) })
     );
   }
 

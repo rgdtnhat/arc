@@ -1,7 +1,6 @@
 import {
   createPublicClient,
   createWalletClient,
-  http,
   maxUint256,
   parseEventLogs,
   type Account,
@@ -16,6 +15,7 @@ import {
   tesseraTabAbi,
   erc20Abi,
   PaymentStatus,
+  pacedHttp,
 } from "@tessera/shared";
 import { encodePacked, keccak256 } from "viem";
 
@@ -57,13 +57,13 @@ export class TesseraClient {
     this.tab = cfg.tabAddress;
     this.public = createPublicClient({
       chain: cfg.chain,
-      transport: http(cfg.rpcUrl, { retryCount: 8, retryDelay: 4000 }),
+      transport: pacedHttp(cfg.rpcUrl),
       pollingInterval: 8000,
     });
     this.wallet = createWalletClient({
       account: cfg.account,
       chain: cfg.chain,
-      transport: http(cfg.rpcUrl, { retryCount: 8, retryDelay: 4000 }),
+      transport: pacedHttp(cfg.rpcUrl),
     });
   }
 

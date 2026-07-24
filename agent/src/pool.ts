@@ -1,7 +1,6 @@
 import {
   createPublicClient,
   createWalletClient,
-  http,
   maxUint256,
   type Account,
   type Chain,
@@ -9,7 +8,7 @@ import {
   type PublicClient,
   type WalletClient,
 } from "viem";
-import { tesseraPoolAbi, erc20Abi } from "@tessera/shared";
+import { tesseraPoolAbi, erc20Abi, pacedHttp } from "@tessera/shared";
 
 /**
  * Thin, typed wrapper over TesseraPool for an agent: supply idle USDC to earn
@@ -50,13 +49,13 @@ export class TesseraPoolClient {
     this.pool = cfg.poolAddress;
     this.public = createPublicClient({
       chain: cfg.chain,
-      transport: http(cfg.rpcUrl, { retryCount: 8, retryDelay: 4000 }),
+      transport: pacedHttp(cfg.rpcUrl),
       pollingInterval: 8000,
     });
     this.wallet = createWalletClient({
       account: cfg.account,
       chain: cfg.chain,
-      transport: http(cfg.rpcUrl, { retryCount: 8, retryDelay: 4000 }),
+      transport: pacedHttp(cfg.rpcUrl),
     });
   }
 
