@@ -32,9 +32,46 @@ const $ = (id) => document.getElementById(id);
       const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
+      // Visible connection state. Without this a failing /api/state just left
+      // every field at "—", which looks identical to a healthy-but-empty app.
+      function showConnError(detail) {
+        let bar = $("connErr");
+        if (!bar) {
+          bar = document.createElement("div");
+          bar.id = "connErr";
+          bar.style.cssText =
+            "margin:12px 0;padding:10px 14px;border:1px solid #7f1d1d;background:#2a1212;" +
+            "color:#fca5a5;border-radius:10px;font-size:13px;line-height:1.5";
+          document.body.insertBefore(bar, document.body.firstChild);
+        }
+        bar.textContent = "⚠ Can't reach the Tessera server (/api/state): " + detail +
+          " — the app container may be down. Check: docker compose ps · docker compose logs tessera --tail=50";
+        bar.style.display = "block";
+      }
+      const clearConnError = () => { const b = $("connErr"); if (b) b.style.display = "none"; };
+
       async function tick() {
         let s;
-        try { s = await (await fetch("/api/state")).json(); } catch { return; }
+        try {
+          // Bound the wait: a hung read (rate-limited RPC, wedged container)
+          // should report itself, not leave the page spinning on "—" forever.
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 25000);
+          const res = await fetch("/api/state", { signal: ctl.signal }).finally(() => clearTimeout(timer));
+          if (!res.ok) { showConnError("HTTP " + res.status); return; }
+          s = await res.json();
+        } catch (e) {
+          const m = e && e.name === "AbortError" ? "timed out after 25s" : String(e && e.message ? e.message : e);
+          showConnError(m);
+          return;
+        }
+        // A well-formed state always carries meta/task/agent. Anything else means
+        // the server answered but isn't healthy — say so rather than crashing.
+        if (!s || !s.meta || !s.task || !s.agent) {
+          showConnError("server returned an incomplete state payload");
+          return;
+        }
+        clearConnError();
 
         $("brainPill").textContent = "brain: " + s.meta.brain;
         $("chainPill").textContent = s.meta.chain;
