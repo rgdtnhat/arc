@@ -259,6 +259,53 @@
         <div class="kv" id="lendingMsg" style="margin-top:10px;display:none"></div>
       </div>
 
+      <!-- Vault: auto-yield on USDC -->
+      <div class="card" id="vaultCard" style="margin-top:18px;display:none">
+        <h2>🏛 Vault — auto-yield on USDC</h2>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
+          Deposit USDC; a <b id="vReserve">—</b>% liquid reserve is always kept for instant
+          withdrawals and the rest earns the pool's supply APR. You keep the yield; the app takes
+          a <b id="vFee">—</b>% performance fee on yield only (never principal).
+        </div>
+        <div style="display:flex;gap:22px;flex-wrap:wrap;margin-bottom:14px">
+          <div><div style="font-size:11px;color:var(--muted)">Vault TVL</div><div id="vTvl" style="font-size:16px;font-weight:700">—</div></div>
+          <div><div style="font-size:11px;color:var(--muted)">Your balance</div><div id="vYours" style="font-size:16px;font-weight:700">—</div></div>
+          <div><div style="font-size:11px;color:var(--muted)">APR</div><div id="vApr" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
+          <div><div style="font-size:11px;color:var(--muted)">Liquid buffer</div><div id="vBuffer" style="font-size:16px;font-weight:700">—</div></div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <select id="vAction" class="btn" style="padding:8px 12px">
+            <option value="deposit">Deposit</option>
+            <option value="withdraw">Withdraw</option>
+          </select>
+          <input id="vAmount" class="btn" inputmode="decimal" placeholder="USDC amount"
+                 style="padding:8px 12px;width:150px;font-variant-numeric:tabular-nums" />
+          <button class="btn" id="vMax" style="padding:8px 12px">Max</button>
+          <button class="btn" id="vExecute" style="padding:8px 14px;font-weight:700">Execute</button>
+          <span id="vHint" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+        <div class="kv" id="vaultMsg" style="margin-top:10px;display:none"></div>
+      </div>
+
+      <!-- Swap desk -->
+      <div class="card" id="swapCard" style="margin-top:18px;display:none">
+        <h2>🔁 Swap</h2>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
+          Swap between pool assets at oracle prices. A 0.30% fee applies; part of it is the app's revenue.
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <input id="swAmount" class="btn" inputmode="decimal" placeholder="Amount"
+                 style="padding:8px 12px;width:130px;font-variant-numeric:tabular-nums" />
+          <select id="swIn" class="btn" style="padding:8px 12px"></select>
+          <span style="color:var(--muted)">→</span>
+          <select id="swOut" class="btn" style="padding:8px 12px"></select>
+          <button class="btn" id="swQuote" style="padding:8px 12px">Quote</button>
+          <button class="btn" id="swExecute" style="padding:8px 14px;font-weight:700">Swap</button>
+        </div>
+        <div id="swQuoteOut" style="font-size:12.5px;color:var(--muted);margin-top:10px"></div>
+        <div class="kv" id="swapMsg" style="margin-top:8px;display:none"></div>
+      </div>
+
       <div class="card" id="liveCard" style="margin-top:18px;display:none;border-color:#3a2a2a">
         <h2 style="color:#ff6b6b">🔴 Live on Arc testnet — real on-chain deployment</h2>
         <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">

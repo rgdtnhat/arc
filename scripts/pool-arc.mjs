@@ -11,6 +11,10 @@ import {
   erc20Abi,
   tesseraPoolAbi,
   tesseraPoolBytecode,
+  tesseraVaultAbi,
+  tesseraVaultBytecode,
+  tesseraSwapAbi,
+  tesseraSwapBytecode,
   formatUsdc,
   pacedHttp,
 } from "@tessera/shared";
@@ -103,15 +107,57 @@ async function main() {
     console.log("   (skip agent position — no cirBTC to use as collateral; supply from the dashboard once funded)");
   }
 
-  // 5) Persist to deployments/arc.json (multi-asset).
+  // 5) TesseraVault over USDC: 20% liquid reserve buffer, 15% performance fee.
+  console.log("→ deploying TesseraVault (USDC, 20% reserve, 15% perf fee)…");
+  let vh = await dWallet.deployContract({
+    abi: tesseraVaultAbi,
+    bytecode: tesseraVaultBytecode,
+    args: [ARC_USDC_ADDRESS, pool, deployer.address, 2000, 1500],
+    account: deployer,
+    chain: arcTestnet,
+  });
+  const vault = (await pub.waitForTransactionReceipt({ hash: vh })).contractAddress;
+  console.log("   vault", vault);
+  await pace();
+
+  // 6) TesseraSwap: 0.30% fee, half of it to the app treasury. Seed inventory.
+  console.log("→ deploying TesseraSwap (0.30% fee, 50% to treasury)…");
+  let sh = await dWallet.deployContract({
+    abi: tesseraSwapAbi,
+    bytecode: tesseraSwapBytecode,
+    args: [pool, deployer.address, 30, 5000],
+    account: deployer,
+    chain: arcTestnet,
+  });
+  const swap = (await pub.waitForTransactionReceipt({ hash: sh })).contractAddress;
+  console.log("   swap", swap);
+  await pace();
+  // Seed the swap desk with a slice of each asset the deployer still holds.
+  for (const r of RESERVES) {
+    const held = await bal(deployer.address, r.address);
+    const want = r.symbol === "cirBTC" ? 10_000n : 2_000_000n; // 0.0001 cirBTC or 2 units
+    const seed = want < held ? want : held;
+    if (seed > 0n) {
+      await dSend(r.address, erc20Abi, "approve", [swap, maxUint256]);
+      await dSend(swap, tesseraSwapAbi, "seed", [r.address, seed]);
+      console.log(`   seeded swap ${seed} ${r.symbol}`);
+    }
+  }
+
+  // 7) Persist to deployments/arc.json (multi-asset + vault + swap).
   const p = new URL("../deployments/arc.json", import.meta.url);
   const dep = JSON.parse(readFileSync(p, "utf8"));
   dep.tesseraPool = pool;
+  dep.tesseraVault = vault;
+  dep.vaultAsset = ARC_USDC_ADDRESS;
+  dep.tesseraSwap = swap;
   dep.poolAssets = RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
   writeFileSync(p, JSON.stringify(dep, null, 2) + "\n");
-  console.log("\n✅ Pool live on Arc:");
+  console.log("\n✅ Pool + Vault + Swap live on Arc:");
   console.log("   pool     ", pool);
+  console.log("   vault    ", vault);
+  console.log("   swap     ", swap);
   for (const r of RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
   console.log("   explorer ", `https://testnet.arcscan.app/address/${pool}`);
 }

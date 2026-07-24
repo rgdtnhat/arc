@@ -33,6 +33,7 @@ interface PoolDeploymentRef {
 }
 import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
+import { VaultClient, SwapClient } from "./defi.js";
 import { AdminAuth } from "./auth.js";
 import type { Faucet } from "./circle/faucet.js";
 
@@ -161,6 +162,18 @@ async function main() {
   // Lending pool client (present when a pool is recorded in deployments/arc.json).
   const poolClient = poolDeployment
     ? new TesseraPoolClient({ chain, rpcUrl, account: agentAccount, poolAddress: poolDeployment.poolAddress })
+    : undefined;
+
+  // Vault + swap clients (present when recorded in deployments/arc.json).
+  const vaultClient = liveDeployment.tesseraVault
+    ? new VaultClient(
+        { chain, rpcUrl, account: agentAccount },
+        liveDeployment.tesseraVault as Hex,
+        (liveDeployment.vaultAsset as Hex) ?? usdcAddress,
+      )
+    : undefined;
+  const swapClient = liveDeployment.tesseraSwap
+    ? new SwapClient({ chain, rpcUrl, account: agentAccount }, liveDeployment.tesseraSwap as Hex)
     : undefined;
 
   // Guardian policy: one-shot/CI runs auto-approve so they don't block on a human.
@@ -552,6 +565,88 @@ async function main() {
     }
   });
 
+  // --- Vault (TesseraVault) -------------------------------------------------
+  // USDC has 6 decimals; the vault is single-asset over USDC.
+  let lastVault: Awaited<ReturnType<typeof readVault>> | null = null;
+  async function readVault() {
+    if (!vaultClient || !poolClient) return null;
+    const [snap, usdcReserve] = await Promise.all([
+      vaultClient.snapshot(),
+      poolClient.reserveData(usdcAddress),
+    ]);
+    return {
+      address: vaultClient.vault,
+      asset: "USDC",
+      decimals: 6,
+      totalAssets: fmtUnits(snap.totalAssets, 6),
+      yourAssets: fmtUnits(snap.userAssets, 6),
+      yourAssetsRaw: snap.userAssets.toString(),
+      yourShares: snap.shares.toString(),
+      maxWithdraw: fmtUnits(snap.maxWithdraw, 6),
+      maxWithdrawRaw: snap.maxWithdraw.toString(),
+      bufferPct: (Number(snap.bufferBps) / 100).toFixed(1),
+      reserveRatioPct: (Number(snap.reserveRatioBps) / 100).toFixed(0),
+      performanceFeePct: (Number(snap.perfFeeBps) / 100).toFixed(0),
+      // The vault earns the pool's USDC supply APR on the deployed portion.
+      supplyApr: fmtApr(usdcReserve.supplyAprWad),
+    };
+  }
+  async function vaultState() {
+    if (!vaultClient) return null;
+    try { lastVault = await readVault(); return lastVault; } catch (e) {
+      console.error(`[vault] read failed (serving last good): ${String(e).slice(0, 100)}`);
+      return lastVault;
+    }
+  }
+
+  app.post("/api/vault/:action", requireAuth, async (req, res) => {
+    if (!vaultClient) { res.status(404).json({ ok: false, error: "vault not deployed" }); return; }
+    const amount = BigInt((req.query.amount as string) ?? "0");
+    const shares = BigInt((req.query.shares as string) ?? "0");
+    try {
+      const a = req.params.action;
+      const txHash =
+        a === "deposit" ? await vaultClient.deposit(amount)
+        : a === "withdraw" ? await vaultClient.withdrawShares(shares)
+        : null;
+      if (txHash === null) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
+      if (chainCache) chainCache.at = 0;
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e).slice(0, 200) });
+    }
+  });
+
+  // --- Swap (TesseraSwap) ---------------------------------------------------
+  // Public quote so anyone can price a swap before connecting a wallet.
+  app.get("/api/swap/quote", async (req, res) => {
+    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
+    try {
+      const tokenIn = req.query.tokenIn as Hex;
+      const tokenOut = req.query.tokenOut as Hex;
+      const amountIn = BigInt((req.query.amountIn as string) ?? "0");
+      const [out, fee, appFee] = await swapClient.quote(tokenIn, tokenOut, amountIn);
+      res.json({ ok: true, out: out.toString(), fee: fee.toString(), appFee: appFee.toString() });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: String(e).slice(0, 160) });
+    }
+  });
+
+  app.post("/api/swap", requireAuth, async (req, res) => {
+    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
+    try {
+      const tokenIn = req.query.tokenIn as Hex;
+      const tokenOut = req.query.tokenOut as Hex;
+      const amountIn = BigInt((req.query.amountIn as string) ?? "0");
+      const minOut = BigInt((req.query.minOut as string) ?? "0");
+      const txHash = await swapClient.execute(tokenIn, tokenOut, amountIn, minOut);
+      if (chainCache) chainCache.at = 0;
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e).slice(0, 200) });
+    }
+  });
+
   app.get("/api/state", async (_req, res) => {
     const { providers, agentBalance } = ensureChain();
     const settled = ledgerRef.filter((e) => e.status === "settled");
@@ -616,6 +711,10 @@ async function main() {
       treasury: { ...treasurySnapshot, settlement, faucetUrl: "https://faucet.circle.com/" },
       live: liveDeployment,
       lending: await lendingState(),
+      vault: await vaultState(),
+      swap: swapClient
+        ? { address: swapClient.swap, assets: poolDeployment?.assets ?? [{ symbol: "USDC", address: usdcAddress }] }
+        : null,
       balanceHistory,
       invoices: await fetch(`http://127.0.0.1:${PROVIDERS_PORT}/invoices`)
         .then((r) => r.json())

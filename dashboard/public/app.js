@@ -231,6 +231,36 @@ const $ = (id) => document.getElementById(id);
           if (window.renderLendingAsset) window.renderLendingAsset();
         }
 
+        // Vault (auto-yield on USDC).
+        const vt = s.vault;
+        if (vt) {
+          window.__vault = vt;
+          window.__agentUsdc = s.agent ? s.agent.balanceUsdc : "0";
+          $("vaultCard").style.display = "block";
+          $("vReserve").textContent = vt.reserveRatioPct;
+          $("vFee").textContent = vt.performanceFeePct;
+          $("vTvl").textContent = vt.totalAssets + " USDC";
+          $("vYours").textContent = vt.yourAssets + " USDC";
+          $("vApr").textContent = vt.supplyApr + "%";
+          $("vBuffer").textContent = vt.bufferPct + "%";
+        }
+
+        // Swap desk.
+        const sw = s.swap;
+        if (sw && sw.assets && sw.assets.length) {
+          window.__swap = sw;
+          $("swapCard").style.display = "block";
+          const syms = sw.assets.map((a) => a.symbol).join(",");
+          if ($("swIn").dataset.symbols !== syms) {
+            const opts = sw.assets.map((a) => `<option value="${a.address}" data-sym="${a.symbol}" data-dec="${a.decimals || 6}">${a.symbol}</option>`).join("");
+            $("swIn").innerHTML = opts;
+            $("swOut").innerHTML = opts;
+            $("swIn").dataset.symbols = syms;
+            $("swOut").dataset.symbols = syms;
+            if (sw.assets.length > 1) $("swOut").selectedIndex = 1;
+          }
+        }
+
         // Live Arc testnet deployment (from deployments/arc.json).
         const live = s.live;
         if (live && live.agent) {
@@ -485,6 +515,94 @@ const $ = (id) => document.getElementById(id);
           btn.disabled = false;
           tick();
         }
+      });
+
+      // --- Vault: deposit / withdraw USDC ------------------------------------
+      $("vMax").addEventListener("click", () => {
+        const vt = window.__vault;
+        if (!vt) return;
+        $("vAmount").value = $("vAction").value === "deposit" ? (window.__agentUsdc || "0") : vt.maxWithdraw;
+      });
+      $("vExecute").addEventListener("click", async () => {
+        const vt = window.__vault;
+        if (!vt) return;
+        const action = $("vAction").value;
+        const human = $("vAmount").value.trim();
+        const msg = $("vaultMsg");
+        if (!human || Number(human.replace(/,/g, "")) <= 0) {
+          msg.style.display = "block"; msg.style.color = "var(--warn)";
+          msg.textContent = "Enter a USDC amount (or tap Max)."; return;
+        }
+        const raw = toRaw(human, vt.decimals);
+        let query;
+        if (action === "deposit") {
+          query = `/api/vault/deposit?amount=${raw}`;
+        } else {
+          // Convert the requested USDC amount to shares proportionally; a full
+          // Max (>= your balance) redeems all your shares exactly.
+          let shares;
+          if (BigInt(raw) >= BigInt(vt.yourAssetsRaw || "0")) {
+            shares = vt.yourShares;
+          } else {
+            shares = (BigInt(vt.yourShares) * BigInt(raw) / BigInt(vt.yourAssetsRaw || "1")).toString();
+          }
+          query = `/api/vault/withdraw?shares=${shares}`;
+        }
+        const btn = $("vExecute"); btn.disabled = true;
+        try {
+          const r = await (await postAuthed(query)).json();
+          msg.style.display = "block";
+          msg.textContent = r.ok ? `${action} ${human} USDC ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;
+          msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
+          if (r.ok) $("vAmount").value = "";
+        } catch {
+          msg.style.display = "block"; msg.textContent = "request failed"; msg.style.color = "var(--warn)";
+        } finally { btn.disabled = false; tick(); }
+      });
+
+      // --- Swap: quote + execute --------------------------------------------
+      function swapSelected() {
+        const inOpt = $("swIn").selectedOptions[0], outOpt = $("swOut").selectedOptions[0];
+        if (!inOpt || !outOpt) return null;
+        return {
+          tokenIn: $("swIn").value, tokenOut: $("swOut").value,
+          symIn: inOpt.dataset.sym, symOut: outOpt.dataset.sym,
+          decIn: +(inOpt.dataset.dec || 6), decOut: +(outOpt.dataset.dec || 6),
+        };
+      }
+      async function swapQuote() {
+        const s = swapSelected(); if (!s) return null;
+        const human = $("swAmount").value.trim();
+        if (!human || Number(human) <= 0) return null;
+        if (s.tokenIn === s.tokenOut) { $("swQuoteOut").textContent = "Pick two different assets."; return null; }
+        const amountIn = toRaw(human, s.decIn);
+        const r = await (await fetch(`/api/swap/quote?tokenIn=${s.tokenIn}&tokenOut=${s.tokenOut}&amountIn=${amountIn}`)).json();
+        if (!r.ok) { $("swQuoteOut").textContent = "Quote failed: " + r.error; return null; }
+        const out = fmtUnitsJs(r.out, s.decOut), fee = fmtUnitsJs(r.appFee, s.decOut);
+        $("swQuoteOut").textContent = `≈ ${out} ${s.symOut}  ·  app fee ${fee} ${s.symOut}`;
+        return { ...s, amountIn, out: r.out };
+      }
+      function fmtUnitsJs(raw, dec) {
+        const s = String(raw).padStart(dec + 1, "0");
+        const i = s.slice(0, s.length - dec), f = s.slice(s.length - dec).replace(/0+$/, "");
+        return f ? `${i}.${f}` : i;
+      }
+      $("swQuote").addEventListener("click", swapQuote);
+      $("swExecute").addEventListener("click", async () => {
+        const q = await swapQuote();
+        const msg = $("swapMsg");
+        if (!q) { msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = "Get a valid quote first."; return; }
+        // 1% slippage floor.
+        const minOut = (BigInt(q.out) * 99n / 100n).toString();
+        const btn = $("swExecute"); btn.disabled = true;
+        try {
+          const r = await (await postAuthed(`/api/swap?tokenIn=${q.tokenIn}&tokenOut=${q.tokenOut}&amountIn=${q.amountIn}&minOut=${minOut}`)).json();
+          msg.style.display = "block";
+          msg.textContent = r.ok ? `swapped ${q.symIn} → ${q.symOut} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;
+          msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
+        } catch {
+          msg.style.display = "block"; msg.textContent = "request failed"; msg.style.color = "var(--warn)";
+        } finally { btn.disabled = false; tick(); }
       });
 
       // Poll interval is driven by the server (slower in live mode to spare the

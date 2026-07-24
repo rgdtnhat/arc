@@ -38,7 +38,7 @@ async function deployFixture() {
   return { deployer, alice, bob, liquidator, publicClient, usdc, cbtc, pool, fundAndApprove, as };
 }
 
-describe("TesseraPool (Blend-inspired lending)", () => {
+describe("TesseraPool (lending & borrowing)", () => {
   it("supplies and lets another account borrow against collateral", async () => {
     const { alice, bob, usdc, cbtc, pool, fundAndApprove, as } = await loadFixture(deployFixture);
 
