@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
-import { verifyMessage } from "viem";
+import { verifyMessage, formatUnits } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID } from "node:crypto";
 import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS } from "@tessera/shared";
@@ -19,11 +19,17 @@ import { describePolicy } from "./policy.js";
 import { AGENT_TASK, AGENT_POLICY } from "./scenario.js";
 import { usdc } from "@tessera/shared";
 
+/** One reserve asset in the pool (label + on-chain address; the rest is read live). */
+interface PoolAsset {
+  symbol: string;
+  address: Hex;
+}
 /** Reference to the TesseraPool deployment on Arc (from deployments/arc.json). */
 interface PoolDeploymentRef {
   poolAddress: Hex;
-  wbtcAddress: Hex;
   usdcAddress: Hex;
+  /** Every reserve the pool lists — USDC, EURC, BTC collateral, etc. */
+  assets: PoolAsset[];
 }
 import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
@@ -95,10 +101,26 @@ async function main() {
     providerKeys[s.resource] = specific ?? provKey;
   }
   const faucet: Faucet = faucetFromEnv();
-  const poolDeployment: PoolDeploymentRef | null =
-    liveDeployment.tesseraPool && liveDeployment.poolCollateral
-      ? { poolAddress: liveDeployment.tesseraPool as Hex, wbtcAddress: liveDeployment.poolCollateral as Hex, usdcAddress }
-      : null;
+  const poolDeployment: PoolDeploymentRef | null = liveDeployment.tesseraPool
+    ? {
+        poolAddress: liveDeployment.tesseraPool as Hex,
+        usdcAddress,
+        // Prefer the explicit asset list written by the deploy script; fall back
+        // to USDC + the legacy single collateral for older deployments.
+        assets:
+          Array.isArray(liveDeployment.poolAssets) && liveDeployment.poolAssets.length
+            ? (liveDeployment.poolAssets as { symbol: string; address: string }[]).map((a) => ({
+                symbol: a.symbol,
+                address: a.address as Hex,
+              }))
+            : [
+                { symbol: "USDC", address: usdcAddress },
+                ...(liveDeployment.poolCollateral
+                  ? [{ symbol: "wBTC", address: liveDeployment.poolCollateral as Hex }]
+                  : []),
+              ],
+      }
+    : null;
   console.log(`🔴 LIVE on ${chainLabel} — agent ${agentAccount.address}`);
   console.log(`   escrow ${escrowAddress} · tab ${tabAddress}${poolDeployment ? ` · pool ${poolDeployment.poolAddress}` : ""}`);
 
@@ -422,32 +444,79 @@ async function main() {
   // whole Lending & borrowing panel vanish, so we fall back to the last value.
   let lastLending: Awaited<ReturnType<typeof readLending>> | null = null;
 
+  const fmtUnits = (v: bigint, d: number) => formatUnits(v, d);
+  const minB = (a: bigint, b: bigint) => (a < b ? a : b);
+
   async function readLending() {
-    // Sequential (not Promise.all) to stay under the public RPC's per-window
-    // request limit — three simultaneous eth_calls is what trips "request limit
-    // reached" and hides this panel.
-    const usdcR = await poolClient!.reserveData(usdcAddress);
-    const acct = await poolClient!.accountData();
-    const borrowedUsdc = await poolClient!.borrowBalance(usdcAddress);
+    const pool = poolClient!;
+    const acct = await pool.accountData();
     const hf = acct.healthFactor;
+    // Remaining USD borrow headroom against the account's collateral (1e8 scale).
+    const headroomUsd = acct.borrowLimit > acct.borrowValue ? acct.borrowLimit - acct.borrowValue : 0n;
+
+    // All per-asset reads fire together; multicall batches them into one call.
+    const assets = await Promise.all(
+      poolDeployment.assets.map(async (a) => {
+        const [cfg, r, supplied, borrowed, wallet] = await Promise.all([
+          pool.reserveConfig(a.address),
+          pool.reserveData(a.address),
+          pool.supplyBalance(a.address),
+          pool.borrowBalance(a.address),
+          pool.walletBalance(a.address),
+        ]);
+        const dec = cfg.decimals;
+        const unit = 10n ** BigInt(dec);
+        // MAX per action, capped to what's actually possible for this account.
+        const supplyMax = wallet; // can't supply more than you hold
+        const withdrawMax = minB(supplied, r.cash); // your deposit, capped by liquidity
+        const repayMax = minB(borrowed, wallet); // your debt, capped by wallet
+        let borrowMax = 0n;
+        if (cfg.borrowable && cfg.priceE8 > 0n) {
+          borrowMax = minB((headroomUsd * unit) / cfg.priceE8, r.cash); // headroom, capped by liquidity
+        }
+        return {
+          symbol: a.symbol,
+          address: a.address,
+          decimals: dec,
+          borrowable: cfg.borrowable,
+          priceUsd: (Number(cfg.priceE8) / 1e8).toFixed(2),
+          reserve: {
+            cash: fmtUnits(r.cash, dec),
+            borrows: fmtUnits(r.totalBorrows, dec),
+            utilizationPct: ((Number(r.utilizationWad) / 1e18) * 100).toFixed(1),
+            borrowApr: fmtApr(r.borrowAprWad),
+            supplyApr: fmtApr(r.supplyAprWad),
+          },
+          position: {
+            supplied: fmtUnits(supplied, dec),
+            borrowed: fmtUnits(borrowed, dec),
+            wallet: fmtUnits(wallet, dec),
+          },
+          // Both a display string and the exact raw integer for a precise MAX fill.
+          max: {
+            supply: fmtUnits(supplyMax, dec),
+            withdraw: fmtUnits(withdrawMax, dec),
+            borrow: fmtUnits(borrowMax, dec),
+            repay: fmtUnits(repayMax, dec),
+            supplyRaw: supplyMax.toString(),
+            withdrawRaw: withdrawMax.toString(),
+            borrowRaw: borrowMax.toString(),
+            repayRaw: repayMax.toString(),
+          },
+        };
+      }),
+    );
+
     return {
-        poolAddress: poolDeployment.poolAddress,
-        assets: { usdc: usdcAddress, wbtc: poolDeployment.wbtcAddress },
-        usdcReserve: {
-          cashUsdc: formatUsdc(usdcR.cash),
-          borrowsUsdc: formatUsdc(usdcR.totalBorrows),
-          utilizationPct: ((Number(usdcR.utilizationWad) / 1e18) * 100).toFixed(1),
-          borrowApr: fmtApr(usdcR.borrowAprWad),
-          supplyApr: fmtApr(usdcR.supplyAprWad),
-        },
-        account: {
-          suppliedUsd: fmtUsd(acct.supplyValue),
-          borrowedUsd: fmtUsd(acct.borrowValue),
-          borrowLimitUsd: fmtUsd(acct.borrowLimit),
-          borrowedUsdc: formatUsdc(borrowedUsdc),
-          healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
-        },
-      };
+      poolAddress: poolDeployment.poolAddress,
+      account: {
+        suppliedUsd: fmtUsd(acct.supplyValue),
+        borrowedUsd: fmtUsd(acct.borrowValue),
+        borrowLimitUsd: fmtUsd(acct.borrowLimit),
+        healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
+      },
+      assets,
+    };
   }
 
   async function lendingState() {

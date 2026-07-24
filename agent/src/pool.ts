@@ -51,6 +51,8 @@ export class TesseraPoolClient {
       chain: cfg.chain,
       transport: pacedHttp(cfg.rpcUrl),
       pollingInterval: 8000,
+      // Batch the per-asset reserve/position reads into one multicall3 call.
+      batch: { multicall: true },
     });
     this.wallet = createWalletClient({
       account: cfg.account,
@@ -146,6 +148,27 @@ export class TesseraPoolClient {
       abi: tesseraPoolAbi,
       functionName: "borrowBalance",
       args: [asset, user ?? this.account.address],
+    }) as Promise<bigint>;
+  }
+
+  /** Reserve config: decimals, USD price (1e8), and whether it can be borrowed. */
+  async reserveConfig(asset: Hex): Promise<{ decimals: number; priceE8: bigint; borrowable: boolean }> {
+    const r = (await this.public.readContract({
+      address: this.pool,
+      abi: tesseraPoolAbi,
+      functionName: "reserves",
+      args: [asset],
+    })) as readonly [boolean, boolean, number, number, number, number, bigint, bigint, bigint, bigint, bigint, bigint];
+    return { borrowable: r[1], decimals: Number(r[2]), priceE8: r[6] };
+  }
+
+  /** The account's raw ERC-20 balance of an asset (its spendable wallet funds). */
+  walletBalance(asset: Hex, user?: Hex): Promise<bigint> {
+    return this.public.readContract({
+      address: asset,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [user ?? this.account.address],
     }) as Promise<bigint>;
   }
 }

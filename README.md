@@ -92,17 +92,16 @@ downstream), and `CIRCLE_PAYMASTER_URL` enables **Paymaster** gasless-first-call
 sponsorship. Both default to today's working path. See
 [`docs/CIRCLE_INTEGRATION.md`](docs/CIRCLE_INTEGRATION.md).
 
-## Lending & borrowing (Blend-inspired)
+## Lending & borrowing
 
-`TesseraPool` is an isolated money market on Arc, modelled on
-[Blend](https://www.blend.capital/) (Stellar): **reserves** with per-asset
+`TesseraPool` is an isolated money market on Arc: **reserves** with per-asset
 **collateral / liability factors**, **utilization-driven interest** (a kinked
 rate curve), **health-factor liquidations**, and a **protocol take-rate** that
-accrues to the app-owner treasury. Agents put idle USDC to work (supply → yield)
-or open a credit line (borrow against collateral) to fund their pay-per-call
-operations. **Live on Arc testnet** (`TesseraPool`
-[`0x065f…ca5f`](https://testnet.arcscan.app/address/0x065f1bb38fdc65a1c41e2e888940af713cabca5f)),
-with a **Lending & borrowing** dashboard panel. See
+accrues to the app-owner treasury. Reserves are three real Circle assets — **USDC**,
+**EURC**, and **cirBTC** (Circle Wrapped Bitcoin) — all borrowable. Agents put idle
+stablecoins to work (supply → yield) or open a credit line (borrow against collateral)
+to fund their pay-per-call operations. **Live on Arc testnet**, with a **Lending &
+borrowing** dashboard panel (multi-asset, custom + Max amounts). See
 [`docs/LENDING.md`](docs/LENDING.md). *(Unaudited testnet code.)*
 
 ## Web3 wallet login

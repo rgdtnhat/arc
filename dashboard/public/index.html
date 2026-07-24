@@ -204,10 +204,27 @@
       </div>
 
       <div class="card" id="lendingCard" style="margin-top:18px;display:none">
-        <h2>🏦 Lending &amp; borrowing — TesseraPool (Blend-inspired)</h2>
+        <h2>🏦 Lending &amp; borrowing — TesseraPool</h2>
+
+        <!-- Account-wide position -->
+        <div style="display:flex;gap:22px;flex-wrap:wrap;margin-bottom:14px">
+          <div><div style="font-size:11px;color:var(--muted)">Supplied</div><div id="lnSupplied" style="font-size:16px;font-weight:700">—</div></div>
+          <div><div style="font-size:11px;color:var(--muted)">Borrowed</div><div id="lnBorrowed" style="font-size:16px;font-weight:700">—</div></div>
+          <div><div style="font-size:11px;color:var(--muted)">Borrow limit</div><div id="lnLimit" style="font-size:16px;font-weight:700">—</div></div>
+          <div><div style="font-size:11px;color:var(--muted)">Health</div><div id="lnHealth" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
+        </div>
+
+        <!-- Asset picker -->
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+          <label style="font-size:12px;color:var(--muted)">Asset</label>
+          <select id="lnAsset" class="btn" style="padding:8px 12px"></select>
+          <span id="lnPrice" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+
+        <!-- Selected-asset reserve + position -->
         <div style="display:flex;flex-wrap:wrap;gap:26px;align-items:flex-start;justify-content:space-between">
-          <div style="flex:1;min-width:250px">
-            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">USDC reserve</div>
+          <div style="flex:1;min-width:240px">
+            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Reserve</div>
             <div style="display:flex;gap:22px;flex-wrap:wrap">
               <div><div style="font-size:11px;color:var(--muted)">Liquidity</div><div id="lnCash" style="font-size:16px;font-weight:700">—</div></div>
               <div><div style="font-size:11px;color:var(--muted)">Utilization</div><div id="lnUtil" style="font-size:16px;font-weight:700">—</div></div>
@@ -215,21 +232,29 @@
               <div><div style="font-size:11px;color:var(--muted)">Supply APR</div><div id="lnSupplyApr" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
             </div>
           </div>
-          <div style="flex:1;min-width:250px">
-            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Agent position</div>
+          <div style="flex:1;min-width:240px">
+            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Your position in this asset</div>
             <div style="display:flex;gap:22px;flex-wrap:wrap">
-              <div><div style="font-size:11px;color:var(--muted)">Supplied</div><div id="lnSupplied" style="font-size:16px;font-weight:700">—</div></div>
-              <div><div style="font-size:11px;color:var(--muted)">Borrowed</div><div id="lnBorrowed" style="font-size:16px;font-weight:700">—</div></div>
-              <div><div style="font-size:11px;color:var(--muted)">Limit</div><div id="lnLimit" style="font-size:16px;font-weight:700">—</div></div>
-              <div><div style="font-size:11px;color:var(--muted)">Health</div><div id="lnHealth" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Supplied</div><div id="lnAssetSupplied" style="font-size:16px;font-weight:700">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Borrowed</div><div id="lnAssetBorrowed" style="font-size:16px;font-weight:700">—</div></div>
+              <div><div style="font-size:11px;color:var(--muted)">Wallet</div><div id="lnWallet" style="font-size:16px;font-weight:700">—</div></div>
             </div>
           </div>
         </div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:16px">
-          <button class="btn" data-lend="supply" data-asset="usdc" data-amount="10000000">Supply 10 USDC</button>
-          <button class="btn" data-lend="withdraw" data-asset="usdc" data-amount="10000000">Withdraw 10 USDC</button>
-          <button class="btn" data-lend="borrow" data-asset="usdc" data-amount="2000000">Borrow 2 USDC</button>
-          <button class="btn" data-lend="repay" data-asset="usdc" data-amount="2000000">Repay 2 USDC</button>
+
+        <!-- Action + custom amount + Max -->
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px">
+          <select id="lnAction" class="btn" style="padding:8px 12px">
+            <option value="supply">Supply</option>
+            <option value="withdraw">Withdraw</option>
+            <option value="borrow">Borrow</option>
+            <option value="repay">Repay</option>
+          </select>
+          <input id="lnAmount" class="btn" inputmode="decimal" placeholder="Amount"
+                 style="padding:8px 12px;width:150px;font-variant-numeric:tabular-nums" />
+          <button class="btn" id="lnMax" style="padding:8px 12px">Max</button>
+          <button class="btn" id="lnExecute" style="padding:8px 14px;font-weight:700">Execute</button>
+          <span id="lnMaxHint" style="font-size:12px;color:var(--muted)"></span>
         </div>
         <div class="kv" id="lendingMsg" style="margin-top:10px;display:none"></div>
       </div>

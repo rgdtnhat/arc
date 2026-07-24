@@ -59,6 +59,9 @@ export class TesseraClient {
       chain: cfg.chain,
       transport: pacedHttp(cfg.rpcUrl),
       pollingInterval: 8000,
+      // Collapse concurrent contract reads into one multicall3 eth_call (Arc has
+      // it at the canonical address) — far fewer round-trips, much faster loads.
+      batch: { multicall: true },
     });
     this.wallet = createWalletClient({
       account: cfg.account,

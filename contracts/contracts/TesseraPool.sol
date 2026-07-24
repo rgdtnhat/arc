@@ -10,16 +10,16 @@ interface IERC20 {
 
 /**
  * @title TesseraPool
- * @notice An isolated lending & borrowing pool, inspired by Blend (Stellar).
+ * @notice An isolated lending & borrowing pool (money market).
  *
- * Design borrowed from Blend:
+ * Design:
  *  - **Isolated pool** with independent **reserves** (assets), each configured
  *    with a **collateral factor** (how much it backs borrowing) and a
  *    **liability factor** (how much borrowing it consumes of your limit).
  *  - **Utilization-driven interest**: a kinked rate model; suppliers earn, and
  *    borrowers pay, an index that accrues with pool utilization.
  *  - **Protocol take-rate** (`reserveFactor`): a cut of interest is minted to a
- *    treasury — the app-owner's revenue (Blend routes this to its backstop).
+ *    treasury — the app-owner's revenue.
  *  - **Health-factor liquidation**: an unhealthy position can be liquidated,
  *    the liquidator repaying debt and seizing collateral at a bonus.
  *
@@ -35,7 +35,7 @@ contract TesseraPool is ReentrancyGuard {
     uint256 internal constant SECONDS_PER_YEAR = 365 days;
 
     // Kinked interest-rate model (annual, WAD). rate(u) rises gently to the kink,
-    // then steeply — pushing utilization back toward target, like Blend's curve.
+    // then steeply — pushing utilization back toward target.
     uint256 internal constant BASE_RATE = 0.01e18; // 1% at 0% utilization
     uint256 internal constant SLOPE_1 = 0.04e18; // +4% up to the kink (→5% at kink)
     uint256 internal constant SLOPE_2 = 1.00e18; // +100% from kink to 100%

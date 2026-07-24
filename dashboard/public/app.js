@@ -209,19 +209,26 @@ const $ = (id) => document.getElementById(id);
           if (tr.faucetUrl) $("faucetLink").href = tr.faucetUrl;
         }
 
-        // Lending & borrowing (TesseraPool).
+        // Lending & borrowing (TesseraPool) — multi-asset.
         const ln = s.lending;
-        if (ln) {
+        if (ln && ln.assets && ln.assets.length) {
           $("lendingCard").style.display = "block";
-          $("lnCash").textContent = ln.usdcReserve.cashUsdc + " USDC";
-          $("lnUtil").textContent = ln.usdcReserve.utilizationPct + "%";
-          $("lnBorrowApr").textContent = ln.usdcReserve.borrowApr + "%";
-          $("lnSupplyApr").textContent = ln.usdcReserve.supplyApr + "%";
           $("lnSupplied").textContent = "$" + ln.account.suppliedUsd;
           $("lnBorrowed").textContent = "$" + ln.account.borrowedUsd;
           $("lnLimit").textContent = "$" + ln.account.borrowLimitUsd;
           $("lnHealth").textContent = ln.account.healthFactor;
-          window.__lendingAssets = ln.assets;
+          window.__lending = ln;
+          const sel = $("lnAsset");
+          // (Re)build the asset dropdown only when the set of symbols changes,
+          // so it doesn't reset the user's selection on every poll.
+          const symbols = ln.assets.map((a) => a.symbol).join(",");
+          if (sel.dataset.symbols !== symbols) {
+            const keep = sel.value;
+            sel.innerHTML = ln.assets.map((a) => `<option value="${a.symbol}">${a.symbol}</option>`).join("");
+            sel.dataset.symbols = symbols;
+            if (ln.assets.some((a) => a.symbol === keep)) sel.value = keep;
+          }
+          if (window.renderLendingAsset) window.renderLendingAsset();
         }
 
         // Live Arc testnet deployment (from deployments/arc.json).
@@ -404,30 +411,80 @@ const $ = (id) => document.getElementById(id);
         } catch {}
       })();
 
-      // Lending action buttons (supply / withdraw / borrow / repay).
-      document.querySelectorAll("[data-lend]").forEach((btn) => {
-        btn.addEventListener("click", async () => {
-          const assets = window.__lendingAssets;
-          if (!assets) return;
-          const asset = assets[btn.dataset.asset];
-          const msg = $("lendingMsg");
-          btn.disabled = true;
-          try {
-            const r = await (
-              await postAuthed(`/api/lending/${btn.dataset.lend}?asset=${asset}&amount=${btn.dataset.amount}`)
-            ).json();
-            msg.style.display = "block";
-            msg.textContent = r.ok ? `${btn.dataset.lend} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;
-            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
-          } catch {
-            msg.style.display = "block";
-            msg.textContent = "request failed";
-            msg.style.color = "var(--warn)";
-          } finally {
-            btn.disabled = false;
-            tick();
-          }
-        });
+      // --- Lending: multi-asset supply / withdraw / borrow / repay ------------
+      function selectedLendingAsset() {
+        const ln = window.__lending;
+        if (!ln) return null;
+        return ln.assets.find((a) => a.symbol === $("lnAsset").value) || ln.assets[0];
+      }
+      // Convert a human amount string to the asset's raw integer (string), no floats.
+      function toRaw(human, decimals) {
+        const [i, f = ""] = String(human).trim().replace(/,/g, "").split(".");
+        const frac = (f + "0".repeat(decimals)).slice(0, decimals);
+        return (BigInt(i || "0") * 10n ** BigInt(decimals) + BigInt(frac || "0")).toString();
+      }
+      // Render the reserve + position + max hint for the currently selected asset.
+      window.renderLendingAsset = function renderLendingAsset() {
+        const a = selectedLendingAsset();
+        if (!a) return;
+        $("lnPrice").textContent = "≈ $" + a.priceUsd + " / " + a.symbol;
+        $("lnCash").textContent = a.reserve.cash + " " + a.symbol;
+        $("lnUtil").textContent = a.reserve.utilizationPct + "%";
+        $("lnBorrowApr").textContent = a.borrowable ? a.reserve.borrowApr + "%" : "—";
+        $("lnSupplyApr").textContent = a.reserve.supplyApr + "%";
+        $("lnAssetSupplied").textContent = a.position.supplied + " " + a.symbol;
+        $("lnAssetBorrowed").textContent = a.position.borrowed + " " + a.symbol;
+        $("lnWallet").textContent = a.position.wallet + " " + a.symbol;
+        const action = $("lnAction").value;
+        const max = a.max[action];
+        $("lnMaxHint").textContent = "max " + action + ": " + max + " " + a.symbol +
+          (action === "borrow" && !a.borrowable ? " (not borrowable)" : "");
+      };
+      function fillMax() {
+        const a = selectedLendingAsset();
+        if (!a) return;
+        const action = $("lnAction").value;
+        $("lnAmount").value = a.max[action];
+        $("lnAmount").dataset.raw = a.max[action + "Raw"]; // exact raw for a true MAX
+      }
+      $("lnAsset").addEventListener("change", renderLendingAsset);
+      $("lnAction").addEventListener("change", renderLendingAsset);
+      // Manual edits invalidate the remembered exact-MAX raw value.
+      $("lnAmount").addEventListener("input", () => { delete $("lnAmount").dataset.raw; });
+      $("lnMax").addEventListener("click", fillMax);
+      $("lnExecute").addEventListener("click", async () => {
+        const a = selectedLendingAsset();
+        if (!a) return;
+        const action = $("lnAction").value;
+        const human = $("lnAmount").value.trim();
+        const msg = $("lendingMsg");
+        if (!human || Number(human.replace(/,/g, "")) <= 0) {
+          msg.style.display = "block"; msg.style.color = "var(--warn)";
+          msg.textContent = "Enter an amount (or tap Max).";
+          return;
+        }
+        // Use the exact raw when the field is an untouched Max; else parse the input.
+        const raw = $("lnAmount").dataset.raw || toRaw(human, a.decimals);
+        const btn = $("lnExecute");
+        btn.disabled = true;
+        try {
+          const r = await (
+            await postAuthed(`/api/lending/${action}?asset=${a.address}&amount=${raw}`)
+          ).json();
+          msg.style.display = "block";
+          msg.textContent = r.ok
+            ? `${action} ${human} ${a.symbol} ✓ — tx ${String(r.txHash).slice(0, 12)}…`
+            : `failed: ${r.error}`;
+          msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
+          if (r.ok) { $("lnAmount").value = ""; delete $("lnAmount").dataset.raw; }
+        } catch {
+          msg.style.display = "block";
+          msg.textContent = "request failed";
+          msg.style.color = "var(--warn)";
+        } finally {
+          btn.disabled = false;
+          tick();
+        }
       });
 
       // Poll interval is driven by the server (slower in live mode to spare the

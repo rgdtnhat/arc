@@ -56,6 +56,7 @@ export function createProviderApp(config: ProviderConfig): Express {
     chain: config.chain,
     transport: pacedHttp(config.rpcUrl),
     pollingInterval: 8000,
+    batch: { multicall: true },
   });
 
   // Resolve each service's provider wallet.
