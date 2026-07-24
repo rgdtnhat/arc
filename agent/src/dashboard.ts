@@ -418,16 +418,19 @@ async function main() {
   // --- Lending (TesseraPool) ------------------------------------------------
   const fmtApr = (wad: bigint) => ((Number(wad) / 1e18) * 100).toFixed(2);
   const fmtUsd = (v: bigint) => (Number(v) / 1e8).toFixed(2);
-  async function lendingState() {
-    if (!poolClient || !poolDeployment) return null;
-    try {
-      const [usdcR, acct, borrowedUsdc] = await Promise.all([
-        poolClient.reserveData(usdcAddress),
-        poolClient.accountData(),
-        poolClient.borrowBalance(usdcAddress),
-      ]);
-      const hf = acct.healthFactor;
-      return {
+  // Last good lending snapshot: a throttled public RPC read shouldn't make the
+  // whole Lending & borrowing panel vanish, so we fall back to the last value.
+  let lastLending: Awaited<ReturnType<typeof readLending>> | null = null;
+
+  async function readLending() {
+    // Sequential (not Promise.all) to stay under the public RPC's per-window
+    // request limit — three simultaneous eth_calls is what trips "request limit
+    // reached" and hides this panel.
+    const usdcR = await poolClient!.reserveData(usdcAddress);
+    const acct = await poolClient!.accountData();
+    const borrowedUsdc = await poolClient!.borrowBalance(usdcAddress);
+    const hf = acct.healthFactor;
+    return {
         poolAddress: poolDeployment.poolAddress,
         assets: { usdc: usdcAddress, wbtc: poolDeployment.wbtcAddress },
         usdcReserve: {
@@ -445,9 +448,18 @@ async function main() {
           healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
         },
       };
+  }
+
+  async function lendingState() {
+    if (!poolClient || !poolDeployment) return null;
+    try {
+      lastLending = await readLending();
+      return lastLending;
     } catch (e) {
-      console.error(`[lending] read failed: ${String(e).slice(0, 100)}`);
-      return null;
+      // Transient throttle: keep showing the last good snapshot instead of
+      // dropping the panel. Only null before the very first successful read.
+      console.error(`[lending] read failed (serving last good): ${String(e).slice(0, 100)}`);
+      return lastLending;
     }
   }
 
