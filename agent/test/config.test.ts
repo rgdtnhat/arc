@@ -61,6 +61,19 @@ test("cadence must be between one second and one year", () => {
   assert.equal(s.update({ feeIntervalSeconds: 31_536_001 }).ok, false);
 });
 
+test("cadence multiplier gives 'every N units' and rejects nonsense", () => {
+  const s = new AppConfigStore(tmpFile());
+  assert.equal(s.get().feeIntervalEvery, 1, "defaults to every single unit");
+  // Every 3 days.
+  const r = s.update({ feeIntervalEvery: 3, feeIntervalLabel: "day", feeIntervalSeconds: 3 * 86_400 });
+  assert.equal(r.ok, true);
+  assert.equal(s.get().feeIntervalEvery, 3);
+  assert.equal(s.get().feeIntervalSeconds, 259_200);
+  assert.equal(s.update({ feeIntervalEvery: 0 }).ok, false);
+  assert.equal(s.update({ feeIntervalEvery: 1001 }).ok, false);
+  assert.equal(s.update({ feeIntervalEvery: 2.5 }).ok, false);
+});
+
 test("weekly schedule validates the weekday and HH:MM time", () => {
   const s = new AppConfigStore(tmpFile());
   assert.equal(s.update({ feeScheduleMode: "weekly", feeWeekday: 6, feeTimeUtc: "23:59" }).ok, true);

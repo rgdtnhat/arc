@@ -10,7 +10,9 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="Tessera" />
     <link rel="apple-touch-icon" href="icon-192.png" />
-    <link rel="icon" href="icon-192.png" type="image/png" />
+    <!-- Ticket mark, matching the Tessera logo -->
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
       /* ====================================================================
        * Tessera design system
@@ -321,6 +323,62 @@
         background: var(--panel-2); color: var(--text); font: inherit; font-size: 13px;
       }
 
+
+      /* ---- clickable landing cards ---------------------------------------- */
+      .feat[data-goto] { cursor: pointer; }
+      .feat[data-goto]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+      .feat[data-goto]::after {
+        content: "Open →"; display: block; margin-top: 12px;
+        font-size: 12.5px; color: var(--accent); opacity: 0; transform: translateX(-4px);
+        transition: opacity .2s ease, transform .2s ease;
+      }
+      .feat[data-goto]:hover::after, .feat[data-goto]:focus-visible::after { opacity: 1; transform: none; }
+      /* Brief highlight when a card deep-links you to a panel. */
+      @keyframes flash { 0%,100% { box-shadow: none; } 30% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent); } }
+      .flashTarget { animation: flash 1.4s ease; }
+
+      /* ---- modal ---------------------------------------------------------- */
+      .modalWrap {
+        position: fixed; inset: 0; z-index: 120; display: grid; place-items: center;
+        background: rgba(4, 7, 14, .62); backdrop-filter: blur(6px); padding: 20px;
+      }
+      .modalWrap[hidden] { display: none; }
+      .modalCard {
+        width: min(94vw, 400px); border: 1px solid var(--line-strong); border-radius: 18px;
+        background: var(--bg-soft); box-shadow: var(--shadow); padding: 20px 22px;
+        animation: fade .2s ease both;
+      }
+      .fLabel { display: block; font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 5px; }
+      .fWide { width: 100%; }
+      .pwRow { display: flex; gap: 8px; align-items: stretch; }
+      .pwRow .field { flex: 1; min-width: 0; }
+      .pwEye { padding: 8px 11px; }
+
+      /* ---- responsiveness ------------------------------------------------- */
+      @media (max-width: 720px) {
+        .wrap { padding: 0 14px; }
+        .topbar .inner { padding: 8px 14px; gap: 7px; flex-wrap: wrap; }
+        .brand .name { font-size: 15.5px; }
+        .btn { padding: 7px 11px; font-size: 13px; }
+        .card { padding: 15px 15px; border-radius: 15px; }
+        .metrics { gap: 15px; }
+        .metric .v { font-size: 15.5px; }
+        .balance { font-size: 27px; }
+        .hero { padding: 52px 0 30px; }
+        .tabsBar { top: 52px; }
+        .startDock { top: 56px; }
+        .row-actions { gap: 7px; }
+        .row-actions .field, .row-actions .btn { flex: 1 1 auto; }
+        #lnAmount, #vAmount, #swAmount { width: 100% !important; }
+      }
+      @media (max-width: 420px) {
+        .hero h1 { font-size: 30px; }
+        .stat .v { font-size: 19px; }
+        .navDrawer .inner .btn { flex: 1 1 100%; }
+      }
+      /* Never let a control overflow its card on any width. */
+      .row-actions > * { max-width: 100%; }
+
       .foot { color: var(--muted); font-size: 12px; padding: 26px 0 40px; display: flex; gap: 14px; flex-wrap: wrap; }
     </style>
   </head>
@@ -373,12 +431,19 @@
               </select>
             </div>
             <div class="cfgRow" id="cfgRowInterval"><span>Allocate every</span>
-              <select id="cfgCadence">
+              <span style="display:flex;gap:6px;align-items:center">
+              <input id="cfgEvery" type="number" min="1" max="1000" step="1" style="width:56px"
+                     title="Leave as 1 for every unit, or set N for every N units" />
+              <select id="cfgCadence" style="width:104px">
                 <option value="second">Second</option><option value="minute">Minute</option>
                 <option value="hour">Hour</option><option value="day">Day</option>
                 <option value="week">Week</option><option value="month">Month</option>
                 <option value="year">Year</option>
               </select>
+              </span>
+            </div>
+            <div class="cfgRow" id="cfgRowEffective" style="color:var(--muted);font-size:12px">
+              <span>Effective</span><span id="cfgEffective">—</span>
             </div>
             <div class="cfgRow" id="cfgRowWeekday" style="display:none"><span>On</span>
               <select id="cfgWeekday">
@@ -458,21 +523,21 @@
             <p>Escrowed payments, a money market, a yield vault and a swap desk — all denominated in USDC on Arc.</p>
           </div>
           <div class="featGrid">
-            <div class="feat reveal"><div class="ico">🔐</div><h3>Programmable escrow</h3>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">🔐</div><h3>Programmable escrow</h3>
               <p>Payment locks before delivery and releases only when the response passes an integrity and quality check.</p></div>
-            <div class="feat reveal"><div class="ico">↩️</div><h3>SLA auto-refund</h3>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">↩️</div><h3>SLA auto-refund</h3>
               <p>Miss the deadline or return junk and the agent reclaims its USDC automatically — enforced by the contract, not goodwill.</p></div>
-            <div class="feat reveal"><div class="ico">⭐</div><h3>On-chain reputation</h3>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">⭐</div><h3>On-chain reputation</h3>
               <p>Every settlement and failure is recorded against the provider, with bonded stake slashed on a breach.</p></div>
-            <div class="feat reveal"><div class="ico">⚡</div><h3>Nanopayment tabs</h3>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">⚡</div><h3>Nanopayment tabs</h3>
               <p>One deposit, then hundreds of off-chain signed vouchers at zero gas, settled in a single transaction.</p></div>
-            <div class="feat reveal"><div class="ico">🏦</div><h3>Lending &amp; borrowing</h3>
+            <div class="feat reveal" data-goto="defi#lendingCard" role="link" tabindex="0"><div class="ico">🏦</div><h3>Lending &amp; borrowing</h3>
               <p>Supply USDC, EURC or cirBTC for yield, or borrow against collateral with health-factor liquidation.</p></div>
-            <div class="feat reveal"><div class="ico">🏛</div><h3>Yield vault</h3>
+            <div class="feat reveal" data-goto="defi#vaultCard" role="link" tabindex="0"><div class="ico">🏛</div><h3>Yield vault</h3>
               <p>Deposit USDC and earn the pool's APR automatically, with a large liquid reserve kept for instant exits.</p></div>
-            <div class="feat reveal"><div class="ico">🔁</div><h3>Swap desk</h3>
+            <div class="feat reveal" data-goto="defi#swapCard" role="link" tabindex="0"><div class="ico">🔁</div><h3>Swap desk</h3>
               <p>Oracle-priced swaps between every pool asset, with the rate and both balances shown before you commit.</p></div>
-            <div class="feat reveal"><div class="ico">🛡</div><h3>Guardian policy</h3>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">🛡</div><h3>Guardian policy</h3>
               <p>A spending cap keeps the agent autonomous for small buys and escalates anything larger to a human co-signer.</p></div>
           </div>
         </section>
@@ -483,17 +548,17 @@
             <p>Most agent-payment projects stop at "the agent sends USDC". These are the parts that make a stranger safe to deal with.</p>
           </div>
           <div class="featGrid">
-            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>Skin in the game</h3>
+            <div class="feat spot reveal" data-goto="agents" role="link" tabindex="0"><span class="tagline">Unique</span><h3>Skin in the game</h3>
               <p>Providers bond USDC stake. An SLA breach slashes it and pays the agent compensation — the counterparty carries real downside.</p></div>
-            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>Self-custody DeFi</h3>
+            <div class="feat spot reveal" data-goto="defi" role="link" tabindex="0"><span class="tagline">Unique</span><h3>Self-custody DeFi</h3>
               <p>Your wallet signs, your own funds move. The server never holds a key and cannot touch user balances.</p></div>
-            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>Trust memory</h3>
+            <div class="feat spot reveal" data-goto="agents" role="link" tabindex="0"><span class="tagline">Unique</span><h3>Trust memory</h3>
               <p>The agent remembers who burned it and declines their invoices next time, without any human intervention.</p></div>
-            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>Liveness guard</h3>
+            <div class="feat spot reveal" data-goto="agents" role="link" tabindex="0"><span class="tagline">Unique</span><h3>Liveness guard</h3>
               <p>A delivered payment can never be locked forever by an unresponsive agent — the provider can always claim.</p></div>
-            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>USDC is the gas</h3>
+            <div class="feat spot reveal" data-goto="dashboard" role="link" tabindex="0"><span class="tagline">Unique</span><h3>USDC is the gas</h3>
               <p>On Arc the agent funds one asset for both the toll and the fees, and settlement clears inside a request.</p></div>
-            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>80% liquid vault floor</h3>
+            <div class="feat spot reveal" data-goto="defi#vaultCard" role="link" tabindex="0"><span class="tagline">Unique</span><h3>80% liquid vault floor</h3>
               <p>A contract constant no admin can lower, so most of the vault is always redeemable on demand.</p></div>
           </div>
         </section>
@@ -789,6 +854,34 @@
             <span>escrow <span class="mono" id="escrowLink">—</span></span>
             <span id="note"></span>
           </div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- Sign-in dialog: masked password with a reveal toggle -->
+    <div id="authModal" class="modalWrap" hidden>
+      <div class="modalCard" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+        <h3 id="authTitle" style="margin:0 0 4px;font-size:17px;letter-spacing:-0.02em">Operator sign-in</h3>
+        <p style="margin:0 0 14px;color:var(--muted);font-size:13px" id="authHint">
+          Enter your admin id and password.
+        </p>
+        <label class="fLabel" for="authId" id="authIdLabel">Admin id</label>
+        <input id="authId" class="field fWide" autocomplete="off" autocapitalize="none" spellcheck="false" />
+        <label class="fLabel" for="authPw" id="authPwLabel" style="margin-top:10px">Password</label>
+        <div class="pwRow">
+          <input id="authPw" class="field fWide" type="password" autocomplete="current-password" />
+          <button class="btn pwEye" id="authEye" type="button" aria-label="Show password" title="Show password">👁</button>
+        </div>
+        <label class="fLabel" for="authPw2" id="authPw2Label" style="margin-top:10px;display:none">New password</label>
+        <div class="pwRow" id="authPw2Row" style="display:none">
+          <input id="authPw2" class="field fWide" type="password" autocomplete="new-password" />
+          <button class="btn pwEye" id="authEye2" type="button" aria-label="Show password" title="Show password">👁</button>
+        </div>
+        <div class="kv" id="authMsg" style="margin-top:10px;display:none"></div>
+        <div style="display:flex;gap:9px;margin-top:16px">
+          <button class="btn primary" id="authSubmit" style="flex:1">Sign in</button>
+          <button class="btn" id="authCancel">Cancel</button>
         </div>
       </div>
     </div>

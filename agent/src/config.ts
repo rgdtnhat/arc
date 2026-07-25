@@ -25,8 +25,13 @@ export interface AppConfig {
   };
   /** Allocation cadence in seconds (1 … 31536000). */
   feeIntervalSeconds: number;
-  /** Human label for the cadence, e.g. "weekly" or "manual". */
+  /** Human label for the cadence unit, e.g. "week". */
   feeIntervalLabel: string;
+  /**
+   * Multiplier for the cadence unit — "every N <unit>", e.g. 3 + "day" = every
+   * 3 days. Blank/1 means every single unit.
+   */
+  feeIntervalEvery: number;
   /**
    * How allocation is triggered:
    *  - `interval` — every `feeIntervalSeconds` (the on-chain cadence)
@@ -59,6 +64,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   feeShares: { agentBps: 2_000, lendingBps: 2_000, vaultBps: 2_000, swapBps: 2_000, retainedBps: 2_000 },
   feeIntervalSeconds: CADENCES.week, // once a week by default
   feeIntervalLabel: "week",
+  feeIntervalEvery: 1,
   feeScheduleMode: "interval",
   feeWeekday: 1, // Monday
   feeTimeUtc: "09:00",
@@ -141,6 +147,9 @@ export class AppConfigStore {
       next.feeIntervalSeconds > LIMITS.feeIntervalMax
     ) {
       return { ok: false, error: "Allocation cadence must be between 1 second and 1 year." };
+    }
+    if (!Number.isInteger(next.feeIntervalEvery) || next.feeIntervalEvery < 1 || next.feeIntervalEvery > 1000) {
+      return { ok: false, error: "The cadence multiplier must be a whole number between 1 and 1000." };
     }
     if (!["interval", "weekly", "manual"].includes(next.feeScheduleMode)) {
       return { ok: false, error: "Allocation trigger must be interval, weekly, or manual." };

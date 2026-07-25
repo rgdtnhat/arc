@@ -1,6 +1,6 @@
 import express from "express";
 import path from "node:path";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
@@ -38,6 +38,16 @@ import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
 import { OwnerClient } from "./owner.js";
 import type { Faucet } from "./circle/faucet.js";
+
+const APP_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../..");
+/**
+ * Where mutable state lives (admin credential hash, App Config, profiles, trust
+ * memory). Defaults to the app root; set STATE_DIR to a mounted volume so a
+ * container rebuild doesn't reset the admin password or lose the config.
+ */
+const STATE_DIR = process.env.STATE_DIR ?? APP_ROOT;
+const statePath = (name: string) => path.join(STATE_DIR, name);
+try { mkdirSync(STATE_DIR, { recursive: true }); } catch { /* already there */ }
 
 const PROVIDERS_PORT = 8788;
 // Cloud hosts inject $PORT; default to 8787 locally. Providers stay internal.
@@ -225,7 +235,7 @@ async function main() {
     autoApprove: process.env.TESSERA_ONCE === "1" || process.env.TESSERA_AUTO_APPROVE === "1",
   };
   const memory = new TrustMemory(
-    path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-memory.json")
+    statePath(".tessera-memory.json")
   );
 
   const treasury = new TesseraTreasury({
@@ -392,7 +402,7 @@ async function main() {
   // --- Admin login (credentials from env → gitignored scrypt hash) ----------
   const admin = process.env.ADMIN_PASSWORD
     ? new AdminAuth(
-        path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-admin.json"),
+        statePath(".tessera-admin.json"),
         { id: process.env.ADMIN_ID ?? "admin", password: process.env.ADMIN_PASSWORD }
       )
     : null;
@@ -728,7 +738,7 @@ async function main() {
         : a === "repay" ? await p.repay(asset, amount)
         : null;
       if (txHash === null) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
-      if (chainCache) chainCache.at = 0;
+      invalidateAll();
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
@@ -864,7 +874,7 @@ async function main() {
         : a === "withdraw" ? await vaultClient.withdrawShares(shares)
         : null;
       if (txHash === null) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
-      if (chainCache) chainCache.at = 0;
+      invalidateAll();
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
@@ -895,7 +905,7 @@ async function main() {
   // --- Profile (any signed-in identity: admin or connected wallet) ----------
   // A display name per identity, persisted. Keyed by wallet address or by the
   // admin session, never by the admin id itself (that stays secret).
-  const profilesFile = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-profiles.json");
+  const profilesFile = statePath(".tessera-profiles.json");
   const loadProfiles = (): Record<string, { name?: string }> => {
     try { return JSON.parse(readFileSync(profilesFile, "utf8")); } catch { return {}; }
   };
@@ -944,7 +954,7 @@ async function main() {
   // of yield and fees is not public information, and the menu is hidden for
   // non-admins client-side because the API refuses it server-side.
   const appConfig = new AppConfigStore(
-    path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-config.json"),
+    statePath(".tessera-config.json"),
   );
 
   /**
@@ -983,12 +993,24 @@ async function main() {
     }
   }, 60_000).unref?.();
 
+  /**
+   * Seconds the collector should wait between permissionless allocations:
+   * the chosen unit times the "every N" multiplier, clamped to the contract's
+   * 1s…1y window.
+   */
+  const effectiveIntervalSeconds = (c: AppConfig) => {
+    const unit = CADENCES[c.feeIntervalLabel] ?? c.feeIntervalSeconds ?? CADENCES.week;
+    const n = Math.max(1, Math.floor(c.feeIntervalEvery || 1));
+    return Math.min(LIMITS.feeIntervalMax, Math.max(LIMITS.feeIntervalMin, unit * n));
+  };
+
   app.get("/api/app-config", requireOperator, (_req, res) => {
     res.json({
       ok: true,
       config: appConfig.get(),
       limits: LIMITS,
       cadences: CADENCES,
+      effectiveIntervalSeconds: effectiveIntervalSeconds(appConfig.get()),
       // Contract-enforced values, so the UI can explain what can't be changed.
       enforced: {
         vaultReserveRatioFloorBps: LIMITS.vaultReserveRatioMin,
@@ -1047,7 +1069,7 @@ async function main() {
           onchain.push({ target: "feeShares", ok: false, error: friendlyError(e) });
         }
         try {
-          const tx = await owner.setFeeInterval(collector, cfg.feeIntervalSeconds);
+          const tx = await owner.setFeeInterval(collector, effectiveIntervalSeconds(cfg));
           onchain.push({ target: "feeInterval", ok: true, txHash: tx });
         } catch (e) {
           onchain.push({ target: "feeInterval", ok: false, error: friendlyError(e) });
@@ -1055,7 +1077,7 @@ async function main() {
       }
     }
     // Config is saved either way; `onchain` tells the UI what reached the chain.
-    if (lastVault) vaultAt = 0; // re-read the vault so the new ratio shows up
+    invalidateAll(); // the new ratio/split must show up immediately
     recomputeSchedule(); // a changed weekday/time takes effect immediately
     res.json({
       ok: true,
@@ -1087,8 +1109,7 @@ async function main() {
     }
     try {
       const hash = await owner.allocateNow(collector);
-      if (chainCache) chainCache.at = 0;
-      vaultAt = 0; // the vault just received a deposit leg
+      invalidateAll(); // the allocation touches the agent, pool, vault and swap
       res.json({ ok: true, txHash: hash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
@@ -1122,14 +1143,45 @@ async function main() {
       const amountIn = BigInt((req.query.amountIn as string) ?? "0");
       const minOut = BigInt((req.query.minOut as string) ?? "0");
       const txHash = await swapClient.execute(tokenIn, tokenOut, amountIn, minOut);
-      if (chainCache) chainCache.at = 0;
+      invalidateAll();
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
 
-  app.get("/api/state", async (_req, res) => {
+  /**
+   * Drop every read cache so the next poll re-reads the chain.
+   *
+   * Call after ANY state-changing action: individual endpoints used to clear only
+   * `chainCache`, which left the lending/vault/swap panels showing pre-transaction
+   * values for up to READ_TTL. `refreshAll()` additionally awaits the re-reads so
+   * `/api/state?fresh=1` can return post-transaction values immediately.
+   */
+  function invalidateAll() {
+    if (chainCache) chainCache.at = 0;
+    lendingAt = 0;
+    vaultAt = 0;
+    swapAt = 0;
+  }
+  async function refreshAll() {
+    invalidateAll();
+    // Kick each snapshot and wait, bounded, so a throttled RPC can't hang a request.
+    const jobs: Promise<unknown>[] = [];
+    if (poolClient) jobs.push(readLending().then((d) => { lastLending = d; lendingAt = Date.now(); }).catch(() => {}));
+    if (vaultClient) jobs.push(readVault().then((d) => { lastVault = d; vaultAt = Date.now(); }).catch(() => {}));
+    if (swapClient) jobs.push(readSwap().then((d) => { lastSwap = d; swapAt = Date.now(); }).catch(() => {}));
+    jobs.push(refreshChain().catch(() => {}));
+    await Promise.race([
+      Promise.all(jobs),
+      new Promise((r) => setTimeout(r, 9000)),
+    ]);
+  }
+
+  app.get("/api/state", async (req, res) => {
+    // ?fresh=1 — used right after a transaction so the UI shows the new balances
+    // without waiting for the next poll.
+    if (req.query.fresh === "1") await refreshAll();
     const { providers, agentBalance } = ensureChain();
     const settled = ledgerRef.filter((e) => e.status === "settled");
     const refunded = ledgerRef.filter((e) => e.status === "refunded");

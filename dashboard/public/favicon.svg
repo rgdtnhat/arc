@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Tessera ticket mark: rounded ticket with notches and a perforation line -->
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4c8dff"/><stop offset="1" stop-color="#7b5cff"/>
+    </linearGradient>
+    <mask id="notch">
+      <rect width="64" height="64" fill="#fff"/>
+      <circle cx="4" cy="32" r="7" fill="#000"/>
+      <circle cx="60" cy="32" r="7" fill="#000"/>
+    </mask>
+  </defs>
+  <rect x="4" y="14" width="56" height="36" rx="8" fill="url(#g)" mask="url(#notch)"/>
+  <line x1="40" y1="19" x2="40" y2="45" stroke="#fff" stroke-width="2.5"
+        stroke-dasharray="3 3" opacity=".85"/>
+  <circle cx="24" cy="32" r="5.5" fill="#fff" opacity=".92"/>
+</svg>

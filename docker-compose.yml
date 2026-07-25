@@ -14,13 +14,26 @@ services:
       # in real USDC. Set these in a .env file next to this compose file.
       - AGENT_PRIVATE_KEY=${AGENT_PRIVATE_KEY:-}
       - PROVIDER_PRIVATE_KEY=${PROVIDER_PRIVATE_KEY:-}
+      # Owner key. REQUIRED for App Config to reach the contracts and for
+      # "Allocate now" — the deployer owns the vault and the fee collector, so
+      # without this the server can only save config locally.
+      - DEPLOYER_PRIVATE_KEY=${DEPLOYER_PRIVATE_KEY:-}
       - ARC_RPC_URL=${ARC_RPC_URL:-https://rpc.testnet.arc.network}
+      - ARC_CHAIN_ID=${ARC_CHAIN_ID:-}
+      - ARC_EXPLORER_URL=${ARC_EXPLORER_URL:-}
       # Dashboard admin login (secret — set in a .env next to this file). Blank = disabled.
       - ADMIN_ID=${ADMIN_ID:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # Optional: programmatic testnet USDC drips.
+      - CIRCLE_API_KEY=${CIRCLE_API_KEY:-}
       # Optional LLM brain:
-      # - AGENT_BRAIN=llm
-      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - AGENT_BRAIN=${AGENT_BRAIN:-rules}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      # Live deployment record + persisted admin/config/profile state, so a
+      # redeploy or a container rebuild doesn't lose them.
+      - ./deployments:/app/deployments
+      - tessera_state:/app/state   # STATE_DIR below points here
     expose:
       - "8787"
     restart: unless-stopped
@@ -43,3 +56,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  tessera_state:

@@ -106,6 +106,31 @@ const $ = (id) => document.getElementById(id);
       });
       document.querySelectorAll(".tab").forEach((b) =>
         b.addEventListener("click", () => navigate(b.dataset.tab, { keepScroll: true })));
+      // Landing capability cards deep-link into the panel that implements them:
+      // "defi#vaultCard" switches to the DeFi tab, scrolls to the vault card and
+      // flashes it so it's obvious where you landed.
+      function gotoTarget(spec) {
+        const [tab, anchor] = String(spec).split("#");
+        navigate(tab, { keepScroll: true });
+        requestAnimationFrame(() => {
+          const el = anchor && $(anchor);
+          if (el) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            el.classList.remove("flashTarget");
+            void el.offsetWidth; // restart the animation
+            el.classList.add("flashTarget");
+          } else {
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }
+        });
+      }
+      document.querySelectorAll("[data-goto]").forEach((el) => {
+        el.addEventListener("click", () => gotoTarget(el.dataset.goto));
+        el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); gotoTarget(el.dataset.goto); }
+        });
+      });
+
       document.querySelectorAll("[data-nav]").forEach((b) =>
         b.addEventListener("click", () => navigate(b.dataset.nav)));
       $("navToggle").addEventListener("click", () => {
@@ -154,6 +179,16 @@ const $ = (id) => document.getElementById(id);
       const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
+      /**
+       * Post-transaction refresh: re-read the chain now, then once more shortly
+       * after, because a state change can land a moment after the receipt.
+       */
+      function afterTx() {
+        tick({ fresh: true });
+        refreshMyPositions().catch(() => {});
+        setTimeout(() => { tick({ fresh: true }); refreshMyPositions().catch(() => {}); }, 4000);
+      }
+
       // Visible connection state. Without this a failing /api/state just left
       // every field at "—", which looks identical to a healthy-but-empty app.
       function showConnError(detail) {
@@ -172,14 +207,20 @@ const $ = (id) => document.getElementById(id);
       }
       const clearConnError = () => { const b = $("connErr"); if (b) b.style.display = "none"; };
 
-      async function tick() {
+      /**
+       * Poll the server. `fresh` forces it to re-read the chain before replying,
+       * which is what makes balances update the instant a transaction lands
+       * instead of after the next cache window.
+       */
+      async function tick(opts) {
         let s;
         try {
           // Bound the wait: a hung read (rate-limited RPC, wedged container)
           // should report itself, not leave the page spinning on "—" forever.
           const ctl = new AbortController();
           const timer = setTimeout(() => ctl.abort(), 25000);
-          const res = await fetch("/api/state", { signal: ctl.signal }).finally(() => clearTimeout(timer));
+          const url = opts && opts.fresh ? "/api/state?fresh=1" : "/api/state";
+          const res = await fetch(url, { signal: ctl.signal }).finally(() => clearTimeout(timer));
           if (!res.ok) { showConnError("HTTP " + res.status); return; }
           s = await res.json();
         } catch (e) {
@@ -535,6 +576,86 @@ const $ = (id) => document.getElementById(id);
         return res;
       }
 
+
+      /* ====================================================================
+       * Sign-in / change-password dialog.
+       * Replaces window.prompt(), which showed the password in clear text and
+       * couldn't mask input. Fields are type=password with a reveal toggle.
+       * ==================================================================== */
+      function bindEye(btnId, inputId) {
+        const b = $(btnId), i = $(inputId);
+        if (!b || !i) return;
+        b.addEventListener("click", () => {
+          const show = i.type === "password";
+          i.type = show ? "text" : "password";
+          b.textContent = show ? "🙈" : "👁";
+          b.setAttribute("aria-label", show ? "Hide password" : "Show password");
+          i.focus();
+        });
+      }
+      bindEye("authEye", "authPw");
+      bindEye("authEye2", "authPw2");
+
+      let authResolve = null;
+      /**
+       * Open the dialog. mode "login" asks id+password; mode "change" asks the
+       * current and the new password. Resolves with the values or null.
+       */
+      function askAuth(mode) {
+        const wrap = $("authModal");
+        const isChange = mode === "change";
+        $("authTitle").textContent = isChange ? "Change password" : "Operator sign-in";
+        $("authHint").textContent = isChange
+          ? "Enter your current password, then the new one (min 8 characters)."
+          : "Enter your admin id and password.";
+        // Target labels/inputs by id — the password input sits inside .pwRow, so
+        // previousElementSibling is null there and would throw before the dialog
+        // ever opened.
+        $("authId").style.display = isChange ? "none" : "";
+        $("authIdLabel").style.display = isChange ? "none" : "";
+        $("authPwLabel").textContent = isChange ? "Current password" : "Password";
+        $("authPw2Row").style.display = isChange ? "" : "none";
+        $("authPw2Label").style.display = isChange ? "" : "none";
+        $("authSubmit").textContent = isChange ? "Change password" : "Sign in";
+        $("authMsg").style.display = "none";
+        $("authId").value = ""; $("authPw").value = ""; $("authPw2").value = "";
+        $("authPw").type = "password"; $("authPw2").type = "password";
+        $("authEye").textContent = "👁"; $("authEye2").textContent = "👁";
+        wrap.hidden = false;
+        setTimeout(() => (isChange ? $("authPw") : $("authId")).focus(), 40);
+        return new Promise((res) => { authResolve = res; });
+      }
+      function closeAuth(value) {
+        $("authModal").hidden = true;
+        const r = authResolve; authResolve = null;
+        if (r) r(value);
+      }
+      function authError(text) {
+        const m = $("authMsg");
+        m.style.display = "block"; m.style.color = "var(--warn)"; m.textContent = text;
+      }
+      $("authCancel").addEventListener("click", () => closeAuth(null));
+      $("authModal").addEventListener("click", (e) => { if (e.target === $("authModal")) closeAuth(null); });
+      $("authSubmit").addEventListener("click", () => {
+        const isChange = $("authPw2Row").style.display !== "none";
+        if (isChange) {
+          const current = $("authPw").value, next = $("authPw2").value;
+          if (!current || !next) return authError("Fill in both passwords.");
+          if (next.length < 8) return authError("The new password must be at least 8 characters.");
+          closeAuth({ current, next });
+        } else {
+          const id = $("authId").value.trim(), password = $("authPw").value;
+          if (!id) return authError("Enter your admin id.");
+          if (!password) return authError("Enter your password.");
+          closeAuth({ id, password });
+        }
+      });
+      document.addEventListener("keydown", (e) => {
+        if ($("authModal").hidden) return;
+        if (e.key === "Escape") closeAuth(null);
+        if (e.key === "Enter") $("authSubmit").click();
+      });
+
       // --- Admin login (id + password) ---
       // The admin id is a secret: it is never pre-filled, never defaulted, and
       // never rendered in the UI. A signed-in operator only sees a neutral
@@ -549,31 +670,16 @@ const $ = (id) => document.getElementById(id);
         b.style.color = id ? "var(--good)" : "";
       }
       async function adminFlow() {
+        // Already signed in? The profile menu owns change-password and sign-out,
+        // so just open it rather than duplicating those flows here.
         if (adminId) {
-          const choice = prompt("Admin — type 'password' to change password, or 'logout' to sign out:", "");
-          if (choice === "logout") {
-            await postAuthed("/api/admin/logout").catch(() => {});
-            localStorage.removeItem("tessera_token");
-            setAdmin(null);
-            return;
-          }
-          if (choice === "password") {
-            const current = prompt("Current password:");
-            const next = prompt("New password (min 8 chars):");
-            if (!current || !next) return;
-            const r = await (await postAuthed("/api/admin/change-password", {
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ current, next }),
-            })).json();
-            alert(r.ok ? "Password changed." : "Failed: " + r.error);
-          }
+          $("profileBtn").click();
           return;
         }
-        // No default value — the operator must type the id from memory.
-        const id = prompt("Admin id:");
-        if (!id) return;
-        const password = prompt("Password:");
-        if (!password) return;
+        // Masked entry via the dialog; the id is never pre-filled.
+        const creds = await askAuth("login");
+        if (!creds) return;
+        const { id, password } = creds;
         const r = await (await fetch("/api/admin/login", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -752,7 +858,7 @@ const $ = (id) => document.getElementById(id);
           msg.style.color = "var(--warn)";
         } finally {
           btn.disabled = false;
-          tick();
+          afterTx();
         }
       });
 
@@ -817,7 +923,7 @@ const $ = (id) => document.getElementById(id);
           if (r.ok) $("vAmount").value = "";
         } catch {
           msg.style.display = "block"; msg.textContent = "request failed"; msg.style.color = "var(--warn)";
-        } finally { btn.disabled = false; tick(); }
+        } finally { btn.disabled = false; afterTx(); }
       });
 
       // --- Swap: quote + execute --------------------------------------------
@@ -1029,7 +1135,7 @@ const $ = (id) => document.getElementById(id);
           msg.style.color = "var(--warn)";
           msg.textContent = walletError(e);
         } finally {
-          tick();
+          afterTx();
         }
       }
       // Plain-language wallet/chain errors (mirrors the server's friendlyError).
@@ -1229,10 +1335,9 @@ const $ = (id) => document.getElementById(id);
             alert(r.ok ? "Profile saved." : "Couldn't save: " + r.error);
             refreshProfile();
           } else if (what === "password") {
-            const current = prompt("Current password:");
-            if (!current) return;
-            const next = prompt("New password (min 8 characters):");
-            if (!next) return;
+            const pw = await askAuth("change");
+            if (!pw) return;
+            const { current, next } = pw;
             const r = await (await postAuthed("/api/admin/change-password", {
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ current, next }),
@@ -1284,6 +1389,8 @@ const $ = (id) => document.getElementById(id);
           $("cfgFeeSwap").value = Math.round(c.feeShares.swapBps / 100);
           $("cfgFeeRetained").value = Math.round(c.feeShares.retainedBps / 100);
           $("cfgCadence").value = c.feeIntervalLabel in (r.cadences || {}) ? c.feeIntervalLabel : "week";
+          $("cfgEvery").value = String(c.feeIntervalEvery || 1);
+          showEffectiveCadence(r.effectiveIntervalSeconds);
           $("cfgMode").value = c.feeScheduleMode || "interval";
           $("cfgWeekday").value = String(c.feeWeekday ?? 1);
           $("cfgTime").value = c.feeTimeUtc || "09:00";
@@ -1297,6 +1404,7 @@ const $ = (id) => document.getElementById(id);
       function syncScheduleRows(nextRunUtc) {
         const mode = $("cfgMode").value;
         $("cfgRowInterval").style.display = mode === "interval" ? "" : "none";
+        $("cfgRowEffective").style.display = mode === "interval" ? "" : "none";
         $("cfgRowWeekday").style.display = mode === "weekly" ? "" : "none";
         $("cfgRowTime").style.display = mode === "weekly" ? "" : "none";
         $("cfgRowNext").style.display = mode === "weekly" && nextRunUtc ? "" : "none";
@@ -1305,7 +1413,18 @@ const $ = (id) => document.getElementById(id);
           $("cfgNextRun").textContent = d.toUTCString().replace(" GMT", " UTC");
         }
       }
-      if ($("cfgMode")) $("cfgMode").addEventListener("change", () => syncScheduleRows(null));
+      // Show the cadence in plain words, e.g. "every 3 days (259200s)".
+      function showEffectiveCadence(seconds) {
+        const el = $("cfgEffective");
+        if (!el) return;
+        const n = Math.max(1, parseInt(($("cfgEvery") && $("cfgEvery").value) || "1", 10));
+        const unit = ($("cfgCadence") && $("cfgCadence").value) || "week";
+        const secs = seconds != null ? seconds : (cfgCadences[unit] || 604800) * n;
+        el.textContent = `every ${n === 1 ? "" : n + " "}${unit}${n === 1 ? "" : "s"} (${secs}s)`;
+      }
+      if ($("cfgEvery")) $("cfgEvery").addEventListener("input", () => showEffectiveCadence());
+      if ($("cfgCadence")) $("cfgCadence").addEventListener("change", () => showEffectiveCadence());
+      if ($("cfgMode")) $("cfgMode").addEventListener("change", () => { syncScheduleRows(null); showEffectiveCadence(); });
 
       if ($("cfgSave")) {
         $("cfgSave").addEventListener("click", async () => {
@@ -1321,8 +1440,9 @@ const $ = (id) => document.getElementById(id);
               swapBps: Math.round(+$("cfgFeeSwap").value * 100),
               retainedBps: Math.round(+$("cfgFeeRetained").value * 100),
             },
-            feeIntervalSeconds: cfgCadences[label] || 604800,
+            feeIntervalSeconds: (cfgCadences[label] || 604800) * Math.max(1, parseInt($("cfgEvery").value || "1", 10)),
             feeIntervalLabel: label,
+            feeIntervalEvery: Math.max(1, parseInt($("cfgEvery").value || "1", 10)),
             feeScheduleMode: $("cfgMode").value,
             feeWeekday: Number($("cfgWeekday").value),
             feeTimeUtc: $("cfgTime").value || "09:00",
