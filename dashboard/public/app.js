@@ -58,6 +58,91 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
+      /* ====================================================================
+       * Router — landing page ⇄ in-app tabs, with no page reload.
+       * The hash drives it (#/dashboard, #/defi, …) so links and the browser
+       * back button work, and "#" (or no hash) is the landing page.
+       * ==================================================================== */
+      const TABS = ["dashboard", "defi", "agents", "other"];
+      function showView(route) {
+        const isApp = TABS.includes(route);
+        $("viewLanding").hidden = isApp;
+        $("viewApp").hidden = !isApp;
+        // The Start button belongs to the landing page only.
+        $("startDock").style.display = isApp ? "none" : "";
+        if (isApp) {
+          for (const t of TABS) {
+            const pane = $("pane" + t[0].toUpperCase() + t.slice(1));
+            if (pane) pane.hidden = t !== route;
+          }
+          document.querySelectorAll(".tab").forEach((b) =>
+            b.classList.toggle("active", b.dataset.tab === route));
+        }
+        // Close the nav drawer on any navigation.
+        $("navDrawer").classList.remove("open");
+        $("navToggle").setAttribute("aria-expanded", "false");
+      }
+      function routeFromHash() {
+        const h = (location.hash || "").replace(/^#\/?/, "");
+        return TABS.includes(h) ? h : "home";
+      }
+      function navigate(route, opts) {
+        const target = route === "home" ? "#" : "#/" + route;
+        if (location.hash !== target) {
+          // replace on first paint so we don't stack history entries
+          if (opts && opts.replace) history.replaceState(null, "", target);
+          else location.hash = target;
+        }
+        showView(route === "home" ? "home" : route);
+        if (!opts || !opts.keepScroll) window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
+      }
+      window.addEventListener("hashchange", () => showView(routeFromHash()));
+
+      // Brand → home; Start / CTA → dashboard.
+      $("brandBtn").addEventListener("click", () => navigate("home"));
+      ["startBtn", "heroStart", "ctaStart"].forEach((id) => {
+        const el = $(id);
+        if (el) el.addEventListener("click", () => navigate("dashboard"));
+      });
+      document.querySelectorAll(".tab").forEach((b) =>
+        b.addEventListener("click", () => navigate(b.dataset.tab, { keepScroll: true })));
+      document.querySelectorAll("[data-nav]").forEach((b) =>
+        b.addEventListener("click", () => navigate(b.dataset.nav)));
+      $("navToggle").addEventListener("click", () => {
+        const open = $("navDrawer").classList.toggle("open");
+        $("navToggle").setAttribute("aria-expanded", open ? "true" : "false");
+      });
+
+      // Start button: hide while scrolling down, bring it back on scroll up.
+      (function startButtonAutoHide() {
+        const dock = $("startDock");
+        let last = window.scrollY;
+        window.addEventListener(
+          "scroll",
+          () => {
+            const y = window.scrollY;
+            if (y > last && y > 90) dock.classList.add("hide");
+            else dock.classList.remove("hide");
+            last = y;
+          },
+          { passive: true },
+        );
+      })();
+
+      // Reveal landing sections as they enter the viewport.
+      (function scrollReveal() {
+        const items = document.querySelectorAll(".reveal");
+        if (!("IntersectionObserver" in window)) {
+          items.forEach((el) => el.classList.add("in"));
+          return;
+        }
+        const io = new IntersectionObserver(
+          (entries) => entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } }),
+          { rootMargin: "0px 0px -12% 0px" },
+        );
+        items.forEach((el) => io.observe(el));
+      })();
+
       const short = (a) => (a ? a.slice(0, 6) + "…" + a.slice(-4) : "—");
       const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
@@ -278,6 +363,36 @@ const $ = (id) => document.getElementById(id);
 
         window.__ledger = s.ledger || [];
 
+        // ---- Dashboard tab + landing stat strip -------------------------------
+        // Same numbers in both places, so the landing page shows real live state.
+        const setAll = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+        setAll("dashSettled", String(s.summary.settled));
+        setAll("dashRefunded", String(s.summary.refunded));
+        setAll("dashSkipped", String(s.summary.skipped));
+        setAll("dashSpent", s.summary.spentUsdc + " USDC");
+        setAll("landSettled", String(s.summary.settled));
+        setAll("landChain", (s.meta.chain || "Arc").replace(/\s*\(.*\)$/, ""));
+
+        const vaultTvl = s.vault && s.vault.ready ? s.vault.totalAssets + " USDC" : "—";
+        setAll("dashVaultTvl", vaultTvl);
+        setAll("landTvl", vaultTvl);
+        setAll("dashBuffer", s.vault && s.vault.ready ? s.vault.bufferPct + "%" : "—");
+
+        if (s.lending && s.lending.ready && s.lending.assets.length) {
+          // Headline the pool on its USDC reserve, falling back to the first asset.
+          const u = s.lending.assets.find((a) => a.symbol === "USDC") || s.lending.assets[0];
+          setAll("dashPoolCash", u.reserve.cash + " " + u.symbol);
+          setAll("dashPoolBorrows", u.reserve.borrows + " " + u.symbol);
+          setAll("landLiquidity", u.reserve.cash + " " + u.symbol);
+        } else {
+          setAll("dashPoolCash", "—"); setAll("dashPoolBorrows", "—"); setAll("landLiquidity", "—");
+        }
+        if (s.swap && s.swap.ready && s.swap.assets.length) {
+          setAll("dashSwapInv", s.swap.assets.map((a) => `${a.inventory} ${a.symbol}`).join(" · "));
+        } else {
+          setAll("dashSwapInv", "—");
+        }
+
         // Lending & borrowing (TesseraPool) — multi-asset. The card is always
         // visible; when the pool isn't deployed we show the not-ready notice and
         // disable the controls rather than hiding the whole feature.
@@ -298,7 +413,7 @@ const $ = (id) => document.getElementById(id);
           const symbols = ln.assets.map((a) => a.symbol).join(",");
           if (sel.dataset.symbols !== symbols) {
             const keep = sel.value;
-            sel.innerHTML = ln.assets.map((a) => `<option value="${a.symbol}">${a.symbol}</option>`).join("");
+            sel.innerHTML = ln.assets.map((a) => `<option value="${esc(a.symbol)}">${esc(a.symbol)}</option>`).join("");
             sel.dataset.symbols = symbols;
             if (ln.assets.some((a) => a.symbol === keep)) sel.value = keep;
           }
@@ -330,7 +445,7 @@ const $ = (id) => document.getElementById(id);
           renderSwapBalances();
           const syms = sw.assets.map((a) => a.symbol).join(",");
           if ($("swIn").dataset.symbols !== syms) {
-            const opts = sw.assets.map((a) => `<option value="${a.address}" data-sym="${a.symbol}" data-dec="${a.decimals || 6}">${a.symbol}</option>`).join("");
+            const opts = sw.assets.map((a) => `<option value="${esc(a.address)}" data-sym="${esc(a.symbol)}" data-dec="${Number(a.decimals) || 6}">${esc(a.symbol)}</option>`).join("");
             $("swIn").innerHTML = opts;
             $("swOut").innerHTML = opts;
             $("swIn").dataset.symbols = syms;
@@ -862,8 +977,14 @@ const $ = (id) => document.getElementById(id);
           const hash = await fn(from, await loadDefiConfig());
           const cfg = await loadDefiConfig();
           msg.style.color = "var(--good)";
-          msg.innerHTML = `${esc(label)} sent from your wallet ✓ — ` +
-            `<a href="${cfg.explorer}/tx/${hash}" target="_blank" rel="noopener">${String(hash).slice(0, 12)}…</a>`;
+          // `hash` comes from the wallet provider, so treat it as untrusted:
+          // accept only a 0x-hex tx hash, and escape everything interpolated.
+          const safeHash = /^0x[0-9a-fA-F]{64}$/.test(String(hash)) ? String(hash) : "";
+          msg.innerHTML = safeHash
+            ? `${esc(label)} sent from your wallet ✓ — ` +
+              `<a href="${esc(cfg.explorer)}/tx/${esc(safeHash)}" target="_blank" rel="noopener">` +
+              `${esc(safeHash.slice(0, 12))}…</a>`
+            : `${esc(label)} sent from your wallet ✓`;
         } catch (e) {
           msg.style.color = "var(--warn)";
           msg.textContent = walletError(e);
@@ -1089,6 +1210,23 @@ const $ = (id) => document.getElementById(id);
 
       // Reflect any existing session as soon as the page loads.
       refreshProfile();
+
+      // Land on whatever the hash asks for (default: the landing page).
+      showView(routeFromHash());
+
+      /* Live updates without a manual refresh:
+       *  - refresh as soon as the tab regains focus / becomes visible
+       *  - refresh right after any action (each handler already calls tick())
+       *  - refresh when the wallet switches account or chain
+       * The polling loop below is the steady-state backstop.
+       */
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+      window.addEventListener("focus", () => tick());
+      window.addEventListener("online", () => tick());
+      if (window.ethereum && window.ethereum.on) {
+        window.ethereum.on("accountsChanged", () => tick());
+        window.ethereum.on("chainChanged", () => tick());
+      }
 
       // Poll interval is driven by the server (slower in live mode to spare the
       // rate-limited public RPC). Re-schedule when the advertised cadence changes.

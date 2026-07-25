@@ -11,218 +11,335 @@
     <meta name="apple-mobile-web-app-title" content="Tessera" />
     <link rel="apple-touch-icon" href="icon-192.png" />
     <style>
+      /* ====================================================================
+       * Tessera design system
+       * Calm, typographic, generous whitespace; soft gradients and glassy
+       * surfaces. Every long value is wrapped so nothing escapes its card.
+       * ==================================================================== */
       :root {
-        --bg: #0a0e17;
-        --panel: #121826;
-        --panel-2: #0e1421;
-        --line: #1f2937;
-        --text: #e6edf6;
-        --muted: #8695ab;
-        --accent: #3a7bff; /* USDC/Circle blue */
-        --good: #34d399;
-        --bad: #f87171;
-        --warn: #fbbf24;
+        --bg: #07090f;
+        --bg-soft: #0b0f18;
+        --panel: rgba(20, 26, 40, 0.72);
+        --panel-2: rgba(13, 18, 29, 0.72);
+        --line: rgba(255, 255, 255, 0.09);
+        --line-strong: rgba(255, 255, 255, 0.16);
+        --text: #eef3fb;
+        --muted: #8d9bb2;
+        --accent: #4c8dff;
+        --accent-2: #7b5cff;
+        --good: #35d6a4;
+        --bad: #ff7b7b;
+        --warn: #ffc857;
         --skip: #64748b;
+        --r: 18px;
+        --shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+        --maxw: 1140px;
       }
-      /* Light theme (applied when the selector resolves to light). */
       :root[data-theme="light"] {
-        --bg: #eef2fa; --panel: #ffffff; --panel-2: #f6f8fd; --line: #e2e8f0;
-        --text: #0d1424; --muted: #55637d; --accent: #2f6be0;
-        --good: #0f9d6b; --bad: #d94b4b; --warn: #b9791a; --skip: #64748b;
+        --bg: #f6f8fc; --bg-soft: #ffffff;
+        --panel: rgba(255, 255, 255, 0.86); --panel-2: rgba(246, 249, 254, 0.9);
+        --line: rgba(9, 20, 44, 0.10); --line-strong: rgba(9, 20, 44, 0.18);
+        --text: #0c1526; --muted: #5a6880; --accent: #2f6be0; --accent-2: #6a45f0;
+        --good: #0f9d6b; --bad: #d94b4b; --warn: #b3760f;
+        --shadow: 0 18px 50px rgba(12, 21, 38, 0.10);
       }
-      :root[data-theme="light"] body { background: radial-gradient(1200px 600px at 80% -10%, #dbe6ff 0%, var(--bg) 55%); }
-      :root[data-theme="light"] .btn { background: #eaf1ff; color: #1b4ea0; border-color: #b8ceff; }
-      :root[data-theme="light"] .btn:hover { background: #dce8ff; }
-      :root[data-theme="light"] .pill { background: #eef2f9; }
-      :root[data-theme="light"] .pill.blue { background: #e5edff; color: #2f6be0; border-color: #bcd3ff; }
 
       * { box-sizing: border-box; }
-      /* ---- Overflow containment -------------------------------------------
-       * Long values (addresses, tx hashes, raw RPC error text) were spilling
-       * outside their cards. Wrap aggressively everywhere, let flex/grid
-       * children actually shrink (min-width:0), and never let the page scroll
-       * sideways. Wide blocks scroll inside themselves instead.
-       */
+      html { scroll-behavior: smooth; }
       html, body { max-width: 100%; overflow-x: hidden; }
-      .card, .kv, .prov .row, .notready, .section { min-width: 0; }
-      .card *, .kv, .notready { overflow-wrap: anywhere; word-break: break-word; }
-      .mono, [id$="Addr"], [id$="Msg"], #swQuoteOut, #swBalances, #connErr {
-        overflow-wrap: anywhere; word-break: break-all;
-      }
-      /* Flex rows: allow children to shrink below their content width. */
-      .card > div, .prov .row > * { min-width: 0; }
-      select, input, button { max-width: 100%; }
-      table, pre { display: block; max-width: 100%; overflow-x: auto; }
-
-      /* ---- Floating scroll controls ---------------------------------------
-       * Always available while scrolling, so the user can jump to either end
-       * from anywhere on a long page.
-       */
-      .scrollDock {
-        position: fixed; right: 16px; bottom: 20px; z-index: 60;
-        display: flex; flex-direction: column; gap: 8px;
-      }
-      .scrollDock button {
-        width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
-        border: 1px solid var(--line); background: var(--panel); color: var(--text);
-        font-size: 16px; line-height: 1; display: grid; place-items: center;
-        box-shadow: 0 6px 20px rgba(0,0,0,.28); transition: transform .15s ease, opacity .2s ease;
-      }
-      .scrollDock button:hover { transform: translateY(-2px); border-color: var(--accent); color: var(--accent); }
-      .scrollDock button[hidden] { display: none; }
-      @media (max-width: 600px) { .scrollDock { right: 10px; bottom: 14px; } }
-
-      /* ---- Profile / App Config menus ------------------------------------- */
-      .menuWrap { position: relative; display: inline-block; }
-      .menuPanel {
-        position: absolute; right: 0; top: calc(100% + 8px); z-index: 70;
-        min-width: 250px; max-width: min(92vw, 340px);
-        border: 1px solid var(--line); border-radius: 14px; background: var(--panel);
-        box-shadow: 0 18px 44px rgba(0,0,0,.34); padding: 8px;
-        opacity: 0; transform: translateY(-6px) scale(.98); pointer-events: none;
-        transition: opacity .18s ease, transform .18s ease;
-      }
-      .menuPanel.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
-      .menuItem {
-        display: block; width: 100%; text-align: left; padding: 9px 11px;
-        border: 0; border-radius: 9px; background: transparent; color: var(--text);
-        font: inherit; font-size: 13.5px; cursor: pointer;
-      }
-      .menuItem:hover { background: var(--panel-2); }
-      .menuHead {
-        padding: 8px 11px 6px; font-size: 11px; letter-spacing: .08em;
-        text-transform: uppercase; color: var(--muted);
-      }
-      .menuSep { height: 1px; background: var(--line); margin: 6px 4px; }
-      .cfgRow { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 5px 11px; font-size: 13px; }
-      .cfgRow input, .cfgRow select { width: 108px; padding: 5px 7px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: var(--text); font: inherit; font-size: 13px; }
       body {
         margin: 0;
-        font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-        background: radial-gradient(1200px 600px at 80% -10%, #12203f 0%, var(--bg) 55%);
+        background:
+          radial-gradient(1100px 620px at 82% -8%, rgba(76, 141, 255, 0.16), transparent 60%),
+          radial-gradient(900px 520px at 6% 4%, rgba(123, 92, 255, 0.12), transparent 58%),
+          var(--bg);
         color: var(--text);
+        font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
         -webkit-font-smoothing: antialiased;
-        /* Make everything easy to select & copy. */
-        -webkit-user-select: text;
-        user-select: text;
-      }
-      /* One-click select for addresses, hashes, and other monospace values. */
-      .mono, .addr, code, [id$="Addr"], [class*="hash"] {
-        -webkit-user-select: all;
-        user-select: all;
-        cursor: text;
-      }
-      .btn, .pill { -webkit-user-select: none; user-select: none; }
-      .themesel {
-        background: var(--panel); color: var(--muted); border: 1px solid var(--line);
-        border-radius: 8px; padding: 5px 8px; font-size: 12px; cursor: pointer; margin-left: 8px;
+        letter-spacing: -0.006em;
+        /* Keep text easy to select/copy. */
+        -webkit-user-select: text; user-select: text;
       }
       a { color: var(--accent); text-decoration: none; }
       a:hover { text-decoration: underline; }
-      .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 22px 60px; }
-      header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-      .logo { font-size: 30px; }
-      h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
-      .tag { font-size: 12px; color: var(--muted); }
-      .pill {
-        font-size: 11px; padding: 3px 9px; border-radius: 999px;
-        background: #172035; border: 1px solid var(--line); color: var(--muted);
+      .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 22px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+      /* ---- top bar ------------------------------------------------------- */
+      .topbar {
+        position: sticky; top: 0; z-index: 80;
+        backdrop-filter: saturate(160%) blur(16px);
+        -webkit-backdrop-filter: saturate(160%) blur(16px);
+        background: color-mix(in srgb, var(--bg) 78%, transparent);
+        border-bottom: 1px solid var(--line);
       }
-      .pill.blue { color: #cfe0ff; border-color: #24447f; background: #10203f; }
-      .task {
-        margin: 18px 0 22px; padding: 16px 18px; border: 1px solid var(--line);
-        border-radius: 14px; background: linear-gradient(180deg, var(--panel), var(--panel-2));
-        display: flex; justify-content: space-between; gap: 16px; align-items: center; flex-wrap: wrap;
-      }
-      .task .goal { font-size: 15px; }
-      .task .goal b { color: var(--text); }
-      .btn {
-        border: 1px solid #24447f; background: #12233f; color: #cfe0ff;
-        padding: 9px 16px; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 13px;
-      }
-      .btn:hover { background: #163057; }
-      .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-      .grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 18px; }
-      @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-      /* Section divider for grouped panels (e.g. DeFi). */
-      .section {
+      .topbar .inner {
+        max-width: var(--maxw); margin: 0 auto; padding: 10px 22px;
         display: flex; align-items: center; gap: 10px;
-        margin: 26px 0 12px; font-size: 13px; font-weight: 700;
-        letter-spacing: .09em; text-transform: uppercase; color: var(--muted);
       }
-      .section::after { content: ""; flex: 1; height: 1px; background: var(--line); }
-      /* Shown inside a DeFi panel when its contract isn't deployed yet. */
-      .notready {
-        margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--line);
-        border-radius: 10px; background: var(--panel-2);
-        font-size: 12.5px; color: var(--muted);
+      .brand {
+        display: flex; align-items: center; gap: 10px; cursor: pointer;
+        background: none; border: 0; color: inherit; font: inherit; padding: 4px 6px; border-radius: 12px;
       }
+      .brand:hover { background: var(--panel-2); }
+      .brand .mark { font-size: 20px; line-height: 1; }
+      .brand .name { font-weight: 700; font-size: 17px; letter-spacing: -0.02em; }
+      .spacer { flex: 1; }
+
+      .btn {
+        border: 1px solid var(--line-strong); background: var(--panel);
+        color: var(--text); padding: 8px 13px; border-radius: 12px;
+        font: inherit; font-size: 13.5px; cursor: pointer; white-space: nowrap;
+        transition: border-color .16s ease, background .16s ease, transform .12s ease;
+      }
+      .btn:hover { border-color: var(--accent); }
+      .btn:active { transform: translateY(1px); }
+      .btn:disabled { opacity: .5; cursor: not-allowed; }
+      .btn.primary {
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        border-color: transparent; color: #fff; font-weight: 650;
+      }
+      .themesel {
+        border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
+        border-radius: 12px; padding: 8px 10px; font: inherit; font-size: 13px; cursor: pointer;
+      }
+
+      /* Start button — centred, floats, hides on scroll-down, returns on scroll-up */
+      .startDock {
+        position: fixed; left: 50%; top: 62px; transform: translate(-50%, 0);
+        z-index: 75; transition: opacity .25s ease, transform .25s ease;
+      }
+      .startDock.hide { opacity: 0; transform: translate(-50%, -18px); pointer-events: none; }
+      .startDock .btn { padding: 11px 22px; font-size: 14.5px; box-shadow: var(--shadow); }
+
+      /* ---- nav drawer ---------------------------------------------------- */
+      .navDrawer {
+        overflow: hidden; max-height: 0; transition: max-height .28s ease;
+        border-bottom: 1px solid transparent;
+      }
+      .navDrawer.open { max-height: 260px; border-bottom-color: var(--line); }
+      .navDrawer .inner { max-width: var(--maxw); margin: 0 auto; padding: 12px 22px 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+
+      /* ---- landing ------------------------------------------------------- */
+      .hero { padding: 76px 0 40px; text-align: center; }
+      .eyebrow {
+        display: inline-block; font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+        color: var(--accent); border: 1px solid var(--line-strong); background: var(--panel);
+        padding: 6px 12px; border-radius: 999px; margin-bottom: 22px;
+      }
+      .hero h1 {
+        margin: 0 0 18px; font-size: clamp(34px, 6.2vw, 68px); line-height: 1.04;
+        letter-spacing: -0.035em; font-weight: 700;
+      }
+      .hero h1 .grad {
+        background: linear-gradient(120deg, var(--accent), var(--accent-2) 70%);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+      }
+      .hero p.lead {
+        margin: 0 auto 30px; max-width: 660px; font-size: clamp(15px, 2.2vw, 19px);
+        color: var(--muted); line-height: 1.62;
+      }
+      .heroCtas { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+
+      .statStrip {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px;
+        margin: 54px 0 10px;
+      }
+      .stat {
+        border: 1px solid var(--line); border-radius: var(--r); background: var(--panel);
+        padding: 16px 18px; text-align: left;
+      }
+      .stat .k { font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+      .stat .v { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; margin-top: 4px; }
+
+      .sectionHead { text-align: center; margin: 84px 0 30px; }
+      .sectionHead h2 { margin: 0 0 10px; font-size: clamp(24px, 3.6vw, 38px); letter-spacing: -0.03em; }
+      .sectionHead p { margin: 0 auto; max-width: 620px; color: var(--muted); }
+
+      .featGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(268px, 1fr)); gap: 16px; }
+      .feat {
+        border: 1px solid var(--line); border-radius: var(--r); background: var(--panel);
+        padding: 22px; transition: transform .2s ease, border-color .2s ease;
+      }
+      .feat:hover { transform: translateY(-3px); border-color: var(--line-strong); }
+      .feat .ico { font-size: 24px; }
+      .feat h3 { margin: 12px 0 8px; font-size: 17px; letter-spacing: -0.015em; }
+      .feat p { margin: 0; color: var(--muted); font-size: 14px; }
+      .feat.spot { border-color: color-mix(in srgb, var(--accent) 42%, var(--line)); }
+      .feat .tagline {
+        display: inline-block; margin-bottom: 10px; font-size: 11px; letter-spacing: .1em;
+        text-transform: uppercase; color: var(--accent);
+      }
+
+      /* Scroll-reveal */
+      .reveal { opacity: 0; transform: translateY(16px); transition: opacity .55s ease, transform .55s ease; }
+      .reveal.in { opacity: 1; transform: none; }
+      @media (prefers-reduced-motion: reduce) {
+        html { scroll-behavior: auto; }
+        .reveal { opacity: 1; transform: none; transition: none; }
+      }
+
+      /* ---- app shell / tabs ---------------------------------------------- */
+      .tabsBar {
+        position: sticky; top: 57px; z-index: 60; padding: 12px 0 10px;
+        backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+        background: color-mix(in srgb, var(--bg) 82%, transparent);
+        border-bottom: 1px solid var(--line);
+      }
+      .tabs { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+      .tabs::-webkit-scrollbar { display: none; }
+      .tab {
+        border: 1px solid transparent; background: transparent; color: var(--muted);
+        padding: 8px 15px; border-radius: 999px; font: inherit; font-size: 13.5px;
+        cursor: pointer; white-space: nowrap;
+      }
+      .tab:hover { color: var(--text); background: var(--panel-2); }
+      .tab.active { color: var(--text); background: var(--panel); border-color: var(--line-strong); font-weight: 600; }
+      .view { padding: 24px 0 90px; }
+      .view[hidden] { display: none; }
+      /* Fade tab content in on switch */
+      .tabPane { animation: fade .26s ease both; }
+      .tabPane[hidden] { display: none; }
+      @keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+      /* ---- cards / primitives -------------------------------------------- */
       .card {
-        border: 1px solid var(--line); border-radius: 14px; background: var(--panel);
-        padding: 16px 18px;
+        border: 1px solid var(--line); border-radius: var(--r); background: var(--panel);
+        padding: 18px 20px; margin-bottom: 16px; min-width: 0;
       }
-      .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 12px; }
-      .wallet { display: flex; align-items: baseline; gap: 10px; }
-      .balance { font-size: 34px; font-weight: 700; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
-      .balance .u { font-size: 15px; color: var(--muted); font-weight: 600; margin-left: 4px; }
-      .bar { height: 8px; border-radius: 6px; background: #1b2536; margin: 14px 0 6px; overflow: hidden; }
-      .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), #6aa2ff); transition: width .5s ease; }
-      .kv { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
-      .prov { display: flex; flex-direction: column; gap: 10px; }
+      .card > h2 {
+        margin: 0 0 14px; font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
+        color: var(--muted); font-weight: 650;
+      }
+      .grid2 { display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; align-items: start; }
+      @media (max-width: 880px) { .grid2 { grid-template-columns: 1fr; } }
+      .metrics { display: flex; flex-wrap: wrap; gap: 22px; }
+      .metric { min-width: 0; }
+      .metric .k { font-size: 11px; color: var(--muted); }
+      .metric .v { font-size: 17px; font-weight: 700; letter-spacing: -0.015em; }
+      .kv { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12.5px; min-width: 0; }
+      .pill {
+        border: 1px solid var(--line-strong); background: var(--panel); color: var(--muted);
+        padding: 5px 11px; border-radius: 999px; font-size: 12px; white-space: nowrap;
+      }
+      .pill.blue { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+      .pill.live { color: var(--good); }
+      .pill .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--good); margin-right: 6px; }
+      .row-actions { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }
+      input, select { max-width: 100%; }
+      .field {
+        border: 1px solid var(--line-strong); background: var(--panel-2); color: var(--text);
+        border-radius: 11px; padding: 9px 12px; font: inherit; font-size: 13.5px;
+        font-variant-numeric: tabular-nums;
+      }
+      .notready {
+        margin: 0 0 14px; padding: 11px 13px; border: 1px dashed var(--line-strong);
+        border-radius: 12px; background: var(--panel-2); font-size: 12.5px; color: var(--muted);
+      }
+
+      /* Overflow containment — long addresses / hashes / RPC errors */
+      .card *, .kv, .notready, .stat, .feat { overflow-wrap: anywhere; word-break: break-word; }
+      .mono, [id$="Addr"], [id$="Msg"], #swQuoteOut, #swBalances, #connErr { word-break: break-all; }
+      .card > div, .prov .row > * { min-width: 0; }
+      table { width: 100%; border-collapse: collapse; }
+      .tableScroll { overflow-x: auto; }
+      pre { max-width: 100%; overflow-x: auto; }
+
+      /* wallet / spark */
+      .balance { font-size: 34px; font-weight: 700; letter-spacing: -0.03em; }
+      .balance .u { font-size: 13px; color: var(--muted); margin-left: 7px; font-weight: 500; }
+      .bar { height: 6px; border-radius: 999px; background: var(--panel-2); overflow: hidden; margin: 12px 0 8px; }
+      .bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+
+      /* providers */
+      .prov { display: flex; flex-direction: column; gap: 9px; }
       .prov .row {
-        display: flex; align-items: center; gap: 12px; padding: 10px 12px;
-        border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2);
+        display: flex; align-items: center; gap: 12px; padding: 11px 13px;
+        border: 1px solid var(--line); border-radius: 13px; background: var(--panel-2); min-width: 0;
       }
-      .prov .name { font-weight: 600; }
-      .prov .addr { font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; }
-      .prov .rep { margin-left: auto; text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
-      .rep .f { color: var(--good); } .rep .x { color: var(--bad); }
-      .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-      .dot.reliable { background: var(--good); } .dot.bad-data, .dot.no-fulfill { background: var(--warn); }
-      table { width: 100%; border-collapse: collapse; margin-top: 4px; }
-      th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); font-size: 13px; vertical-align: middle; }
-      th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+      .prov .row > div:nth-child(2) { flex: 1; min-width: 0; }
+      .prov .name { font-weight: 600; font-size: 13.5px; }
+      .prov .addr { font-size: 11.5px; color: var(--muted); }
+      .prov .rep { text-align: right; font-size: 12px; white-space: nowrap; }
+      .prov .rep .f { color: var(--good); }
+      .prov .rep .x { color: var(--bad); }
+      .prov .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--good); flex: none; }
+      .prov .dot.flaky { background: var(--warn); }
+      .prov .dot.premium { background: var(--accent-2); }
+
+      /* ledger */
+      th { text-align: left; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 8px 10px; font-weight: 600; }
+      td { padding: 9px 10px; border-top: 1px solid var(--line); font-size: 13px; vertical-align: top; }
       td.num { text-align: right; font-variant-numeric: tabular-nums; }
-      .badge { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
-      .badge.settled { background: #0c2c1e; border: 1px solid #14532d; color: var(--good); }
-      .badge.refunded { color: var(--warn); background: #2c230c; border: 1px solid #533a14; }
-      .badge.skipped { color: var(--skip); background: #1a2130; border: 1px solid #2a3444; }
-      .badge.error { color: var(--bad); background: #2c0c0c; border: 1px solid #531414; }
-      .log { margin-top: 18px; }
-      .log .line { display: flex; gap: 10px; padding: 6px 4px; border-bottom: 1px solid #141c2b; font-size: 12.5px; }
-      .log .t { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
-      .log .src { flex: none; width: 90px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .log .msg { flex: 1; }
-      .lv-settle .msg { color: var(--good); }
-      .lv-refund .msg { color: var(--warn); }
-      .lv-pay .msg { color: #9dc0ff; }
-      .lv-decide .msg { color: #d7c6ff; }
-      .lv-skip .msg { color: var(--muted); }
-      .lv-guardian .msg { color: var(--warn); font-weight: 600; }
-      .foot { margin-top: 22px; font-size: 12px; color: var(--muted); display: flex; gap: 18px; flex-wrap: wrap; }
-      .mono { font-family: ui-monospace, monospace; }
-      .live { display: inline-flex; align-items: center; gap: 6px; }
-      .live .dot { background: var(--good); animation: pulse 1.4s infinite; }
-      @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+      .badge { padding: 3px 9px; border-radius: 999px; font-size: 11.5px; border: 1px solid var(--line-strong); }
+      .badge.settled { color: var(--good); }
+      .badge.refunded { color: var(--warn); }
+      .badge.skipped { color: var(--skip); }
+
+      /* activity log */
+      .log { max-height: 340px; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+      .log .line { display: flex; gap: 10px; font-size: 12.5px; padding: 7px 9px; border-radius: 10px; background: var(--panel-2); min-width: 0; }
+      .log .t { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11.5px; flex: none; }
+      .log .src { color: var(--accent); flex: none; }
+      .log .msg { min-width: 0; }
+      .log .lv-error .msg, .log .lv-reject .msg { color: var(--bad); }
+
+      /* ---- floating scroll controls -------------------------------------- */
+      .scrollDock { position: fixed; right: 18px; bottom: 22px; z-index: 70; display: flex; flex-direction: column; gap: 9px; }
+      .scrollDock button {
+        width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
+        border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
+        font-size: 16px; display: grid; place-items: center; box-shadow: var(--shadow);
+        backdrop-filter: blur(10px); transition: transform .15s ease, border-color .15s ease;
+      }
+      .scrollDock button:hover { transform: translateY(-2px); border-color: var(--accent); color: var(--accent); }
+      .scrollDock button[hidden] { display: none; }
+      @media (max-width: 600px) { .scrollDock { right: 11px; bottom: 15px; } }
+
+      /* ---- dropdown menus ------------------------------------------------ */
+      .menuWrap { position: relative; display: inline-block; }
+      .menuPanel {
+        position: absolute; right: 0; top: calc(100% + 9px); z-index: 90;
+        min-width: 258px; max-width: min(93vw, 350px);
+        border: 1px solid var(--line-strong); border-radius: 16px; background: var(--bg-soft);
+        box-shadow: var(--shadow); padding: 8px;
+        opacity: 0; transform: translateY(-6px) scale(.98); pointer-events: none;
+        transition: opacity .18s ease, transform .18s ease;
+      }
+      .menuPanel.open { opacity: 1; transform: none; pointer-events: auto; }
+      .menuItem {
+        display: block; width: 100%; text-align: left; padding: 9px 11px; border: 0;
+        border-radius: 10px; background: transparent; color: var(--text); font: inherit; font-size: 13.5px; cursor: pointer;
+      }
+      .menuItem:hover { background: var(--panel-2); }
+      .menuHead { padding: 8px 11px 6px; font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+      .menuSep { height: 1px; background: var(--line); margin: 6px 4px; }
+      .cfgRow { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 5px 11px; font-size: 13px; }
+      .cfgRow input, .cfgRow select {
+        width: 106px; padding: 6px 8px; border-radius: 9px; border: 1px solid var(--line-strong);
+        background: var(--panel-2); color: var(--text); font: inherit; font-size: 13px;
+      }
+
+      .foot { color: var(--muted); font-size: 12px; padding: 26px 0 40px; display: flex; gap: 14px; flex-wrap: wrap; }
     </style>
   </head>
   <body>
-    <div class="wrap">
-      <header>
-        <span class="logo">🎟️</span>
-        <h1>Tessera</h1>
-        <span class="tag">trustless pay-per-use commerce for AI agents · settled on Arc in USDC</span>
-        <span style="flex:1"></span>
-        <span class="pill blue" id="brainPill">brain: —</span>
-        <span class="pill" id="policyPill" title="Spends above this per-call cap require guardian approval">🛡 —</span>
-        <span class="pill" id="chainPill">chain: —</span>
-        <span class="pill live"><span class="dot"></span> live</span>
-        <button class="btn" id="walletBtn" style="margin-left:10px">Connect Wallet</button>
-        <button class="btn" id="adminBtn" style="margin-left:8px">Admin</button>
+    <!-- ================= TOP BAR ================= -->
+    <header class="topbar">
+      <div class="inner">
+        <button class="brand" id="brandBtn" title="Back to home">
+          <span class="mark">🎟️</span><span class="name">Tessera</span>
+        </button>
+        <span class="spacer"></span>
 
-        <!-- Profile: shown once any identity is signed in (wallet or operator) -->
-        <span class="menuWrap" id="profileWrap" style="margin-left:8px;display:none">
-          <button class="btn" id="profileBtn" title="Your profile" aria-haspopup="true" aria-expanded="false">👤 <span id="profileLabel">Profile</span> ▾</button>
+        <button class="btn" id="navToggle" title="Navigate" aria-expanded="false">☰ Menu</button>
+        <button class="btn" id="walletBtn">Connect Wallet</button>
+        <button class="btn" id="adminBtn">Admin</button>
+
+        <span class="menuWrap" id="profileWrap" style="display:none">
+          <button class="btn" id="profileBtn" title="Your profile" aria-haspopup="true" aria-expanded="false">
+            👤 <span id="profileLabel">Profile</span> ▾
+          </button>
           <div class="menuPanel" id="profileMenu" role="menu">
             <div class="menuHead" id="profileWho">Signed in</div>
             <button class="menuItem" data-prof="edit" role="menuitem">✏️ Edit profile (set name)</button>
@@ -234,10 +351,9 @@
           </div>
         </span>
 
-        <!-- App Config: operator only -->
-        <span class="menuWrap" id="cfgWrap" style="margin-left:8px;display:none">
-          <button class="btn" id="cfgBtn" title="App Config (admin only)" aria-haspopup="true" aria-expanded="false">⚙️ Config ▾</button>
-          <div class="menuPanel" id="cfgMenu" role="menu" style="min-width:300px">
+        <span class="menuWrap" id="cfgWrap" style="display:none">
+          <button class="btn" id="cfgBtn" title="App Config (operator only)" aria-haspopup="true" aria-expanded="false">⚙️ Config ▾</button>
+          <div class="menuPanel" id="cfgMenu" role="menu" style="min-width:308px">
             <div class="menuHead">App Config — operator only</div>
             <div class="cfgRow"><span>Vault liquid reserve</span><span><input id="cfgReserve" type="number" min="80" max="100" step="1" />%</span></div>
             <div class="cfgRow"><span>App share of vault yield</span><span><input id="cfgPerfFee" type="number" min="0" max="30" step="1" />%</span></div>
@@ -259,259 +375,403 @@
             <div class="menuSep"></div>
             <div style="padding:4px 11px 8px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>
             <div style="display:flex;gap:8px;padding:0 11px 8px">
-              <button class="btn" id="cfgSave" style="flex:1">Save config</button>
+              <button class="btn primary" id="cfgSave" style="flex:1">Save config</button>
               <button class="btn" id="cfgAllocate" title="Distribute collected fees now">Allocate now</button>
             </div>
             <div class="kv" id="cfgMsg" style="padding:0 11px 8px;display:none"></div>
           </div>
         </span>
+
         <select class="themesel" id="themeSel" title="Theme" aria-label="Theme">
           <option value="system">◐ System</option>
           <option value="light">☀ Light</option>
           <option value="dark">☾ Dark</option>
         </select>
-      </header>
-
-      <div class="task">
-        <div class="goal">Agent task: <b id="goal">—</b></div>
-        <div style="display:flex;gap:14px;align-items:center">
-          <div class="kv" style="flex-direction:column;text-align:right">
-            <span>budget <b id="budget" style="color:var(--text)">—</b> · spent <b id="spent" style="color:var(--text)">—</b></span>
-            <span id="summary">—</span>
-          </div>
-          <button class="btn" id="runBtn">Run again ↻</button>
-        </div>
       </div>
 
-      <div class="card">
-        <h2>Agent wallet</h2>
-        <div class="wallet">
-          <span class="balance" id="agentBal">—<span class="u">USDC</span></span>
-        </div>
-        <div class="bar"><span id="balBar" style="width:100%"></span></div>
-        <div class="kv"><span class="mono" id="agentAddr">—</span><span id="balDelta"></span></div>
-        <svg id="spark" viewBox="0 0 300 56" preserveAspectRatio="none"
-             style="width:100%;height:56px;margin-top:12px;display:block"></svg>
-        <div class="kv"><span>balance over session</span><span id="sparkRange"></span></div>
-      </div>
-
-      <div class="card" id="treasuryCard" style="margin-top:18px">
-        <h2>Treasury &amp; faucet — working-capital workflow</h2>
-        <div style="display:flex;flex-wrap:wrap;gap:18px;align-items:center;justify-content:space-between">
-          <div style="display:flex;gap:26px;flex-wrap:wrap">
-            <div><div style="font-size:11px;color:var(--muted)">Balance</div><div id="trBal" style="font-size:18px;font-weight:700">—</div></div>
-            <div><div style="font-size:11px;color:var(--muted)">Runway</div><div id="trRunway" style="font-size:18px;font-weight:700">—</div></div>
-            <div><div style="font-size:11px;color:var(--muted)">Low-water</div><div id="trLow" style="font-size:18px;font-weight:700">—</div></div>
-            <div><div style="font-size:11px;color:var(--muted)">Net this run</div><div id="trNet" style="font-size:18px;font-weight:700">—</div></div>
-            <div><div style="font-size:11px;color:var(--muted)">Health</div><div id="trHealth" style="font-size:18px;font-weight:700">—</div></div>
-          </div>
-          <div style="display:flex;gap:10px;align-items:center">
-            <button class="btn" id="faucetBtn">Get testnet USDC ⛽</button>
-            <a class="btn" id="faucetLink" href="https://faucet.circle.com/" target="_blank" rel="noopener"
-               style="text-decoration:none;display:inline-flex;align-items:center">faucet.circle.com ↗</a>
-          </div>
-        </div>
-        <div class="kv" id="faucetMsg" style="margin-top:10px;display:none"></div>
-      </div>
-
-      <!-- ============ DeFi ============ -->
-      <div class="section" id="defiSection">💠 DeFi</div>
-      <div class="card" style="margin-bottom:14px">
-        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-          <label style="display:flex;gap:8px;align-items:center;cursor:pointer;font-weight:600">
-            <input type="checkbox" id="selfCustodyToggle" checked style="width:16px;height:16px" />
-            Use my own wallet (self-custody)
-          </label>
-          <span class="kv" id="custodyNote" style="flex:1;min-width:240px">
-            Self-custody: your wallet signs and your own funds move. No sign-in needed.
-            (Position figures below track the app's agent wallet; your own balances live in your wallet.)
-          </span>
+      <!-- Expand/collapse navigation -->
+      <div class="navDrawer" id="navDrawer">
+        <div class="inner">
+          <button class="btn" data-nav="home">🏠 Home</button>
+          <button class="btn" data-nav="dashboard">📊 Dashboard</button>
+          <button class="btn" data-nav="defi">💠 DeFi</button>
+          <button class="btn" data-nav="agents">🤖 Agent transactions</button>
+          <button class="btn" data-nav="other">⋯ Other</button>
         </div>
       </div>
+    </header>
 
-      <div class="card">
-        <h2>🛒 Marketplace providers · on-chain reputation</h2>
-        <div class="prov" id="providers"></div>
-      </div>
+    <!-- Floating Start button (landing only) -->
+    <div class="startDock" id="startDock">
+      <button class="btn primary" id="startBtn">Start →</button>
+    </div>
 
-      <div class="card" id="lendingCard" style="margin-top:18px">
-        <h2>🏦 Lending &amp; borrowing — TesseraPool</h2>
-        <div class="notready" id="lendingNotReady" style="display:none">
-          Pool not deployed yet — run <span class="mono">npm run pool:arc</span> to create the
-          USDC / EURC / cirBTC reserves. Live values appear here automatically once it's on-chain.
-        </div>
-
-        <!-- Account-wide position -->
-        <div style="display:flex;gap:22px;flex-wrap:wrap;margin-bottom:14px">
-          <div><div style="font-size:11px;color:var(--muted)">Supplied</div><div id="lnSupplied" style="font-size:16px;font-weight:700">—</div></div>
-          <div><div style="font-size:11px;color:var(--muted)">Borrowed</div><div id="lnBorrowed" style="font-size:16px;font-weight:700">—</div></div>
-          <div><div style="font-size:11px;color:var(--muted)">Borrow limit</div><div id="lnLimit" style="font-size:16px;font-weight:700">—</div></div>
-          <div><div style="font-size:11px;color:var(--muted)">Health</div><div id="lnHealth" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
-        </div>
-
-        <!-- Asset picker -->
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
-          <label style="font-size:12px;color:var(--muted)">Asset</label>
-          <select id="lnAsset" class="btn" style="padding:8px 12px"></select>
-          <span id="lnPrice" style="font-size:12px;color:var(--muted)"></span>
-        </div>
-
-        <!-- Selected-asset reserve + position -->
-        <div style="display:flex;flex-wrap:wrap;gap:26px;align-items:flex-start;justify-content:space-between">
-          <div style="flex:1;min-width:240px">
-            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Reserve</div>
-            <div style="display:flex;gap:22px;flex-wrap:wrap">
-              <div><div style="font-size:11px;color:var(--muted)">Liquidity</div><div id="lnCash" style="font-size:16px;font-weight:700">—</div></div>
-              <div><div style="font-size:11px;color:var(--muted)">Utilization</div><div id="lnUtil" style="font-size:16px;font-weight:700">—</div></div>
-              <div><div style="font-size:11px;color:var(--muted)">Borrow APR</div><div id="lnBorrowApr" style="font-size:16px;font-weight:700;color:var(--warn)">—</div></div>
-              <div><div style="font-size:11px;color:var(--muted)">Supply APR</div><div id="lnSupplyApr" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
-            </div>
-          </div>
-          <div style="flex:1;min-width:240px">
-            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Your position in this asset</div>
-            <div style="display:flex;gap:22px;flex-wrap:wrap">
-              <div><div style="font-size:11px;color:var(--muted)">Supplied</div><div id="lnAssetSupplied" style="font-size:16px;font-weight:700">—</div></div>
-              <div><div style="font-size:11px;color:var(--muted)">Borrowed</div><div id="lnAssetBorrowed" style="font-size:16px;font-weight:700">—</div></div>
-              <div><div style="font-size:11px;color:var(--muted)">Wallet</div><div id="lnWallet" style="font-size:16px;font-weight:700">—</div></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Action + custom amount + Max -->
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px">
-          <select id="lnAction" class="btn" style="padding:8px 12px">
-            <option value="supply">Supply</option>
-            <option value="withdraw">Withdraw</option>
-            <option value="borrow">Borrow</option>
-            <option value="repay">Repay</option>
-          </select>
-          <input id="lnAmount" class="btn" inputmode="decimal" placeholder="Amount"
-                 style="padding:8px 12px;width:150px;font-variant-numeric:tabular-nums" />
-          <button class="btn" id="lnMax" style="padding:8px 12px">Max</button>
-          <button class="btn" id="lnExecute" style="padding:8px 14px;font-weight:700">Execute</button>
-          <span id="lnMaxHint" style="font-size:12px;color:var(--muted)"></span>
-        </div>
-        <div class="kv" id="lendingMsg" style="margin-top:10px;display:none"></div>
-      </div>
-
-      <!-- Vault: auto-yield on USDC -->
-      <div class="card" id="vaultCard" style="margin-top:18px">
-        <h2>🏛 Vault — auto-yield on USDC</h2>
-        <div class="notready" id="vaultNotReady" style="display:none">
-          Vault not deployed yet — run <span class="mono">npm run pool:arc</span> to deploy
-          <span class="mono">TesseraVault</span>. Deposits, APR and your balance appear here once it's live.
-        </div>
-        <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
-          Deposit USDC; a <b id="vReserve">—</b>% liquid reserve is always kept for instant
-          withdrawals and the rest earns the pool's supply APR. You keep the yield; the app takes
-          a <b id="vFee">—</b>% performance fee on yield only (never principal).
-        </div>
-        <div style="display:flex;gap:22px;flex-wrap:wrap;margin-bottom:14px">
-          <div><div style="font-size:11px;color:var(--muted)">Vault TVL</div><div id="vTvl" style="font-size:16px;font-weight:700">—</div></div>
-          <div><div style="font-size:11px;color:var(--muted)">Your balance</div><div id="vYours" style="font-size:16px;font-weight:700">—</div></div>
-          <div><div style="font-size:11px;color:var(--muted)">Wallet available</div><div id="vWallet" style="font-size:16px;font-weight:700">—</div></div>
-          <div><div style="font-size:11px;color:var(--muted)">APR</div><div id="vApr" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
-          <div><div style="font-size:11px;color:var(--muted)">Liquid buffer</div><div id="vBuffer" style="font-size:16px;font-weight:700">—</div></div>
-        </div>
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <select id="vAction" class="btn" style="padding:8px 12px">
-            <option value="deposit">Deposit</option>
-            <option value="withdraw">Withdraw</option>
-          </select>
-          <input id="vAmount" class="btn" inputmode="decimal" placeholder="USDC amount"
-                 style="padding:8px 12px;width:150px;font-variant-numeric:tabular-nums" />
-          <button class="btn" id="vMax" style="padding:8px 12px">Max</button>
-          <button class="btn" id="vExecute" style="padding:8px 14px;font-weight:700">Execute</button>
-          <span id="vHint" style="font-size:12px;color:var(--muted)"></span>
-        </div>
-        <div class="kv" id="vaultMsg" style="margin-top:10px;display:none"></div>
-      </div>
-
-      <!-- Swap desk -->
-      <div class="card" id="swapCard" style="margin-top:18px">
-        <h2>🔁 Swap</h2>
-        <div class="notready" id="swapNotReady" style="display:none">
-          Swap desk not deployed yet — run <span class="mono">npm run pool:arc</span> to deploy
-          <span class="mono">TesseraSwap</span> and seed its inventory. Quotes work as soon as it's live.
-        </div>
-        <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
-          Swap between pool assets at oracle prices. A 0.30% fee applies; part of it is the app's revenue.
-        </div>
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <input id="swAmount" class="btn" inputmode="decimal" placeholder="Amount"
-                 style="padding:8px 12px;width:130px;font-variant-numeric:tabular-nums" />
-          <select id="swIn" class="btn" style="padding:8px 12px"></select>
-          <span style="color:var(--muted)">→</span>
-          <select id="swOut" class="btn" style="padding:8px 12px"></select>
-          <button class="btn" id="swQuote" style="padding:8px 12px">Quote</button>
-          <button class="btn" id="swExecute" style="padding:8px 14px;font-weight:700">Swap</button>
-        </div>
-        <div id="swBalances" style="font-size:12.5px;color:var(--muted);margin-top:10px;line-height:1.6"></div>
-        <div id="swQuoteOut" style="font-size:12.5px;color:var(--text);margin-top:8px;font-weight:600"></div>
-        <div class="kv" id="swapMsg" style="margin-top:8px;display:none"></div>
-      </div>
-
-      <div class="card" id="liveCard" style="margin-top:18px;display:none;border-color:#3a2a2a">
-        <h2 style="color:#ff6b6b">🔴 Live on Arc testnet — real on-chain deployment</h2>
-        <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
-          Every panel above is backed by real, live state. These are the on-chain contracts and
-          wallets deployed on <b>Arc testnet</b> (chainId <span id="liveChain">—</span>). Tap any to open Arcscan.
-        </div>
-        <div id="liveRows" style="display:flex;flex-direction:column;gap:8px;font-size:12.5px"></div>
-      </div>
-
-      <div class="card" id="approvalsCard" style="margin-top:18px;display:none;border-color:#533a14">
-        <h2 style="color:var(--warn)">🛡 Guardian approvals — agent is asking to exceed its policy cap</h2>
-        <div id="approvals" style="display:flex;flex-direction:column;gap:10px"></div>
-      </div>
-
-      <div class="grid" style="margin-top:18px">
-        <div class="card">
-          <h2>Mission briefing — what the agent bought, assembled</h2>
-          <div id="briefing" style="display:flex;flex-direction:column;gap:8px;font-size:13.5px">
-            <span style="color:var(--muted)">Waiting for the agent…</span>
-          </div>
-        </div>
-        <div class="card">
-          <h2>Nanopayments — tab session (TesseraTab)</h2>
-          <div id="stream" style="font-size:13.5px;color:var(--muted)">No stream yet…</div>
-          <p style="font-size:12px;color:var(--muted);margin:10px 0 0">
-            One on-chain deposit → many off-chain signed vouchers (zero gas per tick) →
-            one on-chain settlement; the remainder returns to the agent.
+    <!-- ================= LANDING ================= -->
+    <main id="viewLanding">
+      <div class="wrap">
+        <section class="hero">
+          <span class="eyebrow">Live on Arc testnet · USDC-native</span>
+          <h1>Payments for agents that<br /><span class="grad">don't require trust</span></h1>
+          <p class="lead">
+            Tessera turns an ordinary <b>HTTP 402</b> into a trustless, per-call purchase settled in
+            USDC on Arc. An AI agent can pay a service it has never met — and get its money back
+            automatically if that service breaks its promise.
           </p>
-          <h2 style="margin-top:16px">Payment requests — the agent's billing inbox</h2>
-          <div id="invoices" style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">
-            <span style="color:var(--muted)">No invoices…</span>
+          <div class="heroCtas">
+            <button class="btn primary" id="heroStart" style="padding:12px 24px;font-size:15px">Launch the app →</button>
+            <a class="btn" href="#features" style="padding:12px 20px;font-size:15px">See what it does</a>
           </div>
-          <h2 style="margin-top:16px">Contacts — the agent's own memory</h2>
-          <div id="contacts" style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">
-            <span style="color:var(--muted)">No dealings yet…</span>
+
+          <div class="statStrip">
+            <div class="stat"><div class="k">Vault TVL</div><div class="v" id="landTvl">—</div></div>
+            <div class="stat"><div class="k">Pool liquidity</div><div class="v" id="landLiquidity">—</div></div>
+            <div class="stat"><div class="k">Agent settlements</div><div class="v" id="landSettled">—</div></div>
+            <div class="stat"><div class="k">Network</div><div class="v" id="landChain">Arc</div></div>
+          </div>
+        </section>
+
+        <section id="features">
+          <div class="sectionHead reveal">
+            <h2>Everything in one settlement layer</h2>
+            <p>Escrowed payments, a money market, a yield vault and a swap desk — all denominated in USDC on Arc.</p>
+          </div>
+          <div class="featGrid">
+            <div class="feat reveal"><div class="ico">🔐</div><h3>Programmable escrow</h3>
+              <p>Payment locks before delivery and releases only when the response passes an integrity and quality check.</p></div>
+            <div class="feat reveal"><div class="ico">↩️</div><h3>SLA auto-refund</h3>
+              <p>Miss the deadline or return junk and the agent reclaims its USDC automatically — enforced by the contract, not goodwill.</p></div>
+            <div class="feat reveal"><div class="ico">⭐</div><h3>On-chain reputation</h3>
+              <p>Every settlement and failure is recorded against the provider, with bonded stake slashed on a breach.</p></div>
+            <div class="feat reveal"><div class="ico">⚡</div><h3>Nanopayment tabs</h3>
+              <p>One deposit, then hundreds of off-chain signed vouchers at zero gas, settled in a single transaction.</p></div>
+            <div class="feat reveal"><div class="ico">🏦</div><h3>Lending &amp; borrowing</h3>
+              <p>Supply USDC, EURC or cirBTC for yield, or borrow against collateral with health-factor liquidation.</p></div>
+            <div class="feat reveal"><div class="ico">🏛</div><h3>Yield vault</h3>
+              <p>Deposit USDC and earn the pool's APR automatically, with a large liquid reserve kept for instant exits.</p></div>
+            <div class="feat reveal"><div class="ico">🔁</div><h3>Swap desk</h3>
+              <p>Oracle-priced swaps between every pool asset, with the rate and both balances shown before you commit.</p></div>
+            <div class="feat reveal"><div class="ico">🛡</div><h3>Guardian policy</h3>
+              <p>A spending cap keeps the agent autonomous for small buys and escalates anything larger to a human co-signer.</p></div>
+          </div>
+        </section>
+
+        <section>
+          <div class="sectionHead reveal">
+            <h2>What makes it different</h2>
+            <p>Most agent-payment projects stop at "the agent sends USDC". These are the parts that make a stranger safe to deal with.</p>
+          </div>
+          <div class="featGrid">
+            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>Skin in the game</h3>
+              <p>Providers bond USDC stake. An SLA breach slashes it and pays the agent compensation — the counterparty carries real downside.</p></div>
+            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>Self-custody DeFi</h3>
+              <p>Your wallet signs, your own funds move. The server never holds a key and cannot touch user balances.</p></div>
+            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>Trust memory</h3>
+              <p>The agent remembers who burned it and declines their invoices next time, without any human intervention.</p></div>
+            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>Liveness guard</h3>
+              <p>A delivered payment can never be locked forever by an unresponsive agent — the provider can always claim.</p></div>
+            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>USDC is the gas</h3>
+              <p>On Arc the agent funds one asset for both the toll and the fees, and settlement clears inside a request.</p></div>
+            <div class="feat spot reveal"><span class="tagline">Unique</span><h3>80% liquid vault floor</h3>
+              <p>A contract constant no admin can lower, so most of the vault is always redeemable on demand.</p></div>
+          </div>
+        </section>
+
+        <section style="margin:90px 0 30px;text-align:center" class="reveal">
+          <h2 style="font-size:clamp(22px,3.4vw,34px);letter-spacing:-0.03em;margin:0 0 14px">Ready to look inside?</h2>
+          <p style="color:var(--muted);max-width:520px;margin:0 auto 22px">
+            Open the dashboard to watch a live agent buy data, settle escrow, reclaim a refund, and put idle USDC to work.
+          </p>
+          <button class="btn primary" id="ctaStart" style="padding:12px 26px;font-size:15px">Open the dashboard →</button>
+        </section>
+
+        <div class="foot"><span>Unaudited testnet software · Arc testnet · not for real funds</span></div>
+      </div>
+    </main>
+
+    <!-- ================= APP ================= -->
+    <div id="viewApp" hidden>
+      <div class="tabsBar">
+        <div class="wrap">
+          <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="dashboard" role="tab">📊 Dashboard</button>
+            <button class="tab" data-tab="defi" role="tab">💠 DeFi</button>
+            <button class="tab" data-tab="agents" role="tab">🤖 Agent transactions</button>
+            <button class="tab" data-tab="other" role="tab">⋯ Other</button>
           </div>
         </div>
       </div>
 
-      <div class="card" style="margin-top:18px">
-        <h2>Purchase ledger</h2>
-        <table>
-          <thead>
-            <tr><th>Service</th><th>Provider</th><th class="num">Price</th><th>Outcome</th><th>Why</th><th>Payment</th></tr>
-          </thead>
-          <tbody id="ledger"></tbody>
-        </table>
-      </div>
+      <div class="wrap view">
+        <!-- ---------- DASHBOARD ---------- -->
+        <div class="tabPane" id="paneDashboard">
+          <div class="card">
+            <h2>Status</h2>
+            <div class="row-actions">
+              <span class="pill blue" id="brainPill">brain: —</span>
+              <span class="pill" id="policyPill" title="Spends above this per-call cap need guardian approval">🛡 —</span>
+              <span class="pill" id="chainPill">chain: —</span>
+              <span class="pill live"><span class="dot"></span> live</span>
+            </div>
+          </div>
 
-      <div class="card log">
-        <h2>Autonomous activity — agent ⇄ providers ⇄ Arc</h2>
-        <div id="log"></div>
-      </div>
+          <div class="card">
+            <h2>Value locked</h2>
+            <div class="metrics">
+              <div class="metric"><div class="k">Vault TVL</div><div class="v" id="dashVaultTvl">—</div></div>
+              <div class="metric"><div class="k">Pool liquidity</div><div class="v" id="dashPoolCash">—</div></div>
+              <div class="metric"><div class="k">Pool borrowed</div><div class="v" id="dashPoolBorrows">—</div></div>
+              <div class="metric"><div class="k">Swap inventory</div><div class="v" id="dashSwapInv">—</div></div>
+              <div class="metric"><div class="k">Vault liquid buffer</div><div class="v" id="dashBuffer">—</div></div>
+            </div>
+          </div>
 
-      <div class="foot">
-        <span>escrow <span class="mono" id="escrowLink">—</span></span>
-        <span id="note"></span>
+          <div class="card">
+            <h2>Agent transactions</h2>
+            <div class="metrics">
+              <div class="metric"><div class="k">Settled</div><div class="v" id="dashSettled" style="color:var(--good)">—</div></div>
+              <div class="metric"><div class="k">Refunded</div><div class="v" id="dashRefunded" style="color:var(--warn)">—</div></div>
+              <div class="metric"><div class="k">Skipped</div><div class="v" id="dashSkipped" style="color:var(--skip)">—</div></div>
+              <div class="metric"><div class="k">Total spent</div><div class="v" id="dashSpent">—</div></div>
+            </div>
+          </div>
+
+          <div class="grid2">
+            <div class="card">
+              <h2>Agent wallet</h2>
+              <div class="balance" id="agentBal">—<span class="u">USDC</span></div>
+              <div class="bar"><span id="balBar" style="width:100%"></span></div>
+              <div class="kv"><span class="mono" id="agentAddr">—</span><span id="balDelta"></span></div>
+              <svg id="spark" viewBox="0 0 300 56" preserveAspectRatio="none" style="width:100%;height:56px;margin-top:12px;display:block"></svg>
+              <div class="kv"><span>balance over session</span><span id="sparkRange"></span></div>
+            </div>
+            <div class="card">
+              <h2>Mission briefing</h2>
+              <div id="briefing" style="font-size:13.5px;color:var(--muted)">Waiting for the agent…</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------- DEFI ---------- -->
+        <div class="tabPane" id="paneDefi" hidden>
+          <div class="card">
+            <div class="row-actions">
+              <label style="display:flex;gap:9px;align-items:center;cursor:pointer;font-weight:600">
+                <input type="checkbox" id="selfCustodyToggle" checked style="width:16px;height:16px" />
+                Use my own wallet (self-custody)
+              </label>
+              <span class="kv" id="custodyNote" style="flex:1;min-width:230px">
+                Self-custody: your wallet signs and your own funds move. No sign-in needed.
+                (Position figures below track the app's agent wallet; your own balances live in your wallet.)
+              </span>
+            </div>
+          </div>
+
+          <!-- Swap -->
+          <div class="card" id="swapCard">
+            <h2>🔁 Swap</h2>
+            <div class="notready" id="swapNotReady" style="display:none">
+              Swap desk not deployed yet — run <span class="mono">npm run pool:arc</span> to deploy
+              <span class="mono">TesseraSwap</span> and seed its inventory. Quotes work as soon as it's live.
+            </div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
+              Oracle-priced swaps between pool assets. A 0.30% fee applies; part of it is the app's revenue.
+            </div>
+            <div class="row-actions">
+              <input id="swAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
+              <select id="swIn" class="field"></select>
+              <span style="color:var(--muted)">→</span>
+              <select id="swOut" class="field"></select>
+              <button class="btn" id="swQuote">Quote</button>
+              <button class="btn primary" id="swExecute">Swap</button>
+            </div>
+            <div id="swBalances" style="font-size:12.5px;color:var(--muted);margin-top:11px;line-height:1.6"></div>
+            <div id="swQuoteOut" style="font-size:13px;margin-top:8px;font-weight:600"></div>
+            <div class="kv" id="swapMsg" style="margin-top:9px;display:none"></div>
+          </div>
+
+          <!-- Lending -->
+          <div class="card" id="lendingCard">
+            <h2>🏦 Lending &amp; borrowing — TesseraPool</h2>
+            <div class="notready" id="lendingNotReady" style="display:none">
+              Pool not deployed yet — run <span class="mono">npm run pool:arc</span> to create the
+              USDC / EURC / cirBTC reserves. Live values appear here automatically once it's on-chain.
+            </div>
+            <div class="metrics" style="margin-bottom:16px">
+              <div class="metric"><div class="k">Supplied</div><div class="v" id="lnSupplied">—</div></div>
+              <div class="metric"><div class="k">Borrowed</div><div class="v" id="lnBorrowed">—</div></div>
+              <div class="metric"><div class="k">Borrow limit</div><div class="v" id="lnLimit">—</div></div>
+              <div class="metric"><div class="k">Health</div><div class="v" id="lnHealth" style="color:var(--good)">—</div></div>
+            </div>
+            <div class="row-actions" style="margin-bottom:14px">
+              <label style="font-size:12px;color:var(--muted)">Asset</label>
+              <select id="lnAsset" class="field"></select>
+              <span id="lnPrice" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+            <div class="grid2">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Reserve</div>
+                <div class="metrics">
+                  <div class="metric"><div class="k">Liquidity</div><div class="v" id="lnCash">—</div></div>
+                  <div class="metric"><div class="k">Utilization</div><div class="v" id="lnUtil">—</div></div>
+                  <div class="metric"><div class="k">Borrow APR</div><div class="v" id="lnBorrowApr" style="color:var(--warn)">—</div></div>
+                  <div class="metric"><div class="k">Supply APR</div><div class="v" id="lnSupplyApr" style="color:var(--good)">—</div></div>
+                </div>
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Your position in this asset</div>
+                <div class="metrics">
+                  <div class="metric"><div class="k">Supplied</div><div class="v" id="lnAssetSupplied">—</div></div>
+                  <div class="metric"><div class="k">Borrowed</div><div class="v" id="lnAssetBorrowed">—</div></div>
+                  <div class="metric"><div class="k">Wallet</div><div class="v" id="lnWallet">—</div></div>
+                </div>
+              </div>
+            </div>
+            <div class="row-actions" style="margin-top:16px">
+              <select id="lnAction" class="field">
+                <option value="supply">Supply</option>
+                <option value="withdraw">Withdraw</option>
+                <option value="borrow">Borrow</option>
+                <option value="repay">Repay</option>
+              </select>
+              <input id="lnAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:150px" />
+              <button class="btn" id="lnMax">Max</button>
+              <button class="btn primary" id="lnExecute">Execute</button>
+              <span id="lnMaxHint" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+            <div class="kv" id="lendingMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <!-- Vault -->
+          <div class="card" id="vaultCard">
+            <h2>🏛 Vault — auto-yield on USDC</h2>
+            <div class="notready" id="vaultNotReady" style="display:none">
+              Vault not deployed yet — run <span class="mono">npm run pool:arc</span> to deploy
+              <span class="mono">TesseraVault</span>. Deposits, APR and your balance appear here once it's live.
+            </div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Deposit USDC; a <b id="vReserve">—</b>% liquid reserve is always kept for instant withdrawals
+              (an 80% floor is fixed in the contract) and the rest earns the pool's supply APR.
+              You keep the yield; the app takes a <b id="vFee">—</b>% performance fee on yield only — never principal.
+            </div>
+            <div class="metrics" style="margin-bottom:16px">
+              <div class="metric"><div class="k">Vault TVL</div><div class="v" id="vTvl">—</div></div>
+              <div class="metric"><div class="k">Your balance</div><div class="v" id="vYours">—</div></div>
+              <div class="metric"><div class="k">Wallet available</div><div class="v" id="vWallet">—</div></div>
+              <div class="metric"><div class="k">APR</div><div class="v" id="vApr" style="color:var(--good)">—</div></div>
+              <div class="metric"><div class="k">Liquid buffer</div><div class="v" id="vBuffer">—</div></div>
+            </div>
+            <div class="row-actions">
+              <select id="vAction" class="field">
+                <option value="deposit">Deposit</option>
+                <option value="withdraw">Withdraw</option>
+              </select>
+              <input id="vAmount" class="field" inputmode="decimal" placeholder="USDC amount" style="width:150px" />
+              <button class="btn" id="vMax">Max</button>
+              <button class="btn primary" id="vExecute">Execute</button>
+              <span id="vHint" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+            <div class="kv" id="vaultMsg" style="margin-top:11px;display:none"></div>
+          </div>
+        </div>
+
+        <!-- ---------- AGENT TRANSACTIONS ---------- -->
+        <div class="tabPane" id="paneAgents" hidden>
+          <div class="card">
+            <h2>Agent task</h2>
+            <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;justify-content:space-between">
+              <div style="min-width:0">
+                <div style="font-size:15px;font-weight:600" id="goal">—</div>
+                <div class="kv" style="justify-content:flex-start;gap:8px;margin-top:5px">
+                  <span>budget <b style="color:var(--text)" id="budget">—</b></span>
+                  <span>· spent <b style="color:var(--text)" id="spent">—</b></span>
+                  <span id="summary">—</span>
+                </div>
+              </div>
+              <button class="btn primary" id="runBtn">Run again ↻</button>
+            </div>
+          </div>
+
+          <div class="card" id="approvalsCard" style="display:none;border-color:color-mix(in srgb, var(--warn) 40%, var(--line))">
+            <h2 style="color:var(--warn)">🛡 Guardian approvals — agent wants to exceed its policy cap</h2>
+            <div id="approvals" style="display:flex;flex-direction:column;gap:10px"></div>
+          </div>
+
+          <div class="card">
+            <h2>🛒 Marketplace providers · on-chain reputation</h2>
+            <div class="prov" id="providers"></div>
+          </div>
+
+          <div class="card">
+            <h2>Purchase ledger</h2>
+            <div class="tableScroll">
+              <table>
+                <thead><tr><th>Service</th><th>Provider</th><th class="num">Price</th><th>Outcome</th><th>Why</th><th>Payment</th></tr></thead>
+                <tbody id="ledger"><tr><td colspan="6" style="color:var(--muted)">No purchases yet…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="grid2">
+            <div class="card">
+              <h2>⚡ Nanopayments — tab session</h2>
+              <div id="stream" style="font-size:13px;color:var(--muted)">No stream yet…</div>
+            </div>
+            <div class="card">
+              <h2>Payment requests — billing inbox</h2>
+              <div id="invoices" style="display:flex;flex-direction:column;gap:9px"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Contacts — the agent's own memory</h2>
+            <div id="contacts" style="font-size:13px;color:var(--muted)">No dealings yet…</div>
+          </div>
+
+          <div class="card">
+            <h2>Autonomous activity — agent ⇄ providers ⇄ Arc</h2>
+            <div class="log" id="log"></div>
+          </div>
+        </div>
+
+        <!-- ---------- OTHER ---------- -->
+        <div class="tabPane" id="paneOther" hidden>
+          <div class="card">
+            <h2>Treasury &amp; faucet — working capital</h2>
+            <div style="display:flex;flex-wrap:wrap;gap:18px;align-items:center;justify-content:space-between">
+              <div class="metrics">
+                <div class="metric"><div class="k">Balance</div><div class="v" id="trBal">—</div></div>
+                <div class="metric"><div class="k">Runway</div><div class="v" id="trRunway">—</div></div>
+                <div class="metric"><div class="k">Low-water</div><div class="v" id="trLow">—</div></div>
+                <div class="metric"><div class="k">Net this run</div><div class="v" id="trNet">—</div></div>
+                <div class="metric"><div class="k">Health</div><div class="v" id="trHealth">—</div></div>
+              </div>
+              <div class="row-actions">
+                <button class="btn" id="faucetBtn">Get testnet USDC ⛽</button>
+                <a class="btn" id="faucetLink" href="https://faucet.circle.com/" target="_blank" rel="noopener"
+                   style="display:inline-flex;align-items:center">faucet.circle.com ↗</a>
+              </div>
+            </div>
+            <div class="kv" id="faucetMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <div class="card" id="liveCard" style="display:none;border-color:color-mix(in srgb, var(--bad) 34%, var(--line))">
+            <h2 style="color:var(--bad)">🔴 Live on Arc testnet — real on-chain deployment</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Every panel is backed by real, live state. These are the on-chain contracts and wallets
+              deployed on <b>Arc testnet</b> (chainId <span id="liveChain">—</span>). Tap any to open Arcscan.
+            </div>
+            <div id="liveRows" style="display:flex;flex-direction:column;gap:8px;font-size:12.5px"></div>
+          </div>
+
+          <div class="foot">
+            <span>escrow <span class="mono" id="escrowLink">—</span></span>
+            <span id="note"></span>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- Floating scroll controls: always reachable while scrolling -->
+    <!-- Floating scroll controls -->
     <div class="scrollDock" id="scrollDock">
       <button id="toTop" title="Back to top" aria-label="Scroll to top">↑</button>
       <button id="toBottom" title="Jump to bottom" aria-label="Scroll to bottom">↓</button>
