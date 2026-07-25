@@ -476,6 +476,8 @@ const $ = (id) => document.getElementById(id);
           window.__vault = vt;
           window.__agentUsdc = vt.walletUsdc || (s.agent ? s.agent.balanceUsdc : "0");
           setUnlessMine("vWallet", (vt.walletUsdc || "0") + " USDC");
+          // These come straight from the contract each refresh, so an admin
+          // change to the ratio or fee shows up here as soon as it lands.
           $("vReserve").textContent = vt.reserveRatioPct;
           $("vFee").textContent = vt.performanceFeePct;
           $("vTvl").textContent = vt.totalAssets + " USDC";
@@ -1000,6 +1002,26 @@ const $ = (id) => document.getElementById(id);
       $("swIn").addEventListener("change", () => { renderSwapBalances(); $("swQuoteOut").textContent = ""; });
       $("swOut").addEventListener("change", () => { renderSwapBalances(); $("swQuoteOut").textContent = ""; });
       $("swQuote").addEventListener("click", swapQuote);
+      /* Auto-quote while typing. A stale quote is a real risk — the rate could
+       * have moved since it was fetched — so the figure refreshes as the amount
+       * changes (debounced) and is re-fetched immediately before executing. */
+      let quoteTimer = null;
+      function scheduleQuote() {
+        clearTimeout(quoteTimer);
+        const v = $("swAmount").value.trim();
+        if (!v || Number(v) <= 0) { $("swQuoteOut").textContent = ""; return; }
+        $("swQuoteOut").textContent = "Quoting…";
+        quoteTimer = setTimeout(() => { swapQuote().catch(() => {}); }, 350);
+      }
+      $("swAmount").addEventListener("input", scheduleQuote);
+      $("swIn").addEventListener("change", scheduleQuote);
+      $("swOut").addEventListener("change", scheduleQuote);
+      // Keep the live rate honest while the panel is open.
+      setInterval(() => {
+        if (!$("swapCard") || $("paneDefi").hidden) return;
+        const v = $("swAmount").value.trim();
+        if (v && Number(v) > 0) swapQuote().catch(() => {});
+      }, 15000);
       $("swExecute").addEventListener("click", async () => {
         const q = await swapQuote();
         const msg = $("swapMsg");
@@ -1294,7 +1316,39 @@ const $ = (id) => document.getElementById(id);
         return { close };
       }
       const profileMenu = bindMenu("profileBtn", "profileMenu");
-      const cfgMenu = bindMenu("cfgBtn", "cfgMenu");
+      /* App Config opens as a large scrollable dialog rather than a dropdown —
+       * it has far too many controls for a menu panel now. */
+      function openCfg() {
+        $("cfgModal").hidden = false;
+        $("cfgBtn").setAttribute("aria-expanded", "true");
+        loadAppConfig();
+        syncCfgDock();
+      }
+      function closeCfg() {
+        $("cfgModal").hidden = true;
+        $("cfgBtn").setAttribute("aria-expanded", "false");
+      }
+      if ($("cfgBtn")) $("cfgBtn").addEventListener("click", openCfg);
+      if ($("cfgCloseBtn")) $("cfgCloseBtn").addEventListener("click", closeCfg);
+      if ($("cfgModal")) {
+        $("cfgModal").addEventListener("click", (e) => { if (e.target === $("cfgModal")) closeCfg(); });
+      }
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && $("cfgModal") && !$("cfgModal").hidden) closeCfg();
+      });
+      // Jump controls scroll the dialog's own body, not the page.
+      function syncCfgDock() {
+        const b = $("cfgBody"), up = $("cfgToTop"), dn = $("cfgToBottom");
+        if (!b || !up || !dn) return;
+        up.hidden = b.scrollTop < 80;
+        dn.hidden = b.scrollHeight - b.scrollTop - b.clientHeight < 80;
+      }
+      if ($("cfgBody")) {
+        $("cfgBody").addEventListener("scroll", syncCfgDock, { passive: true });
+        $("cfgToTop").addEventListener("click", () => $("cfgBody").scrollTo({ top: 0, behavior: "smooth" }));
+        $("cfgToBottom").addEventListener("click", () =>
+          $("cfgBody").scrollTo({ top: $("cfgBody").scrollHeight, behavior: "smooth" }));
+      }
 
       // Reflect who's signed in: show the profile menu for any identity, and the
       // App Config menu only for the operator.
@@ -1312,7 +1366,7 @@ const $ = (id) => document.getElementById(id);
           $("profileWho").textContent = p.kind === "admin" ? "Signed in as operator" : "Wallet " + short(p.address);
           $("profPassword").style.display = p.canChangePassword ? "block" : "none";
           if (cw) cw.style.display = p.isOperator ? "inline-block" : "none";
-          if (p.isOperator) loadAppConfig();
+          // Config values load when the dialog is opened.
         } catch {
           profileState = null;
           if (wrap) wrap.style.display = "none";
@@ -1469,6 +1523,7 @@ const $ = (id) => document.getElementById(id);
                 msg.style.color = "var(--good)";
                 msg.textContent = "Config saved and pushed on-chain ✓ — " + landed.join(", ");
                 syncScheduleRows(r.schedule && r.schedule.nextRunUtc);
+                afterTx(); // vault reserve/fee copy updates immediately
               } else {
                 msg.style.color = "var(--warn)";
                 msg.textContent =
@@ -1492,6 +1547,7 @@ const $ = (id) => document.getElementById(id);
             const r = await (await postAuthed("/api/fees/allocate")).json();
             msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
             msg.textContent = r.ok ? "Fees allocated ✓" : r.error;
+            if (r.ok) afterTx();
           } catch {
             msg.style.color = "var(--warn)";
             msg.textContent = "Allocation request failed.";

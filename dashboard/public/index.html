@@ -324,6 +324,44 @@
       }
 
 
+
+      /* ---- App Config panel ---------------------------------------------- */
+      .cfgCard {
+        position: relative; display: flex; flex-direction: column;
+        width: min(96vw, 720px); max-height: min(88vh, 900px);
+        border: 1px solid var(--line-strong); border-radius: 20px;
+        background: var(--bg-soft); box-shadow: var(--shadow); overflow: hidden;
+        animation: fade .2s ease both;
+      }
+      .cfgHead {
+        display: flex; gap: 12px; align-items: flex-start; justify-content: space-between;
+        padding: 16px 20px 12px; border-bottom: 1px solid var(--line);
+        background: var(--bg-soft); flex-wrap: wrap;
+      }
+      .cfgHead h3 { margin: 0; font-size: 17px; letter-spacing: -0.02em; }
+      .cfgHead p { margin: 3px 0 0; font-size: 12px; color: var(--muted); }
+      .cfgHeadActions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .cfgClose { padding: 8px 11px; }
+      .cfgBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 12px 0 22px; }
+      .cfgBody .menuHead { padding: 14px 20px 6px; }
+      .cfgBody .cfgRow { padding: 7px 20px; }
+      .cfgBody .menuSep { margin: 8px 20px; }
+      .cfgDock {
+        position: absolute; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 8px;
+      }
+      .cfgDock button {
+        width: 36px; height: 36px; border-radius: 50%; cursor: pointer;
+        border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
+        display: grid; place-items: center; box-shadow: var(--shadow);
+      }
+      .cfgDock button:hover { border-color: var(--accent); color: var(--accent); }
+      @media (max-width: 560px) {
+        .cfgCard { width: 96vw; max-height: 92vh; }
+        .cfgHead { padding: 13px 15px 10px; }
+        .cfgBody .cfgRow, .cfgBody .menuHead { padding-left: 15px; padding-right: 15px; }
+        .cfgHeadActions .btn { flex: 1 1 auto; }
+      }
+
       /* ---- clickable landing cards ---------------------------------------- */
       .feat[data-goto] { cursor: pointer; }
       .feat[data-goto]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
@@ -353,6 +391,14 @@
       .pwRow { display: flex; gap: 8px; align-items: stretch; }
       .pwRow .field { flex: 1; min-width: 0; }
       .pwEye { padding: 8px 11px; }
+      /* Some browsers (Edge, several mobile ones) add their own reveal icon,
+         which appeared as a second eye next to ours. Hide theirs. */
+      input[type="password"]::-ms-reveal,
+      input[type="password"]::-ms-clear { display: none; }
+      input[type="password"]::-webkit-credentials-auto-fill-button,
+      input[type="password"]::-webkit-strong-password-auto-fill-button {
+        display: none !important; visibility: hidden; pointer-events: none;
+      }
 
       /* ---- responsiveness ------------------------------------------------- */
       @media (max-width: 720px) {
@@ -411,63 +457,9 @@
         </span>
 
         <span class="menuWrap" id="cfgWrap" style="display:none">
-          <button class="btn" id="cfgBtn" title="App Config (operator only)" aria-haspopup="true" aria-expanded="false">⚙️ Config ▾</button>
-          <div class="menuPanel" id="cfgMenu" role="menu" style="min-width:308px">
-            <div class="menuHead">App Config — operator only</div>
-            <div class="cfgRow"><span>Vault liquid reserve</span><span><input id="cfgReserve" type="number" min="80" max="100" step="1" />%</span></div>
-            <div class="cfgRow"><span>App share of vault yield</span><span><input id="cfgPerfFee" type="number" min="0" max="30" step="1" />%</span></div>
-            <div class="menuSep"></div>
-            <div class="menuHead">Fee allocation (must total 100%)</div>
-            <div class="cfgRow"><span>→ Agent balance</span><span><input id="cfgFeeAgent" type="number" min="0" max="100" step="1" />%</span></div>
-            <div class="cfgRow"><span>→ App lending position</span><span><input id="cfgFeeLending" type="number" min="0" max="100" step="1" />%</span></div>
-            <div class="cfgRow"><span>→ Vault</span><span><input id="cfgFeeVault" type="number" min="0" max="100" step="1" />%</span></div>
-            <div class="cfgRow"><span>→ Swap pool</span><span><input id="cfgFeeSwap" type="number" min="0" max="100" step="1" />%</span></div>
-            <div class="cfgRow"><span>→ Retained</span><span><input id="cfgFeeRetained" type="number" min="0" max="100" step="1" />%</span></div>
-            <div class="cfgRow"><span>Trigger</span>
-              <select id="cfgMode">
-                <option value="interval">Every…</option>
-                <option value="weekly">Day + time</option>
-                <option value="manual">Manual only</option>
-              </select>
-            </div>
-            <div class="cfgRow" id="cfgRowInterval"><span>Allocate every</span>
-              <span style="display:flex;gap:6px;align-items:center">
-              <input id="cfgEvery" type="number" min="1" max="1000" step="1" style="width:56px"
-                     title="Leave as 1 for every unit, or set N for every N units" />
-              <select id="cfgCadence" style="width:104px">
-                <option value="second">Second</option><option value="minute">Minute</option>
-                <option value="hour">Hour</option><option value="day">Day</option>
-                <option value="week">Week</option><option value="month">Month</option>
-                <option value="year">Year</option>
-              </select>
-              </span>
-            </div>
-            <div class="cfgRow" id="cfgRowEffective" style="color:var(--muted);font-size:12px">
-              <span>Effective</span><span id="cfgEffective">—</span>
-            </div>
-            <div class="cfgRow" id="cfgRowWeekday" style="display:none"><span>On</span>
-              <select id="cfgWeekday">
-                <option value="0">Sunday</option><option value="1">Monday</option>
-                <option value="2">Tuesday</option><option value="3">Wednesday</option>
-                <option value="4">Thursday</option><option value="5">Friday</option>
-                <option value="6">Saturday</option>
-              </select>
-            </div>
-            <div class="cfgRow" id="cfgRowTime" style="display:none"><span>At (UTC)</span>
-              <input id="cfgTime" type="time" />
-            </div>
-            <div class="cfgRow" id="cfgRowNext" style="display:none;color:var(--muted);font-size:12px">
-              <span>Next run</span><span id="cfgNextRun">—</span>
-            </div>
-            <div class="menuSep"></div>
-            <div style="padding:4px 11px 8px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>
-            <div style="display:flex;gap:8px;padding:0 11px 8px">
-              <button class="btn primary" id="cfgSave" style="flex:1">Save config</button>
-              <button class="btn" id="cfgAllocate" title="Distribute collected fees now">Allocate now</button>
-            </div>
-            <div class="kv" id="cfgMsg" style="padding:0 11px 8px;display:none"></div>
-          </div>
+          <button class="btn" id="cfgBtn" title="App Config (operator only)" aria-haspopup="dialog" aria-expanded="false">⚙️ Config</button>
         </span>
+
 
         <select class="themesel" id="themeSel" title="Theme" aria-label="Theme">
           <option value="system">◐ System</option>
@@ -483,7 +475,7 @@
           <button class="btn" data-nav="dashboard">📊 Dashboard</button>
           <button class="btn" data-nav="defi">💠 DeFi</button>
           <button class="btn" data-nav="agents">🤖 Agent transactions</button>
-          <button class="btn" data-nav="other">⋯ Other</button>
+          <button class="btn" data-nav="other">🧰 Treasury &amp; system</button>
         </div>
       </div>
     </header>
@@ -583,7 +575,7 @@
             <button class="tab active" data-tab="dashboard" role="tab">📊 Dashboard</button>
             <button class="tab" data-tab="defi" role="tab">💠 DeFi</button>
             <button class="tab" data-tab="agents" role="tab">🤖 Agent transactions</button>
-            <button class="tab" data-tab="other" role="tab">⋯ Other</button>
+            <button class="tab" data-tab="other" role="tab">🧰 Treasury &amp; system</button>
           </div>
         </div>
       </div>
@@ -858,6 +850,79 @@
       </div>
     </div>
 
+
+
+    <!-- App Config — operator only. Large scrollable panel: actions pinned at the
+         top, X to close, and its own jump-to-top/bottom controls. -->
+    <div id="cfgModal" class="modalWrap" hidden>
+      <div class="cfgCard" role="dialog" aria-modal="true" aria-labelledby="cfgTitle">
+        <div class="cfgHead">
+          <div>
+            <h3 id="cfgTitle">App Config</h3>
+            <p>Operator only · changes are validated and pushed on-chain</p>
+          </div>
+          <div class="cfgHeadActions">
+            <button class="btn primary" id="cfgSave">Save config</button>
+            <button class="btn" id="cfgAllocate" title="Distribute collected fees now">Allocate now</button>
+            <button class="btn cfgClose" id="cfgCloseBtn" aria-label="Close App Config" title="Close">✕</button>
+          </div>
+        </div>
+        <div class="kv" id="cfgMsg" style="padding:8px 20px;display:none"></div>
+        <div class="cfgBody" id="cfgBody">
+          <div class="cfgRow"><span>Vault liquid reserve</span><span><input id="cfgReserve" type="number" min="80" max="100" step="1" />%</span></div>
+          <div class="cfgRow"><span>App share of vault yield</span><span><input id="cfgPerfFee" type="number" min="0" max="30" step="1" />%</span></div>
+          <div class="menuSep"></div>
+          <div class="menuHead">Fee allocation (must total 100%)</div>
+          <div class="cfgRow"><span>→ Agent balance</span><span><input id="cfgFeeAgent" type="number" min="0" max="100" step="1" />%</span></div>
+          <div class="cfgRow"><span>→ App lending position</span><span><input id="cfgFeeLending" type="number" min="0" max="100" step="1" />%</span></div>
+          <div class="cfgRow"><span>→ Vault</span><span><input id="cfgFeeVault" type="number" min="0" max="100" step="1" />%</span></div>
+          <div class="cfgRow"><span>→ Swap pool</span><span><input id="cfgFeeSwap" type="number" min="0" max="100" step="1" />%</span></div>
+          <div class="cfgRow"><span>→ Retained</span><span><input id="cfgFeeRetained" type="number" min="0" max="100" step="1" />%</span></div>
+          <div class="cfgRow"><span>Trigger</span>
+            <select id="cfgMode">
+              <option value="interval">Every…</option>
+              <option value="weekly">Day + time</option>
+              <option value="manual">Manual only</option>
+            </select>
+          </div>
+          <div class="cfgRow" id="cfgRowInterval"><span>Allocate every</span>
+            <span style="display:flex;gap:6px;align-items:center">
+            <input id="cfgEvery" type="number" min="1" max="1000" step="1" style="width:56px"
+                   title="Leave as 1 for every unit, or set N for every N units" />
+            <select id="cfgCadence" style="width:104px">
+              <option value="second">Second</option><option value="minute">Minute</option>
+              <option value="hour">Hour</option><option value="day">Day</option>
+              <option value="week">Week</option><option value="month">Month</option>
+              <option value="year">Year</option>
+            </select>
+            </span>
+          </div>
+          <div class="cfgRow" id="cfgRowEffective" style="color:var(--muted);font-size:12px">
+            <span>Effective</span><span id="cfgEffective">—</span>
+          </div>
+          <div class="cfgRow" id="cfgRowWeekday" style="display:none"><span>On</span>
+            <select id="cfgWeekday">
+              <option value="0">Sunday</option><option value="1">Monday</option>
+              <option value="2">Tuesday</option><option value="3">Wednesday</option>
+              <option value="4">Thursday</option><option value="5">Friday</option>
+              <option value="6">Saturday</option>
+            </select>
+          </div>
+          <div class="cfgRow" id="cfgRowTime" style="display:none"><span>At (UTC)</span>
+            <input id="cfgTime" type="time" />
+          </div>
+          <div class="cfgRow" id="cfgRowNext" style="display:none;color:var(--muted);font-size:12px">
+            <span>Next run</span><span id="cfgNextRun">—</span>
+          </div>
+          <div class="menuSep"></div>
+          <div style="padding:6px 20px 10px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>
+        </div>
+        <div class="cfgDock">
+          <button id="cfgToTop" title="Top of App Config" aria-label="Scroll config to top">↑</button>
+          <button id="cfgToBottom" title="Bottom of App Config" aria-label="Scroll config to bottom">↓</button>
+        </div>
+      </div>
+    </div>
 
     <!-- Sign-in dialog: masked password with a reveal toggle -->
     <div id="authModal" class="modalWrap" hidden>
