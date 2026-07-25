@@ -9,7 +9,7 @@
 //    offline. Cache-first would pin index.html/app.js forever, so shipped UI
 //    changes would never reach a returning visitor.
 //  - CACHE is versioned; bump it whenever the shell changes.
-const CACHE = "tessera-v9";
+const CACHE = "tessera-v10";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

@@ -898,6 +898,21 @@ const $ = (id) => document.getElementById(id);
         const q = await swapQuote();
         const msg = $("swapMsg");
         if (!q) { msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = "Get a valid quote first."; return; }
+        // Pre-flight the two things that actually make a swap revert, so the user
+        // gets a plain reason instead of a bare "RPC request failed".
+        const ai = swAsset(q.tokenIn), ao = swAsset(q.tokenOut);
+        const held = window.__myTokenIn != null ? window.__myTokenIn : ai && ai.wallet;
+        const human = $("swAmount").value.trim();
+        if (held != null && Number(held) < Number(human)) {
+          msg.style.display = "block"; msg.style.color = "var(--warn)";
+          msg.textContent = `You only have ${held} ${q.symIn} — reduce the amount.`;
+          return;
+        }
+        if (ao && Number(ao.inventory) < Number(fmtUnitsJs(q.out, q.decOut))) {
+          msg.style.display = "block"; msg.style.color = "var(--warn)";
+          msg.textContent = `The desk only holds ${ao.inventory} ${q.symOut} — try a smaller amount.`;
+          return;
+        }
         // 1% slippage floor.
         const minOut = (BigInt(q.out) * 99n / 100n).toString();
         const btn = $("swExecute");

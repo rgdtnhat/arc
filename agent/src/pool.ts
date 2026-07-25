@@ -168,6 +168,59 @@ export class TesseraPoolClient {
     return { enabled: r[0], borrowable: r[1], decimals: Number(r[2]), priceE8: r[6] };
   }
 
+  /**
+   * Read the whole lending picture in **one** RPC round-trip.
+   *
+   * Reading per-asset with separate calls meant ~5 requests per reserve, which
+   * the public RPC throttled — panels then showed stale or empty values. This
+   * aggregates every field for every asset (plus the account summary) into a
+   * single multicall3 `eth_call`. `allowFailure` keeps one bad reserve from
+   * discarding the rest.
+   */
+  async readAll(assets: Hex[], user?: Hex) {
+    const who = user ?? (this.account.address as Hex);
+    const per = (asset: Hex) => [
+      { address: this.pool, abi: tesseraPoolAbi, functionName: "reserves", args: [asset] } as const,
+      { address: this.pool, abi: tesseraPoolAbi, functionName: "reserveData", args: [asset] } as const,
+      { address: this.pool, abi: tesseraPoolAbi, functionName: "supplyBalance", args: [asset, who] } as const,
+      { address: this.pool, abi: tesseraPoolAbi, functionName: "borrowBalance", args: [asset, who] } as const,
+      { address: asset, abi: erc20Abi, functionName: "balanceOf", args: [who] } as const,
+    ];
+    const contracts = [
+      { address: this.pool, abi: tesseraPoolAbi, functionName: "accountData", args: [who] } as const,
+      ...assets.flatMap(per),
+    ];
+    const res = await this.public.multicall({ contracts: contracts as never, allowFailure: true });
+    const acctRow = res[0];
+    const account =
+      acctRow.status === "success"
+        ? (() => {
+            const v = acctRow.result as readonly [bigint, bigint, bigint, bigint];
+            return { supplyValue: v[0], borrowValue: v[1], borrowLimit: v[2], healthFactor: v[3] };
+          })()
+        : null;
+    const perAsset = assets.map((asset, i) => {
+      const base = 1 + i * 5;
+      const [cfgR, dataR, supR, borR, walR] = res.slice(base, base + 5);
+      if (cfgR.status !== "success") return { asset, ok: false as const };
+      const c = cfgR.result as readonly [boolean, boolean, number, number, number, number, bigint, bigint, bigint, bigint, bigint, bigint];
+      const cfg = { enabled: c[0], borrowable: c[1], decimals: Number(c[2]), priceE8: c[6] };
+      if (!cfg.enabled) return { asset, ok: true as const, cfg, reserve: null, supplied: 0n, borrowed: 0n, wallet: 0n };
+      if (dataR.status !== "success") return { asset, ok: false as const };
+      const d = dataR.result as readonly [bigint, bigint, bigint, bigint, bigint];
+      return {
+        asset,
+        ok: true as const,
+        cfg,
+        reserve: { cash: d[0], totalBorrows: d[1], utilizationWad: d[2], borrowAprWad: d[3], supplyAprWad: d[4] },
+        supplied: supR.status === "success" ? (supR.result as bigint) : 0n,
+        borrowed: borR.status === "success" ? (borR.result as bigint) : 0n,
+        wallet: walR.status === "success" ? (walR.result as bigint) : 0n,
+      };
+    });
+    return { account, perAsset };
+  }
+
   /** The account's raw ERC-20 balance of an asset (its spendable wallet funds). */
   walletBalance(asset: Hex, user?: Hex): Promise<bigint> {
     return this.public.readContract({

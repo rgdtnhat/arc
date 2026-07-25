@@ -48,6 +48,21 @@ const RESERVES = [
   { symbol: "cirBTC", address: CIRBTC_ADDRESS, decimals: 8, cFactor: 7000, lFactor: 8000, rf: 1000, price: 95_000n * USD, seed: 20_000n },
 ];
 
+/** Read the current deployment record, preferring the gitignored local override. */
+function readDeployment() {
+  for (const name of ["arc.local.json", "arc.json"]) {
+    try {
+      return { url: new URL(`../deployments/${name}`, import.meta.url), dep: JSON.parse(readFileSync(new URL(`../deployments/${name}`, import.meta.url), "utf8")) };
+    } catch { /* next */ }
+  }
+  return { url: new URL("../deployments/arc.json", import.meta.url), dep: {} };
+}
+/** Is there contract code at this address? */
+async function isContract(address) {
+  if (!address) return false;
+  try { const c = await pub.getCode({ address }); return !!c && c !== "0x"; } catch { return false; }
+}
+
 async function main() {
   console.log("deployer", deployer.address, formatUsdc(await bal(deployer.address)), "USDC");
   console.log("agent   ", agent.address, formatUsdc(await bal(agent.address)), "USDC");
@@ -58,12 +73,26 @@ async function main() {
     try { r.decimals = Number(await pub.readContract({ address: r.address, abi: metaAbi, functionName: "decimals" })); } catch {}
   }
 
-  // 1) TesseraPool (treasury = deployer → receives the reserveFactor cut)
-  console.log("→ deploying TesseraPool…");
-  const hash = await dWallet.deployContract({ abi: tesseraPoolAbi, bytecode: tesseraPoolBytecode, args: [deployer.address], account: deployer, chain: arcTestnet });
-  const pool = (await pub.waitForTransactionReceipt({ hash })).contractAddress;
-  console.log("   pool", pool);
-  await pace();
+  // 1) TesseraPool — REUSE the recorded pool when one is already live.
+  //
+  //     Re-running this script used to deploy a brand-new pool every time, which
+  //     silently orphaned the previous pool and every deposit inside it. Now it
+  //     adopts the existing deployment and only fills in what's missing. Pass
+  //     --fresh to deliberately start over (the old contracts and any funds in
+  //     them stay on-chain but are no longer used by the app).
+  const FRESH = process.argv.includes("--fresh");
+  const { url: depUrl, dep: existing } = readDeployment();
+  let pool = FRESH ? null : existing.tesseraPool;
+  if (pool && (await isContract(pool))) {
+    console.log(`♻  reusing existing TesseraPool ${pool} (pass --fresh to deploy a new one)`);
+  } else {
+    if (pool) console.log(`   recorded pool ${pool} has no code — deploying a new one`);
+    console.log("→ deploying TesseraPool…");
+    const hash = await dWallet.deployContract({ abi: tesseraPoolAbi, bytecode: tesseraPoolBytecode, args: [deployer.address], account: deployer, chain: arcTestnet });
+    pool = (await pub.waitForTransactionReceipt({ hash })).contractAddress;
+    console.log("   pool", pool);
+    await pace();
+  }
 
   const dSend = async (address, abi, fn, args, account = deployer, wallet = dWallet) => {
     const { request } = await pub.simulateContract({ address, abi, functionName: fn, args, account });
@@ -87,8 +116,14 @@ async function main() {
     }
   };
   for (const r of RESERVES) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      console.log(`→ addReserve ${r.symbol} (${r.decimals}d, borrowable)${attempt > 1 ? " — retry" : ""}…`);
+    // Already there (e.g. an earlier partial run)? Leave it alone.
+    r.registered = await isRegistered(r.address);
+    if (r.registered) {
+      console.log(`   ${r.symbol}: already registered ✓`);
+      continue;
+    }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      console.log(`→ addReserve ${r.symbol} (${r.decimals}d, borrowable)${attempt > 1 ? ` — retry ${attempt - 1}` : ""}…`);
       try {
         await dSend(pool, tesseraPoolAbi, "addReserve", [r.address, r.cFactor, r.lFactor, r.rf, true, r.decimals, r.price]);
       } catch (e) {
@@ -96,9 +131,9 @@ async function main() {
       }
       r.registered = await isRegistered(r.address);
       if (r.registered) break;
-      await pace();
+      await pace(8000); // give the throttled RPC room before retrying
     }
-    console.log(`   ${r.symbol}: ${r.registered ? "registered ✓" : "NOT registered ✗ (will be omitted)"}`);
+    console.log(`   ${r.symbol}: ${r.registered ? "registered ✓" : "NOT registered ✗ (omitted from the deployment)"}`);
   }
   const LIVE_RESERVES = RESERVES.filter((r) => r.registered);
   if (!LIVE_RESERVES.length) throw new Error("No reserves registered — aborting before writing a deployment.");
@@ -133,30 +168,41 @@ async function main() {
   }
 
   // 5) TesseraVault over USDC: 80% liquid reserve (contract floor + default).
-  console.log("→ deploying TesseraVault (USDC, 80% reserve floor, 15% perf fee)…");
-  let vh = await dWallet.deployContract({
-    abi: tesseraVaultAbi,
-    bytecode: tesseraVaultBytecode,
-    args: [ARC_USDC_ADDRESS, pool, deployer.address, 8000, 1500],
-    account: deployer,
-    chain: arcTestnet,
-  });
-  const vault = (await pub.waitForTransactionReceipt({ hash: vh })).contractAddress;
-  console.log("   vault", vault);
-  await pace();
+  //     Reused when already deployed, so depositors keep their shares.
+  let vault = FRESH ? null : existing.tesseraVault;
+  if (vault && (await isContract(vault))) {
+    console.log(`♻  reusing existing TesseraVault ${vault}`);
+  } else {
+    console.log("→ deploying TesseraVault (USDC, 80% reserve floor, 15% perf fee)…");
+    const vh = await dWallet.deployContract({
+      abi: tesseraVaultAbi,
+      bytecode: tesseraVaultBytecode,
+      args: [ARC_USDC_ADDRESS, pool, deployer.address, 8000, 1500],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    vault = (await pub.waitForTransactionReceipt({ hash: vh })).contractAddress;
+    console.log("   vault", vault);
+    await pace();
+  }
 
   // 6) TesseraSwap: 0.30% fee, half of it to the app treasury. Seed inventory.
-  console.log("→ deploying TesseraSwap (0.30% fee, 50% to treasury)…");
-  let sh = await dWallet.deployContract({
-    abi: tesseraSwapAbi,
-    bytecode: tesseraSwapBytecode,
-    args: [pool, deployer.address, 30, 5000],
-    account: deployer,
-    chain: arcTestnet,
-  });
-  const swap = (await pub.waitForTransactionReceipt({ hash: sh })).contractAddress;
-  console.log("   swap", swap);
-  await pace();
+  let swap = FRESH ? null : existing.tesseraSwap;
+  if (swap && (await isContract(swap))) {
+    console.log(`♻  reusing existing TesseraSwap ${swap}`);
+  } else {
+    console.log("→ deploying TesseraSwap (0.30% fee, 50% to treasury)…");
+    const sh = await dWallet.deployContract({
+      abi: tesseraSwapAbi,
+      bytecode: tesseraSwapBytecode,
+      args: [pool, deployer.address, 30, 5000],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    swap = (await pub.waitForTransactionReceipt({ hash: sh })).contractAddress;
+    console.log("   swap", swap);
+    await pace();
+  }
   // Seed the swap desk with a slice of each asset the deployer still holds.
   for (const r of LIVE_RESERVES) {
     const held = await bal(deployer.address, r.address);
@@ -171,26 +217,39 @@ async function main() {
 
   // 6b) TesseraFeeCollector: every app fee lands here, then gets allocated
   //     20/20/20/20/20 (agent / lending / vault / swap / retained), weekly.
-  console.log("→ deploying TesseraFeeCollector (20/20/20/20/20, weekly)…");
-  const fh = await dWallet.deployContract({
+  let feeCollectorExisting = FRESH ? null : existing.tesseraFeeCollector;
+  if (feeCollectorExisting && (await isContract(feeCollectorExisting))) {
+    console.log(`♻  reusing existing TesseraFeeCollector ${feeCollectorExisting}`);
+  }
+  console.log(feeCollectorExisting ? "" : "→ deploying TesseraFeeCollector (20/20/20/20/20, weekly)…");
+  const fh = feeCollectorExisting ? null : await dWallet.deployContract({
     abi: tesseraFeeCollectorAbi,
     bytecode: tesseraFeeCollectorBytecode,
     args: [ARC_USDC_ADDRESS, agent.address, pool, vault, swap],
     account: deployer,
     chain: arcTestnet,
   });
-  const feeCollector = (await pub.waitForTransactionReceipt({ hash: fh })).contractAddress;
-  console.log("   feeCollector", feeCollector);
-  await pace();
-  // The collector needs to own the swap desk so its `seed` leg can run, and it
-  // becomes the treasury for both the pool and the vault so fees flow to it.
-  await dSend(swap, tesseraSwapAbi, "transferOwnership", [feeCollector]);
-  await dSend(pool, tesseraPoolAbi, "setTreasury", [feeCollector]);
-  await dSend(vault, tesseraVaultAbi, "setTreasury", [feeCollector]);
+  const feeCollector = feeCollectorExisting
+    ?? (await pub.waitForTransactionReceipt({ hash: fh })).contractAddress;
+  if (!feeCollectorExisting) {
+    console.log("   feeCollector", feeCollector);
+    await pace();
+    // The collector needs to own the swap desk so its `seed` leg can run, and it
+    // becomes the treasury for both the pool and the vault so fees flow to it.
+    // Each is best-effort: on a reused deployment these may already be set, and
+    // a revert here must not abort the whole run.
+    for (const [label, fn] of [
+      ["swap ownership", () => dSend(swap, tesseraSwapAbi, "transferOwnership", [feeCollector])],
+      ["pool treasury", () => dSend(pool, tesseraPoolAbi, "setTreasury", [feeCollector])],
+      ["vault treasury", () => dSend(vault, tesseraVaultAbi, "setTreasury", [feeCollector])],
+    ]) {
+      try { await fn(); } catch (e) { console.warn(`   ${label} not set: ${String(e.shortMessage ?? e.message).slice(0, 80)}`); }
+    }
+  }
 
-  // 7) Persist to deployments/arc.json (multi-asset + vault + swap).
-  const p = new URL("../deployments/arc.json", import.meta.url);
-  const dep = JSON.parse(readFileSync(p, "utf8"));
+  // 7) Persist. Merge into whatever record we adopted so escrow/tab and any
+  //     other recorded addresses survive.
+  const dep = { ...existing };
   dep.tesseraPool = pool;
   dep.tesseraVault = vault;
   dep.vaultAsset = ARC_USDC_ADDRESS;
@@ -199,10 +258,11 @@ async function main() {
   dep.poolAssets = LIVE_RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
   const body = JSON.stringify(dep, null, 2) + "\n";
-  writeFileSync(p, body);
+  writeFileSync(new URL("../deployments/arc.json", import.meta.url), body);
   // Also write the gitignored override the app prefers, so a later
   // `git reset --hard` can't revert this server to older addresses.
   writeFileSync(new URL("../deployments/arc.local.json", import.meta.url), body);
+  if (depUrl) { /* adopted record merged above */ }
   console.log("\n✅ Pool + Vault + Swap live on Arc:");
   console.log("   pool     ", pool);
   console.log("   vault    ", vault);

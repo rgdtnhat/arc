@@ -560,14 +560,12 @@ async function main() {
 
   async function readLending() {
     const pool = poolClient!;
-    // Read the account summary defensively: a throttled RPC must degrade this
-    // panel to "values pending", never make a deployed pool look undeployed.
-    let acct: { supplyValue: bigint; borrowValue: bigint; borrowLimit: bigint; healthFactor: bigint } | null = null;
-    try {
-      acct = await pool.accountData();
-    } catch (e) {
-      console.error(`[lending] accountData unavailable: ${String(e).slice(0, 100)}`);
-    }
+    // ONE multicall for the account summary and every per-asset field. Doing
+    // this as ~5 calls per reserve got throttled by the public RPC, which is why
+    // panels sat empty; a single round-trip removes that whole failure mode.
+    const bulk = await pool.readAll(poolDeployment.assets.map((a) => a.address));
+    const byAsset = new Map(bulk.perAsset.map((p) => [p.asset.toLowerCase(), p]));
+    const acct = bulk.account;
     const hf = acct?.healthFactor ?? 0n;
     // Remaining USD borrow headroom against the account's collateral (1e8 scale).
     const headroomUsd = acct && acct.borrowLimit > acct.borrowValue ? acct.borrowLimit - acct.borrowValue : 0n;
@@ -578,11 +576,12 @@ async function main() {
     const settled = await Promise.all(
       poolDeployment.assets.map(async (a) => {
         try {
-        // Check registration first: an unregistered reserve makes the other
-        // reads revert, which previously looked like a read failure and made the
-        // asset silently disappear from the picker.
-        const cfg = await pool.reserveConfig(a.address);
-        if (!cfg.enabled) {
+        const row = byAsset.get(a.address.toLowerCase());
+        if (!row || !row.ok) throw new Error("reserve read failed");
+        const cfg = row.cfg;
+        // An unregistered reserve is reported as clearly disabled rather than
+        // throwing, so it stays visible in the picker with an explanation.
+        if (!cfg.enabled || !row.reserve) {
           const dec0 = cfg.decimals || 6;
           const zero = fmtUnits(0n, dec0);
           return {
@@ -600,12 +599,8 @@ async function main() {
             },
           };
         }
-        const [r, supplied, borrowed, wallet] = await Promise.all([
-          pool.reserveData(a.address),
-          pool.supplyBalance(a.address),
-          pool.borrowBalance(a.address),
-          pool.walletBalance(a.address),
-        ]);
+        const r = row.reserve;
+        const { supplied, borrowed, wallet } = row;
         const dec = cfg.decimals;
         const unit = 10n ** BigInt(dec);
         // MAX per action, capped to what's actually possible for this account.
@@ -745,12 +740,12 @@ async function main() {
   let lastVault: Awaited<ReturnType<typeof readVault>> | null = null;
   async function readVault() {
     if (!vaultClient || !poolClient) return null;
-    const [snap, usdcReserve, walletUsdc] = await Promise.all([
-      vaultClient.snapshot(),
-      poolClient.reserveData(usdcAddress),
-      // What the signed-in operator can actually deposit right now.
-      poolClient.walletBalance(usdcAddress),
-    ]);
+    // One multicall for the vault; the USDC supply APR comes from the lending
+    // snapshot we already have, so this adds a single round-trip, not several.
+    const snap = await vaultClient.snapshot();
+    if (!snap.ok) throw new Error("vault read failed");
+    const usdcAsset = lastLending?.assets.find((a) => a.address.toLowerCase() === usdcAddress.toLowerCase());
+    const walletUsdc = snap.walletAsset;
     return {
       deployed: true,
       ready: true,
@@ -769,7 +764,8 @@ async function main() {
       reserveRatioPct: (Number(snap.reserveRatioBps) / 100).toFixed(0),
       performanceFeePct: (Number(snap.perfFeeBps) / 100).toFixed(0),
       // The vault earns the pool's USDC supply APR on the deployed portion.
-      supplyApr: fmtApr(usdcReserve.supplyAprWad),
+      // Reuse the APR already read for the USDC reserve (no extra RPC call).
+      supplyApr: usdcAsset?.reserve.supplyApr ?? "0.00",
     };
   }
   // Same non-blocking contract as the lending snapshot: cached read, background

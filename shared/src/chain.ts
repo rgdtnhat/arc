@@ -44,6 +44,20 @@ export const arcChain = defineChain({
   blockExplorers: {
     default: { name: "Arcscan", url: ARC_EXPLORER_URL },
   },
+  /**
+   * Multicall3 at its canonical cross-chain address (verified deployed on Arc).
+   *
+   * Without this declaration viem throws `ChainDoesNotSupportContract` for
+   * `multicall()` and silently ignores `batch: { multicall: true }` — so every
+   * contract read went out as its own request and the public RPC throttled us.
+   * Declaring it lets a whole panel's reads collapse into one `eth_call`.
+   */
+  contracts: {
+    multicall3: {
+      address: (process.env.ARC_MULTICALL3 ??
+        "0xcA11bde05977b3631167028862bE2a173976CA11") as `0x${string}`,
+    },
+  },
   testnet: ARC_IS_TESTNET,
 });
 

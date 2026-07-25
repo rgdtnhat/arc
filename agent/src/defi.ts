@@ -74,18 +74,43 @@ export class VaultClient {
     return this.public.readContract({ address: this.vault, abi: tesseraVaultAbi, functionName: fn as never, args: args as never }) as Promise<T>;
   }
 
+  /**
+   * Every vault field plus the caller's asset balance in **one** multicall.
+   * Seven separate reads were being throttled by the public RPC, which left the
+   * vault panel blank; a single round-trip fixes that.
+   */
   async snapshot(user?: Hex) {
     const who = user ?? (this.cfg.account.address as Hex);
-    const [totalAssets, shares, userAssets, bufferBps, maxWithdraw, reserveRatioBps, perfFeeBps] = await Promise.all([
-      this.read<bigint>("totalAssets"),
-      this.read<bigint>("sharesOf", [who]),
-      this.read<bigint>("balanceOfAssets", [who]),
-      this.read<bigint>("currentBufferBps"),
-      this.read<bigint>("maxWithdraw", [who]),
-      this.read<number>("reserveRatioBps"),
-      this.read<number>("performanceFeeBps"),
-    ]);
-    return { totalAssets, shares, userAssets, bufferBps, maxWithdraw, reserveRatioBps, perfFeeBps };
+    const v = (functionName: string, args: unknown[] = []) =>
+      ({ address: this.vault, abi: tesseraVaultAbi, functionName, args }) as const;
+    const res = await this.public.multicall({
+      allowFailure: true,
+      contracts: [
+        v("totalAssets"),
+        v("sharesOf", [who]),
+        v("balanceOfAssets", [who]),
+        v("currentBufferBps"),
+        v("maxWithdraw", [who]),
+        v("reserveRatioBps"),
+        v("performanceFeeBps"),
+        { address: this.asset, abi: erc20Abi, functionName: "balanceOf", args: [who] } as const,
+      ] as never,
+    });
+    const big = (i: number) => (res[i].status === "success" ? (res[i].result as bigint) : 0n);
+    const num = (i: number) => (res[i].status === "success" ? Number(res[i].result) : 0);
+    // The two config reads are the tell for "did the vault answer at all".
+    const ok = res[5].status === "success" && res[0].status === "success";
+    return {
+      ok,
+      totalAssets: big(0),
+      shares: big(1),
+      userAssets: big(2),
+      bufferBps: big(3),
+      maxWithdraw: big(4),
+      reserveRatioBps: num(5),
+      perfFeeBps: num(6),
+      walletAsset: big(7),
+    };
   }
 }
 
