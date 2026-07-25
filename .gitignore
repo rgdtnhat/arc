@@ -11,5 +11,9 @@ typechain-types/
 !.env.example
 .DS_Store
 deployments/local.json
+# Live deployment written by the deploy scripts on the host that ran them.
+# Untracked on purpose so `git reset --hard` can never revert a running server
+# to older contract addresses; it takes precedence over the committed arc.json.
+deployments/arc.local.json
 .tessera-memory.json
 .tessera-admin.json

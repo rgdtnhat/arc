@@ -211,9 +211,17 @@
 
       <!-- ============ DeFi ============ -->
       <div class="section" id="defiSection">💠 DeFi</div>
-      <div class="kv" id="defiAuthHint" style="margin:-4px 0 12px">
-        Everything below is public to read. Actions execute with the agent's wallet, so they
-        need an operator sign-in (Admin).
+      <div class="card" style="margin-bottom:14px">
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+          <label style="display:flex;gap:8px;align-items:center;cursor:pointer;font-weight:600">
+            <input type="checkbox" id="selfCustodyToggle" checked style="width:16px;height:16px" />
+            Use my own wallet (self-custody)
+          </label>
+          <span class="kv" id="custodyNote" style="flex:1;min-width:240px">
+            Self-custody: your wallet signs and your own funds move. No sign-in needed.
+            (Position figures below track the app's agent wallet; your own balances live in your wallet.)
+          </span>
+        </div>
       </div>
 
       <div class="card">

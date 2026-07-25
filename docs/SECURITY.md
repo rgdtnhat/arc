@@ -49,6 +49,27 @@ the public `/api/swap/quote`.
 | Slippage | `minOut` enforced on every swap |
 | Rebalance bricking withdrawals | `_rebalance()` is wrapped in `try/catch`, so a pool hiccup can't block a deposit/withdraw |
 
+## Two custody modes (and why they differ)
+
+The dashboard exposes the same DeFi actions through two distinct paths:
+
+| | **Self-custody** (default) | **Agent wallet** (operator) |
+|---|---|---|
+| Whose funds move | the connected user's | the app's agent wallet |
+| Who signs | the user's browser wallet | the server, with `AGENT_PRIVATE_KEY` |
+| Auth needed | none — the wallet *is* the auth | admin sign-in (`requireOperator`) |
+| Server sees a key | never | yes (its own) |
+
+Self-custody calldata is assembled in the browser from selectors served by
+`GET /api/defi/config` (public chain metadata; selectors are derived from the
+contract signatures at runtime so they cannot drift). The server is not in the
+trust path: it cannot move a user's tokens, and a compromised server still
+cannot spend user funds — only the agent's own.
+
+Because self-custody needs no sign-in, keeping the operator path admin-only
+(Finding 2) costs users nothing: anyone can transact with their own money, while
+only the operator can spend the app's.
+
 ## Economic safety model (vault)
 
 The vault is deliberately conservative:

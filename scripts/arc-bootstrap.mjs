@@ -181,23 +181,23 @@ async function main() {
   });
   const depDir = path.join(root, "deployments");
   fs.mkdirSync(depDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(depDir, "arc.json"),
-    JSON.stringify(
-      {
-        chainId: CHAIN_ID,
-        rpc: RPC,
-        usdc: USDC,
-        tesseraEscrow: escrowAddress,
-        tesseraTab: tabAddress,
-        agent: agent.address,
-        provider: provider.address,
-        deployedAt: new Date().toISOString(),
-      },
-      null,
-      2
-    )
+  const depBody = JSON.stringify(
+    {
+      chainId: CHAIN_ID,
+      rpc: RPC,
+      usdc: USDC,
+      tesseraEscrow: escrowAddress,
+      tesseraTab: tabAddress,
+      agent: agent.address,
+      provider: provider.address,
+      deployedAt: new Date().toISOString(),
+    },
+    null,
+    2
   );
+  fs.writeFileSync(path.join(depDir, "arc.json"), depBody);
+  // Gitignored override the app prefers — survives `git reset --hard`.
+  fs.writeFileSync(path.join(depDir, "arc.local.json"), depBody);
 
   const explorer = CHAIN_ID === 5042002 ? "https://testnet.arcscan.app/address/" : "";
   console.log(`\n✅ Bootstrap complete. Addresses saved to .env and deployments/arc.json`);

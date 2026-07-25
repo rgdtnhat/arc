@@ -585,6 +585,23 @@ const $ = (id) => document.getElementById(id);
         // Use the exact raw when the field is an untouched Max; else parse the input.
         const raw = $("lnAmount").dataset.raw || toRaw(human, a.decimals);
         const btn = $("lnExecute");
+        // Self-custody: sign with the user's wallet against their own balance.
+        if (selfMode()) {
+          btn.disabled = true;
+          await selfCustody("lendingMsg", `${action} ${human} ${a.symbol}`, async (from, cfg) => {
+            const sel = cfg.selectors;
+            if (action === "supply" || action === "repay") {
+              await ensureAllowance(from, a.address, cfg.pool, raw);
+            }
+            const fn = action === "supply" ? sel.poolSupply
+              : action === "withdraw" ? sel.poolWithdraw
+              : action === "borrow" ? sel.poolBorrow
+              : sel.poolRepay;
+            return sendTx(from, cfg.pool, callData(fn, encAddr(a.address), encUint(raw)));
+          });
+          btn.disabled = false;
+          return;
+        }
         btn.disabled = true;
         try {
           const r = await (
@@ -623,6 +640,27 @@ const $ = (id) => document.getElementById(id);
           msg.textContent = "Enter a USDC amount (or tap Max)."; return;
         }
         const raw = toRaw(human, vt.decimals);
+        // Self-custody: deposit/redeem the user's own USDC via their wallet.
+        if (selfMode()) {
+          const b = $("vExecute"); b.disabled = true;
+          await selfCustody("vaultMsg", `${action} ${human} USDC`, async (from, cfg) => {
+            const sel = cfg.selectors;
+            if (action === "deposit") {
+              await ensureAllowance(from, cfg.vaultAsset, cfg.vault, raw);
+              return sendTx(from, cfg.vault, callData(sel.vaultDeposit, encUint(raw)));
+            }
+            // Withdraw takes shares: read the caller's own shares/assets and
+            // scale, so "Max" redeems exactly everything they hold.
+            const shares = BigInt(await ethCall(cfg.vault, callData(sel.sharesOf, encAddr(from))) || "0x0");
+            const assets = BigInt(await ethCall(cfg.vault, callData(sel.balanceOfAssets, encAddr(from))) || "0x0");
+            if (shares === 0n || assets === 0n) throw new Error("You have no vault balance to withdraw.");
+            const want = BigInt(raw);
+            const useShares = want >= assets ? shares : (shares * want) / assets;
+            return sendTx(from, cfg.vault, callData(sel.vaultWithdraw, encUint(useShares)));
+          });
+          b.disabled = false;
+          return;
+        }
         let query;
         if (action === "deposit") {
           query = `/api/vault/deposit?amount=${raw}`;
@@ -718,7 +756,22 @@ const $ = (id) => document.getElementById(id);
         if (!q) { msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = "Get a valid quote first."; return; }
         // 1% slippage floor.
         const minOut = (BigInt(q.out) * 99n / 100n).toString();
-        const btn = $("swExecute"); btn.disabled = true;
+        const btn = $("swExecute");
+        // Self-custody: swap the user's own tokens through their wallet.
+        if (selfMode()) {
+          btn.disabled = true;
+          await selfCustody("swapMsg", `swap ${q.symIn} → ${q.symOut}`, async (from, cfg) => {
+            await ensureAllowance(from, q.tokenIn, cfg.swap, q.amountIn);
+            return sendTx(
+              from,
+              cfg.swap,
+              callData(cfg.selectors.swapExec, encAddr(q.tokenIn), encAddr(q.tokenOut), encUint(q.amountIn), encUint(minOut)),
+            );
+          });
+          btn.disabled = false;
+          return;
+        }
+        btn.disabled = true;
         try {
           const r = await (await postAuthed(`/api/swap?tokenIn=${q.tokenIn}&tokenOut=${q.tokenOut}&amountIn=${q.amountIn}&minOut=${minOut}`)).json();
           msg.style.display = "block";
@@ -728,6 +781,123 @@ const $ = (id) => document.getElementById(id);
           msg.style.display = "block"; msg.textContent = "request failed"; msg.style.color = "var(--warn)";
         } finally { btn.disabled = false; tick(); }
       });
+
+      /* ===================================================================
+       * Self-custody mode — the user's own wallet, the user's own funds.
+       *
+       * Server-side actions spend the *agent's* wallet and are operator-only.
+       * This path is different: we build calldata in the browser, the connected
+       * wallet signs it, and the transaction moves the **user's** tokens. The
+       * server never sees a key and isn't in the trust path at all.
+       *
+       * Calldata is assembled by hand (selector + 32-byte-padded static args)
+       * so no ABI library is needed — that keeps the CSP at script-src 'self'.
+       * =================================================================== */
+      let defiCfg = null;
+      async function loadDefiConfig() {
+        if (defiCfg) return defiCfg;
+        defiCfg = await (await fetch("/api/defi/config")).json();
+        return defiCfg;
+      }
+      const pad32 = (hex) => hex.replace(/^0x/, "").toLowerCase().padStart(64, "0");
+      const encAddr = (a) => pad32(a);
+      const encUint = (v) => pad32(BigInt(v).toString(16));
+      const callData = (selector, ...parts) => selector + parts.join("");
+
+      async function selfAccount() {
+        if (!window.ethereum) throw new Error("No browser wallet detected.");
+        const [a] = await window.ethereum.request({ method: "eth_requestAccounts" });
+        const cfg = await loadDefiConfig();
+        // Make sure the wallet is on Arc, offering to add the network if unknown.
+        const want = "0x" + Number(cfg.chainId).toString(16);
+        const have = await window.ethereum.request({ method: "eth_chainId" });
+        if (have !== want) {
+          try {
+            await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: want }] });
+          } catch (e) {
+            if (e && (e.code === 4902 || String(e.message || "").includes("Unrecognized"))) {
+              await window.ethereum.request({
+                method: "wallet_addEthereumChain",
+                params: [{
+                  chainId: want,
+                  chainName: cfg.chainName,
+                  nativeCurrency: { name: "USDC", symbol: "USDC", decimals: 18 },
+                  rpcUrls: [cfg.rpcUrl],
+                  blockExplorerUrls: [cfg.explorer],
+                }],
+              });
+            } else throw e;
+          }
+        }
+        return a;
+      }
+
+      async function ethCall(to, data) {
+        return window.ethereum.request({ method: "eth_call", params: [{ to, data }, "latest"] });
+      }
+      async function sendTx(from, to, data) {
+        return window.ethereum.request({ method: "eth_sendTransaction", params: [{ from, to, data }] });
+      }
+      // Ensure `spender` may move `amount` of `token` on the user's behalf.
+      async function ensureAllowance(from, token, spender, amount) {
+        const cfg = await loadDefiConfig();
+        const cur = await ethCall(token, callData(cfg.selectors.allowance, encAddr(from), encAddr(spender)));
+        if (BigInt(cur || "0x0") >= BigInt(amount)) return null;
+        const max = "f".repeat(64);
+        return sendTx(from, token, cfg.selectors.approve + encAddr(spender) + max);
+      }
+
+      /** Run a self-custody action, reporting progress into `msgEl`. */
+      async function selfCustody(msgEl, label, fn) {
+        const msg = $(msgEl);
+        msg.style.display = "block";
+        msg.style.color = "var(--muted)";
+        msg.textContent = "Confirm in your wallet…";
+        try {
+          const from = await selfAccount();
+          const hash = await fn(from, await loadDefiConfig());
+          const cfg = await loadDefiConfig();
+          msg.style.color = "var(--good)";
+          msg.innerHTML = `${esc(label)} sent from your wallet ✓ — ` +
+            `<a href="${cfg.explorer}/tx/${hash}" target="_blank" rel="noopener">${String(hash).slice(0, 12)}…</a>`;
+        } catch (e) {
+          msg.style.color = "var(--warn)";
+          msg.textContent = walletError(e);
+        } finally {
+          tick();
+        }
+      }
+      // Plain-language wallet/chain errors (mirrors the server's friendlyError).
+      function walletError(e) {
+        const raw = String((e && (e.data && e.data.message)) || (e && e.message) || e);
+        const s = raw.toLowerCase();
+        if (e && (e.code === 4001 || s.includes("user rejected") || s.includes("user denied"))) return "You cancelled it in your wallet.";
+        if (s.includes("no browser wallet")) return "No browser wallet detected — install or enable one, then reconnect.";
+        if (s.includes("insufficient funds") || s.includes("gas")) return "Not enough USDC in your wallet to cover network fees.";
+        if (s.includes("insufficient inventory")) return "The swap desk can't fill that size right now. Try less.";
+        if (s.includes("slippage")) return "Price moved — get a fresh quote and retry.";
+        if (s.includes("pool illiquid") || s.includes("insufficientliquidity")) return "Not enough free liquidity for that amount right now.";
+        if (s.includes("unhealthy")) return "That would exceed your safe collateral limit.";
+        if (s.includes("balance")) return "Not enough balance for that amount.";
+        if (s.includes("request limit") || s.includes("rate limit") || s.includes("429")) return "Network is rate-limiting — wait a few seconds and retry.";
+        return "Transaction failed. " + raw.split("\n")[0].slice(0, 110);
+      }
+
+      // Toggle: "My wallet" (self-custody) vs "Agent wallet" (operator).
+      const selfMode = () => {
+        const t = $("selfCustodyToggle");
+        return !!(t && t.checked);
+      };
+      if ($("selfCustodyToggle")) {
+        $("selfCustodyToggle").addEventListener("change", () => {
+          const on = selfMode();
+          $("custodyNote").textContent = on
+            ? "Self-custody: your wallet signs and your own funds move. No sign-in needed. " +
+              "(Position figures below track the app's agent wallet; your own balances live in your wallet.)"
+            : "Agent wallet: actions spend the app's agent funds and require an operator (Admin) sign-in.";
+          tick();
+        });
+      }
 
       // Poll interval is driven by the server (slower in live mode to spare the
       // rate-limited public RPC). Re-schedule when the advertised cadence changes.

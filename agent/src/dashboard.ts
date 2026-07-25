@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
-import { verifyMessage, formatUnits } from "viem";
+import { verifyMessage, formatUnits, toFunctionSelector } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID } from "node:crypto";
 import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS } from "@tessera/shared";
@@ -45,17 +45,52 @@ const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
 
 // The Arc testnet deployment (contracts + wallets) recorded in deployments/arc.json.
 // Shown on the dashboard so it's clear which on-chain contracts/wallets are live.
+// `arc.local.json` (gitignored, written by the deploy scripts) wins over the
+// committed `arc.json`, so pulling/resetting the repo can never point a running
+// server at older contract addresses than the ones it actually deployed.
 const liveDeployment = (() => {
-  try {
-    const p = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../deployments/arc.json");
-    const d = JSON.parse(readFileSync(p, "utf8"));
-    return { ...d, explorer: "https://testnet.arcscan.app" };
-  } catch {
-    return null;
+  const dir = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../deployments");
+  for (const name of ["arc.local.json", "arc.json"]) {
+    try {
+      const d = JSON.parse(readFileSync(path.join(dir, name), "utf8"));
+      if (d && d.tesseraEscrow) {
+        if (name === "arc.local.json") console.log("[deployment] using deployments/arc.local.json (local override)");
+        return { ...d, explorer: process.env.ARC_EXPLORER_URL ?? "https://testnet.arcscan.app" };
+      }
+    } catch {
+      /* try the next candidate */
+    }
   }
+  return null;
 })();
 
 type UiEvent = (AgentEvent & { source: "agent" }) | (ProviderEvent & { source: "provider"; ts: number; level: string });
+
+/**
+ * Selectors handed to the browser for the self-custody path. Computed from the
+ * signatures at startup, so they always match the deployed contracts.
+ */
+const CLIENT_SELECTORS = Object.fromEntries(
+  Object.entries({
+    approve: "function approve(address,uint256)",
+    balanceOf: "function balanceOf(address)",
+    allowance: "function allowance(address,address)",
+    poolSupply: "function supply(address,uint256)",
+    poolWithdraw: "function withdraw(address,uint256)",
+    poolBorrow: "function borrow(address,uint256)",
+    poolRepay: "function repay(address,uint256)",
+    supplyBalance: "function supplyBalance(address,address)",
+    borrowBalance: "function borrowBalance(address,address)",
+    accountData: "function accountData(address)",
+    vaultDeposit: "function deposit(uint256)",
+    vaultWithdraw: "function withdraw(uint256)",
+    sharesOf: "function sharesOf(address)",
+    balanceOfAssets: "function balanceOfAssets(address)",
+    maxWithdraw: "function maxWithdraw(address)",
+    swapQuote: "function quote(address,address,uint256)",
+    swapExec: "function swap(address,address,uint256,uint256)",
+  }).map(([k, sig]) => [k, toFunctionSelector(sig)]),
+);
 
 // Keep the long-lived dashboard alive across transient RPC failures (public-RPC
 // rate limits during a live-mode read shouldn't crash the whole server).
@@ -802,6 +837,31 @@ async function main() {
     } catch (e) {
       res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
+  });
+
+  /**
+   * Contract addresses + minimal ABIs so the browser can build and sign its own
+   * transactions. This is the self-custody path: the user's wallet signs, the
+   * user's own funds move, and this server never touches their keys. Public on
+   * purpose — it's just public chain metadata.
+   */
+  app.get("/api/defi/config", (_req, res) => {
+    res.json({
+      chainId: liveDeployment.chainId,
+      chainName: chainLabel,
+      rpcUrl,
+      explorer: liveDeployment.explorer,
+      usdc: usdcAddress,
+      pool: poolDeployment?.poolAddress ?? null,
+      vault: vaultClient?.vault ?? null,
+      vaultAsset: (liveDeployment.vaultAsset as Hex) ?? usdcAddress,
+      swap: swapClient?.swap ?? null,
+      assets: poolDeployment?.assets ?? [],
+      // 4-byte selectors, derived from the signatures at runtime so they can
+      // never drift from the contracts. The browser appends 32-byte-padded
+      // static args — no ABI library needed client-side (keeps the CSP strict).
+      selectors: CLIENT_SELECTORS,
+    });
   });
 
   app.post("/api/swap", requireOperator, async (req, res) => {

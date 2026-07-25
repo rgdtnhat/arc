@@ -153,7 +153,11 @@ async function main() {
   dep.tesseraSwap = swap;
   dep.poolAssets = RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
-  writeFileSync(p, JSON.stringify(dep, null, 2) + "\n");
+  const body = JSON.stringify(dep, null, 2) + "\n";
+  writeFileSync(p, body);
+  // Also write the gitignored override the app prefers, so a later
+  // `git reset --hard` can't revert this server to older addresses.
+  writeFileSync(new URL("../deployments/arc.local.json", import.meta.url), body);
   console.log("\n✅ Pool + Vault + Swap live on Arc:");
   console.log("   pool     ", pool);
   console.log("   vault    ", vault);
