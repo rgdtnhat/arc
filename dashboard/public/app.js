@@ -28,6 +28,23 @@ const $ = (id) => document.getElementById(id);
         });
       }
       applyTheme();
+      /**
+       * DeFi panels are always rendered so every capability is discoverable.
+       * When the underlying contract isn't deployed yet we surface the panel's
+       * "not ready" notice and disable its inputs instead of hiding the card.
+       */
+      function setPanelReady(name, ready, controlIds) {
+        const notice = $(name + "NotReady");
+        if (notice) notice.style.display = ready ? "none" : "block";
+        for (const id of controlIds) {
+          const el = $(id);
+          if (!el) continue;
+          el.disabled = !ready;
+          el.style.opacity = ready ? "" : "0.5";
+          el.style.cursor = ready ? "" : "not-allowed";
+        }
+      }
+
       const short = (a) => (a ? a.slice(0, 6) + "…" + a.slice(-4) : "—");
       const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
@@ -246,10 +263,13 @@ const $ = (id) => document.getElementById(id);
           if (tr.faucetUrl) $("faucetLink").href = tr.faucetUrl;
         }
 
-        // Lending & borrowing (TesseraPool) — multi-asset.
+        // Lending & borrowing (TesseraPool) — multi-asset. The card is always
+        // visible; when the pool isn't deployed we show the not-ready notice and
+        // disable the controls rather than hiding the whole feature.
         const ln = s.lending;
-        if (ln && ln.assets && ln.assets.length) {
-          $("lendingCard").style.display = "block";
+        const lnReady = !!(ln && ln.assets && ln.assets.length);
+        setPanelReady("lending", lnReady, ["lnAsset", "lnAction", "lnAmount", "lnMax", "lnExecute"]);
+        if (lnReady) {
           $("lnSupplied").textContent = "$" + ln.account.suppliedUsd;
           $("lnBorrowed").textContent = "$" + ln.account.borrowedUsd;
           $("lnLimit").textContent = "$" + ln.account.borrowLimitUsd;
@@ -268,12 +288,12 @@ const $ = (id) => document.getElementById(id);
           if (window.renderLendingAsset) window.renderLendingAsset();
         }
 
-        // Vault (auto-yield on USDC).
+        // Vault (auto-yield on USDC) — always visible.
         const vt = s.vault;
+        setPanelReady("vault", !!vt, ["vAction", "vAmount", "vMax", "vExecute"]);
         if (vt) {
           window.__vault = vt;
           window.__agentUsdc = s.agent ? s.agent.balanceUsdc : "0";
-          $("vaultCard").style.display = "block";
           $("vReserve").textContent = vt.reserveRatioPct;
           $("vFee").textContent = vt.performanceFeePct;
           $("vTvl").textContent = vt.totalAssets + " USDC";
@@ -282,11 +302,12 @@ const $ = (id) => document.getElementById(id);
           $("vBuffer").textContent = vt.bufferPct + "%";
         }
 
-        // Swap desk.
+        // Swap desk — always visible.
         const sw = s.swap;
-        if (sw && sw.assets && sw.assets.length) {
+        const swReady = !!(sw && sw.assets && sw.assets.length);
+        setPanelReady("swap", swReady, ["swAmount", "swIn", "swOut", "swQuote", "swExecute"]);
+        if (swReady) {
           window.__swap = sw;
-          $("swapCard").style.display = "block";
           const syms = sw.assets.map((a) => a.symbol).join(",");
           if ($("swIn").dataset.symbols !== syms) {
             const opts = sw.assets.map((a) => `<option value="${a.address}" data-sym="${a.symbol}" data-dec="${a.decimals || 6}">${a.symbol}</option>`).join("");
@@ -373,11 +394,15 @@ const $ = (id) => document.getElementById(id);
       }
 
       // --- Admin login (id + password) ---
+      // The admin id is a secret: it is never pre-filled, never defaulted, and
+      // never rendered in the UI. A signed-in operator only sees a neutral
+      // "Signed in" state, so the id can't be read off the screen.
       let adminId = null;
       function setAdmin(id) {
         adminId = id;
         const b = $("adminBtn");
-        b.textContent = id ? `Admin: ${id} ⚙` : "Admin";
+        b.textContent = id ? "Signed in ⚙" : "Admin";
+        b.title = id ? "Operator session active — click to change password or sign out" : "Operator sign-in";
         b.style.borderColor = id ? "var(--good)" : "";
         b.style.color = id ? "var(--good)" : "";
       }
@@ -402,9 +427,11 @@ const $ = (id) => document.getElementById(id);
           }
           return;
         }
-        const id = prompt("Admin id:", "admin");
+        // No default value — the operator must type the id from memory.
+        const id = prompt("Admin id:");
+        if (!id) return;
         const password = prompt("Password:");
-        if (!id || !password) return;
+        if (!password) return;
         const r = await (await fetch("/api/admin/login", {
           method: "POST",
           headers: { "content-type": "application/json" },
