@@ -36,6 +36,7 @@ import { TesseraPoolClient } from "./pool.js";
 import { VaultClient, SwapClient } from "./defi.js";
 import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, type AppConfig } from "./config.js";
+import { OwnerClient } from "./owner.js";
 import type { Faucet } from "./circle/faucet.js";
 
 const PROVIDERS_PORT = 8788;
@@ -211,6 +212,12 @@ async function main() {
   const swapClient = liveDeployment.tesseraSwap
     ? new SwapClient({ chain, rpcUrl, account: agentAccount }, liveDeployment.tesseraSwap as Hex)
     : undefined;
+
+  // Signs owner-gated calls (vault setParams, fee collector setShares/interval/
+  // allocateNow). The deployer owns those contracts, so the agent key can't.
+  const owner = OwnerClient.fromEnv(chain, rpcUrl);
+  if (owner) console.log(`🔑 Owner ops enabled via deployer ${owner.account.address}`);
+  else console.log("🔑 Owner ops disabled (no DEPLOYER_PRIVATE_KEY) — App Config saves locally only");
 
   // Guardian policy: one-shot/CI runs auto-approve so they don't block on a human.
   const policy = {
@@ -914,14 +921,63 @@ async function main() {
         note: "The 80% vault reserve floor and the 30% yield-fee cap are constants in the contract — no admin action can exceed them.",
       },
       feeCollector: liveDeployment.tesseraFeeCollector ?? null,
+      // Whether saving can actually reach the contracts, so the UI can say so.
+      onchainWrites: !!owner,
+      ownerAddress: owner ? owner.account.address : null,
     });
   });
 
-  app.post("/api/app-config", requireOperator, (req, res) => {
+  /**
+   * Save the config and push the on-chain parts to the contracts.
+   *
+   * Saving only server-side would be misleading: the vault's reserve ratio and
+   * the collector's split/cadence live on-chain, so a saved-but-unpushed value
+   * would show one thing and behave as another. Each leg reports independently —
+   * the config is still saved if a transaction fails, and the response says
+   * exactly which legs landed.
+   */
+  app.post("/api/app-config", requireOperator, async (req, res) => {
     const patch = (req.body ?? {}) as Partial<AppConfig>;
     const r = appConfig.update(patch);
     if (!r.ok) { res.status(400).json({ ok: false, error: r.error }); return; }
-    res.json({ ok: true, config: r.config });
+    const cfg = r.config;
+
+    const onchain: { target: string; ok: boolean; txHash?: string; error?: string }[] = [];
+    if (!owner) {
+      onchain.push({
+        target: "all",
+        ok: false,
+        error: "Saved locally only — set DEPLOYER_PRIVATE_KEY to push these to the contracts.",
+      });
+    } else {
+      const vault = liveDeployment.tesseraVault as Hex | undefined;
+      const collector = liveDeployment.tesseraFeeCollector as Hex | undefined;
+      if (vault) {
+        try {
+          const tx = await owner.setVaultParams(vault, cfg.vaultReserveRatioBps, cfg.vaultPerformanceFeeBps);
+          onchain.push({ target: "vault", ok: true, txHash: tx });
+        } catch (e) {
+          onchain.push({ target: "vault", ok: false, error: friendlyError(e) });
+        }
+      }
+      if (collector) {
+        try {
+          const tx = await owner.setFeeShares(collector, cfg.feeShares);
+          onchain.push({ target: "feeShares", ok: true, txHash: tx });
+        } catch (e) {
+          onchain.push({ target: "feeShares", ok: false, error: friendlyError(e) });
+        }
+        try {
+          const tx = await owner.setFeeInterval(collector, cfg.feeIntervalSeconds);
+          onchain.push({ target: "feeInterval", ok: true, txHash: tx });
+        } catch (e) {
+          onchain.push({ target: "feeInterval", ok: false, error: friendlyError(e) });
+        }
+      }
+    }
+    // Config is saved either way; `onchain` tells the UI what reached the chain.
+    if (lastVault) vaultAt = 0; // re-read the vault so the new ratio shows up
+    res.json({ ok: true, config: cfg, onchain });
   });
 
   /**
@@ -935,16 +991,19 @@ async function main() {
       res.status(404).json({ ok: false, error: "Fee collector isn't deployed yet — run npm run pool:arc." });
       return;
     }
-    try {
-      const { request } = await client.public.simulateContract({
-        address: collector,
-        abi: tesseraFeeCollectorAbi,
-        functionName: "allocateNow",
-        account: agentAccount,
+    // allocateNow() is onlyOwner and the deployer owns the collector, so this
+    // must be signed by the owner key — the agent account would revert.
+    if (!owner) {
+      res.status(503).json({
+        ok: false,
+        error: "Set DEPLOYER_PRIVATE_KEY on the server to allocate fees (the deployer owns the collector).",
       });
-      const hash = await client.wallet.writeContract(request);
-      await client.public.waitForTransactionReceipt({ hash });
+      return;
+    }
+    try {
+      const hash = await owner.allocateNow(collector);
       if (chainCache) chainCache.at = 0;
+      vaultAt = 0; // the vault just received a deposit leg
       res.json({ ok: true, txHash: hash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });

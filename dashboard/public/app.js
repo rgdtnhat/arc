@@ -143,6 +143,13 @@ const $ = (id) => document.getElementById(id);
         items.forEach((el) => io.observe(el));
       })();
 
+      // Write agent-state into a field unless the user's own value owns it.
+      function setUnlessMine(id, text) {
+        const el = $(id);
+        if (!el || el.dataset.mine) return;
+        el.textContent = text;
+      }
+
       const short = (a) => (a ? a.slice(0, 6) + "…" + a.slice(-4) : "—");
       const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
@@ -427,11 +434,11 @@ const $ = (id) => document.getElementById(id);
         if (vtReady) {
           window.__vault = vt;
           window.__agentUsdc = vt.walletUsdc || (s.agent ? s.agent.balanceUsdc : "0");
-          $("vWallet").textContent = (vt.walletUsdc || "0") + " USDC";
+          setUnlessMine("vWallet", (vt.walletUsdc || "0") + " USDC");
           $("vReserve").textContent = vt.reserveRatioPct;
           $("vFee").textContent = vt.performanceFeePct;
           $("vTvl").textContent = vt.totalAssets + " USDC";
-          $("vYours").textContent = vt.yourAssets + " USDC";
+          setUnlessMine("vYours", vt.yourAssets + " USDC");
           $("vApr").textContent = vt.supplyApr + "%";
           $("vBuffer").textContent = vt.bufferPct + "%";
         }
@@ -630,6 +637,7 @@ const $ = (id) => document.getElementById(id);
             localStorage.setItem("tessera_token", r.token);
             setWallet(r.address);
             refreshProfile();
+            refreshMyPositions().catch(() => {});
           } else {
             alert("Sign-in failed: " + r.error);
           }
@@ -670,9 +678,9 @@ const $ = (id) => document.getElementById(id);
         $("lnUtil").textContent = a.reserve.utilizationPct + "%";
         $("lnBorrowApr").textContent = a.borrowable ? a.reserve.borrowApr + "%" : "—";
         $("lnSupplyApr").textContent = a.reserve.supplyApr + "%";
-        $("lnAssetSupplied").textContent = a.position.supplied + " " + a.symbol;
-        $("lnAssetBorrowed").textContent = a.position.borrowed + " " + a.symbol;
-        $("lnWallet").textContent = a.position.wallet + " " + a.symbol;
+        setUnlessMine("lnAssetSupplied", a.position.supplied + " " + a.symbol);
+        setUnlessMine("lnAssetBorrowed", a.position.borrowed + " " + a.symbol);
+        setUnlessMine("lnWallet", a.position.wallet + " " + a.symbol);
         const action = $("lnAction").value;
         const max = a.max[action];
         $("lnMaxHint").textContent = "max " + action + ": " + max + " " + a.symbol +
@@ -685,7 +693,7 @@ const $ = (id) => document.getElementById(id);
         $("lnAmount").value = a.max[action];
         $("lnAmount").dataset.raw = a.max[action + "Raw"]; // exact raw for a true MAX
       }
-      $("lnAsset").addEventListener("change", renderLendingAsset);
+      $("lnAsset").addEventListener("change", () => { renderLendingAsset(); refreshMyPositions().catch(() => {}); });
       $("lnAction").addEventListener("change", renderLendingAsset);
       // Manual edits invalidate the remembered exact-MAX raw value.
       $("lnAmount").addEventListener("input", () => { delete $("lnAmount").dataset.raw; });
@@ -836,9 +844,13 @@ const $ = (id) => document.getElementById(id);
           const f = (n) => (n >= 1000 ? n.toFixed(2) : n >= 1 ? n.toFixed(4) : n.toPrecision(4));
           rate = `1 ${ai.symbol} ≈ ${f(outPerIn)} ${ao.symbol}  ·  1 ${ao.symbol} ≈ ${f(inPerOut)} ${ai.symbol}`;
         }
+        // In self-custody mode prefer the connected wallet's own balance.
+        const mine = window.__myTokenIn;
+        const yours = mine != null ? mine : ai.wallet;
         el.innerHTML =
           `<div>${esc(rate)}</div>` +
-          `<div style="margin-top:4px">Your ${esc(ai.symbol)}: <b>${esc(ai.wallet)}</b>` +
+          `<div style="margin-top:4px">Your ${esc(ai.symbol)}: <b>${esc(yours)}</b>` +
+          `${mine != null ? ' <span style="opacity:.7">(your wallet)</span>' : ""}` +
           ` · desk has <b>${esc(ao.inventory)}</b> ${esc(ao.symbol)} to give</div>`;
       };
       async function swapQuote() {
@@ -1008,6 +1020,73 @@ const $ = (id) => document.getElementById(id);
         return "Transaction failed. " + raw.split("\n")[0].slice(0, 110);
       }
 
+      /**
+       * Read the *connected user's* own positions straight from the chain via
+       * their wallet, so self-custody mode shows their balances rather than the
+       * agent's. Cheap eth_calls through the injected provider — no server
+       * involvement, and it silently no-ops when no wallet is connected.
+       */
+      const decStr = (raw, dec) => fmtUnitsJs(BigInt(raw || "0x0").toString(), dec);
+      async function refreshMyPositions() {
+        if (!selfMode() || !window.ethereum) { clearMine(); return; }
+        let from;
+        try {
+          const accts = await window.ethereum.request({ method: "eth_accounts" });
+          from = accts && accts[0];
+        } catch { return; }
+        if (!from) { clearMine(); return; }
+        let cfg;
+        try { cfg = await loadDefiConfig(); } catch { return; }
+        const sel = cfg.selectors;
+
+        // Vault: my redeemable balance + my wallet's USDC.
+        if (cfg.vault) {
+          try {
+            const [mine, wal] = await Promise.all([
+              ethCall(cfg.vault, callData(sel.balanceOfAssets, encAddr(from))),
+              ethCall(cfg.vaultAsset, callData(sel.balanceOf, encAddr(from))),
+            ]);
+            setMine("vYours", decStr(mine, 6) + " USDC");
+            setMine("vWallet", decStr(wal, 6) + " USDC");
+          } catch {}
+        }
+        // Lending: my position in the asset currently selected.
+        const a = selectedLendingAsset();
+        if (cfg.pool && a) {
+          try {
+            const [sup, bor, wal] = await Promise.all([
+              ethCall(cfg.pool, callData(sel.supplyBalance, encAddr(a.address), encAddr(from))),
+              ethCall(cfg.pool, callData(sel.borrowBalance, encAddr(a.address), encAddr(from))),
+              ethCall(a.address, callData(sel.balanceOf, encAddr(from))),
+            ]);
+            setMine("lnAssetSupplied", decStr(sup, a.decimals) + " " + a.symbol);
+            setMine("lnAssetBorrowed", decStr(bor, a.decimals) + " " + a.symbol);
+            setMine("lnWallet", decStr(wal, a.decimals) + " " + a.symbol);
+          } catch {}
+        }
+        // Swap: my balance of the input asset.
+        const sw = swapSelected();
+        if (sw) {
+          try {
+            const wal = await ethCall(sw.tokenIn, callData(sel.balanceOf, encAddr(from)));
+            window.__myTokenIn = decStr(wal, sw.decIn);
+            renderSwapBalances();
+          } catch {}
+        }
+      }
+      // Mark a field as "yours" so the agent-state render doesn't overwrite it.
+      function setMine(id, text) {
+        const el = $(id);
+        if (!el) return;
+        el.dataset.mine = "1";
+        el.textContent = text;
+        el.title = "Your wallet's position";
+      }
+      function clearMine() {
+        document.querySelectorAll("[data-mine]").forEach((el) => { delete el.dataset.mine; el.title = ""; });
+        window.__myTokenIn = null;
+      }
+
       // Toggle: "My wallet" (self-custody) vs "Agent wallet" (operator).
       const selfMode = () => {
         const t = $("selfCustodyToggle");
@@ -1016,6 +1095,7 @@ const $ = (id) => document.getElementById(id);
       if ($("selfCustodyToggle")) {
         $("selfCustodyToggle").addEventListener("change", () => {
           const on = selfMode();
+          if (!on) clearMine(); else refreshMyPositions().catch(() => {});
           $("custodyNote").textContent = on
             ? "Self-custody: your wallet signs and your own funds move. No sign-in needed. " +
               "(Position figures below track the app's agent wallet; your own balances live in your wallet.)"
@@ -1183,8 +1263,28 @@ const $ = (id) => document.getElementById(id);
               headers: { "content-type": "application/json" },
               body: JSON.stringify(body),
             })).json();
-            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
-            msg.textContent = r.ok ? "Config saved ✓" : r.error;
+            if (!r.ok) {
+              msg.style.color = "var(--warn)";
+              msg.textContent = r.error;
+            } else {
+              // Report what actually reached the chain, not just "saved" — a
+              // saved-but-unpushed ratio would behave differently than shown.
+              const legs = r.onchain || [];
+              const failed = legs.filter((l) => !l.ok);
+              const landed = legs.filter((l) => l.ok).map((l) => l.target);
+              if (!legs.length) {
+                msg.style.color = "var(--good)";
+                msg.textContent = "Config saved ✓ (no on-chain contracts to update yet)";
+              } else if (!failed.length) {
+                msg.style.color = "var(--good)";
+                msg.textContent = "Config saved and pushed on-chain ✓ — " + landed.join(", ");
+              } else {
+                msg.style.color = "var(--warn)";
+                msg.textContent =
+                  "Config saved" + (landed.length ? " · on-chain: " + landed.join(", ") : "") +
+                  " · not pushed: " + failed.map((l) => `${l.target} (${l.error})`).join("; ");
+              }
+            }
           } catch {
             msg.style.color = "var(--warn)";
             msg.textContent = "Couldn't save the config.";
@@ -1211,6 +1311,8 @@ const $ = (id) => document.getElementById(id);
       // Reflect any existing session as soon as the page loads.
       refreshProfile();
 
+      refreshMyPositions().catch(() => {});
+
       // Land on whatever the hash asks for (default: the landing page).
       showView(routeFromHash());
 
@@ -1221,6 +1323,8 @@ const $ = (id) => document.getElementById(id);
        * The polling loop below is the steady-state backstop.
        */
       document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+      // Keep the user's own figures in step with the agent-state refresh.
+      setInterval(() => { refreshMyPositions().catch(() => {}); }, 12000);
       window.addEventListener("focus", () => tick());
       window.addEventListener("online", () => tick());
       if (window.ethereum && window.ethereum.on) {
