@@ -23,12 +23,20 @@ import { http, type HttpTransportConfig, type Transport } from "viem";
  * Tunables (env):
  *   ARC_RPC_MIN_INTERVAL_MS  min gap between request starts (default 180 → ~5.5/s)
  *   ARC_RPC_MAX_RETRIES      max backoff attempts (default 10)
- *   ARC_RPC_TIMEOUT_MS       per-request timeout (default 30000)
+ *   ARC_RPC_TIMEOUT_MS       per-request timeout (default 12000)
+ *   ARC_RPC_RETRY_BUDGET_MS  total time one call may spend incl. backoff (15000)
  */
 
 const MIN_INTERVAL_MS = Number(process.env.ARC_RPC_MIN_INTERVAL_MS ?? 180);
-const MAX_RETRIES = Number(process.env.ARC_RPC_MAX_RETRIES ?? 10);
-const TIMEOUT_MS = Number(process.env.ARC_RPC_TIMEOUT_MS ?? 30_000);
+const MAX_RETRIES = Number(process.env.ARC_RPC_MAX_RETRIES ?? 6);
+const TIMEOUT_MS = Number(process.env.ARC_RPC_TIMEOUT_MS ?? 12_000);
+/**
+ * Hard ceiling on the *total* time one logical RPC call may spend, including all
+ * backoff sleeps. Without this, 10 retries with exponential backoff could stack
+ * to 30s+ and stall whatever awaited the call. Retrying past this budget is
+ * pointless anyway — the caller has already given up or the data is stale.
+ */
+const RETRY_BUDGET_MS = Number(process.env.ARC_RPC_RETRY_BUDGET_MS ?? 15_000);
 
 // Pure reads: safe to de-dupe and safe to retry on any transient failure.
 const READ_METHODS = new Set([
@@ -111,14 +119,19 @@ function isTransient(err: unknown): boolean {
 }
 
 async function withRetry<T>(fn: () => Promise<T>, retryable: (e: unknown) => boolean): Promise<T> {
-  let delay = 500;
+  const deadline = Date.now() + RETRY_BUDGET_MS;
+  let delay = 400;
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
     } catch (err) {
       if (attempt >= MAX_RETRIES || !retryable(err)) throw err;
-      await sleep(delay + Math.random() * 250);
-      delay = Math.min(delay * 2, 8000);
+      const wait = delay + Math.random() * 200;
+      // Give up rather than sleep past the budget — a caller waiting on this
+      // must get an answer (even an error) in bounded time.
+      if (Date.now() + wait >= deadline) throw err;
+      await sleep(wait);
+      delay = Math.min(delay * 2, 4000);
     }
   }
 }

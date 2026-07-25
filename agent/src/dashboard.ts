@@ -544,17 +544,27 @@ async function main() {
     };
   }
 
-  async function lendingState() {
+  /**
+   * Lending snapshot — **never awaited by a request**.
+   *
+   * `/api/state` used to `await` this. Each call fans out per-asset chain reads,
+   * and a throttled public RPC can push one read into a long backoff chain, so
+   * the whole endpoint hung and the dashboard rendered nothing. Same contract as
+   * `ensureChain()` now: serve the cached snapshot immediately and refresh in the
+   * background. A slow chain can delay *freshness*, never the response.
+   */
+  let lendingRefreshing = false;
+  let lendingAt = 0;
+  function lendingSnapshot() {
     if (!poolClient || !poolDeployment) return null;
-    try {
-      lastLending = await readLending();
-      return lastLending;
-    } catch (e) {
-      // Transient throttle: keep showing the last good snapshot instead of
-      // dropping the panel. Only null before the very first successful read.
-      console.error(`[lending] read failed (serving last good): ${String(e).slice(0, 100)}`);
-      return lastLending;
+    if (!lendingRefreshing && Date.now() - lendingAt > READ_TTL) {
+      lendingRefreshing = true;
+      readLending()
+        .then((d) => { lastLending = d; lendingAt = Date.now(); })
+        .catch((e) => console.error(`[lending] refresh failed (keeping last good): ${String(e).slice(0, 120)}`))
+        .finally(() => (lendingRefreshing = false));
     }
+    return lastLending;
   }
 
   // Agent-driven lending actions from the dashboard.
@@ -608,12 +618,20 @@ async function main() {
       supplyApr: fmtApr(usdcReserve.supplyAprWad),
     };
   }
-  async function vaultState() {
+  // Same non-blocking contract as the lending snapshot: cached read, background
+  // refresh. A slow chain must never delay /api/state.
+  let vaultRefreshing = false;
+  let vaultAt = 0;
+  function vaultSnapshot() {
     if (!vaultClient) return null;
-    try { lastVault = await readVault(); return lastVault; } catch (e) {
-      console.error(`[vault] read failed (serving last good): ${String(e).slice(0, 100)}`);
-      return lastVault;
+    if (!vaultRefreshing && Date.now() - vaultAt > READ_TTL) {
+      vaultRefreshing = true;
+      readVault()
+        .then((d) => { lastVault = d; vaultAt = Date.now(); })
+        .catch((e) => console.error(`[vault] refresh failed (keeping last good): ${String(e).slice(0, 120)}`))
+        .finally(() => (vaultRefreshing = false));
     }
+    return lastVault;
   }
 
   app.post("/api/vault/:action", requireOperator, async (req, res) => {
@@ -727,13 +745,17 @@ async function main() {
       contacts: memory.list(),
       treasury: { ...treasurySnapshot, settlement, faucetUrl: "https://faucet.circle.com/" },
       live: liveDeployment,
-      lending: await lendingState(),
-      vault: await vaultState(),
+      lending: lendingSnapshot(),
+      vault: vaultSnapshot(),
       swap: swapClient
         ? { address: swapClient.swap, assets: poolDeployment?.assets ?? [{ symbol: "USDC", address: usdcAddress }] }
         : null,
       balanceHistory,
-      invoices: await fetch(`http://127.0.0.1:${PROVIDERS_PORT}/invoices`)
+      // Local call, but bounded anyway: `.catch()` handles errors, not hangs, and
+      // an unbounded await here would stall the whole state response.
+      invoices: await fetch(`http://127.0.0.1:${PROVIDERS_PORT}/invoices`, {
+        signal: AbortSignal.timeout(3000),
+      })
         .then((r) => r.json())
         .then((j: any) =>
           (j.invoices ?? []).map((inv: any) => ({
