@@ -27,6 +27,17 @@ export interface AppConfig {
   feeIntervalSeconds: number;
   /** Human label for the cadence, e.g. "weekly" or "manual". */
   feeIntervalLabel: string;
+  /**
+   * How allocation is triggered:
+   *  - `interval` — every `feeIntervalSeconds` (the on-chain cadence)
+   *  - `weekly`   — at `feeWeekday` / `feeTimeUtc` each week (server scheduler)
+   *  - `manual`   — only when the operator presses "Allocate now"
+   */
+  feeScheduleMode: "interval" | "weekly" | "manual";
+  /** 0=Sunday … 6=Saturday. Used when feeScheduleMode is "weekly". */
+  feeWeekday: number;
+  /** "HH:MM" in UTC. Used when feeScheduleMode is "weekly". */
+  feeTimeUtc: string;
   /** Swap fee (bps) and the app's share of it (bps of the fee). */
   swapFeeBps: number;
   swapAppFeeShareBps: number;
@@ -48,6 +59,9 @@ export const DEFAULT_CONFIG: AppConfig = {
   feeShares: { agentBps: 2_000, lendingBps: 2_000, vaultBps: 2_000, swapBps: 2_000, retainedBps: 2_000 },
   feeIntervalSeconds: CADENCES.week, // once a week by default
   feeIntervalLabel: "week",
+  feeScheduleMode: "interval",
+  feeWeekday: 1, // Monday
+  feeTimeUtc: "09:00",
   swapFeeBps: 30,
   swapAppFeeShareBps: 5_000,
 };
@@ -128,6 +142,15 @@ export class AppConfigStore {
     ) {
       return { ok: false, error: "Allocation cadence must be between 1 second and 1 year." };
     }
+    if (!["interval", "weekly", "manual"].includes(next.feeScheduleMode)) {
+      return { ok: false, error: "Allocation trigger must be interval, weekly, or manual." };
+    }
+    if (!Number.isInteger(next.feeWeekday) || next.feeWeekday < 0 || next.feeWeekday > 6) {
+      return { ok: false, error: "Weekday must be 0 (Sunday) through 6 (Saturday)." };
+    }
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(next.feeTimeUtc))) {
+      return { ok: false, error: "Time must be HH:MM in 24-hour UTC, e.g. 09:00." };
+    }
     if (!Number.isInteger(next.swapFeeBps) || next.swapFeeBps < 0 || next.swapFeeBps > LIMITS.swapFeeMax) {
       return { ok: false, error: `Swap fee cannot exceed ${LIMITS.swapFeeMax / 100}%.` };
     }
@@ -143,4 +166,21 @@ export class AppConfigStore {
     }
     return { ok: true, config: next };
   }
+}
+
+/**
+ * Next UTC timestamp for a weekly `weekday` @ `HH:MM` schedule, strictly after
+ * `from`. Used by the fee-allocation scheduler for the "at a specific time on a
+ * day of the week" cadence.
+ */
+export function nextWeeklyRun(weekday: number, timeUtc: string, from = new Date()): Date {
+  const [h, m] = timeUtc.split(":").map(Number);
+  const next = new Date(from);
+  next.setUTCSeconds(0, 0);
+  next.setUTCHours(h, m, 0, 0);
+  // Advance to the target weekday; if that lands in the past, go a week out.
+  const delta = (weekday - next.getUTCDay() + 7) % 7;
+  next.setUTCDate(next.getUTCDate() + delta);
+  if (next.getTime() <= from.getTime()) next.setUTCDate(next.getUTCDate() + 7);
+  return next;
 }

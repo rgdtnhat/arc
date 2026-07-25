@@ -365,13 +365,34 @@
             <div class="cfgRow"><span>→ Vault</span><span><input id="cfgFeeVault" type="number" min="0" max="100" step="1" />%</span></div>
             <div class="cfgRow"><span>→ Swap pool</span><span><input id="cfgFeeSwap" type="number" min="0" max="100" step="1" />%</span></div>
             <div class="cfgRow"><span>→ Retained</span><span><input id="cfgFeeRetained" type="number" min="0" max="100" step="1" />%</span></div>
-            <div class="cfgRow"><span>Allocate every</span>
+            <div class="cfgRow"><span>Trigger</span>
+              <select id="cfgMode">
+                <option value="interval">Every…</option>
+                <option value="weekly">Day + time</option>
+                <option value="manual">Manual only</option>
+              </select>
+            </div>
+            <div class="cfgRow" id="cfgRowInterval"><span>Allocate every</span>
               <select id="cfgCadence">
                 <option value="second">Second</option><option value="minute">Minute</option>
                 <option value="hour">Hour</option><option value="day">Day</option>
                 <option value="week">Week</option><option value="month">Month</option>
                 <option value="year">Year</option>
               </select>
+            </div>
+            <div class="cfgRow" id="cfgRowWeekday" style="display:none"><span>On</span>
+              <select id="cfgWeekday">
+                <option value="0">Sunday</option><option value="1">Monday</option>
+                <option value="2">Tuesday</option><option value="3">Wednesday</option>
+                <option value="4">Thursday</option><option value="5">Friday</option>
+                <option value="6">Saturday</option>
+              </select>
+            </div>
+            <div class="cfgRow" id="cfgRowTime" style="display:none"><span>At (UTC)</span>
+              <input id="cfgTime" type="time" />
+            </div>
+            <div class="cfgRow" id="cfgRowNext" style="display:none;color:var(--muted);font-size:12px">
+              <span>Next run</span><span id="cfgNextRun">—</span>
             </div>
             <div class="menuSep"></div>
             <div style="padding:4px 11px 8px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>

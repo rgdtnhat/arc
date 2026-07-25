@@ -35,7 +35,7 @@ import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
 import { VaultClient, SwapClient } from "./defi.js";
 import { AdminAuth } from "./auth.js";
-import { AppConfigStore, CADENCES, LIMITS, type AppConfig } from "./config.js";
+import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
 import { OwnerClient } from "./owner.js";
 import type { Faucet } from "./circle/faucet.js";
 
@@ -908,6 +908,42 @@ async function main() {
     path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-config.json"),
   );
 
+  /**
+   * Fee-allocation scheduler for the "weekly at a specific time" cadence.
+   *
+   * The on-chain `interval` already gates the permissionless `allocate()`, but a
+   * "every Monday 09:00 UTC" schedule needs an off-chain trigger. One minute-
+   * granularity timer checks whether the configured moment has passed and, if
+   * so, calls the owner-only `allocateNow()`. `interval` and `manual` modes are
+   * left entirely to the chain and the operator's button respectively.
+   */
+  let nextScheduledAllocation: Date | null = null;
+  let lastScheduledAllocation: string | null = null;
+  function recomputeSchedule() {
+    const c = appConfig.get();
+    nextScheduledAllocation =
+      c.feeScheduleMode === "weekly" ? nextWeeklyRun(c.feeWeekday, c.feeTimeUtc) : null;
+  }
+  recomputeSchedule();
+  setInterval(async () => {
+    const c = appConfig.get();
+    if (c.feeScheduleMode !== "weekly" || !nextScheduledAllocation) return;
+    if (Date.now() < nextScheduledAllocation.getTime()) return;
+    const collector = liveDeployment.tesseraFeeCollector as Hex | undefined;
+    // Roll the schedule forward first, so a failure can't spin on a due time.
+    recomputeSchedule();
+    if (!collector || !owner) return;
+    try {
+      const tx = await owner.allocateNow(collector);
+      lastScheduledAllocation = new Date().toISOString();
+      console.log(`[fees] scheduled allocation sent ${tx}`);
+      vaultAt = 0;
+      if (chainCache) chainCache.at = 0;
+    } catch (e) {
+      console.error(`[fees] scheduled allocation failed: ${String(e).slice(0, 140)}`);
+    }
+  }, 60_000).unref?.();
+
   app.get("/api/app-config", requireOperator, (_req, res) => {
     res.json({
       ok: true,
@@ -924,6 +960,10 @@ async function main() {
       // Whether saving can actually reach the contracts, so the UI can say so.
       onchainWrites: !!owner,
       ownerAddress: owner ? owner.account.address : null,
+      schedule: {
+        nextRunUtc: nextScheduledAllocation ? nextScheduledAllocation.toISOString() : null,
+        lastRunUtc: lastScheduledAllocation,
+      },
     });
   });
 
@@ -977,7 +1017,13 @@ async function main() {
     }
     // Config is saved either way; `onchain` tells the UI what reached the chain.
     if (lastVault) vaultAt = 0; // re-read the vault so the new ratio shows up
-    res.json({ ok: true, config: cfg, onchain });
+    recomputeSchedule(); // a changed weekday/time takes effect immediately
+    res.json({
+      ok: true,
+      config: cfg,
+      onchain,
+      schedule: { nextRunUtc: nextScheduledAllocation ? nextScheduledAllocation.toISOString() : null },
+    });
   });
 
   /**

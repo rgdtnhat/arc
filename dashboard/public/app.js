@@ -1237,9 +1237,29 @@ const $ = (id) => document.getElementById(id);
           $("cfgFeeSwap").value = Math.round(c.feeShares.swapBps / 100);
           $("cfgFeeRetained").value = Math.round(c.feeShares.retainedBps / 100);
           $("cfgCadence").value = c.feeIntervalLabel in (r.cadences || {}) ? c.feeIntervalLabel : "week";
-          $("cfgNote").textContent = (r.enforced && r.enforced.note) || "";
+          $("cfgMode").value = c.feeScheduleMode || "interval";
+          $("cfgWeekday").value = String(c.feeWeekday ?? 1);
+          $("cfgTime").value = c.feeTimeUtc || "09:00";
+          syncScheduleRows(r.schedule && r.schedule.nextRunUtc);
+          $("cfgNote").textContent =
+            ((r.enforced && r.enforced.note) || "") +
+            (r.onchainWrites ? "" : " Saving stores locally only — DEPLOYER_PRIVATE_KEY isn't set, so changes can't reach the contracts.");
         } catch {}
       }
+      // Show only the fields the chosen trigger actually uses.
+      function syncScheduleRows(nextRunUtc) {
+        const mode = $("cfgMode").value;
+        $("cfgRowInterval").style.display = mode === "interval" ? "" : "none";
+        $("cfgRowWeekday").style.display = mode === "weekly" ? "" : "none";
+        $("cfgRowTime").style.display = mode === "weekly" ? "" : "none";
+        $("cfgRowNext").style.display = mode === "weekly" && nextRunUtc ? "" : "none";
+        if (nextRunUtc) {
+          const d = new Date(nextRunUtc);
+          $("cfgNextRun").textContent = d.toUTCString().replace(" GMT", " UTC");
+        }
+      }
+      if ($("cfgMode")) $("cfgMode").addEventListener("change", () => syncScheduleRows(null));
+
       if ($("cfgSave")) {
         $("cfgSave").addEventListener("click", async () => {
           const msg = $("cfgMsg");
@@ -1256,6 +1276,9 @@ const $ = (id) => document.getElementById(id);
             },
             feeIntervalSeconds: cfgCadences[label] || 604800,
             feeIntervalLabel: label,
+            feeScheduleMode: $("cfgMode").value,
+            feeWeekday: Number($("cfgWeekday").value),
+            feeTimeUtc: $("cfgTime").value || "09:00",
           };
           msg.style.display = "block";
           try {
@@ -1278,6 +1301,7 @@ const $ = (id) => document.getElementById(id);
               } else if (!failed.length) {
                 msg.style.color = "var(--good)";
                 msg.textContent = "Config saved and pushed on-chain ✓ — " + landed.join(", ");
+                syncScheduleRows(r.schedule && r.schedule.nextRunUtc);
               } else {
                 msg.style.color = "var(--warn)";
                 msg.textContent =
