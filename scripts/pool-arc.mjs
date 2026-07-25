@@ -15,6 +15,8 @@ import {
   tesseraVaultBytecode,
   tesseraSwapAbi,
   tesseraSwapBytecode,
+  tesseraFeeCollectorAbi,
+  tesseraFeeCollectorBytecode,
   formatUsdc,
   pacedHttp,
 } from "@tessera/shared";
@@ -107,12 +109,12 @@ async function main() {
     console.log("   (skip agent position — no cirBTC to use as collateral; supply from the dashboard once funded)");
   }
 
-  // 5) TesseraVault over USDC: 50% liquid reserve buffer, 15% performance fee.
-  console.log("→ deploying TesseraVault (USDC, 50% reserve, 15% perf fee)…");
+  // 5) TesseraVault over USDC: 80% liquid reserve (contract floor + default).
+  console.log("→ deploying TesseraVault (USDC, 80% reserve floor, 15% perf fee)…");
   let vh = await dWallet.deployContract({
     abi: tesseraVaultAbi,
     bytecode: tesseraVaultBytecode,
-    args: [ARC_USDC_ADDRESS, pool, deployer.address, 5000, 1500],
+    args: [ARC_USDC_ADDRESS, pool, deployer.address, 8000, 1500],
     account: deployer,
     chain: arcTestnet,
   });
@@ -144,6 +146,25 @@ async function main() {
     }
   }
 
+  // 6b) TesseraFeeCollector: every app fee lands here, then gets allocated
+  //     20/20/20/20/20 (agent / lending / vault / swap / retained), weekly.
+  console.log("→ deploying TesseraFeeCollector (20/20/20/20/20, weekly)…");
+  const fh = await dWallet.deployContract({
+    abi: tesseraFeeCollectorAbi,
+    bytecode: tesseraFeeCollectorBytecode,
+    args: [ARC_USDC_ADDRESS, agent.address, pool, vault, swap],
+    account: deployer,
+    chain: arcTestnet,
+  });
+  const feeCollector = (await pub.waitForTransactionReceipt({ hash: fh })).contractAddress;
+  console.log("   feeCollector", feeCollector);
+  await pace();
+  // The collector needs to own the swap desk so its `seed` leg can run, and it
+  // becomes the treasury for both the pool and the vault so fees flow to it.
+  await dSend(swap, tesseraSwapAbi, "transferOwnership", [feeCollector]);
+  await dSend(pool, tesseraPoolAbi, "setTreasury", [feeCollector]);
+  await dSend(vault, tesseraVaultAbi, "setTreasury", [feeCollector]);
+
   // 7) Persist to deployments/arc.json (multi-asset + vault + swap).
   const p = new URL("../deployments/arc.json", import.meta.url);
   const dep = JSON.parse(readFileSync(p, "utf8"));
@@ -151,6 +172,7 @@ async function main() {
   dep.tesseraVault = vault;
   dep.vaultAsset = ARC_USDC_ADDRESS;
   dep.tesseraSwap = swap;
+  dep.tesseraFeeCollector = feeCollector;
   dep.poolAssets = RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
   const body = JSON.stringify(dep, null, 2) + "\n";
@@ -162,6 +184,7 @@ async function main() {
   console.log("   pool     ", pool);
   console.log("   vault    ", vault);
   console.log("   swap     ", swap);
+  console.log("   fees     ", feeCollector);
   for (const r of RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
   console.log("   explorer ", `https://testnet.arcscan.app/address/${pool}`);
 }

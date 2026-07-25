@@ -1,13 +1,13 @@
 import express from "express";
 import path from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
 import { verifyMessage, formatUnits, toFunctionSelector } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID } from "node:crypto";
-import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS } from "@tessera/shared";
+import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS, tesseraFeeCollectorAbi } from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { faucetFromEnv } from "./circle/faucet.js";
 import { createProviderApp, type ProviderEvent } from "@tessera/providers";
@@ -35,6 +35,7 @@ import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
 import { VaultClient, SwapClient } from "./defi.js";
 import { AdminAuth } from "./auth.js";
+import { AppConfigStore, CADENCES, LIMITS, type AppConfig } from "./config.js";
 import type { Faucet } from "./circle/faucet.js";
 
 const PROVIDERS_PORT = 8788;
@@ -845,6 +846,111 @@ async function main() {
    * user's own funds move, and this server never touches their keys. Public on
    * purpose — it's just public chain metadata.
    */
+  // --- Profile (any signed-in identity: admin or connected wallet) ----------
+  // A display name per identity, persisted. Keyed by wallet address or by the
+  // admin session, never by the admin id itself (that stays secret).
+  const profilesFile = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-profiles.json");
+  const loadProfiles = (): Record<string, { name?: string }> => {
+    try { return JSON.parse(readFileSync(profilesFile, "utf8")); } catch { return {}; }
+  };
+  let profiles = loadProfiles();
+  // Identity key for the caller: their wallet address, or "admin" for the operator.
+  const identityOf = (req: express.Request): { key: string; kind: "admin" | "wallet"; address?: string } | null => {
+    const t = bearer(req);
+    if (admin?.session(t)) return { key: "operator", kind: "admin" };
+    const w = web3Session(t);
+    if (w) return { key: w.address.toLowerCase(), kind: "wallet", address: w.address };
+    return null;
+  };
+
+  app.get("/api/profile", requireAuth, (req, res) => {
+    const id = identityOf(req)!;
+    res.json({
+      ok: true,
+      kind: id.kind,
+      address: id.address ?? null,
+      name: profiles[id.key]?.name ?? "",
+      // Only a password-based (admin) login can change a password.
+      canChangePassword: id.kind === "admin",
+      isOperator: id.kind === "admin",
+    });
+  });
+
+  app.post("/api/profile", requireAuth, (req, res) => {
+    const id = identityOf(req)!;
+    const name = String(req.body?.name ?? "").trim().slice(0, 40);
+    if (name && !/^[\w .'-]{1,40}$/.test(name)) {
+      res.status(400).json({ ok: false, error: "Use letters, numbers, spaces, or . ' - only (max 40 characters)." });
+      return;
+    }
+    profiles = { ...profiles, [id.key]: { ...profiles[id.key], name } };
+    try {
+      writeFileSync(profilesFile, JSON.stringify(profiles, null, 2) + "\n");
+    } catch (e) {
+      res.status(500).json({ ok: false, error: "Couldn't save your profile." });
+      return;
+    }
+    res.json({ ok: true, name });
+  });
+
+  // --- App Config (admin-only) ----------------------------------------------
+  // Operator-tunable economics. Read *and* write are operator-gated: the split
+  // of yield and fees is not public information, and the menu is hidden for
+  // non-admins client-side because the API refuses it server-side.
+  const appConfig = new AppConfigStore(
+    path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../.tessera-config.json"),
+  );
+
+  app.get("/api/app-config", requireOperator, (_req, res) => {
+    res.json({
+      ok: true,
+      config: appConfig.get(),
+      limits: LIMITS,
+      cadences: CADENCES,
+      // Contract-enforced values, so the UI can explain what can't be changed.
+      enforced: {
+        vaultReserveRatioFloorBps: LIMITS.vaultReserveRatioMin,
+        vaultPerformanceFeeCapBps: LIMITS.vaultPerformanceFeeMax,
+        note: "The 80% vault reserve floor and the 30% yield-fee cap are constants in the contract — no admin action can exceed them.",
+      },
+      feeCollector: liveDeployment.tesseraFeeCollector ?? null,
+    });
+  });
+
+  app.post("/api/app-config", requireOperator, (req, res) => {
+    const patch = (req.body ?? {}) as Partial<AppConfig>;
+    const r = appConfig.update(patch);
+    if (!r.ok) { res.status(400).json({ ok: false, error: r.error }); return; }
+    res.json({ ok: true, config: r.config });
+  });
+
+  /**
+   * Manual fee allocation ("Allocate now"). Calls the collector's owner-only
+   * `allocateNow()`, which ignores the scheduled interval. Operator-gated
+   * because it moves the app's own fee balance.
+   */
+  app.post("/api/fees/allocate", requireOperator, async (_req, res) => {
+    const collector = liveDeployment.tesseraFeeCollector as Hex | undefined;
+    if (!collector) {
+      res.status(404).json({ ok: false, error: "Fee collector isn't deployed yet — run npm run pool:arc." });
+      return;
+    }
+    try {
+      const { request } = await client.public.simulateContract({
+        address: collector,
+        abi: tesseraFeeCollectorAbi,
+        functionName: "allocateNow",
+        account: agentAccount,
+      });
+      const hash = await client.wallet.writeContract(request);
+      await client.public.waitForTransactionReceipt({ hash });
+      if (chainCache) chainCache.at = 0;
+      res.json({ ok: true, txHash: hash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   app.get("/api/defi/config", (_req, res) => {
     res.json({
       chainId: liveDeployment.chainId,

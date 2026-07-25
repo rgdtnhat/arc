@@ -276,6 +276,8 @@ const $ = (id) => document.getElementById(id);
           if (tr.faucetUrl) $("faucetLink").href = tr.faucetUrl;
         }
 
+        window.__ledger = s.ledger || [];
+
         // Lending & borrowing (TesseraPool) — multi-asset. The card is always
         // visible; when the pool isn't deployed we show the not-ready notice and
         // disable the controls rather than hiding the whole feature.
@@ -458,6 +460,7 @@ const $ = (id) => document.getElementById(id);
         if (r.ok) {
           localStorage.setItem("tessera_token", r.token);
           setAdmin(r.id);
+          refreshProfile();
         } else {
           alert("Login failed: " + r.error);
         }
@@ -511,6 +514,7 @@ const $ = (id) => document.getElementById(id);
           if (r.ok) {
             localStorage.setItem("tessera_token", r.token);
             setWallet(r.address);
+            refreshProfile();
           } else {
             alert("Sign-in failed: " + r.error);
           }
@@ -898,6 +902,193 @@ const $ = (id) => document.getElementById(id);
           tick();
         });
       }
+
+      /* ---- Floating scroll controls ------------------------------------- */
+      (function scrollDock() {
+        const up = $("toTop"), down = $("toBottom");
+        if (!up || !down) return;
+        const sync = () => {
+          const y = window.scrollY;
+          const max = document.documentElement.scrollHeight - window.innerHeight;
+          // Hide the direction you're already at; keep the other always available.
+          up.hidden = y < 120;
+          down.hidden = max - y < 120;
+        };
+        up.addEventListener("click", () => window.scrollTo({ top: 0, behavior: "smooth" }));
+        down.addEventListener("click", () =>
+          window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }));
+        window.addEventListener("scroll", sync, { passive: true });
+        window.addEventListener("resize", sync);
+        sync();
+      })();
+
+      /* ---- Dropdown menus (profile, App Config) -------------------------- */
+      function bindMenu(btnId, panelId) {
+        const btn = $(btnId), panel = $(panelId);
+        if (!btn || !panel) return null;
+        const close = () => { panel.classList.remove("open"); btn.setAttribute("aria-expanded", "false"); };
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const open = panel.classList.toggle("open");
+          btn.setAttribute("aria-expanded", open ? "true" : "false");
+          // Only one menu open at a time.
+          document.querySelectorAll(".menuPanel.open").forEach((p) => { if (p !== panel) p.classList.remove("open"); });
+        });
+        panel.addEventListener("click", (e) => e.stopPropagation());
+        document.addEventListener("click", close);
+        document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+        return { close };
+      }
+      const profileMenu = bindMenu("profileBtn", "profileMenu");
+      const cfgMenu = bindMenu("cfgBtn", "cfgMenu");
+
+      // Reflect who's signed in: show the profile menu for any identity, and the
+      // App Config menu only for the operator.
+      let profileState = null;
+      async function refreshProfile() {
+        const t = authToken();
+        const wrap = $("profileWrap"), cw = $("cfgWrap");
+        if (!t) { profileState = null; if (wrap) wrap.style.display = "none"; if (cw) cw.style.display = "none"; return; }
+        try {
+          const p = await (await fetch("/api/profile", { headers: authHeaders() })).json();
+          if (!p.ok) throw new Error("no session");
+          profileState = p;
+          if (wrap) wrap.style.display = "inline-block";
+          $("profileLabel").textContent = p.name || (p.kind === "admin" ? "Operator" : short(p.address));
+          $("profileWho").textContent = p.kind === "admin" ? "Signed in as operator" : "Wallet " + short(p.address);
+          $("profPassword").style.display = p.canChangePassword ? "block" : "none";
+          if (cw) cw.style.display = p.isOperator ? "inline-block" : "none";
+          if (p.isOperator) loadAppConfig();
+        } catch {
+          profileState = null;
+          if (wrap) wrap.style.display = "none";
+          if (cw) cw.style.display = "none";
+        }
+      }
+
+      // Profile menu actions.
+      document.querySelectorAll("[data-prof]").forEach((el) => {
+        el.addEventListener("click", async () => {
+          const what = el.dataset.prof;
+          if (profileMenu) profileMenu.close();
+          if (what === "edit") {
+            const name = prompt("Display name:", (profileState && profileState.name) || "");
+            if (name === null) return;
+            const r = await (await postAuthed("/api/profile", {
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ name }),
+            })).json();
+            alert(r.ok ? "Profile saved." : "Couldn't save: " + r.error);
+            refreshProfile();
+          } else if (what === "password") {
+            const current = prompt("Current password:");
+            if (!current) return;
+            const next = prompt("New password (min 8 characters):");
+            if (!next) return;
+            const r = await (await postAuthed("/api/admin/change-password", {
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ current, next }),
+            })).json();
+            alert(r.ok ? "Password changed." : "Failed: " + r.error);
+          } else if (what === "status") {
+            const v = window.__vault, l = window.__lending;
+            const lines = [
+              profileState && profileState.kind === "admin" ? "Signed in as operator" : "Wallet " + ((profileState && profileState.address) || "—"),
+              "",
+              "Agent wallet: " + (window.__agentUsdc || "—") + " USDC",
+              "Vault TVL: " + (v ? v.totalAssets + " USDC" : "—") + "  ·  vault position: " + (v ? v.yourAssets + " USDC" : "—"),
+              "Lending supplied: " + (l && l.account ? "$" + l.account.suppliedUsd : "—") +
+                "  ·  borrowed: " + (l && l.account ? "$" + l.account.borrowedUsd : "—"),
+              "Health factor: " + (l && l.account ? l.account.healthFactor : "—"),
+            ];
+            alert(lines.join("\n"));
+          } else if (what === "history") {
+            // The ledger already holds every settled/refunded purchase.
+            const led = window.__ledger || [];
+            if (!led.length) { alert("No transactions yet."); return; }
+            alert(
+              "Recent transactions\n\n" +
+                led.slice(-12).map((e) => `${e.status.toUpperCase()} · ${e.name} · ${e.priceUsdc} USDC`).join("\n")
+            );
+          } else if (what === "signout") {
+            await postAuthed("/api/admin/logout").catch(() => {});
+            localStorage.removeItem("tessera_token");
+            setAdmin(null);
+            setWallet(null);
+            refreshProfile();
+          }
+        });
+      });
+
+      /* ---- App Config (operator only) ------------------------------------ */
+      let cfgCadences = {};
+      async function loadAppConfig() {
+        try {
+          const r = await (await fetch("/api/app-config", { headers: authHeaders() })).json();
+          if (!r.ok) return;
+          cfgCadences = r.cadences || {};
+          const c = r.config;
+          $("cfgReserve").value = Math.round(c.vaultReserveRatioBps / 100);
+          $("cfgPerfFee").value = Math.round(c.vaultPerformanceFeeBps / 100);
+          $("cfgFeeAgent").value = Math.round(c.feeShares.agentBps / 100);
+          $("cfgFeeLending").value = Math.round(c.feeShares.lendingBps / 100);
+          $("cfgFeeVault").value = Math.round(c.feeShares.vaultBps / 100);
+          $("cfgFeeSwap").value = Math.round(c.feeShares.swapBps / 100);
+          $("cfgFeeRetained").value = Math.round(c.feeShares.retainedBps / 100);
+          $("cfgCadence").value = c.feeIntervalLabel in (r.cadences || {}) ? c.feeIntervalLabel : "week";
+          $("cfgNote").textContent = (r.enforced && r.enforced.note) || "";
+        } catch {}
+      }
+      if ($("cfgSave")) {
+        $("cfgSave").addEventListener("click", async () => {
+          const msg = $("cfgMsg");
+          const label = $("cfgCadence").value;
+          const body = {
+            vaultReserveRatioBps: Math.round(+$("cfgReserve").value * 100),
+            vaultPerformanceFeeBps: Math.round(+$("cfgPerfFee").value * 100),
+            feeShares: {
+              agentBps: Math.round(+$("cfgFeeAgent").value * 100),
+              lendingBps: Math.round(+$("cfgFeeLending").value * 100),
+              vaultBps: Math.round(+$("cfgFeeVault").value * 100),
+              swapBps: Math.round(+$("cfgFeeSwap").value * 100),
+              retainedBps: Math.round(+$("cfgFeeRetained").value * 100),
+            },
+            feeIntervalSeconds: cfgCadences[label] || 604800,
+            feeIntervalLabel: label,
+          };
+          msg.style.display = "block";
+          try {
+            const r = await (await postAuthed("/api/app-config", {
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(body),
+            })).json();
+            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
+            msg.textContent = r.ok ? "Config saved ✓" : r.error;
+          } catch {
+            msg.style.color = "var(--warn)";
+            msg.textContent = "Couldn't save the config.";
+          }
+        });
+      }
+      if ($("cfgAllocate")) {
+        $("cfgAllocate").addEventListener("click", async () => {
+          const msg = $("cfgMsg");
+          msg.style.display = "block";
+          msg.style.color = "var(--muted)";
+          msg.textContent = "Allocating collected fees…";
+          try {
+            const r = await (await postAuthed("/api/fees/allocate")).json();
+            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
+            msg.textContent = r.ok ? "Fees allocated ✓" : r.error;
+          } catch {
+            msg.style.color = "var(--warn)";
+            msg.textContent = "Allocation request failed.";
+          }
+        });
+      }
+
+      // Reflect any existing session as soon as the page loads.
+      refreshProfile();
 
       // Poll interval is driven by the server (slower in live mode to spare the
       // rate-limited public RPC). Re-schedule when the advertised cadence changes.

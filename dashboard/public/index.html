@@ -37,6 +37,65 @@
       :root[data-theme="light"] .pill.blue { background: #e5edff; color: #2f6be0; border-color: #bcd3ff; }
 
       * { box-sizing: border-box; }
+      /* ---- Overflow containment -------------------------------------------
+       * Long values (addresses, tx hashes, raw RPC error text) were spilling
+       * outside their cards. Wrap aggressively everywhere, let flex/grid
+       * children actually shrink (min-width:0), and never let the page scroll
+       * sideways. Wide blocks scroll inside themselves instead.
+       */
+      html, body { max-width: 100%; overflow-x: hidden; }
+      .card, .kv, .prov .row, .notready, .section { min-width: 0; }
+      .card *, .kv, .notready { overflow-wrap: anywhere; word-break: break-word; }
+      .mono, [id$="Addr"], [id$="Msg"], #swQuoteOut, #swBalances, #connErr {
+        overflow-wrap: anywhere; word-break: break-all;
+      }
+      /* Flex rows: allow children to shrink below their content width. */
+      .card > div, .prov .row > * { min-width: 0; }
+      select, input, button { max-width: 100%; }
+      table, pre { display: block; max-width: 100%; overflow-x: auto; }
+
+      /* ---- Floating scroll controls ---------------------------------------
+       * Always available while scrolling, so the user can jump to either end
+       * from anywhere on a long page.
+       */
+      .scrollDock {
+        position: fixed; right: 16px; bottom: 20px; z-index: 60;
+        display: flex; flex-direction: column; gap: 8px;
+      }
+      .scrollDock button {
+        width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
+        border: 1px solid var(--line); background: var(--panel); color: var(--text);
+        font-size: 16px; line-height: 1; display: grid; place-items: center;
+        box-shadow: 0 6px 20px rgba(0,0,0,.28); transition: transform .15s ease, opacity .2s ease;
+      }
+      .scrollDock button:hover { transform: translateY(-2px); border-color: var(--accent); color: var(--accent); }
+      .scrollDock button[hidden] { display: none; }
+      @media (max-width: 600px) { .scrollDock { right: 10px; bottom: 14px; } }
+
+      /* ---- Profile / App Config menus ------------------------------------- */
+      .menuWrap { position: relative; display: inline-block; }
+      .menuPanel {
+        position: absolute; right: 0; top: calc(100% + 8px); z-index: 70;
+        min-width: 250px; max-width: min(92vw, 340px);
+        border: 1px solid var(--line); border-radius: 14px; background: var(--panel);
+        box-shadow: 0 18px 44px rgba(0,0,0,.34); padding: 8px;
+        opacity: 0; transform: translateY(-6px) scale(.98); pointer-events: none;
+        transition: opacity .18s ease, transform .18s ease;
+      }
+      .menuPanel.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+      .menuItem {
+        display: block; width: 100%; text-align: left; padding: 9px 11px;
+        border: 0; border-radius: 9px; background: transparent; color: var(--text);
+        font: inherit; font-size: 13.5px; cursor: pointer;
+      }
+      .menuItem:hover { background: var(--panel-2); }
+      .menuHead {
+        padding: 8px 11px 6px; font-size: 11px; letter-spacing: .08em;
+        text-transform: uppercase; color: var(--muted);
+      }
+      .menuSep { height: 1px; background: var(--line); margin: 6px 4px; }
+      .cfgRow { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 5px 11px; font-size: 13px; }
+      .cfgRow input, .cfgRow select { width: 108px; padding: 5px 7px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: var(--text); font: inherit; font-size: 13px; }
       body {
         margin: 0;
         font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
@@ -160,6 +219,52 @@
         <span class="pill live"><span class="dot"></span> live</span>
         <button class="btn" id="walletBtn" style="margin-left:10px">Connect Wallet</button>
         <button class="btn" id="adminBtn" style="margin-left:8px">Admin</button>
+
+        <!-- Profile: shown once any identity is signed in (wallet or operator) -->
+        <span class="menuWrap" id="profileWrap" style="margin-left:8px;display:none">
+          <button class="btn" id="profileBtn" title="Your profile" aria-haspopup="true" aria-expanded="false">👤 <span id="profileLabel">Profile</span> ▾</button>
+          <div class="menuPanel" id="profileMenu" role="menu">
+            <div class="menuHead" id="profileWho">Signed in</div>
+            <button class="menuItem" data-prof="edit" role="menuitem">✏️ Edit profile (set name)</button>
+            <button class="menuItem" data-prof="password" role="menuitem" id="profPassword">🔑 Change password</button>
+            <button class="menuItem" data-prof="status" role="menuitem">📊 Account status</button>
+            <button class="menuItem" data-prof="history" role="menuitem">🧾 Transaction history</button>
+            <div class="menuSep"></div>
+            <button class="menuItem" data-prof="signout" role="menuitem" style="color:var(--bad)">↩ Sign out</button>
+          </div>
+        </span>
+
+        <!-- App Config: operator only -->
+        <span class="menuWrap" id="cfgWrap" style="margin-left:8px;display:none">
+          <button class="btn" id="cfgBtn" title="App Config (admin only)" aria-haspopup="true" aria-expanded="false">⚙️ Config ▾</button>
+          <div class="menuPanel" id="cfgMenu" role="menu" style="min-width:300px">
+            <div class="menuHead">App Config — operator only</div>
+            <div class="cfgRow"><span>Vault liquid reserve</span><span><input id="cfgReserve" type="number" min="80" max="100" step="1" />%</span></div>
+            <div class="cfgRow"><span>App share of vault yield</span><span><input id="cfgPerfFee" type="number" min="0" max="30" step="1" />%</span></div>
+            <div class="menuSep"></div>
+            <div class="menuHead">Fee allocation (must total 100%)</div>
+            <div class="cfgRow"><span>→ Agent balance</span><span><input id="cfgFeeAgent" type="number" min="0" max="100" step="1" />%</span></div>
+            <div class="cfgRow"><span>→ App lending position</span><span><input id="cfgFeeLending" type="number" min="0" max="100" step="1" />%</span></div>
+            <div class="cfgRow"><span>→ Vault</span><span><input id="cfgFeeVault" type="number" min="0" max="100" step="1" />%</span></div>
+            <div class="cfgRow"><span>→ Swap pool</span><span><input id="cfgFeeSwap" type="number" min="0" max="100" step="1" />%</span></div>
+            <div class="cfgRow"><span>→ Retained</span><span><input id="cfgFeeRetained" type="number" min="0" max="100" step="1" />%</span></div>
+            <div class="cfgRow"><span>Allocate every</span>
+              <select id="cfgCadence">
+                <option value="second">Second</option><option value="minute">Minute</option>
+                <option value="hour">Hour</option><option value="day">Day</option>
+                <option value="week">Week</option><option value="month">Month</option>
+                <option value="year">Year</option>
+              </select>
+            </div>
+            <div class="menuSep"></div>
+            <div style="padding:4px 11px 8px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>
+            <div style="display:flex;gap:8px;padding:0 11px 8px">
+              <button class="btn" id="cfgSave" style="flex:1">Save config</button>
+              <button class="btn" id="cfgAllocate" title="Distribute collected fees now">Allocate now</button>
+            </div>
+            <div class="kv" id="cfgMsg" style="padding:0 11px 8px;display:none"></div>
+          </div>
+        </span>
         <select class="themesel" id="themeSel" title="Theme" aria-label="Theme">
           <option value="system">◐ System</option>
           <option value="light">☀ Light</option>
@@ -404,6 +509,12 @@
         <span>escrow <span class="mono" id="escrowLink">—</span></span>
         <span id="note"></span>
       </div>
+    </div>
+
+    <!-- Floating scroll controls: always reachable while scrolling -->
+    <div class="scrollDock" id="scrollDock">
+      <button id="toTop" title="Back to top" aria-label="Scroll to top">↑</button>
+      <button id="toBottom" title="Jump to bottom" aria-label="Scroll to bottom">↓</button>
     </div>
 
     <script src="app.js" defer></script>

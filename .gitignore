@@ -17,3 +17,5 @@ deployments/local.json
 deployments/arc.local.json
 .tessera-memory.json
 .tessera-admin.json
+.tessera-config.json
+.tessera-profiles.json
