@@ -57,10 +57,53 @@ function readDeployment() {
   }
   return { url: new URL("../deployments/arc.json", import.meta.url), dep: {} };
 }
-/** Is there contract code at this address? */
-async function isContract(address) {
-  if (!address) return false;
-  try { const c = await pub.getCode({ address }); return !!c && c !== "0x"; } catch { return false; }
+/**
+ * Does this address hold contract code?
+ *
+ * Returns "yes" | "no" | "unknown". The distinction matters: an RPC failure must
+ * NEVER be read as "no contract", because the caller would then deploy a
+ * replacement and orphan a live deployment along with the funds inside it. The
+ * read is retried, and a persistent failure surfaces as "unknown" so the caller
+ * can stop instead of guessing.
+ */
+async function codeStatus(address) {
+  if (!address) return "no";
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const c = await pub.getCode({ address });
+      return c && c !== "0x" ? "yes" : "no";
+    } catch (e) {
+      lastErr = e;
+      await pace(3000);
+    }
+  }
+  console.warn(`   could not read code at ${address}: ${String(lastErr?.shortMessage ?? lastErr?.message).slice(0, 90)}`);
+  return "unknown";
+}
+
+/**
+ * Resolve a recorded contract: reuse it when it's live, deploy when the slot is
+ * genuinely empty, and abort when we simply couldn't tell.
+ */
+async function adopt(label, recorded, fresh, deployFn) {
+  if (!fresh && recorded) {
+    const status = await codeStatus(recorded);
+    if (status === "yes") {
+      console.log(`♻  reusing existing ${label} ${recorded}`);
+      return { address: recorded, reused: true };
+    }
+    if (status === "unknown") {
+      throw new Error(
+        `Could not verify whether ${label} at ${recorded} still exists (the RPC kept failing). ` +
+          `Refusing to deploy a replacement, because that would orphan the existing deployment and any funds in it. ` +
+          `Retry when the network settles, or pass --fresh to deliberately deploy new contracts.`,
+      );
+    }
+    console.log(`   recorded ${label} ${recorded} has no code — deploying a new one`);
+  }
+  const address = await deployFn();
+  return { address, reused: false };
 }
 
 async function main() {
@@ -82,17 +125,15 @@ async function main() {
   //     them stay on-chain but are no longer used by the app).
   const FRESH = process.argv.includes("--fresh");
   const { url: depUrl, dep: existing } = readDeployment();
-  let pool = FRESH ? null : existing.tesseraPool;
-  if (pool && (await isContract(pool))) {
-    console.log(`♻  reusing existing TesseraPool ${pool} (pass --fresh to deploy a new one)`);
-  } else {
-    if (pool) console.log(`   recorded pool ${pool} has no code — deploying a new one`);
+  const poolRes = await adopt("TesseraPool", existing.tesseraPool, FRESH, async () => {
     console.log("→ deploying TesseraPool…");
     const hash = await dWallet.deployContract({ abi: tesseraPoolAbi, bytecode: tesseraPoolBytecode, args: [deployer.address], account: deployer, chain: arcTestnet });
-    pool = (await pub.waitForTransactionReceipt({ hash })).contractAddress;
-    console.log("   pool", pool);
+    const addr = (await pub.waitForTransactionReceipt({ hash })).contractAddress;
+    console.log("   pool", addr);
     await pace();
-  }
+    return addr;
+  });
+  const pool = poolRes.address;
 
   const dSend = async (address, abi, fn, args, account = deployer, wallet = dWallet) => {
     const { request } = await pub.simulateContract({ address, abi, functionName: fn, args, account });
@@ -169,10 +210,7 @@ async function main() {
 
   // 5) TesseraVault over USDC: 80% liquid reserve (contract floor + default).
   //     Reused when already deployed, so depositors keep their shares.
-  let vault = FRESH ? null : existing.tesseraVault;
-  if (vault && (await isContract(vault))) {
-    console.log(`♻  reusing existing TesseraVault ${vault}`);
-  } else {
+  const vaultRes = await adopt("TesseraVault", existing.tesseraVault, FRESH, async () => {
     console.log("→ deploying TesseraVault (USDC, 80% reserve floor, 15% perf fee)…");
     const vh = await dWallet.deployContract({
       abi: tesseraVaultAbi,
@@ -181,16 +219,15 @@ async function main() {
       account: deployer,
       chain: arcTestnet,
     });
-    vault = (await pub.waitForTransactionReceipt({ hash: vh })).contractAddress;
-    console.log("   vault", vault);
+    const addr = (await pub.waitForTransactionReceipt({ hash: vh })).contractAddress;
+    console.log("   vault", addr);
     await pace();
-  }
+    return addr;
+  });
+  const vault = vaultRes.address;
 
   // 6) TesseraSwap: 0.30% fee, half of it to the app treasury. Seed inventory.
-  let swap = FRESH ? null : existing.tesseraSwap;
-  if (swap && (await isContract(swap))) {
-    console.log(`♻  reusing existing TesseraSwap ${swap}`);
-  } else {
+  const swapRes = await adopt("TesseraSwap", existing.tesseraSwap, FRESH, async () => {
     console.log("→ deploying TesseraSwap (0.30% fee, 50% to treasury)…");
     const sh = await dWallet.deployContract({
       abi: tesseraSwapAbi,
@@ -199,10 +236,12 @@ async function main() {
       account: deployer,
       chain: arcTestnet,
     });
-    swap = (await pub.waitForTransactionReceipt({ hash: sh })).contractAddress;
-    console.log("   swap", swap);
+    const addr = (await pub.waitForTransactionReceipt({ hash: sh })).contractAddress;
+    console.log("   swap", addr);
     await pace();
-  }
+    return addr;
+  });
+  const swap = swapRes.address;
   // Seed the swap desk with a slice of each asset the deployer still holds.
   for (const r of LIVE_RESERVES) {
     const held = await bal(deployer.address, r.address);
@@ -217,21 +256,19 @@ async function main() {
 
   // 6b) TesseraFeeCollector: every app fee lands here, then gets allocated
   //     20/20/20/20/20 (agent / lending / vault / swap / retained), weekly.
-  let feeCollectorExisting = FRESH ? null : existing.tesseraFeeCollector;
-  if (feeCollectorExisting && (await isContract(feeCollectorExisting))) {
-    console.log(`♻  reusing existing TesseraFeeCollector ${feeCollectorExisting}`);
-  }
-  console.log(feeCollectorExisting ? "" : "→ deploying TesseraFeeCollector (20/20/20/20/20, weekly)…");
-  const fh = feeCollectorExisting ? null : await dWallet.deployContract({
-    abi: tesseraFeeCollectorAbi,
-    bytecode: tesseraFeeCollectorBytecode,
-    args: [ARC_USDC_ADDRESS, agent.address, pool, vault, swap],
-    account: deployer,
-    chain: arcTestnet,
+  const feeRes = await adopt("TesseraFeeCollector", existing.tesseraFeeCollector, FRESH, async () => {
+    console.log("→ deploying TesseraFeeCollector (20/20/20/20/20, weekly)…");
+    const fh = await dWallet.deployContract({
+      abi: tesseraFeeCollectorAbi,
+      bytecode: tesseraFeeCollectorBytecode,
+      args: [ARC_USDC_ADDRESS, agent.address, pool, vault, swap],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    return (await pub.waitForTransactionReceipt({ hash: fh })).contractAddress;
   });
-  const feeCollector = feeCollectorExisting
-    ?? (await pub.waitForTransactionReceipt({ hash: fh })).contractAddress;
-  if (!feeCollectorExisting) {
+  const feeCollector = feeRes.address;
+  if (!feeRes.reused) {
     console.log("   feeCollector", feeCollector);
     await pace();
     // The collector needs to own the swap desk so its `seed` leg can run, and it
