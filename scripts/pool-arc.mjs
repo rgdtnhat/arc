@@ -83,26 +83,74 @@ async function codeStatus(address) {
 }
 
 /**
- * Resolve a recorded contract: reuse it when it's live, deploy when the slot is
- * genuinely empty, and abort when we simply couldn't tell.
+ * Append-only history of every address this script has ever deployed, keyed by
+ * component. Gitignored, so `git reset --hard` can't erase it.
+ *
+ * The deployment record itself can be lost (overwritten by a checkout, a wiped
+ * volume, a fresh clone). Without a second source we would treat a missing vault
+ * as "never deployed" and create a new one — stranding depositors' shares in the
+ * old contract. History lets us recover the address instead.
  */
-async function adopt(label, recorded, fresh, deployFn) {
-  if (!fresh && recorded) {
-    const status = await codeStatus(recorded);
-    if (status === "yes") {
-      console.log(`♻  reusing existing ${label} ${recorded}`);
-      return { address: recorded, reused: true };
+const HISTORY_URL = new URL("../deployments/arc.history.json", import.meta.url);
+function readHistory() {
+  try { return JSON.parse(readFileSync(HISTORY_URL, "utf8")); } catch { return {}; }
+}
+function recordHistory(label, address) {
+  const h = readHistory();
+  h[label] = [...new Set([...(h[label] ?? []), address])];
+  try { writeFileSync(HISTORY_URL, JSON.stringify(h, null, 2) + "\n"); } catch { /* best effort */ }
+}
+
+/**
+ * Resolve a contract for this run:
+ *   1. the recorded address, when it still holds code;
+ *   2. otherwise the newest address in history that holds code — this is the
+ *      safety net that stops a lost record from stranding user funds;
+ *   3. otherwise deploy, which for a fund-custody component (vault, swap desk,
+ *      fee collector) requires an explicit --fresh or --deploy-missing so it can
+ *      never happen silently.
+ * An unverifiable read aborts rather than guessing.
+ */
+async function adopt(label, recorded, fresh, deployFn, { custodial = false } = {}) {
+  if (!fresh) {
+    const candidates = [recorded, ...readHistory()[label] ?? []].filter(Boolean);
+    const seen = new Set();
+    for (const addr of candidates) {
+      const key = String(addr).toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const status = await codeStatus(addr);
+      if (status === "yes") {
+        const fromHistory = !recorded || String(recorded).toLowerCase() !== key;
+        console.log(
+          fromHistory
+            ? `♻  recovered ${label} ${addr} from deployment history (the record had lost it)`
+            : `♻  reusing existing ${label} ${addr}`,
+        );
+        return { address: addr, reused: true };
+      }
+      if (status === "unknown") {
+        throw new Error(
+          `Could not verify whether ${label} at ${addr} still exists (the RPC kept failing). ` +
+            `Refusing to deploy a replacement, because that would orphan the existing deployment and any funds in it. ` +
+            `Retry when the network settles, or pass --fresh to deliberately deploy new contracts.`,
+        );
+      }
     }
-    if (status === "unknown") {
+    if (candidates.length) console.log(`   no live ${label} among ${candidates.length} known address(es)`);
+    // Nothing known and nothing live: deploying is only safe if the operator
+    // meant to. Fund-custody components demand an explicit opt-in.
+    if (custodial && !process.argv.includes("--deploy-missing")) {
       throw new Error(
-        `Could not verify whether ${label} at ${recorded} still exists (the RPC kept failing). ` +
-          `Refusing to deploy a replacement, because that would orphan the existing deployment and any funds in it. ` +
-          `Retry when the network settles, or pass --fresh to deliberately deploy new contracts.`,
+        `No ${label} is recorded or found in history, so a NEW one would be deployed. ` +
+          `${label} holds funds, so this needs an explicit opt-in: re-run with --deploy-missing ` +
+          `(first deployment) or --fresh (deliberately abandon the old one). If you expected an existing ` +
+          `${label}, restore deployments/arc.json (or arc.local.json) with its address first.`,
       );
     }
-    console.log(`   recorded ${label} ${recorded} has no code — deploying a new one`);
   }
   const address = await deployFn();
+  recordHistory(label, address);
   return { address, reused: false };
 }
 
@@ -223,7 +271,7 @@ async function main() {
     console.log("   vault", addr);
     await pace();
     return addr;
-  });
+  }, { custodial: true });
   const vault = vaultRes.address;
 
   // 6) TesseraSwap: 0.30% fee, half of it to the app treasury. Seed inventory.
@@ -240,7 +288,7 @@ async function main() {
     console.log("   swap", addr);
     await pace();
     return addr;
-  });
+  }, { custodial: true });
   const swap = swapRes.address;
   // Seed the swap desk with a slice of each asset the deployer still holds.
   for (const r of LIVE_RESERVES) {
@@ -266,7 +314,7 @@ async function main() {
       chain: arcTestnet,
     });
     return (await pub.waitForTransactionReceipt({ hash: fh })).contractAddress;
-  });
+  }, { custodial: true });
   const feeCollector = feeRes.address;
   if (!feeRes.reused) {
     console.log("   feeCollector", feeCollector);

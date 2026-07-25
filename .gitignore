@@ -19,3 +19,4 @@ deployments/arc.local.json
 .tessera-admin.json
 .tessera-config.json
 .tessera-profiles.json
+deployments/arc.history.json
