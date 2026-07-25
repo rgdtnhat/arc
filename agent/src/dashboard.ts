@@ -472,16 +472,62 @@ async function main() {
   const fmtUnits = (v: bigint, d: number) => formatUnits(v, d);
   const minB = (a: bigint, b: bigint) => (a < b ? a : b);
 
+  /**
+   * Turn a raw chain/RPC error into something a non-developer can act on.
+   *
+   * Viem surfaces failures as multi-line `ContractFunctionExecutionError` dumps
+   * containing ABI blobs and request bodies — useless in a UI. We match the
+   * known causes (our own contract `require` strings, RPC throttling, gas) and
+   * return one plain sentence that says what to do next.
+   */
+  function friendlyError(err: unknown): string {
+    const raw = String((err as { shortMessage?: string; message?: string })?.shortMessage ?? (err as Error)?.message ?? err);
+    const s = raw.toLowerCase();
+    const table: [RegExp, string][] = [
+      [/request limit|rate limit|too many requests|429|-32005/, "The Arc network is rate-limiting us right now. Wait a few seconds and try again."],
+      [/timeout|timed out|fetch failed|socket|econnreset|network/, "Couldn't reach the Arc network. Check your connection and try again."],
+      [/insufficient inventory/, "The swap desk doesn't hold enough of that asset to fill this trade. Try a smaller amount."],
+      [/slippage/, "The price moved while the order was being sent. Get a fresh quote and try again."],
+      [/pool illiquid/, "The pool doesn't have enough free liquidity for that amount right now. Try withdrawing less."],
+      [/insufficientliquidity/, "The pool is fully lent out at the moment — not enough free liquidity. Try a smaller amount."],
+      [/unhealthy/, "That would push your position below the safe collateral limit. Borrow less or add collateral."],
+      [/min deposit/, "That first deposit is too small. Deposit a slightly larger amount."],
+      [/same token/, "Pick two different assets to swap between."],
+      [/no price/, "That asset has no price configured yet, so it can't be swapped."],
+      [/zero ?amount|zero in|zero out|no shares|\bzero\b/, "Enter an amount greater than zero."],
+      [/not borrowable/, "That asset can't be borrowed from this pool."],
+      [/unknownreserve/, "That asset isn't a reserve in this pool."],
+      [/allowance|transferfrom/, "Token approval failed — the wallet may not hold enough of that token."],
+      [/exceeds balance|insufficient balance|\bbalance\b/, "Not enough balance for that amount."],
+      [/insufficient funds|gas required|out of gas/, "Not enough USDC to cover network fees. Top up the wallet at faucet.circle.com."],
+      [/nonce/, "A previous transaction is still settling. Wait a moment and try again."],
+      [/user rejected|user denied/, "You cancelled the transaction in your wallet."],
+      [/reverted/, "The contract rejected this transaction. Double-check the amount and try again."],
+    ];
+    for (const [re, msg] of table) if (re.test(s)) return msg;
+    // Unknown cause: give a short, single-line hint rather than a stack dump.
+    return "That transaction didn't go through. " + raw.split("\n")[0].slice(0, 120);
+  }
+
   async function readLending() {
     const pool = poolClient!;
-    const acct = await pool.accountData();
-    const hf = acct.healthFactor;
+    // Read the account summary defensively: a throttled RPC must degrade this
+    // panel to "values pending", never make a deployed pool look undeployed.
+    let acct: { supplyValue: bigint; borrowValue: bigint; borrowLimit: bigint; healthFactor: bigint } | null = null;
+    try {
+      acct = await pool.accountData();
+    } catch (e) {
+      console.error(`[lending] accountData unavailable: ${String(e).slice(0, 100)}`);
+    }
+    const hf = acct?.healthFactor ?? 0n;
     // Remaining USD borrow headroom against the account's collateral (1e8 scale).
-    const headroomUsd = acct.borrowLimit > acct.borrowValue ? acct.borrowLimit - acct.borrowValue : 0n;
+    const headroomUsd = acct && acct.borrowLimit > acct.borrowValue ? acct.borrowLimit - acct.borrowValue : 0n;
 
-    // All per-asset reads fire together; multicall batches them into one call.
-    const assets = await Promise.all(
+    // Per-asset reads. Each asset is isolated so one failing reserve can't wipe
+    // out the whole panel — we surface every asset that answered.
+    const settled = await Promise.all(
       poolDeployment.assets.map(async (a) => {
+        try {
         const [cfg, r, supplied, borrowed, wallet] = await Promise.all([
           pool.reserveConfig(a.address),
           pool.reserveData(a.address),
@@ -529,17 +575,29 @@ async function main() {
             repayRaw: repayMax.toString(),
           },
         };
+        } catch (e) {
+          console.error(`[lending] ${a.symbol} read failed: ${String(e).slice(0, 90)}`);
+          return null;
+        }
       }),
     );
+    const assets = settled.filter((a): a is NonNullable<typeof a> => a !== null);
 
     return {
+      // `deployed` is derived from the recorded address, never from whether the
+      // reads succeeded — a throttled RPC must not make a live pool look absent.
+      deployed: true,
       poolAddress: poolDeployment.poolAddress,
-      account: {
-        suppliedUsd: fmtUsd(acct.supplyValue),
-        borrowedUsd: fmtUsd(acct.borrowValue),
-        borrowLimitUsd: fmtUsd(acct.borrowLimit),
-        healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
-      },
+      // True when the chain answered for at least one asset and the account.
+      ready: assets.length > 0 && acct !== null,
+      account: acct
+        ? {
+            suppliedUsd: fmtUsd(acct.supplyValue),
+            borrowedUsd: fmtUsd(acct.borrowValue),
+            borrowLimitUsd: fmtUsd(acct.borrowLimit),
+            healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
+          }
+        : null,
       assets,
     };
   }
@@ -561,10 +619,22 @@ async function main() {
       lendingRefreshing = true;
       readLending()
         .then((d) => { lastLending = d; lendingAt = Date.now(); })
+        // Only mark the refresh done on success, so a failure retries on the
+        // next poll instead of waiting out the whole TTL.
         .catch((e) => console.error(`[lending] refresh failed (keeping last good): ${String(e).slice(0, 120)}`))
         .finally(() => (lendingRefreshing = false));
     }
-    return lastLending;
+    // Before the first successful read, still tell the UI the pool IS deployed
+    // (with values pending) so it never shows a misleading "not deployed".
+    return (
+      lastLending ?? {
+        deployed: true,
+        poolAddress: poolDeployment.poolAddress,
+        ready: false,
+        account: null,
+        assets: [] as NonNullable<typeof lastLending>["assets"],
+      }
+    );
   }
 
   // Agent-driven lending actions from the dashboard.
@@ -588,7 +658,7 @@ async function main() {
       if (chainCache) chainCache.at = 0;
       res.json({ ok: true, txHash });
     } catch (e) {
-      res.status(500).json({ ok: false, error: String(e).slice(0, 200) });
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
 
@@ -597,14 +667,20 @@ async function main() {
   let lastVault: Awaited<ReturnType<typeof readVault>> | null = null;
   async function readVault() {
     if (!vaultClient || !poolClient) return null;
-    const [snap, usdcReserve] = await Promise.all([
+    const [snap, usdcReserve, walletUsdc] = await Promise.all([
       vaultClient.snapshot(),
       poolClient.reserveData(usdcAddress),
+      // What the signed-in operator can actually deposit right now.
+      poolClient.walletBalance(usdcAddress),
     ]);
     return {
+      deployed: true,
+      ready: true,
       address: vaultClient.vault,
       asset: "USDC",
       decimals: 6,
+      walletUsdc: fmtUnits(walletUsdc, 6),
+      walletUsdcRaw: walletUsdc.toString(),
       totalAssets: fmtUnits(snap.totalAssets, 6),
       yourAssets: fmtUnits(snap.userAssets, 6),
       yourAssetsRaw: snap.userAssets.toString(),
@@ -631,7 +707,68 @@ async function main() {
         .catch((e) => console.error(`[vault] refresh failed (keeping last good): ${String(e).slice(0, 120)}`))
         .finally(() => (vaultRefreshing = false));
     }
-    return lastVault;
+    // Same rule as lending: report deployment from the recorded address, so a
+    // slow first read shows "pending", not "not deployed".
+    return (
+      lastVault ?? {
+        deployed: true,
+        ready: false,
+        address: vaultClient.vault,
+        asset: "USDC",
+        decimals: 6,
+      }
+    );
+  }
+
+  // --- Swap snapshot: per-asset price + wallet balance + desk inventory -------
+  // The UI needs these to show a human rate ("1 EURC ≈ 1.08 USDC") and to tell
+  // the user how much they can actually swap. Background-refreshed like the rest.
+  type SwapSnap = {
+    deployed: boolean;
+    ready: boolean;
+    address: Hex;
+    assets: { symbol: string; address: Hex; decimals: number; priceUsd: string; wallet: string; inventory: string }[];
+  };
+  let lastSwap: SwapSnap | null = null;
+  let swapRefreshing = false;
+  let swapAt = 0;
+  async function readSwap(): Promise<SwapSnap> {
+    const assets = await Promise.all(
+      (poolDeployment?.assets ?? []).map(async (a) => {
+        try {
+          const [cfg, wallet, inventory] = await Promise.all([
+            poolClient!.reserveConfig(a.address),
+            poolClient!.walletBalance(a.address),
+            swapClient!.inventory(a.address),
+          ]);
+          return {
+            symbol: a.symbol,
+            address: a.address,
+            decimals: cfg.decimals,
+            priceUsd: (Number(cfg.priceE8) / 1e8).toString(),
+            wallet: fmtUnits(wallet, cfg.decimals),
+            inventory: fmtUnits(inventory, cfg.decimals),
+          };
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const ok = assets.filter((a): a is NonNullable<typeof a> => a !== null);
+    return { deployed: true, ready: ok.length > 0, address: swapClient!.swap, assets: ok };
+  }
+  function swapSnapshot(): SwapSnap | null {
+    if (!swapClient || !poolClient) return null;
+    if (!swapRefreshing && Date.now() - swapAt > READ_TTL) {
+      swapRefreshing = true;
+      readSwap()
+        .then((d) => { lastSwap = d; swapAt = Date.now(); })
+        .catch((e) => console.error(`[swap] refresh failed: ${String(e).slice(0, 120)}`))
+        .finally(() => (swapRefreshing = false));
+    }
+    return (
+      lastSwap ?? { deployed: true, ready: false, address: swapClient.swap, assets: [] }
+    );
   }
 
   app.post("/api/vault/:action", requireOperator, async (req, res) => {
@@ -648,7 +785,7 @@ async function main() {
       if (chainCache) chainCache.at = 0;
       res.json({ ok: true, txHash });
     } catch (e) {
-      res.status(500).json({ ok: false, error: String(e).slice(0, 200) });
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
 
@@ -663,7 +800,7 @@ async function main() {
       const [out, fee, appFee] = await swapClient.quote(tokenIn, tokenOut, amountIn);
       res.json({ ok: true, out: out.toString(), fee: fee.toString(), appFee: appFee.toString() });
     } catch (e) {
-      res.status(400).json({ ok: false, error: String(e).slice(0, 160) });
+      res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
 
@@ -678,7 +815,7 @@ async function main() {
       if (chainCache) chainCache.at = 0;
       res.json({ ok: true, txHash });
     } catch (e) {
-      res.status(500).json({ ok: false, error: String(e).slice(0, 200) });
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
 
@@ -747,9 +884,7 @@ async function main() {
       live: liveDeployment,
       lending: lendingSnapshot(),
       vault: vaultSnapshot(),
-      swap: swapClient
-        ? { address: swapClient.swap, assets: poolDeployment?.assets ?? [{ symbol: "USDC", address: usdcAddress }] }
-        : null,
+      swap: swapSnapshot(),
       balanceHistory,
       // Local call, but bounded anyway: `.catch()` handles errors, not hangs, and
       // an unbounded await here would stall the whole state response.

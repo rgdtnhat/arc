@@ -44,7 +44,7 @@ the public `/api/swap/quote`.
 | Reentrancy | `nonReentrant` on every entry point; shares burned **before** external transfers |
 | First-deposit share inflation | Blocked — `MINIMUM_LIQUIDITY` (1000) dead shares burned on first deposit (Uniswap-style) |
 | Fee on principal | Impossible — the performance fee is charged only on `totalAssets` **growth** since the last checkpoint |
-| Unbounded admin fees | Hard caps in code: performance fee ≤ 30%, swap fee ≤ 5%, app fee share ≤ 100% of the fee, reserve ratio ≥ 10% |
+| Unbounded admin fees | Hard caps in code: performance fee ≤ 30%, swap fee ≤ 5%, app fee share ≤ 100% of the fee, reserve ratio ≥ 50% |
 | Swap paying out more than it holds | Blocked — solvency check requires `balance ≥ amountOut + appFee` before any transfer |
 | Slippage | `minOut` enforced on every swap |
 | Rebalance bricking withdrawals | `_rebalance()` is wrapped in `try/catch`, so a pool hiccup can't block a deposit/withdraw |
@@ -53,7 +53,7 @@ the public `/api/swap/quote`.
 
 The vault is deliberately conservative:
 
-- **Liquid reserve buffer.** `reserveRatioBps` (floor 10%, default **20%**) is
+- **Liquid reserve buffer.** `reserveRatioBps` (floor **50%**, default **50%**) is
   always held as idle tokens in the vault, so routine withdrawals never touch the
   pool. Only the excess earns APR.
 - **Yield split.** Depositors keep **≥ 70%** of all yield by construction
@@ -68,9 +68,10 @@ The vault is deliberately conservative:
 
 1. **Pool utilisation risk.** If pool borrowers draw down *all* free cash, the
    portion of vault funds deployed to the pool is temporarily unwithdrawable
-   until borrowers repay or interest lures new supply. The buffer mitigates this
-   for normal-size withdrawals; it cannot cover a simultaneous full exit. Funds
-   are not lost — they're illiquid.
+   until borrowers repay or interest lures new supply. At the 50% floor at least
+   half of TVL is always redeemable instantly, so this can only bite a
+   larger-than-half withdrawal during full utilisation. Funds are not lost —
+   they're illiquid.
 2. **Admin-set prices.** Both the pool and the swap desk price from
    `TesseraPool`'s owner-set oracle. A stale price lets an arbitrageur drain the
    underpriced side of the **swap inventory**. Wire a live oracle before mainnet.

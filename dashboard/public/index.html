@@ -296,6 +296,7 @@
         <div style="display:flex;gap:22px;flex-wrap:wrap;margin-bottom:14px">
           <div><div style="font-size:11px;color:var(--muted)">Vault TVL</div><div id="vTvl" style="font-size:16px;font-weight:700">—</div></div>
           <div><div style="font-size:11px;color:var(--muted)">Your balance</div><div id="vYours" style="font-size:16px;font-weight:700">—</div></div>
+          <div><div style="font-size:11px;color:var(--muted)">Wallet available</div><div id="vWallet" style="font-size:16px;font-weight:700">—</div></div>
           <div><div style="font-size:11px;color:var(--muted)">APR</div><div id="vApr" style="font-size:16px;font-weight:700;color:var(--good)">—</div></div>
           <div><div style="font-size:11px;color:var(--muted)">Liquid buffer</div><div id="vBuffer" style="font-size:16px;font-weight:700">—</div></div>
         </div>
@@ -332,7 +333,8 @@
           <button class="btn" id="swQuote" style="padding:8px 12px">Quote</button>
           <button class="btn" id="swExecute" style="padding:8px 14px;font-weight:700">Swap</button>
         </div>
-        <div id="swQuoteOut" style="font-size:12.5px;color:var(--muted);margin-top:10px"></div>
+        <div id="swBalances" style="font-size:12.5px;color:var(--muted);margin-top:10px;line-height:1.6"></div>
+        <div id="swQuoteOut" style="font-size:12.5px;color:var(--text);margin-top:8px;font-weight:600"></div>
         <div class="kv" id="swapMsg" style="margin-top:8px;display:none"></div>
       </div>
 

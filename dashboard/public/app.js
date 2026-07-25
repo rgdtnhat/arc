@@ -33,9 +33,22 @@ const $ = (id) => document.getElementById(id);
        * When the underlying contract isn't deployed yet we surface the panel's
        * "not ready" notice and disable its inputs instead of hiding the card.
        */
-      function setPanelReady(name, ready, controlIds) {
+      function setPanelReady(name, ready, controlIds, deployed) {
         const notice = $(name + "NotReady");
-        if (notice) notice.style.display = ready ? "none" : "block";
+        if (notice) {
+          // Remember the authored "not deployed" copy so we can restore it.
+          if (!notice.dataset.orig) notice.dataset.orig = notice.textContent.trim();
+          notice.style.display = ready ? "none" : "block";
+          // Deployed but values haven't arrived yet: say *that*, instead of
+          // wrongly claiming the contract isn't deployed.
+          if (!ready && deployed) {
+            notice.textContent =
+              "Contract is live on Arc — reading current values from the network… " +
+              "(the public RPC is rate-limited, so this can take a few seconds).";
+          } else if (!ready && notice.dataset.orig) {
+            notice.textContent = notice.dataset.orig;
+          }
+        }
         for (const id of controlIds) {
           const el = $(id);
           if (!el) continue;
@@ -267,8 +280,10 @@ const $ = (id) => document.getElementById(id);
         // visible; when the pool isn't deployed we show the not-ready notice and
         // disable the controls rather than hiding the whole feature.
         const ln = s.lending;
-        const lnReady = !!(ln && ln.assets && ln.assets.length);
-        setPanelReady("lending", lnReady, ["lnAsset", "lnAction", "lnAmount", "lnMax", "lnExecute"]);
+        const lnReady = !!(ln && ln.ready && ln.assets && ln.assets.length);
+        // Three states, not two: absent (never deployed), deployed-but-pending
+        // (chain read hasn't landed), and ready.
+        setPanelReady("lending", lnReady, ["lnAsset", "lnAction", "lnAmount", "lnMax", "lnExecute"], ln && ln.deployed);
         if (lnReady) {
           $("lnSupplied").textContent = "$" + ln.account.suppliedUsd;
           $("lnBorrowed").textContent = "$" + ln.account.borrowedUsd;
@@ -290,10 +305,12 @@ const $ = (id) => document.getElementById(id);
 
         // Vault (auto-yield on USDC) — always visible.
         const vt = s.vault;
-        setPanelReady("vault", !!vt, ["vAction", "vAmount", "vMax", "vExecute"]);
-        if (vt) {
+        const vtReady = !!(vt && vt.ready);
+        setPanelReady("vault", vtReady, ["vAction", "vAmount", "vMax", "vExecute"], vt && vt.deployed);
+        if (vtReady) {
           window.__vault = vt;
-          window.__agentUsdc = s.agent ? s.agent.balanceUsdc : "0";
+          window.__agentUsdc = vt.walletUsdc || (s.agent ? s.agent.balanceUsdc : "0");
+          $("vWallet").textContent = (vt.walletUsdc || "0") + " USDC";
           $("vReserve").textContent = vt.reserveRatioPct;
           $("vFee").textContent = vt.performanceFeePct;
           $("vTvl").textContent = vt.totalAssets + " USDC";
@@ -304,10 +321,11 @@ const $ = (id) => document.getElementById(id);
 
         // Swap desk — always visible.
         const sw = s.swap;
-        const swReady = !!(sw && sw.assets && sw.assets.length);
-        setPanelReady("swap", swReady, ["swAmount", "swIn", "swOut", "swQuote", "swExecute"]);
+        const swReady = !!(sw && sw.ready && sw.assets && sw.assets.length);
+        setPanelReady("swap", swReady, ["swAmount", "swIn", "swOut", "swQuote", "swExecute"], sw && sw.deployed);
         if (swReady) {
           window.__swap = sw;
+          renderSwapBalances();
           const syms = sw.assets.map((a) => a.symbol).join(",");
           if ($("swIn").dataset.symbols !== syms) {
             const opts = sw.assets.map((a) => `<option value="${a.address}" data-sym="${a.symbol}" data-dec="${a.decimals || 6}">${a.symbol}</option>`).join("");
@@ -641,6 +659,31 @@ const $ = (id) => document.getElementById(id);
           decIn: +(inOpt.dataset.dec || 6), decOut: +(outOpt.dataset.dec || 6),
         };
       }
+      const swAsset = (addr) => (window.__swap ? window.__swap.assets.find((a) => a.address === addr) : null);
+      /**
+       * Show the exchange rate in both directions plus the balances that decide
+       * how much can actually be traded: the user's holding of the input asset
+       * and the desk's inventory of the output asset.
+       */
+      window.renderSwapBalances = function renderSwapBalances() {
+        const s = swapSelected();
+        if (!s) return;
+        const ai = swAsset(s.tokenIn), ao = swAsset(s.tokenOut);
+        const el = $("swBalances");
+        if (!el || !ai || !ao) return;
+        if (s.tokenIn === s.tokenOut) { el.textContent = "Pick two different assets."; return; }
+        const pi = parseFloat(ai.priceUsd), po = parseFloat(ao.priceUsd);
+        let rate = "";
+        if (pi > 0 && po > 0) {
+          const outPerIn = pi / po, inPerOut = po / pi;
+          const f = (n) => (n >= 1000 ? n.toFixed(2) : n >= 1 ? n.toFixed(4) : n.toPrecision(4));
+          rate = `1 ${ai.symbol} ≈ ${f(outPerIn)} ${ao.symbol}  ·  1 ${ao.symbol} ≈ ${f(inPerOut)} ${ai.symbol}`;
+        }
+        el.innerHTML =
+          `<div>${esc(rate)}</div>` +
+          `<div style="margin-top:4px">Your ${esc(ai.symbol)}: <b>${esc(ai.wallet)}</b>` +
+          ` · desk has <b>${esc(ao.inventory)}</b> ${esc(ao.symbol)} to give</div>`;
+      };
       async function swapQuote() {
         const s = swapSelected(); if (!s) return null;
         const human = $("swAmount").value.trim();
@@ -649,8 +692,15 @@ const $ = (id) => document.getElementById(id);
         const amountIn = toRaw(human, s.decIn);
         const r = await (await fetch(`/api/swap/quote?tokenIn=${s.tokenIn}&tokenOut=${s.tokenOut}&amountIn=${amountIn}`)).json();
         if (!r.ok) { $("swQuoteOut").textContent = "Quote failed: " + r.error; return null; }
-        const out = fmtUnitsJs(r.out, s.decOut), fee = fmtUnitsJs(r.appFee, s.decOut);
-        $("swQuoteOut").textContent = `≈ ${out} ${s.symOut}  ·  app fee ${fee} ${s.symOut}`;
+        const out = fmtUnitsJs(r.out, s.decOut);
+        const fee = fmtUnitsJs(r.fee, s.decOut);
+        const appFee = fmtUnitsJs(r.appFee, s.decOut);
+        const eff = Number(out) > 0 && Number(human) > 0 ? (Number(out) / Number(human)) : 0;
+        $("swQuoteOut").innerHTML =
+          `You pay <b>${esc(human)} ${esc(s.symIn)}</b> → you receive <b>${esc(out)} ${esc(s.symOut)}</b><br>` +
+          `<span style="font-weight:400;color:var(--muted)">effective rate 1 ${esc(s.symIn)} = ` +
+          `${eff ? eff.toPrecision(6) : "—"} ${esc(s.symOut)} · total fee ${esc(fee)} ${esc(s.symOut)} ` +
+          `(app keeps ${esc(appFee)}) · 1% max slippage</span>`;
         return { ...s, amountIn, out: r.out };
       }
       function fmtUnitsJs(raw, dec) {
@@ -658,6 +708,9 @@ const $ = (id) => document.getElementById(id);
         const i = s.slice(0, s.length - dec), f = s.slice(s.length - dec).replace(/0+$/, "");
         return f ? `${i}.${f}` : i;
       }
+      // Refresh the rate/balance line whenever either side changes.
+      $("swIn").addEventListener("change", () => { renderSwapBalances(); $("swQuoteOut").textContent = ""; });
+      $("swOut").addEventListener("change", () => { renderSwapBalances(); $("swQuoteOut").textContent = ""; });
       $("swQuote").addEventListener("click", swapQuote);
       $("swExecute").addEventListener("click", async () => {
         const q = await swapQuote();

@@ -6,8 +6,8 @@ const PRICE = 10n ** 8n; // $1.00
 const BTC_PRICE = 30_000n * 10n ** 8n;
 const USDC = (n: string) => BigInt(Math.round(parseFloat(n) * 1e6));
 
-// reserveRatio 20% liquid buffer, 15% performance fee on yield.
-const RESERVE_RATIO = 2000;
+// reserveRatio 50% liquid buffer (contract floor), 15% performance fee on yield.
+const RESERVE_RATIO = 5000;
 const PERF_FEE = 1500;
 
 async function deployFixture() {
@@ -45,10 +45,10 @@ describe("TesseraVault (yield vault over the pool)", () => {
     await mint(alice, USDC("100"));
     await (await asVault(alice)).write.deposit([USDC("100")]);
 
-    // 20% (~20 USDC) stays liquid in the vault; ~80 goes to the pool.
+    // 50% (~50 USDC) stays liquid in the vault; ~50 goes to the pool.
     const buffer = await vault.read.currentBufferBps();
-    expect(Number(buffer)).to.be.greaterThan(1900);
-    expect(Number(buffer)).to.be.lessThan(2100);
+    expect(Number(buffer)).to.be.greaterThan(4900);
+    expect(Number(buffer)).to.be.lessThan(5100);
     expect(await vault.read.totalAssets()).to.equal(USDC("100"));
   });
 
@@ -70,7 +70,7 @@ describe("TesseraVault (yield vault over the pool)", () => {
     const { deployer, alice, borrower, usdc, cbtc, pool, vault, mint, asVault, asPool } =
       await loadFixture(deployFixture);
 
-    // Alice deposits 1,000 USDC → ~800 supplied to the pool.
+    // Alice deposits 1,000 USDC → ~500 supplied to the pool.
     await mint(alice, USDC("1000"));
     await (await asVault(alice)).write.deposit([USDC("1000")]);
 
@@ -103,11 +103,11 @@ describe("TesseraVault (yield vault over the pool)", () => {
     const { deployer, usdc, pool } = await loadFixture(deployFixture);
     // performance fee > 30% → revert
     await expect(
-      hre.viem.deployContract("TesseraVault", [usdc.address, pool.address, deployer.account.address, 2000, 3001])
+      hre.viem.deployContract("TesseraVault", [usdc.address, pool.address, deployer.account.address, 5000, 3001])
     ).to.be.rejected;
-    // reserve ratio < 10% → revert
+    // reserve ratio < 50% → revert
     await expect(
-      hre.viem.deployContract("TesseraVault", [usdc.address, pool.address, deployer.account.address, 999, 1500])
+      hre.viem.deployContract("TesseraVault", [usdc.address, pool.address, deployer.account.address, 4999, 1500])
     ).to.be.rejected;
   });
 

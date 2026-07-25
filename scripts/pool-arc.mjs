@@ -107,12 +107,12 @@ async function main() {
     console.log("   (skip agent position — no cirBTC to use as collateral; supply from the dashboard once funded)");
   }
 
-  // 5) TesseraVault over USDC: 20% liquid reserve buffer, 15% performance fee.
-  console.log("→ deploying TesseraVault (USDC, 20% reserve, 15% perf fee)…");
+  // 5) TesseraVault over USDC: 50% liquid reserve buffer, 15% performance fee.
+  console.log("→ deploying TesseraVault (USDC, 50% reserve, 15% perf fee)…");
   let vh = await dWallet.deployContract({
     abi: tesseraVaultAbi,
     bytecode: tesseraVaultBytecode,
-    args: [ARC_USDC_ADDRESS, pool, deployer.address, 2000, 1500],
+    args: [ARC_USDC_ADDRESS, pool, deployer.address, 5000, 1500],
     account: deployer,
     chain: arcTestnet,
   });

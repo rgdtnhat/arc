@@ -40,9 +40,11 @@ interface IVaultPool {
  *         takes a **capped performance fee** on the yield (never the principal).
  *
  * Safety model (why this is conservative):
- *  - `reserveRatioBps` (≥ 10%) is always held liquid in the vault, so routine
- *    withdrawals never touch the pool. Larger withdrawals unwind pool supply,
- *    bounded by the pool's available cash (`maxWithdraw` tells you the limit).
+ *  - `reserveRatioBps` (≥ 50%) is always held liquid in the vault, so routine
+ *    withdrawals never touch the pool. At the 50% floor at least half of TVL can
+ *    always be redeemed instantly regardless of pool utilisation. Larger
+ *    withdrawals unwind pool supply, bounded by the pool's available cash
+ *    (`maxWithdraw` tells you the exact limit).
  *  - The performance fee is capped at `MAX_PERFORMANCE_FEE` (30%), so users keep
  *    **≥ 70% of all yield**, and the fee is charged only on positive yield —
  *    never on deposits or principal.
@@ -59,7 +61,7 @@ interface IVaultPool {
 contract TesseraVault {
     uint16 internal constant BPS = 10_000;
     uint16 public constant MAX_PERFORMANCE_FEE = 3_000; // 30% of yield, hard cap
-    uint16 public constant MIN_RESERVE_RATIO = 1_000; // 10% always liquid
+    uint16 public constant MIN_RESERVE_RATIO = 5_000; // 50% always liquid (floor)
     uint256 public constant MINIMUM_LIQUIDITY = 1_000; // dead shares (anti-inflation)
 
     IERC20V public immutable asset;
