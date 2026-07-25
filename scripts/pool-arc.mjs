@@ -74,14 +74,37 @@ async function main() {
   };
   const aSend = async (address, abi, fn, args) => dSend(address, abi, fn, args, agent, aWallet);
 
-  // 2) Register each reserve (all borrowable).
+  // 2) Register each reserve (all borrowable), then VERIFY it landed.
+  //     A throttled RPC can drop one of these mid-deploy; recording an asset
+  //     that isn't actually registered leaves the app listing a reserve whose
+  //     reads all revert, so retry once and only keep verified reserves.
+  const isRegistered = async (asset) => {
+    try {
+      const r = await pub.readContract({ address: pool, abi: tesseraPoolAbi, functionName: "reserves", args: [asset] });
+      return r[0] === true; // enabled
+    } catch {
+      return false;
+    }
+  };
   for (const r of RESERVES) {
-    console.log(`→ addReserve ${r.symbol} (${r.decimals}d, borrowable)…`);
-    await dSend(pool, tesseraPoolAbi, "addReserve", [r.address, r.cFactor, r.lFactor, r.rf, true, r.decimals, r.price]);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      console.log(`→ addReserve ${r.symbol} (${r.decimals}d, borrowable)${attempt > 1 ? " — retry" : ""}…`);
+      try {
+        await dSend(pool, tesseraPoolAbi, "addReserve", [r.address, r.cFactor, r.lFactor, r.rf, true, r.decimals, r.price]);
+      } catch (e) {
+        console.warn(`   addReserve ${r.symbol} failed: ${String(e.shortMessage ?? e.message).slice(0, 90)}`);
+      }
+      r.registered = await isRegistered(r.address);
+      if (r.registered) break;
+      await pace();
+    }
+    console.log(`   ${r.symbol}: ${r.registered ? "registered ✓" : "NOT registered ✗ (will be omitted)"}`);
   }
+  const LIVE_RESERVES = RESERVES.filter((r) => r.registered);
+  if (!LIVE_RESERVES.length) throw new Error("No reserves registered — aborting before writing a deployment.");
 
   // 3) Seed liquidity from the deployer's real balances (skip what it can't fund).
-  for (const r of RESERVES) {
+  for (const r of LIVE_RESERVES) {
     const held = await bal(deployer.address, r.address);
     const seed = r.seed < held ? r.seed : held;
     if (seed > 0n) {
@@ -135,7 +158,7 @@ async function main() {
   console.log("   swap", swap);
   await pace();
   // Seed the swap desk with a slice of each asset the deployer still holds.
-  for (const r of RESERVES) {
+  for (const r of LIVE_RESERVES) {
     const held = await bal(deployer.address, r.address);
     const want = r.symbol === "cirBTC" ? 10_000n : 2_000_000n; // 0.0001 cirBTC or 2 units
     const seed = want < held ? want : held;
@@ -173,7 +196,7 @@ async function main() {
   dep.vaultAsset = ARC_USDC_ADDRESS;
   dep.tesseraSwap = swap;
   dep.tesseraFeeCollector = feeCollector;
-  dep.poolAssets = RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
+  dep.poolAssets = LIVE_RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
   const body = JSON.stringify(dep, null, 2) + "\n";
   writeFileSync(p, body);
@@ -185,7 +208,7 @@ async function main() {
   console.log("   vault    ", vault);
   console.log("   swap     ", swap);
   console.log("   fees     ", feeCollector);
-  for (const r of RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
+  for (const r of LIVE_RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
   console.log("   explorer ", `https://testnet.arcscan.app/address/${pool}`);
 }
 

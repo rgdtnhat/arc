@@ -552,6 +552,12 @@ async function main() {
     return "That transaction didn't go through. " + raw.split("\n")[0].slice(0, 120);
   }
 
+  /**
+   * Last good snapshot per asset, so a throttled read for one reserve doesn't
+   * make that asset vanish from the picker. Keyed by lowercased address.
+   */
+  const assetCache = new Map<string, NonNullable<Awaited<ReturnType<typeof readLending>>>["assets"][number]>();
+
   async function readLending() {
     const pool = poolClient!;
     // Read the account summary defensively: a throttled RPC must degrade this
@@ -567,12 +573,34 @@ async function main() {
     const headroomUsd = acct && acct.borrowLimit > acct.borrowValue ? acct.borrowLimit - acct.borrowValue : 0n;
 
     // Per-asset reads. Each asset is isolated so one failing reserve can't wipe
-    // out the whole panel — we surface every asset that answered.
+    // out the whole panel; a failure reuses that asset's previous values so the
+    // asset never disappears from the picker mid-session.
     const settled = await Promise.all(
       poolDeployment.assets.map(async (a) => {
         try {
-        const [cfg, r, supplied, borrowed, wallet] = await Promise.all([
-          pool.reserveConfig(a.address),
+        // Check registration first: an unregistered reserve makes the other
+        // reads revert, which previously looked like a read failure and made the
+        // asset silently disappear from the picker.
+        const cfg = await pool.reserveConfig(a.address);
+        if (!cfg.enabled) {
+          const dec0 = cfg.decimals || 6;
+          const zero = fmtUnits(0n, dec0);
+          return {
+            symbol: a.symbol,
+            address: a.address,
+            decimals: dec0,
+            enabled: false,
+            borrowable: false,
+            priceUsd: "0.00",
+            reserve: { cash: zero, borrows: zero, utilizationPct: "0.0", borrowApr: "0.00", supplyApr: "0.00" },
+            position: { supplied: zero, borrowed: zero, wallet: zero },
+            max: {
+              supply: zero, withdraw: zero, borrow: zero, repay: zero,
+              supplyRaw: "0", withdrawRaw: "0", borrowRaw: "0", repayRaw: "0",
+            },
+          };
+        }
+        const [r, supplied, borrowed, wallet] = await Promise.all([
           pool.reserveData(a.address),
           pool.supplyBalance(a.address),
           pool.borrowBalance(a.address),
@@ -592,6 +620,7 @@ async function main() {
           symbol: a.symbol,
           address: a.address,
           decimals: dec,
+          enabled: true,
           borrowable: cfg.borrowable,
           priceUsd: (Number(cfg.priceE8) / 1e8).toFixed(2),
           reserve: {
@@ -620,27 +649,33 @@ async function main() {
         };
         } catch (e) {
           console.error(`[lending] ${a.symbol} read failed: ${String(e).slice(0, 90)}`);
-          return null;
+          // Reuse the last good values for this asset rather than dropping it.
+          return assetCache.get(a.address.toLowerCase()) ?? null;
         }
       }),
     );
     const assets = settled.filter((a): a is NonNullable<typeof a> => a !== null);
+    for (const a of assets) assetCache.set(a.address.toLowerCase(), a);
+
+    // `ready` is sticky: once the chain has answered we keep rendering values
+    // (possibly a few seconds stale) instead of flipping back to a "loading"
+    // notice on every throttled poll, which made the banner appear constantly.
+    const account = acct
+      ? {
+          suppliedUsd: fmtUsd(acct.supplyValue),
+          borrowedUsd: fmtUsd(acct.borrowValue),
+          borrowLimitUsd: fmtUsd(acct.borrowLimit),
+          healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
+        }
+      : lastLending?.account ?? null;
 
     return {
       // `deployed` is derived from the recorded address, never from whether the
       // reads succeeded — a throttled RPC must not make a live pool look absent.
       deployed: true,
       poolAddress: poolDeployment.poolAddress,
-      // True when the chain answered for at least one asset and the account.
-      ready: assets.length > 0 && acct !== null,
-      account: acct
-        ? {
-            suppliedUsd: fmtUsd(acct.supplyValue),
-            borrowedUsd: fmtUsd(acct.borrowValue),
-            borrowLimitUsd: fmtUsd(acct.borrowLimit),
-            healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
-          }
-        : null,
+      ready: assets.length > 0 && account !== null,
+      account,
       assets,
     };
   }
@@ -775,30 +810,38 @@ async function main() {
   let lastSwap: SwapSnap | null = null;
   let swapRefreshing = false;
   let swapAt = 0;
+  /**
+   * Swap snapshot. Price, decimals and wallet balance are reused from the
+   * lending snapshot (the same reserve data) so this only reads the one thing it
+   * uniquely needs — the desk's inventory. Re-reading everything here doubled
+   * the RPC load and was a big part of why reads were being throttled.
+   */
   async function readSwap(): Promise<SwapSnap> {
+    const prevBySymbol = new Map((lastSwap?.assets ?? []).map((a) => [a.address.toLowerCase(), a]));
     const assets = await Promise.all(
       (poolDeployment?.assets ?? []).map(async (a) => {
+        const key = a.address.toLowerCase();
+        const cached = assetCache.get(key);
         try {
-          const [cfg, wallet, inventory] = await Promise.all([
-            poolClient!.reserveConfig(a.address),
-            poolClient!.walletBalance(a.address),
-            swapClient!.inventory(a.address),
-          ]);
+          const inventory = await swapClient!.inventory(a.address);
+          const decimals = cached?.decimals ?? prevBySymbol.get(key)?.decimals ?? 6;
           return {
             symbol: a.symbol,
             address: a.address,
-            decimals: cfg.decimals,
-            priceUsd: (Number(cfg.priceE8) / 1e8).toString(),
-            wallet: fmtUnits(wallet, cfg.decimals),
-            inventory: fmtUnits(inventory, cfg.decimals),
+            decimals,
+            priceUsd: cached?.priceUsd ?? prevBySymbol.get(key)?.priceUsd ?? "0",
+            wallet: cached?.position.wallet ?? prevBySymbol.get(key)?.wallet ?? "0",
+            inventory: fmtUnits(inventory, decimals),
           };
         } catch {
-          return null;
+          // Keep the asset listed with its previous inventory.
+          return prevBySymbol.get(key) ?? null;
         }
       }),
     );
     const ok = assets.filter((a): a is NonNullable<typeof a> => a !== null);
-    return { deployed: true, ready: ok.length > 0, address: swapClient!.swap, assets: ok };
+    // Sticky, like lending: don't flip back to "loading" on a throttled poll.
+    return { deployed: true, ready: ok.length > 0 || !!lastSwap?.ready, address: swapClient!.swap, assets: ok };
   }
   function swapSnapshot(): SwapSnap | null {
     if (!swapClient || !poolClient) return null;

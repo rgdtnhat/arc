@@ -683,6 +683,12 @@ const $ = (id) => document.getElementById(id);
         setUnlessMine("lnWallet", a.position.wallet + " " + a.symbol);
         const action = $("lnAction").value;
         const max = a.max[action];
+        // An asset listed in the deployment but never registered on-chain can't
+        // be used — say so plainly instead of showing zeros with no explanation.
+        if (a.enabled === false) {
+          $("lnMaxHint").textContent = a.symbol + " isn't registered as a reserve in this pool — redeploy with pool:arc to add it.";
+          return;
+        }
         $("lnMaxHint").textContent = "max " + action + ": " + max + " " + a.symbol +
           (action === "borrow" && !a.borrowable ? " (not borrowable)" : "");
       };
@@ -836,7 +842,13 @@ const $ = (id) => document.getElementById(id);
         const ai = swAsset(s.tokenIn), ao = swAsset(s.tokenOut);
         const el = $("swBalances");
         if (!el || !ai || !ao) return;
-        if (s.tokenIn === s.tokenOut) { el.textContent = "Pick two different assets."; return; }
+        if (s.tokenIn === s.tokenOut) {
+          const n = (window.__swap && window.__swap.assets.length) || 0;
+          el.textContent = n < 2
+            ? "Only one asset is available in this pool, so there's nothing to swap against yet."
+            : "Pick two different assets.";
+          return;
+        }
         const pi = parseFloat(ai.priceUsd), po = parseFloat(ao.priceUsd);
         let rate = "";
         if (pi > 0 && po > 0) {
@@ -857,7 +869,8 @@ const $ = (id) => document.getElementById(id);
         const s = swapSelected(); if (!s) return null;
         const human = $("swAmount").value.trim();
         if (!human || Number(human) <= 0) return null;
-        if (s.tokenIn === s.tokenOut) { $("swQuoteOut").textContent = "Pick two different assets."; return null; }
+        // The same-asset hint already appears under the pickers; don't repeat it.
+        if (s.tokenIn === s.tokenOut) { $("swQuoteOut").textContent = ""; return null; }
         const amountIn = toRaw(human, s.decIn);
         const r = await (await fetch(`/api/swap/quote?tokenIn=${s.tokenIn}&tokenOut=${s.tokenOut}&amountIn=${amountIn}`)).json();
         if (!r.ok) { $("swQuoteOut").textContent = "Quote failed: " + r.error; return null; }
@@ -1088,10 +1101,29 @@ const $ = (id) => document.getElementById(id);
       }
 
       // Toggle: "My wallet" (self-custody) vs "Agent wallet" (operator).
+      // Self-custody needs an injected wallet. On a browser without one (common
+      // on mobile) leaving it on would make every action fail with "no wallet
+      // detected", so we turn it off, lock it, and explain — actions then route
+      // through the operator path, which is what a signed-in admin expects.
+      const hasInjectedWallet = () => !!window.ethereum;
       const selfMode = () => {
         const t = $("selfCustodyToggle");
-        return !!(t && t.checked);
+        return !!(t && t.checked && hasInjectedWallet());
       };
+      (function reflectWalletAvailability() {
+        const t = $("selfCustodyToggle");
+        if (!t || hasInjectedWallet()) return;
+        t.checked = false;
+        t.disabled = true;
+        t.title = "No browser wallet detected";
+        const note = $("custodyNote");
+        if (note) {
+          note.textContent =
+            "No browser wallet detected, so self-custody is unavailable here. Actions use the app's " +
+            "agent wallet and need an operator (Admin) sign-in. Open this page in a wallet browser, " +
+            "or install a wallet extension, to transact with your own funds.";
+        }
+      })();
       if ($("selfCustodyToggle")) {
         $("selfCustodyToggle").addEventListener("change", () => {
           const on = selfMode();

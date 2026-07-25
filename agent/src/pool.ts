@@ -151,15 +151,21 @@ export class TesseraPoolClient {
     }) as Promise<bigint>;
   }
 
-  /** Reserve config: decimals, USD price (1e8), and whether it can be borrowed. */
-  async reserveConfig(asset: Hex): Promise<{ decimals: number; priceE8: bigint; borrowable: boolean }> {
+  /**
+   * Reserve config. `enabled` is false when the asset was never registered with
+   * `addReserve` — worth surfacing, because an unregistered reserve otherwise
+   * looks identical to a read failure.
+   */
+  async reserveConfig(
+    asset: Hex,
+  ): Promise<{ enabled: boolean; decimals: number; priceE8: bigint; borrowable: boolean }> {
     const r = (await this.public.readContract({
       address: this.pool,
       abi: tesseraPoolAbi,
       functionName: "reserves",
       args: [asset],
     })) as readonly [boolean, boolean, number, number, number, number, bigint, bigint, bigint, bigint, bigint, bigint];
-    return { borrowable: r[1], decimals: Number(r[2]), priceE8: r[6] };
+    return { enabled: r[0], borrowable: r[1], decimals: Number(r[2]), priceE8: r[6] };
   }
 
   /** The account's raw ERC-20 balance of an asset (its spendable wallet funds). */
