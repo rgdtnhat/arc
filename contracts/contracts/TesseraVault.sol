@@ -39,12 +39,17 @@ interface IVaultPool {
  *         share price so depositors earn it automatically; the app treasury
  *         takes a **capped performance fee** on the yield (never the principal).
  *
- * Safety model (why this is conservative):
- *  - `reserveRatioBps` (≥ 50%) is always held liquid in the vault, so routine
- *    withdrawals never touch the pool. At the 50% floor at least half of TVL can
- *    always be redeemed instantly regardless of pool utilisation. Larger
- *    withdrawals unwind pool supply, bounded by the pool's available cash
- *    (`maxWithdraw` tells you the exact limit).
+ * Reserve-ratio model:
+ *  - `reserveRatioBps` is the share of TVL held **idle and instantly
+ *    withdrawable**. The rest is supplied to `TesseraPool` to earn APR.
+ *  - **100%** → nothing is lent, so there is no APR at all; every depositor can
+ *    always withdraw everything immediately. This is the maximum-safety setting.
+ *  - **80%** (`MIN_RESERVE_RATIO`) is a hard floor in code — the admin cannot go
+ *    below it, so at least 80% of TVL is always liquid. It is also the
+ *    deploy-time default. Lowering the ratio toward the floor puts more capital
+ *    to work and raises the APR shared between depositors and the app.
+ *  - Withdrawals take the buffer first, then unwind pool supply bounded by the
+ *    pool's free cash; `maxWithdraw()` reports the exact redeemable amount.
  *  - The performance fee is capped at `MAX_PERFORMANCE_FEE` (30%), so users keep
  *    **≥ 70% of all yield**, and the fee is charged only on positive yield —
  *    never on deposits or principal.
@@ -61,7 +66,15 @@ interface IVaultPool {
 contract TesseraVault {
     uint16 internal constant BPS = 10_000;
     uint16 public constant MAX_PERFORMANCE_FEE = 3_000; // 30% of yield, hard cap
-    uint16 public constant MIN_RESERVE_RATIO = 5_000; // 50% always liquid (floor)
+    /**
+     * Hard floor on the liquid reserve, enforced in code and therefore NOT
+     * changeable by the admin: at least 80% of TVL always sits idle in the vault
+     * so depositors can exit. The admin may raise the ratio (up to 100% =
+     * everything liquid, no APR because nothing is lent) but never lower it
+     * below this floor. 80% is also the deploy-time default.
+     */
+    uint16 public constant MIN_RESERVE_RATIO = 8_000; // 80% always liquid (immutable floor)
+    uint16 public constant DEFAULT_RESERVE_RATIO = 8_000; // 80% on first deploy
     uint256 public constant MINIMUM_LIQUIDITY = 1_000; // dead shares (anti-inflation)
 
     IERC20V public immutable asset;

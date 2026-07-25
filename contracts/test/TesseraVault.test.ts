@@ -6,8 +6,8 @@ const PRICE = 10n ** 8n; // $1.00
 const BTC_PRICE = 30_000n * 10n ** 8n;
 const USDC = (n: string) => BigInt(Math.round(parseFloat(n) * 1e6));
 
-// reserveRatio 50% liquid buffer (contract floor), 15% performance fee on yield.
-const RESERVE_RATIO = 5000;
+// reserveRatio 80% liquid buffer (contract floor + default), 15% perf fee on yield.
+const RESERVE_RATIO = 8000;
 const PERF_FEE = 1500;
 
 async function deployFixture() {
@@ -45,10 +45,10 @@ describe("TesseraVault (yield vault over the pool)", () => {
     await mint(alice, USDC("100"));
     await (await asVault(alice)).write.deposit([USDC("100")]);
 
-    // 50% (~50 USDC) stays liquid in the vault; ~50 goes to the pool.
+    // 80% (~80 USDC) stays liquid in the vault; ~20 goes to the pool.
     const buffer = await vault.read.currentBufferBps();
-    expect(Number(buffer)).to.be.greaterThan(4900);
-    expect(Number(buffer)).to.be.lessThan(5100);
+    expect(Number(buffer)).to.be.greaterThan(7900);
+    expect(Number(buffer)).to.be.lessThan(8100);
     expect(await vault.read.totalAssets()).to.equal(USDC("100"));
   });
 
@@ -70,16 +70,18 @@ describe("TesseraVault (yield vault over the pool)", () => {
     const { deployer, alice, borrower, usdc, cbtc, pool, vault, mint, asVault, asPool } =
       await loadFixture(deployFixture);
 
-    // Alice deposits 1,000 USDC → ~500 supplied to the pool.
+    // Alice deposits 1,000 USDC → ~200 supplied to the pool.
     await mint(alice, USDC("1000"));
     await (await asVault(alice)).write.deposit([USDC("1000")]);
 
-    // A borrower posts BTC collateral and borrows 400 USDC, creating utilization.
+    // A borrower posts BTC collateral and borrows 100 USDC, creating utilization.
+    // Only ~200 USDC reached the pool (80% of the deposit stays liquid in the
+    // vault), so the loan must sit inside that.
     await cbtc.write.mint([borrower.account.address, 10n ** 8n]); // 1 cirBTC
     const bcbtc = await hre.viem.getContractAt("MockToken", cbtc.address, { client: { wallet: borrower } });
     await bcbtc.write.approve([pool.address, 10n ** 8n]);
     await (await asPool(borrower)).write.supply([cbtc.address, 10n ** 8n]);
-    await (await asPool(borrower)).write.borrow([usdc.address, USDC("400")]);
+    await (await asPool(borrower)).write.borrow([usdc.address, USDC("100")]);
 
     // A year passes; interest accrues to the pool's suppliers (incl. the vault).
     await time.increase(365 * 24 * 3600);
@@ -103,12 +105,50 @@ describe("TesseraVault (yield vault over the pool)", () => {
     const { deployer, usdc, pool } = await loadFixture(deployFixture);
     // performance fee > 30% → revert
     await expect(
-      hre.viem.deployContract("TesseraVault", [usdc.address, pool.address, deployer.account.address, 5000, 3001])
+      hre.viem.deployContract("TesseraVault", [usdc.address, pool.address, deployer.account.address, 8000, 3001])
     ).to.be.rejected;
-    // reserve ratio < 50% → revert
+    // reserve ratio < 80% → revert
     await expect(
-      hre.viem.deployContract("TesseraVault", [usdc.address, pool.address, deployer.account.address, 4999, 1500])
+      hre.viem.deployContract("TesseraVault", [usdc.address, pool.address, deployer.account.address, 7999, 1500])
     ).to.be.rejected;
+  });
+
+  it("at a 100% reserve ratio keeps everything liquid and lends nothing", async () => {
+    const { deployer, alice, usdc, pool, mint, asVault } = await loadFixture(deployFixture);
+    // Max-safety setting: nothing is supplied to the pool, so there is no APR,
+    // but every depositor can always withdraw in full.
+    const vault100 = await hre.viem.deployContract("TesseraVault", [
+      usdc.address,
+      pool.address,
+      deployer.account.address,
+      10_000,
+      PERF_FEE,
+    ]);
+    await usdc.write.mint([alice.account.address, USDC("100")]);
+    const au = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: alice } });
+    await au.write.approve([vault100.address, USDC("100")]);
+    const av = await hre.viem.getContractAt("TesseraVault", vault100.address, { client: { wallet: alice } });
+    await av.write.deposit([USDC("100")]);
+
+    expect(Number(await vault100.read.currentBufferBps())).to.equal(10_000);
+    // Nothing reached the pool.
+    expect(await pool.read.supplyBalance([usdc.address, vault100.address])).to.equal(0n);
+    // And the whole balance is withdrawable right now.
+    expect(await vault100.read.maxWithdraw([alice.account.address])).to.equal(
+      await vault100.read.balanceOfAssets([alice.account.address])
+    );
+  });
+
+  it("lets the admin raise the ratio but never below the 80% floor", async () => {
+    const { vault } = await loadFixture(deployFixture);
+    await vault.write.setParams([10_000, 1500]); // 100% liquid — allowed
+    expect(await vault.read.reserveRatioBps()).to.equal(10_000);
+    await vault.write.setParams([9_000, 2_000]); // 90% — allowed
+    expect(await vault.read.reserveRatioBps()).to.equal(9_000);
+    await expect(vault.write.setParams([7_999, 1500])).to.be.rejected; // below floor
+    await expect(vault.write.setParams([8_000, 3_001])).to.be.rejected; // fee above cap
+    // The floor is a constant, so it cannot be moved by any admin call.
+    expect(await vault.read.MIN_RESERVE_RATIO()).to.equal(8_000);
   });
 
   it("blocks the first-deposit share-inflation attack", async () => {
