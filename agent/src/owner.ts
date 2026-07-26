@@ -52,6 +52,14 @@ export class OwnerClient {
     return hash;
   }
 
+  /**
+   * Generic owner-signed call, for contracts whose admin surface is broad enough
+   * that a named wrapper per function would just be noise (the AMM, for example).
+   */
+  write(address: Hex, abi: unknown, functionName: string, args: unknown[]): Promise<Hex> {
+    return this.send(address, abi, functionName, args);
+  }
+
   /** Is this account actually the owner of `contract`? */
   async isOwnerOf(contract: Hex, abi: unknown): Promise<boolean> {
     try {

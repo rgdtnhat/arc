@@ -17,6 +17,8 @@ import {
   tesseraSwapBytecode,
   tesseraFeeCollectorAbi,
   tesseraFeeCollectorBytecode,
+  tesseraAmmAbi,
+  tesseraAmmBytecode,
   formatUsdc,
   pacedHttp,
 } from "@tessera/shared";
@@ -332,6 +334,54 @@ async function main() {
     }
   }
 
+  // 6c) TesseraAMM + its own fee collector. Users provide liquidity and keep 50%
+  //     of every swap fee (a floor the contract enforces); the app's half lands in
+  //     the AMM collector, which splits it 20% back into the AMM pool / 20% lending
+  //     / 20% vault / 20% agent / 20% retained.
+  const ammCollectorRes = await adopt("TesseraAmmFeeCollector", existing.tesseraAmmFeeCollector, FRESH, async () => {
+    console.log("→ deploying AMM fee collector (20/20/20/20/20, weekly)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraFeeCollectorAbi,
+      bytecode: tesseraFeeCollectorBytecode,
+      args: [ARC_USDC_ADDRESS, agent.address, pool, vault, "0x0000000000000000000000000000000000000000"],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    return (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+  }, { custodial: true });
+  const ammFeeCollector = ammCollectorRes.address;
+
+  const ammRes = await adopt("TesseraAMM", existing.tesseraAmm, FRESH, async () => {
+    console.log("→ deploying TesseraAMM…");
+    const h = await dWallet.deployContract({
+      abi: tesseraAmmAbi,
+      bytecode: tesseraAmmBytecode,
+      args: [ammFeeCollector],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   amm", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const amm = ammRes.address;
+
+  if (!ammRes.reused) {
+    // One pool per non-USDC reserve, paired against USDC: 0.30% fee, 50% to LPs.
+    for (const r of LIVE_RESERVES.filter((x) => x.address.toLowerCase() !== ARC_USDC_ADDRESS.toLowerCase())) {
+      try {
+        await dSend(amm, tesseraAmmAbi, "createPool", [[ARC_USDC_ADDRESS, r.address], 30, 5000, `USDC / ${r.symbol}`]);
+        console.log(`   AMM pool USDC / ${r.symbol}`);
+      } catch (e) {
+        console.warn(`   AMM pool USDC / ${r.symbol} not created: ${String(e.shortMessage ?? e.message).slice(0, 80)}`);
+      }
+    }
+    // Point the AMM collector's swap leg at pool 0 so app fees cycle back in.
+    try { await dSend(ammFeeCollector, tesseraFeeCollectorAbi, "setAmm", [amm, 0n]); }
+    catch (e) { console.warn(`   AMM collector not linked: ${String(e.shortMessage ?? e.message).slice(0, 80)}`); }
+  }
+
   // 7) Persist. Merge into whatever record we adopted so escrow/tab and any
   //     other recorded addresses survive.
   const dep = { ...existing };
@@ -340,6 +390,8 @@ async function main() {
   dep.vaultAsset = ARC_USDC_ADDRESS;
   dep.tesseraSwap = swap;
   dep.tesseraFeeCollector = feeCollector;
+  dep.tesseraAmm = amm;
+  dep.tesseraAmmFeeCollector = ammFeeCollector;
   dep.poolAssets = LIVE_RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
   const body = JSON.stringify(dep, null, 2) + "\n";
@@ -353,6 +405,8 @@ async function main() {
   console.log("   vault    ", vault);
   console.log("   swap     ", swap);
   console.log("   fees     ", feeCollector);
+  console.log("   amm      ", amm);
+  console.log("   amm fees ", ammFeeCollector);
   for (const r of LIVE_RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
   console.log("   explorer ", `https://testnet.arcscan.app/address/${pool}`);
 }

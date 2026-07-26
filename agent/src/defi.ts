@@ -8,7 +8,7 @@ import {
   type PublicClient,
   type WalletClient,
 } from "viem";
-import { tesseraVaultAbi, tesseraSwapAbi, erc20Abi, pacedHttp } from "@tessera/shared";
+import { tesseraVaultAbi, tesseraSwapAbi, tesseraAmmAbi, erc20Abi, pacedHttp } from "@tessera/shared";
 
 interface Cfg {
   chain: Chain;
@@ -170,5 +170,144 @@ export class SwapClient {
     const hash = await this.wallet.writeContract(request);
     await this.public.waitForTransactionReceipt({ hash });
     return hash;
+  }
+}
+
+export interface AmmPoolView {
+  id: number;
+  name: string;
+  assets: Hex[];
+  balances: bigint[];
+  swapFeeBps: number;
+  lpShareBps: number;
+  totalShares: bigint;
+  frozen: boolean;
+  /** Shares held by the account the snapshot was taken for. */
+  myShares: bigint;
+}
+
+/** Client for the TesseraAMM (multi-asset liquidity pools). */
+export class AmmClient {
+  readonly public: PublicClient;
+  readonly wallet: WalletClient;
+  constructor(
+    private readonly cfg: Cfg,
+    readonly amm: Hex,
+  ) {
+    this.public = createPublicClient({ chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl), batch: { multicall: true } });
+    this.wallet = createWalletClient({ account: cfg.account, chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl) });
+  }
+
+  private a(functionName: string, args: unknown[] = []) {
+    return { address: this.amm, abi: tesseraAmmAbi, functionName, args } as const;
+  }
+
+  /**
+   * Every pool, its balances, and the user's share of each — in two multicalls
+   * (one to learn the pool count, one for everything else). The public RPC
+   * throttles hard, so per-pool round-trips are not an option.
+   */
+  async snapshot(user?: Hex): Promise<{ ok: boolean; pools: AmmPoolView[]; maxAssetsPerPool: number }> {
+    const who = user ?? (this.cfg.account.address as Hex);
+    let count = 0;
+    let maxAssets = 0;
+    try {
+      const head = await this.public.multicall({
+        allowFailure: true,
+        contracts: [this.a("poolCount"), this.a("maxAssetsPerPool")] as never,
+      });
+      if (head[0].status !== "success") return { ok: false, pools: [], maxAssetsPerPool: 0 };
+      count = Number(head[0].result as bigint);
+      maxAssets = head[1].status === "success" ? Number(head[1].result) : 0;
+    } catch {
+      return { ok: false, pools: [], maxAssetsPerPool: 0 };
+    }
+    if (count === 0) return { ok: true, pools: [], maxAssetsPerPool: maxAssets };
+
+    const ids = Array.from({ length: count }, (_, i) => i);
+    const res = await this.public.multicall({
+      allowFailure: true,
+      contracts: ids.flatMap((i) => [
+        this.a("poolInfo", [BigInt(i)]),
+        this.a("sharesOf", [BigInt(i), who]),
+      ]) as never,
+    });
+
+    const pools: AmmPoolView[] = [];
+    for (const i of ids) {
+      const info = res[i * 2];
+      if (info.status !== "success") continue;
+      const [assets, balances, swapFeeBps, lpShareBps, totalShares, frozen, name] = info.result as readonly [
+        Hex[], bigint[], number, number, bigint, boolean, string,
+      ];
+      const sh = res[i * 2 + 1];
+      pools.push({
+        id: i,
+        name,
+        assets: [...assets],
+        balances: [...balances],
+        swapFeeBps: Number(swapFeeBps),
+        lpShareBps: Number(lpShareBps),
+        totalShares,
+        frozen,
+        myShares: sh.status === "success" ? (sh.result as bigint) : 0n,
+      });
+    }
+    return { ok: true, pools, maxAssetsPerPool: maxAssets };
+  }
+
+  quote(poolId: number, tokenIn: Hex, tokenOut: Hex, amountIn: bigint): Promise<readonly [bigint, bigint, bigint]> {
+    return this.public.readContract({
+      address: this.amm,
+      abi: tesseraAmmAbi,
+      functionName: "quote",
+      args: [BigInt(poolId), tokenIn, tokenOut, amountIn],
+    }) as Promise<readonly [bigint, bigint, bigint]>;
+  }
+
+  private async ensureApproval(token: Hex, min: bigint) {
+    const allowance = (await this.public.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [this.cfg.account.address, this.amm],
+    })) as bigint;
+    if (allowance >= min) return;
+    const hash = await this.wallet.writeContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: "approve",
+      args: [this.amm, maxUint256],
+      chain: this.cfg.chain,
+      account: this.cfg.account,
+    });
+    await this.public.waitForTransactionReceipt({ hash });
+  }
+
+  private async write(functionName: string, args: unknown[]): Promise<Hex> {
+    const { request } = await this.public.simulateContract({
+      address: this.amm,
+      abi: tesseraAmmAbi,
+      functionName: functionName as never,
+      args: args as never,
+      account: this.cfg.account,
+    });
+    const hash = await this.wallet.writeContract(request);
+    await this.public.waitForTransactionReceipt({ hash });
+    return hash;
+  }
+
+  async swap(poolId: number, tokenIn: Hex, tokenOut: Hex, amountIn: bigint, minOut: bigint): Promise<Hex> {
+    await this.ensureApproval(tokenIn, amountIn);
+    return this.write("swap", [BigInt(poolId), tokenIn, tokenOut, amountIn, minOut]);
+  }
+
+  async addLiquidity(poolId: number, assets: Hex[], amounts: bigint[], minShares = 0n): Promise<Hex> {
+    for (let i = 0; i < assets.length; i++) await this.ensureApproval(assets[i], amounts[i]);
+    return this.write("addLiquidity", [BigInt(poolId), amounts, minShares]);
+  }
+
+  async removeLiquidity(poolId: number, shares: bigint, minAmounts: bigint[]): Promise<Hex> {
+    return this.write("removeLiquidity", [BigInt(poolId), shares, minAmounts]);
   }
 }

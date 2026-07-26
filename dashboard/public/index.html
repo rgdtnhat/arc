@@ -668,6 +668,58 @@
             <div class="kv" id="swapMsg" style="margin-top:9px;display:none"></div>
           </div>
 
+          <!-- AMM liquidity pools -->
+          <div class="card" id="ammCard">
+            <h2>🌊 Liquidity pools — earn a share of every swap</h2>
+            <div class="notready" id="ammNotReady" style="display:none">
+              AMM not deployed yet — run <span class="mono">npm run pool:arc</span> to deploy
+              <span class="mono">TesseraAMM</span>. Pools, your position and quotes appear here once it's live.
+            </div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Provide liquidity to a pool and earn <b>50% of every swap fee</b> it collects — a floor written
+              into the contract that no admin can lower. Prices come from the pool's own reserves, so no
+              external oracle can be moved against you. Withdrawals stay open even if a pool is frozen.
+            </div>
+            <div class="row-actions" style="margin-bottom:14px">
+              <label style="font-size:12px;color:var(--muted)">Pool</label>
+              <select id="amPool" class="field"></select>
+              <span id="amPoolMeta" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+            <div class="grid2">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Pool reserves</div>
+                <div class="metrics" id="amReserves"></div>
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Your position</div>
+                <div class="metrics" id="amPosition"></div>
+              </div>
+            </div>
+
+            <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">Trade against this pool</div>
+            <div class="row-actions">
+              <input id="amSwapAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
+              <select id="amSwapIn" class="field"></select>
+              <span style="color:var(--muted)">→</span>
+              <select id="amSwapOut" class="field"></select>
+              <button class="btn primary" id="amSwapExec">Swap</button>
+            </div>
+            <div id="amSwapQuote" style="font-size:13px;margin-top:8px;font-weight:600"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">Provide or withdraw liquidity</div>
+            <div class="row-actions">
+              <select id="amLpAction" class="field">
+                <option value="add">Add liquidity</option>
+                <option value="remove">Withdraw liquidity</option>
+              </select>
+              <span id="amLpInputs" style="display:flex;gap:9px;flex-wrap:wrap"></span>
+              <button class="btn" id="amLpMax">Max</button>
+              <button class="btn primary" id="amLpExec">Execute</button>
+            </div>
+            <div id="amLpHint" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
+            <div class="kv" id="ammMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
           <!-- Lending -->
           <div class="card" id="lendingCard">
             <h2>🏦 Lending &amp; borrowing — TesseraPool</h2>
@@ -914,6 +966,40 @@
           <div class="cfgRow" id="cfgRowNext" style="display:none;color:var(--muted);font-size:12px">
             <span>Next run</span><span id="cfgNextRun">—</span>
           </div>
+          <div class="menuSep"></div>
+
+          <div class="menuHead">Liquidity pools (AMM)</div>
+          <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
+            Providers always keep at least 50% of swap fees — the contract rejects anything lower,
+            so this cannot be turned against them. The app's share flows to the AMM fee collector and
+            is allocated on the same schedule as above.
+          </div>
+          <div class="cfgRow"><span>Apply to</span>
+            <select id="cfgAmmPools" multiple size="4" style="min-width:190px"></select>
+          </div>
+          <div class="cfgRow"><span>Swap fee</span><span><input id="cfgAmmFee" type="number" min="0" max="5" step="0.01" style="width:76px" />%</span></div>
+          <div class="cfgRow"><span>→ Providers keep</span><span><input id="cfgAmmLpShare" type="number" min="50" max="100" step="1" style="width:76px" />%</span></div>
+          <div class="cfgRow"><span></span>
+            <span style="display:flex;gap:7px;flex-wrap:wrap">
+              <button class="btn" id="cfgAmmApply">Apply to selected</button>
+              <button class="btn" id="cfgAmmApplyAll">Apply to all</button>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Selected pool</span>
+            <span style="display:flex;gap:7px;flex-wrap:wrap">
+              <button class="btn" id="cfgAmmFreeze">Freeze</button>
+              <button class="btn" id="cfgAmmUnfreeze">Unfreeze</button>
+              <button class="btn" id="cfgAmmRename">Rename…</button>
+            </span>
+          </div>
+          <div class="menuHead">New liquidity pool</div>
+          <div class="cfgRow"><span>Assets (pick 2+)</span>
+            <select id="cfgAmmNewAssets" multiple size="3" style="min-width:190px"></select>
+          </div>
+          <div class="cfgRow"><span>Name</span><span><input id="cfgAmmNewName" class="field" placeholder="e.g. USDC / EURC" style="width:190px" /></span></div>
+          <div class="cfgRow"><span></span><span><button class="btn primary" id="cfgAmmCreate">Create pool</button></span></div>
+          <div class="cfgRow" id="cfgAmmMsg" style="display:none;font-size:12px"><span></span><span></span></div>
+
           <div class="menuSep"></div>
           <div style="padding:6px 20px 10px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>
         </div>

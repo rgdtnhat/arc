@@ -118,5 +118,48 @@ describe("TesseraFeeCollector (fee allocation)", () => {
     await expect(asOther.write.setShares([5000, 5000, 0, 0, 0])).to.be.rejected;
     await expect(asOther.write.setInterval([60])).to.be.rejected;
     await expect(asOther.write.allocateNow()).to.be.rejected;
+    await expect(asOther.write.setAmm([collector.address, 0n])).to.be.rejected;
+  });
+
+  // The same contract, pointed at an AMM pool, is the AMM fee collector: the app's
+  // half of every AMM swap fee is split 20% back into the pool / 20% lending /
+  // 20% vault / 20% agent / 20% retained.
+  it("funds an AMM pool with the swap leg when configured as the AMM collector", async () => {
+    const { deployer, agentWallet, usdc, pool, vault, collector } = await loadFixture(deployFixture);
+    const eurc = await hre.viem.deployContract("MockToken", ["Euro Coin (mock)", "EURC", 6]);
+    const amm = await hre.viem.deployContract("TesseraAMM", [collector.address]);
+    await amm.write.createPool([[usdc.address, eurc.address], 30, 5000, "USDC / EURC"]);
+
+    await usdc.write.mint([deployer.account.address, USDC("1000")]);
+    await eurc.write.mint([deployer.account.address, USDC("1000")]);
+    await usdc.write.approve([amm.address, USDC("1000")]);
+    await eurc.write.approve([amm.address, USDC("1000")]);
+    await amm.write.addLiquidity([0n, [USDC("1000"), USDC("1000")], 0n]);
+
+    const sharesBefore = (await amm.read.poolInfo([0n]))[4];
+    await collector.write.setAmm([amm.address, 0n]);
+    await collector.write.allocateNow();
+
+    const [, balances, , , sharesAfter] = await amm.read.poolInfo([0n]);
+    expect(balances[0]).to.equal(USDC("1020")); // 20% funded into the pool
+    expect(sharesAfter).to.equal(sharesBefore); // funding never mints shares
+    // The other four legs behave exactly as before.
+    expect(await usdc.read.balanceOf([agentWallet.account.address])).to.equal(USDC("20"));
+    expect(await pool.read.supplyBalance([usdc.address, collector.address])).to.equal(USDC("20"));
+    expect((await vault.read.sharesOf([collector.address])) > 0n).to.equal(true);
+    expect(await usdc.read.balanceOf([collector.address])).to.equal(USDC("20"));
+  });
+
+  it("retains the swap leg when the configured AMM pool cannot take it", async () => {
+    const { usdc, collector } = await loadFixture(deployFixture);
+    const eurc = await hre.viem.deployContract("MockToken", ["Euro Coin (mock)", "EURC", 6]);
+    const amm = await hre.viem.deployContract("TesseraAMM", [collector.address]);
+    // Pool exists but has no liquidity yet, so `fund` reverts — the money must
+    // stay in the collector rather than vanish or block the other legs.
+    await amm.write.createPool([[usdc.address, eurc.address], 30, 5000, "empty"]);
+    await collector.write.setAmm([amm.address, 0n]);
+    await collector.write.allocateNow();
+    expect(await usdc.read.balanceOf([amm.address])).to.equal(0n);
+    expect(await usdc.read.balanceOf([collector.address])).to.equal(USDC("40")); // 20 retained + 20 undelivered
   });
 });

@@ -7,7 +7,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { verifyMessage, formatUnits, toFunctionSelector } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID } from "node:crypto";
-import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS, tesseraFeeCollectorAbi } from "@tessera/shared";
+import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS, tesseraFeeCollectorAbi, tesseraAmmAbi } from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { faucetFromEnv } from "./circle/faucet.js";
 import { createProviderApp, type ProviderEvent } from "@tessera/providers";
@@ -23,6 +23,8 @@ import { usdc } from "@tessera/shared";
 interface PoolAsset {
   symbol: string;
   address: Hex;
+  /** Recorded by the deploy script; the live read in `assetCache` wins when present. */
+  decimals?: number;
 }
 /** Reference to the TesseraPool deployment on Arc (from deployments/arc.json). */
 interface PoolDeploymentRef {
@@ -33,7 +35,7 @@ interface PoolDeploymentRef {
 }
 import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
-import { VaultClient, SwapClient } from "./defi.js";
+import { VaultClient, SwapClient, AmmClient } from "./defi.js";
 import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
 import { OwnerClient } from "./owner.js";
@@ -101,6 +103,13 @@ const CLIENT_SELECTORS = Object.fromEntries(
     maxWithdraw: "function maxWithdraw(address)",
     swapQuote: "function quote(address,address,uint256)",
     swapExec: "function swap(address,address,uint256,uint256)",
+    // AMM. `ammAdd`/`ammRemove` take dynamic arrays, so the browser encodes them
+    // with an offset + length header rather than the flat static layout.
+    ammQuote: "function quote(uint256,address,address,uint256)",
+    ammSwap: "function swap(uint256,address,address,uint256,uint256)",
+    ammAdd: "function addLiquidity(uint256,uint256[],uint256)",
+    ammRemove: "function removeLiquidity(uint256,uint256,uint256[])",
+    ammShares: "function sharesOf(uint256,address)",
   }).map(([k, sig]) => [k, toFunctionSelector(sig)]),
 );
 
@@ -221,6 +230,9 @@ async function main() {
     : undefined;
   const swapClient = liveDeployment.tesseraSwap
     ? new SwapClient({ chain, rpcUrl, account: agentAccount }, liveDeployment.tesseraSwap as Hex)
+    : undefined;
+  const ammClient = liveDeployment.tesseraAmm
+    ? new AmmClient({ chain, rpcUrl, account: agentAccount }, liveDeployment.tesseraAmm as Hex)
     : undefined;
 
   // Signs owner-gated calls (vault setParams, fee collector setShares/interval/
@@ -863,6 +875,224 @@ async function main() {
     );
   }
 
+  /** Shown when an owner-gated action is attempted without a deployer key. */
+  const OWNER_HINT =
+    "Set DEPLOYER_PRIVATE_KEY on the server to run admin actions (the deployer owns these contracts).";
+
+  // --- AMM snapshot: every pool, its reserves, and the caller's LP position ---
+  // Formatted server-side against the reserve metadata the lending snapshot
+  // already holds, so the browser never has to read decimals per asset.
+  type AmmSnap = {
+    deployed: boolean;
+    ready: boolean;
+    address: Hex;
+    maxAssetsPerPool: number;
+    pools: {
+      id: number;
+      name: string;
+      frozen: boolean;
+      swapFeeBps: number;
+      lpShareBps: number;
+      totalShares: string;
+      myShares: string;
+      mySharePct: string;
+      assets: { symbol: string; address: Hex; decimals: number; balance: string; myBalance: string }[];
+    }[];
+  };
+  let lastAmm: AmmSnap | null = null;
+  let ammRefreshing = false;
+  let ammAt = 0;
+
+  /**
+   * Symbol/decimals for an asset. Prefers the decimals actually read from chain
+   * (assetCache) over the ones recorded at deploy time, so a wrong record can't
+   * silently mis-scale an AMM balance by orders of magnitude.
+   */
+  const assetMeta = (address: Hex) => {
+    const key = address.toLowerCase();
+    const live = assetCache.get(key);
+    const recorded = (poolDeployment?.assets ?? []).find((x) => x.address.toLowerCase() === key);
+    return {
+      symbol: live?.symbol ?? recorded?.symbol ?? `${address.slice(0, 6)}…`,
+      decimals: live?.decimals ?? recorded?.decimals ?? 6,
+    };
+  };
+
+  async function readAmm(): Promise<AmmSnap> {
+    const snap = await ammClient!.snapshot(agentAccount.address as Hex);
+    const pools = snap.pools.map((p) => {
+      const share = p.totalShares > 0n ? (Number(p.myShares) / Number(p.totalShares)) * 100 : 0;
+      return {
+        id: p.id,
+        name: p.name,
+        frozen: p.frozen,
+        swapFeeBps: p.swapFeeBps,
+        lpShareBps: p.lpShareBps,
+        totalShares: p.totalShares.toString(),
+        myShares: p.myShares.toString(),
+        mySharePct: share.toFixed(share > 0 && share < 0.01 ? 4 : 2),
+        assets: p.assets.map((addr, i) => {
+          const { symbol, decimals } = assetMeta(addr);
+          const bal = p.balances[i] ?? 0n;
+          const mine = p.totalShares > 0n ? (bal * p.myShares) / p.totalShares : 0n;
+          return { symbol, address: addr, decimals, balance: fmtUnits(bal, decimals), myBalance: fmtUnits(mine, decimals) };
+        }),
+      };
+    });
+    return {
+      deployed: true,
+      ready: snap.ok,
+      address: ammClient!.amm,
+      maxAssetsPerPool: snap.maxAssetsPerPool,
+      pools,
+    };
+  }
+  function ammSnapshot(): AmmSnap | null {
+    if (!ammClient) return null;
+    if (!ammRefreshing && Date.now() - ammAt > READ_TTL) {
+      ammRefreshing = true;
+      readAmm()
+        .then((d) => { lastAmm = d; ammAt = Date.now(); })
+        .catch((e) => console.error(`[amm] refresh failed: ${String(e).slice(0, 120)}`))
+        .finally(() => (ammRefreshing = false));
+    }
+    // Sticky: a throttled poll must not blank a panel that was already populated.
+    return lastAmm ?? { deployed: true, ready: false, address: ammClient.amm, maxAssetsPerPool: 0, pools: [] };
+  }
+
+  // Public quote so anyone can price an AMM swap before connecting a wallet.
+  app.get("/api/amm/quote", async (req, res) => {
+    if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
+    try {
+      const poolId = Number(req.query.poolId ?? 0);
+      const [out, lpFee, appFee] = await ammClient.quote(
+        poolId,
+        req.query.tokenIn as Hex,
+        req.query.tokenOut as Hex,
+        BigInt((req.query.amountIn as string) ?? "0"),
+      );
+      res.json({ ok: true, out: out.toString(), lpFee: lpFee.toString(), appFee: appFee.toString() });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Agent-signed AMM actions. Users transact from their own wallet via the
+   * self-custody path in the browser; these exist for the operator's own
+   * positions and for scripted/agent liquidity management.
+   */
+  app.post("/api/amm/:action", requireOperator, async (req, res) => {
+    if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
+    const poolId = Number(req.body?.poolId ?? req.query.poolId ?? 0);
+    try {
+      const pool = (lastAmm?.pools ?? []).find((p) => p.id === poolId) ?? (await readAmm()).pools.find((p) => p.id === poolId);
+      if (!pool) { res.status(404).json({ ok: false, error: "No such AMM pool." }); return; }
+      const assets = pool.assets.map((a) => a.address);
+      let txHash: Hex;
+      if (req.params.action === "add") {
+        const amounts = (req.body?.amounts ?? []).map((v: string) => BigInt(v));
+        if (amounts.length !== assets.length) { res.status(400).json({ ok: false, error: "Provide an amount for every asset in the pool." }); return; }
+        txHash = await ammClient.addLiquidity(poolId, assets, amounts, BigInt(req.body?.minShares ?? "0"));
+      } else if (req.params.action === "remove") {
+        const shares = BigInt(req.body?.shares ?? "0");
+        txHash = await ammClient.removeLiquidity(poolId, shares, assets.map(() => 0n));
+      } else if (req.params.action === "swap") {
+        txHash = await ammClient.swap(
+          poolId,
+          req.body.tokenIn as Hex,
+          req.body.tokenOut as Hex,
+          BigInt(req.body?.amountIn ?? "0"),
+          BigInt(req.body?.minOut ?? "0"),
+        );
+      } else {
+        res.status(400).json({ ok: false, error: "unknown action" });
+        return;
+      }
+      invalidateAll();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Admin: create an AMM pool over 2…maxAssetsPerPool assets. */
+  app.post("/api/amm/admin/create", requireOperator, async (req, res) => {
+    if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const assets = (req.body?.assets ?? []) as Hex[];
+      const name = String(req.body?.name ?? "").slice(0, 40) || assets.map((a) => assetMeta(a).symbol).join(" / ");
+      const swapFeeBps = Number(req.body?.swapFeeBps ?? 30);
+      const lpShareBps = Number(req.body?.lpShareBps ?? 5000);
+      if (assets.length < 2) { res.status(400).json({ ok: false, error: "An AMM pool needs at least two assets." }); return; }
+      const txHash = await owner.write(ammClient.amm, tesseraAmmAbi, "createPool", [assets, swapFeeBps, lpShareBps, name]);
+      await refreshAmm();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Admin: retune fees (one pool or many), freeze, or rename. */
+  app.post("/api/amm/admin/configure", requireOperator, async (req, res) => {
+    if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const ids = (req.body?.poolIds ?? []).map((v: unknown) => BigInt(Number(v)));
+      if (!ids.length) { res.status(400).json({ ok: false, error: "Select at least one pool." }); return; }
+      const swapFeeBps = Number(req.body?.swapFeeBps ?? 30);
+      const lpShareBps = Number(req.body?.lpShareBps ?? 5000);
+      if (lpShareBps < 5000) {
+        res.status(400).json({ ok: false, error: "Liquidity providers always keep at least 50% of swap fees." });
+        return;
+      }
+      const txHash = await owner.write(ammClient.amm, tesseraAmmAbi, "configurePools", [ids, swapFeeBps, lpShareBps]);
+      await refreshAmm();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/amm/admin/freeze", requireOperator, async (req, res) => {
+    if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const txHash = await owner.write(ammClient.amm, tesseraAmmAbi, "setFrozen", [
+        BigInt(Number(req.body?.poolId ?? 0)),
+        Boolean(req.body?.frozen),
+      ]);
+      await refreshAmm();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/amm/admin/rename", requireOperator, async (req, res) => {
+    if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const name = String(req.body?.name ?? "").trim().slice(0, 40);
+      if (!name) { res.status(400).json({ ok: false, error: "Give the pool a name." }); return; }
+      const txHash = await owner.write(ammClient.amm, tesseraAmmAbi, "renamePool", [
+        BigInt(Number(req.body?.poolId ?? 0)),
+        name,
+      ]);
+      await refreshAmm();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  async function refreshAmm() {
+    ammAt = 0;
+    if (!ammClient) return;
+    try { lastAmm = await readAmm(); ammAt = Date.now(); } catch { /* next poll picks it up */ }
+  }
+
   app.post("/api/vault/:action", requireOperator, async (req, res) => {
     if (!vaultClient) { res.status(404).json({ ok: false, error: "vault not deployed" }); return; }
     const amount = BigInt((req.query.amount as string) ?? "0");
@@ -1127,6 +1357,7 @@ async function main() {
       vault: vaultClient?.vault ?? null,
       vaultAsset: (liveDeployment.vaultAsset as Hex) ?? usdcAddress,
       swap: swapClient?.swap ?? null,
+      amm: ammClient?.amm ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded
@@ -1163,6 +1394,7 @@ async function main() {
     lendingAt = 0;
     vaultAt = 0;
     swapAt = 0;
+    ammAt = 0;
   }
   async function refreshAll() {
     invalidateAll();
@@ -1171,6 +1403,7 @@ async function main() {
     if (poolClient) jobs.push(readLending().then((d) => { lastLending = d; lendingAt = Date.now(); }).catch(() => {}));
     if (vaultClient) jobs.push(readVault().then((d) => { lastVault = d; vaultAt = Date.now(); }).catch(() => {}));
     if (swapClient) jobs.push(readSwap().then((d) => { lastSwap = d; swapAt = Date.now(); }).catch(() => {}));
+    if (ammClient) jobs.push(readAmm().then((d) => { lastAmm = d; ammAt = Date.now(); }).catch(() => {}));
     jobs.push(refreshChain().catch(() => {}));
     await Promise.race([
       Promise.all(jobs),
@@ -1247,6 +1480,7 @@ async function main() {
       lending: lendingSnapshot(),
       vault: vaultSnapshot(),
       swap: swapSnapshot(),
+      amm: ammSnapshot(),
       balanceHistory,
       // Local call, but bounded anyway: `.catch()` handles errors, not hangs, and
       // an unbounded await here would stall the whole state response.

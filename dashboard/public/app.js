@@ -504,6 +504,20 @@ const $ = (id) => document.getElementById(id);
           }
         }
 
+        // AMM liquidity pools — always visible.
+        const am = s.amm;
+        const amReady = !!(am && am.ready && am.pools && am.pools.length);
+        setPanelReady(
+          "amm",
+          amReady,
+          ["amPool", "amSwapAmount", "amSwapIn", "amSwapOut", "amSwapExec", "amLpAction", "amLpMax", "amLpExec"],
+          am && am.deployed,
+        );
+        if (am && am.deployed) {
+          window.__amm = am;
+          renderAmm();
+        }
+
         // Live Arc testnet deployment (from deployments/arc.json).
         const live = s.live;
         if (live && live.agent) {
@@ -577,6 +591,9 @@ const $ = (id) => document.getElementById(id);
         }
         return res;
       }
+      /** POST a JSON body with the auth headers attached. */
+      const postJson = (url, body) =>
+        postAuthed(url, { headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
 
       /* ====================================================================
@@ -1070,6 +1087,343 @@ const $ = (id) => document.getElementById(id);
       });
 
       /* ===================================================================
+       * AMM liquidity pools.
+       *
+       * Pool choice is sticky across refreshes (the panel repaints on every
+       * poll, and silently resetting the picker mid-edit would be maddening).
+       * =================================================================== */
+      const amPools = () => (window.__amm && window.__amm.pools) || [];
+      /**
+       * LP shares the *connected wallet* holds, keyed by pool id, filled in by
+       * `refreshMyPositions`. The server snapshot reports the agent's position;
+       * in self-custody mode this map takes precedence.
+       */
+      window.__myAmmShares = {};
+      /** The pool as it should be shown: the caller's own position when known. */
+      function amMine(p) {
+        const own = selfMode() ? window.__myAmmShares[p.id] : undefined;
+        if (own === undefined) return p;
+        const total = BigInt(p.totalShares || "0");
+        const mine = BigInt(own);
+        const pct = total > 0n ? (Number(mine) / Number(total)) * 100 : 0;
+        return {
+          ...p,
+          myShares: own,
+          mySharePct: pct.toFixed(pct > 0 && pct < 0.01 ? 4 : 2),
+          assets: p.assets.map((a) => {
+            const share = total > 0n ? (Number(a.balance) * Number(mine)) / Number(total) : 0;
+            const dec = Number(a.decimals) || 6;
+            return { ...a, myBalance: share ? share.toFixed(dec).replace(/0+$/, "").replace(/\.$/, "") : "0" };
+          }),
+        };
+      }
+      const amSelected = () => {
+        const p = amPools();
+        if (!p.length) return null;
+        const want = Number($("amPool").value);
+        return p.find((x) => x.id === want) || p[0];
+      };
+      const amAsset = (pool, addr) => pool.assets.find((a) => a.address.toLowerCase() === String(addr).toLowerCase());
+
+      window.renderAmm = function renderAmm() {
+        const pools = amPools();
+        const sel = $("amPool");
+        if (!sel) return;
+        const sig = pools.map((p) => `${p.id}:${p.name}:${p.frozen}`).join("|");
+        if (sel.dataset.sig !== sig) {
+          const keep = sel.value;
+          sel.innerHTML = pools
+            .map((p) => `<option value="${p.id}">${esc(p.name)}${p.frozen ? " (frozen)" : ""}</option>`)
+            .join("");
+          if (keep && pools.some((p) => String(p.id) === keep)) sel.value = keep;
+          sel.dataset.sig = sig;
+          sel.dataset.pool = ""; // force the per-pool controls to rebuild
+        }
+        const raw = amSelected();
+        if (!raw) {
+          $("amPoolMeta").textContent = "No liquidity pools yet.";
+          return;
+        }
+        const p = amMine(raw);
+        const lpPct = (p.lpShareBps / 100).toFixed(0);
+        $("amPoolMeta").innerHTML =
+          `${esc((p.swapFeeBps / 100).toFixed(2))}% swap fee · providers keep ${esc(lpPct)}% of it` +
+          (p.frozen ? ' · <b style="color:var(--warn)">frozen — withdrawals still open</b>' : "");
+
+        $("amReserves").innerHTML = p.assets
+          .map((a) => `<div class="metric"><div class="k">${esc(a.symbol)}</div><div class="v">${esc(a.balance)}</div></div>`)
+          .join("");
+        $("amPosition").innerHTML =
+          `<div class="metric"><div class="k">Pool share</div><div class="v">${esc(p.mySharePct)}%</div></div>` +
+          p.assets
+            .map((a) => `<div class="metric"><div class="k">${esc(a.symbol)}</div><div class="v">${esc(a.myBalance)}</div></div>`)
+            .join("");
+
+        // Per-pool controls: asset pickers and one amount box per asset.
+        if (sel.dataset.pool !== String(p.id)) {
+          sel.dataset.pool = String(p.id);
+          const opts = p.assets
+            .map((a) => `<option value="${esc(a.address)}" data-sym="${esc(a.symbol)}" data-dec="${Number(a.decimals) || 6}">${esc(a.symbol)}</option>`)
+            .join("");
+          $("amSwapIn").innerHTML = opts;
+          $("amSwapOut").innerHTML = opts;
+          if (p.assets.length > 1) $("amSwapOut").selectedIndex = 1;
+          $("amSwapQuote").textContent = "";
+          $("amSwapAmount").value = "";
+          renderAmLpInputs();
+        }
+        renderAmLpHint();
+      };
+
+      /** Add mode needs one amount per asset; remove mode needs a share count. */
+      function renderAmLpInputs() {
+        const p = amSelected();
+        const host = $("amLpInputs");
+        if (!p || !host) return;
+        if ($("amLpAction").value === "add") {
+          host.innerHTML = p.assets
+            .map(
+              (a) =>
+                `<input class="field amLpAmt" data-addr="${esc(a.address)}" data-dec="${Number(a.decimals) || 6}" ` +
+                `inputmode="decimal" placeholder="${esc(a.symbol)}" style="width:110px" />`,
+            )
+            .join("");
+        } else {
+          host.innerHTML =
+            `<input id="amLpShares" class="field" inputmode="decimal" placeholder="Shares to burn" style="width:170px" />`;
+        }
+      }
+
+      function renderAmLpHint() {
+        const raw = amSelected();
+        const el = $("amLpHint");
+        if (!raw || !el) return;
+        const p = amMine(raw);
+        if ($("amLpAction").value === "add") {
+          el.textContent = p.frozen
+            ? "This pool is frozen — deposits are paused, but you can still withdraw."
+            : "Deposit every asset in proportion. Shares are minted at the smallest ratio you supply, so an" +
+              " unbalanced deposit donates the excess rather than buying extra shares — match the pool's ratio.";
+        } else {
+          el.textContent = `You hold ${p.myShares} shares (${p.mySharePct}% of the pool). Withdrawing returns a proportional slice of every asset, and stays available even while frozen.`;
+        }
+      }
+
+      if ($("amPool")) {
+        $("amPool").addEventListener("change", () => {
+          const sel = $("amPool");
+          sel.dataset.pool = ""; // rebuild the per-pool controls for the new pool
+          renderAmm();
+        });
+        $("amLpAction").addEventListener("change", () => { renderAmLpInputs(); renderAmLpHint(); });
+        $("amSwapIn").addEventListener("change", () => scheduleAmQuote());
+        $("amSwapOut").addEventListener("change", () => scheduleAmQuote());
+        $("amSwapAmount").addEventListener("input", () => scheduleAmQuote());
+
+        /* Auto-quote as the amount changes. AMM prices move with every trade, so
+         * a quote left on screen goes stale quickly; it is also re-fetched
+         * immediately before executing. */
+        let amQuoteTimer = null;
+        function scheduleAmQuote() {
+          clearTimeout(amQuoteTimer);
+          const v = $("amSwapAmount").value.trim();
+          if (!v || Number(v) <= 0) { $("amSwapQuote").textContent = ""; return; }
+          $("amSwapQuote").textContent = "Quoting…";
+          amQuoteTimer = setTimeout(() => { ammQuote().catch(() => {}); }, 350);
+        }
+        setInterval(() => {
+          if (!$("ammCard") || $("paneDefi").hidden) return;
+          const v = $("amSwapAmount").value.trim();
+          if (v && Number(v) > 0) ammQuote().catch(() => {});
+        }, 15000);
+
+        async function ammQuote() {
+          const p = amSelected();
+          if (!p) return null;
+          const tokenIn = $("amSwapIn").value, tokenOut = $("amSwapOut").value;
+          const ai = amAsset(p, tokenIn), ao = amAsset(p, tokenOut);
+          const human = $("amSwapAmount").value.trim();
+          if (!ai || !ao || !human || Number(human) <= 0) return null;
+          if (tokenIn === tokenOut) { $("amSwapQuote").textContent = "Pick two different assets."; return null; }
+          const amountIn = toRaw(human, ai.decimals);
+          const r = await (
+            await fetch(`/api/amm/quote?poolId=${p.id}&tokenIn=${tokenIn}&tokenOut=${tokenOut}&amountIn=${amountIn}`)
+          ).json();
+          if (!r.ok) { $("amSwapQuote").textContent = "Quote failed: " + r.error; return null; }
+          const out = fmtUnitsJs(r.out, ao.decimals);
+          const lpFee = fmtUnitsJs(r.lpFee, ai.decimals);
+          const appFee = fmtUnitsJs(r.appFee, ai.decimals);
+          const eff = Number(out) > 0 && Number(human) > 0 ? Number(out) / Number(human) : 0;
+          // Price impact: how far this trade moves you off the pool's spot rate.
+          const spot = Number(ao.balance) > 0 && Number(ai.balance) > 0 ? Number(ao.balance) / Number(ai.balance) : 0;
+          const impact = spot > 0 && eff > 0 ? Math.max(0, (1 - eff / spot) * 100) : 0;
+          $("amSwapQuote").innerHTML =
+            `You pay <b>${esc(human)} ${esc(ai.symbol)}</b> → you receive <b>${esc(out)} ${esc(ao.symbol)}</b><br>` +
+            `<span style="font-weight:400;color:var(--muted)">effective rate 1 ${esc(ai.symbol)} = ` +
+            `${eff ? eff.toPrecision(6) : "—"} ${esc(ao.symbol)} · price impact ${esc(impact.toFixed(2))}% · ` +
+            `fee ${esc(lpFee)} to providers + ${esc(appFee)} to the app · 1% max slippage</span>`;
+          return { poolId: p.id, tokenIn, tokenOut, amountIn, out: r.out, ai, ao };
+        }
+
+        $("amSwapExec").addEventListener("click", async () => {
+          const msg = $("ammMsg");
+          const q = await ammQuote();
+          if (!q) {
+            msg.style.display = "block"; msg.style.color = "var(--warn)";
+            msg.textContent = "Enter an amount and pick two different assets first.";
+            return;
+          }
+          const minOut = ((BigInt(q.out) * 99n) / 100n).toString();
+          const btn = $("amSwapExec");
+          if (selfMode()) {
+            btn.disabled = true;
+            await selfCustody("ammMsg", `swap ${q.ai.symbol} → ${q.ao.symbol}`, async (from, cfg) => {
+              await ensureAllowance(from, q.tokenIn, cfg.amm, q.amountIn);
+              return sendTx(
+                from,
+                cfg.amm,
+                callData(
+                  cfg.selectors.ammSwap,
+                  encUint(q.poolId), encAddr(q.tokenIn), encAddr(q.tokenOut), encUint(q.amountIn), encUint(minOut),
+                ),
+              );
+            });
+            btn.disabled = false;
+            return;
+          }
+          btn.disabled = true;
+          try {
+            const r = await (
+              await postJson("/api/amm/swap", {
+                poolId: q.poolId, tokenIn: q.tokenIn, tokenOut: q.tokenOut, amountIn: q.amountIn, minOut,
+              })
+            ).json();
+            msg.style.display = "block";
+            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
+            msg.textContent = r.ok ? `swapped ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;
+          } catch {
+            msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = "request failed";
+          } finally { btn.disabled = false; afterTx(); }
+        });
+
+        // "Max" fills the boxes: for a withdrawal, every share you hold; for a
+        // deposit, the largest balanced deposit your wallet can actually cover.
+        $("amLpMax").addEventListener("click", async () => {
+          const raw = amSelected();
+          if (!raw) return;
+          const p = amMine(raw);
+          if ($("amLpAction").value === "remove") {
+            const el = $("amLpShares");
+            if (el) el.value = p.myShares;
+            return;
+          }
+          const boxes = [...document.querySelectorAll(".amLpAmt")];
+          const balances = await amWalletBalances(p);
+          if (!balances) return;
+          // Largest scale factor the wallet can fund across every asset.
+          let scale = Infinity;
+          p.assets.forEach((a, i) => {
+            const pool = Number(a.balance), have = Number(balances[i]);
+            if (pool > 0) scale = Math.min(scale, have / pool);
+          });
+          if (!isFinite(scale) || scale <= 0) return;
+          p.assets.forEach((a, i) => {
+            const want = Number(a.balance) * scale;
+            if (boxes[i]) boxes[i].value = want > 0 ? want.toFixed(Number(a.decimals) || 6).replace(/0+$/, "").replace(/\.$/, "") : "";
+          });
+        });
+
+        /** The connected wallet's balance of each pool asset (self-custody only). */
+        async function amWalletBalances(p) {
+          if (!selfMode() || !window.ethereum) return null;
+          try {
+            const cfg = await loadDefiConfig();
+            const [from] = await window.ethereum.request({ method: "eth_accounts" });
+            if (!from) return null;
+            return Promise.all(
+              p.assets.map(async (a) =>
+                decStr(await ethCall(a.address, callData(cfg.selectors.balanceOf, encAddr(from))), a.decimals),
+              ),
+            );
+          } catch { return null; }
+        }
+
+        $("amLpExec").addEventListener("click", async () => {
+          const raw = amSelected();
+          const msg = $("ammMsg");
+          if (!raw) return;
+          const p = amMine(raw);
+          const adding = $("amLpAction").value === "add";
+          const btn = $("amLpExec");
+
+          let amounts = [], shares = "0";
+          if (adding) {
+            const boxes = [...document.querySelectorAll(".amLpAmt")];
+            amounts = p.assets.map((a, i) => {
+              const v = (boxes[i] && boxes[i].value.trim()) || "";
+              return v && Number(v) > 0 ? toRaw(v, a.decimals) : "0";
+            });
+            if (amounts.some((v) => v === "0")) {
+              msg.style.display = "block"; msg.style.color = "var(--warn)";
+              msg.textContent = "Enter an amount for every asset in the pool.";
+              return;
+            }
+          } else {
+            shares = (($("amLpShares") && $("amLpShares").value.trim()) || "").replace(/[^\d]/g, "");
+            if (!shares || BigInt(shares) <= 0n) {
+              msg.style.display = "block"; msg.style.color = "var(--warn)";
+              msg.textContent = "Enter how many shares to withdraw.";
+              return;
+            }
+            if (BigInt(shares) > BigInt(p.myShares || "0")) {
+              msg.style.display = "block"; msg.style.color = "var(--warn)";
+              msg.textContent = `You hold ${p.myShares} shares — enter that or less.`;
+              return;
+            }
+          }
+
+          if (selfMode()) {
+            btn.disabled = true;
+            await selfCustody("ammMsg", adding ? "add liquidity" : "withdraw liquidity", async (from, cfg) => {
+              if (adding) {
+                for (let i = 0; i < p.assets.length; i++) {
+                  await ensureAllowance(from, p.assets[i].address, cfg.amm, amounts[i]);
+                }
+                return sendTx(
+                  from, cfg.amm,
+                  // addLiquidity(uint256,uint256[],uint256): the dynamic array
+                  // sits in the tail, so the head carries an offset to it.
+                  callData(cfg.selectors.ammAdd, encUint(p.id), encUint(96), encUint(0), encArray(amounts)),
+                );
+              }
+              return sendTx(
+                from, cfg.amm,
+                // removeLiquidity(uint256,uint256,uint256[]) — zero minimums; the
+                // payout is proportional by construction, so there is nothing to
+                // front-run here.
+                callData(cfg.selectors.ammRemove, encUint(p.id), encUint(shares), encUint(96), encArray(p.assets.map(() => "0"))),
+              );
+            });
+            btn.disabled = false;
+            return;
+          }
+
+          btn.disabled = true;
+          try {
+            const body = adding ? { poolId: p.id, amounts } : { poolId: p.id, shares };
+            const r = await (await postJson(`/api/amm/${adding ? "add" : "remove"}`, body)).json();
+            msg.style.display = "block";
+            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
+            msg.textContent = r.ok
+              ? `${adding ? "added" : "withdrew"} liquidity ✓ — tx ${String(r.txHash).slice(0, 12)}…`
+              : `failed: ${r.error}`;
+          } catch {
+            msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = "request failed";
+          } finally { btn.disabled = false; afterTx(); }
+        });
+      }
+
+      /* ===================================================================
        * Self-custody mode — the user's own wallet, the user's own funds.
        *
        * Server-side actions spend the *agent's* wallet and are operator-only.
@@ -1090,6 +1444,13 @@ const $ = (id) => document.getElementById(id);
       const encAddr = (a) => pad32(a);
       const encUint = (v) => pad32(BigInt(v).toString(16));
       const callData = (selector, ...parts) => selector + parts.join("");
+      /**
+       * Tail encoding for a `uint256[]` argument: length word followed by the
+       * elements. The matching head word is the byte offset to this tail, which
+       * the caller supplies with `encUint(...)` — for a three-word head that is
+       * 96, for a two-word head 64.
+       */
+      const encArray = (values) => encUint(values.length) + values.map(encUint).join("");
 
       async function selfAccount() {
         if (!window.ethereum) throw new Error("No browser wallet detected.");
@@ -1229,6 +1590,18 @@ const $ = (id) => document.getElementById(id);
             renderSwapBalances();
           } catch {}
         }
+        // AMM: my LP shares in the selected pool. The server snapshot reports the
+        // *agent's* position, which would be plainly wrong to show a connected
+        // user. Kept in a side map rather than written into the snapshot, so the
+        // next poll can't flip the panel back to the agent's numbers.
+        const ap = amSelected();
+        if (cfg.amm && ap) {
+          try {
+            const raw = await ethCall(cfg.amm, callData(sel.ammShares, encUint(ap.id), encAddr(from)));
+            window.__myAmmShares[ap.id] = BigInt(raw || "0x0").toString();
+            renderAmm();
+          } catch {}
+        }
       }
       // Mark a field as "yours" so the agent-state render doesn't overwrite it.
       function setMine(id, text) {
@@ -1322,7 +1695,126 @@ const $ = (id) => document.getElementById(id);
         $("cfgModal").hidden = false;
         $("cfgBtn").setAttribute("aria-expanded", "true");
         loadAppConfig();
+        renderCfgAmm();
         syncCfgDock();
+      }
+
+      /* ---- AMM administration inside App Config ---------------------------
+       * Fee retuning is deliberately a separate button from "Save": it is an
+       * on-chain, per-pool change, and burying it in the global save would make
+       * it far too easy to retune every pool by accident. */
+      function cfgAmmMsg(text, good) {
+        const row = $("cfgAmmMsg");
+        if (!row) return;
+        row.style.display = "flex";
+        row.style.color = good ? "var(--good)" : "var(--warn)";
+        row.lastElementChild.textContent = text;
+      }
+      function renderCfgAmm() {
+        const pools = amPools();
+        const sel = $("cfgAmmPools");
+        if (!sel) return;
+        sel.innerHTML = pools
+          .map((p) => `<option value="${p.id}">${esc(p.name)}${p.frozen ? " (frozen)" : ""}</option>`)
+          .join("");
+        if (pools.length) {
+          sel.selectedIndex = 0;
+          const p = pools[0];
+          $("cfgAmmFee").value = (p.swapFeeBps / 100).toFixed(2);
+          $("cfgAmmLpShare").value = String(p.lpShareBps / 100);
+        }
+        // Candidate assets for a new pool: whatever the lending pool lists.
+        const assets = (window.__lending && window.__lending.assets) || [];
+        const na = $("cfgAmmNewAssets");
+        if (na) {
+          na.innerHTML = assets
+            .map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`)
+            .join("");
+        }
+      }
+      const cfgAmmSelectedIds = () =>
+        [...($("cfgAmmPools") ? $("cfgAmmPools").selectedOptions : [])].map((o) => Number(o.value));
+
+      async function cfgAmmConfigure(poolIds) {
+        if (!poolIds.length) { cfgAmmMsg("Select at least one pool.", false); return; }
+        const lpShareBps = Math.round(+$("cfgAmmLpShare").value * 100);
+        if (!(lpShareBps >= 5000)) {
+          cfgAmmMsg("Providers always keep at least 50% — the contract rejects less.", false);
+          return;
+        }
+        cfgAmmMsg("Sending…", true);
+        try {
+          const r = await (
+            await postJson("/api/amm/admin/configure", {
+              poolIds,
+              swapFeeBps: Math.round(+$("cfgAmmFee").value * 100),
+              lpShareBps,
+            })
+          ).json();
+          cfgAmmMsg(r.ok ? `Updated ${poolIds.length} pool(s) ✓` : r.error, !!r.ok);
+          if (r.ok) afterTx();
+        } catch { cfgAmmMsg("Request failed.", false); }
+      }
+
+      if ($("cfgAmmApply")) {
+        $("cfgAmmApply").addEventListener("click", () => cfgAmmConfigure(cfgAmmSelectedIds()));
+        $("cfgAmmApplyAll").addEventListener("click", () => cfgAmmConfigure(amPools().map((p) => p.id)));
+        $("cfgAmmPools").addEventListener("change", () => {
+          const p = amPools().find((x) => x.id === cfgAmmSelectedIds()[0]);
+          if (!p) return;
+          $("cfgAmmFee").value = (p.swapFeeBps / 100).toFixed(2);
+          $("cfgAmmLpShare").value = String(p.lpShareBps / 100);
+        });
+
+        const freeze = async (frozen) => {
+          const [poolId] = cfgAmmSelectedIds();
+          if (poolId === undefined) { cfgAmmMsg("Select a pool first.", false); return; }
+          cfgAmmMsg("Sending…", true);
+          try {
+            const r = await (await postJson("/api/amm/admin/freeze", { poolId, frozen })).json();
+            cfgAmmMsg(
+              r.ok
+                ? `Pool ${frozen ? "frozen" : "unfrozen"} ✓${frozen ? " — withdrawals stay open" : ""}`
+                : r.error,
+              !!r.ok,
+            );
+            if (r.ok) afterTx();
+          } catch { cfgAmmMsg("Request failed.", false); }
+        };
+        $("cfgAmmFreeze").addEventListener("click", () => freeze(true));
+        $("cfgAmmUnfreeze").addEventListener("click", () => freeze(false));
+
+        $("cfgAmmRename").addEventListener("click", async () => {
+          const [poolId] = cfgAmmSelectedIds();
+          if (poolId === undefined) { cfgAmmMsg("Select a pool first.", false); return; }
+          const current = amPools().find((p) => p.id === poolId);
+          const name = prompt("New name for this pool:", current ? current.name : "");
+          if (name === null) return;
+          cfgAmmMsg("Sending…", true);
+          try {
+            const r = await (await postJson("/api/amm/admin/rename", { poolId, name: name.trim() })).json();
+            cfgAmmMsg(r.ok ? "Renamed ✓" : r.error, !!r.ok);
+            if (r.ok) afterTx();
+          } catch { cfgAmmMsg("Request failed.", false); }
+        });
+
+        $("cfgAmmCreate").addEventListener("click", async () => {
+          const assets = [...$("cfgAmmNewAssets").selectedOptions].map((o) => o.value);
+          if (assets.length < 2) { cfgAmmMsg("Pick at least two assets.", false); return; }
+          cfgAmmMsg("Deploying pool…", true);
+          try {
+            const r = await (
+              await postJson("/api/amm/admin/create", {
+                assets,
+                name: $("cfgAmmNewName").value.trim(),
+                swapFeeBps: Math.round(+($("cfgAmmFee").value || 0.3) * 100),
+                lpShareBps: Math.round(+($("cfgAmmLpShare").value || 50) * 100),
+              })
+            ).json();
+            cfgAmmMsg(r.ok ? "Pool created ✓" : r.error, !!r.ok);
+            if (r.ok) { $("cfgAmmNewName").value = ""; afterTx(); setTimeout(renderCfgAmm, 1500); }
+          } catch { cfgAmmMsg("Request failed.", false); }
+        });
       }
       function closeCfg() {
         $("cfgModal").hidden = true;

@@ -24,6 +24,7 @@ const pool = readArtifact("TesseraPool");
 const vault = readArtifact("TesseraVault");
 const swap = readArtifact("TesseraSwap");
 const feeCollector = readArtifact("TesseraFeeCollector");
+const amm = readArtifact("TesseraAMM");
 const mockToken = readArtifact("MockToken");
 
 const outDir = path.resolve(root, "..", "shared", "src");
@@ -38,6 +39,7 @@ const abiTs =
   `export const tesseraVaultAbi = ${JSON.stringify(vault.abi)} as const;\n\n` +
   `export const tesseraSwapAbi = ${JSON.stringify(swap.abi)} as const;\n\n` +
   `export const tesseraFeeCollectorAbi = ${JSON.stringify(feeCollector.abi)} as const;\n\n` +
+  `export const tesseraAmmAbi = ${JSON.stringify(amm.abi)} as const;\n\n` +
   `export const mockTokenAbi = ${JSON.stringify(mockToken.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 
@@ -51,6 +53,7 @@ const bytecodeTs =
   `export const tesseraVaultBytecode = "${vault.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const tesseraSwapBytecode = "${swap.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const tesseraFeeCollectorBytecode = "${feeCollector.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraAmmBytecode = "${amm.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const mockTokenBytecode = "${mockToken.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);
 
