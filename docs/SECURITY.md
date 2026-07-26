@@ -306,45 +306,91 @@ explanatory comment, and the API test suite exercises each one.
 
 ## Dependency advisories
 
-`npm audit` reports ~51 advisories at the repo root. Every one of them is in a
-**devDependency**, and none of them is in the tree that runs in production:
-
 ```
-npm audit --omit=dev     →  found 0 vulnerabilities
-npm audit                →  51 (19 low, 9 moderate, 23 high)
+npm run audit          →  clean
+npm audit --omit=dev   →  found 0 vulnerabilities        (the tree that ships)
+npm audit              →  13 low, 0 moderate, 0 high     (was 51: 19/9/23)
 ```
 
-They come from the Solidity toolchain — `hardhat` and its transitive tree
-(`solidity-coverage`, `eth-gas-reporter`, `sc-istanbul`, `mocha`, and the pinned
-ethers v5 `@ethersproject/*` packages). Hardhat 2.x vendors those versions, so
-they cannot be lifted from here; they clear when Hardhat's own tree moves.
-`npm audit fix` is applied (it took Hardhat to 2.29.0, verified byte-identical
-bytecode and 104/104 contract tests); `--force` is deliberately **not**, because
-it would install a new major of the toolchain that compiles the contracts.
+Nothing that runs in production has an advisory, and nothing at any severity
+above **low** has one anywhere. What is left is a single unfixable advisory
+counted thirteen times; the detail is below.
 
-Two advisory packages do appear in the production tree, both at versions the
-advisories exclude:
+### What was actually wrong
 
-| Package | Production version | Advisory range | Status |
-|---|---|---|---|
-| `cookie` (via `express`) | 0.7.2 | `< 0.7.0` | not affected |
-| `ws` (via `viem` → `isows`) | 8.21.0 | `8.0.0 – 8.20.1` | not affected |
-
-The vulnerable copies of both are nested under the dev tree
-(`@ethersproject/providers/node_modules/ws`, and `cookie@0.4.2` under Hardhat).
-
-**What was actually wrong.** The count itself was not the problem — the
-`Dockerfile` was. It ran a plain `npm install`, so the whole dev toolchain was
-installed into the image that serves the site, even though nothing under
-`agent/`, `shared/` or `providers/` imports Hardhat and nothing reads its build
-artifacts. The build is now two stages: the builder compiles the contracts (which
-exports the ABIs and bytecode into `shared/src/`), and the runtime stage does a
-fresh `npm install --omit=dev`. That takes the shipped tree from 423 packages to
-95, drops the native build toolchain, and removes all 51 advisories from what
-runs — verified by installing the production-only tree and serving real requests
-from it (`/`, `/api/state`, `/api/feeds/*` all 200, live Arc reads intact).
+Not the count — the `Dockerfile`. It ran a plain `npm install`, so the whole
+Solidity toolchain was installed into the image that serves the site, even
+though nothing under `agent/`, `shared/` or `providers/` imports Hardhat and
+nothing reads its build artifacts. The build is now two stages: the builder
+compiles the contracts (which exports the ABIs and bytecode into `shared/src/`),
+and the runtime stage does a fresh `npm install --omit=dev`. That takes the
+shipped tree from **423 packages to 95** and drops the native build toolchain.
+Verified by assembling the runtime stage's exact contents and serving real
+requests from it — `/`, `/api/state` and the feed routes all 200, live Arc reads
+intact, Hardhat absent.
 
 `tsx` is therefore a **production** dependency of the agent, not a dev one: the
 app is served straight from its TypeScript sources via `node --import tsx`, so it
-is a runtime loader here. Listing it under `devDependencies` would make an
-`--omit=dev` install unable to start.
+is a runtime loader here. Under `devDependencies` an `--omit=dev` install could
+not start.
+
+### Getting the count down: 51 → 13
+
+**Dropped `@nomicfoundation/hardhat-toolbox-viem` (51 → 26).** The toolbox is an
+aggregator. Of the five plugins it registers, this project uses two —
+`hardhat-viem` for `hre.viem`, plus its `chai.use(chaiAsPromised)` setup for the
+tests' `.to.be.rejected`. The other three (`hardhat-verify`,
+`hardhat-ignition-viem`, `hardhat-gas-reporter`, `solidity-coverage`) are unused:
+there is no ignition module, no coverage script, and `REPORT_GAS` is never set.
+They were dragging in the entire ethers v5 tree. `contracts/hardhat.config.ts`
+now names the two plugins directly.
+
+**Pinned fixed versions of vulnerable transitives via `overrides` (26 → 13).**
+Every remaining advisory except one had a published fix that Hardhat's own
+version ranges were holding back:
+
+| Override | From | Advisory range | Reached via |
+|---|---|---|---|
+| `adm-zip` ^0.6.0 | 0.4.16 | `<0.6.0` | hardhat |
+| `brace-expansion` ^5.0.8 | 1.1.x / 2.0.x | `<=5.0.7` | mocha → glob → minimatch |
+| `cookie` ^0.7.2 | 0.4.2 | `<0.7.0` | hardhat → @sentry/node 5 |
+| `diff` ^8.0.3 | 7.0.0 | `>=6.0.0 <8.0.3` | mocha |
+| `serialize-javascript` ^7.0.7 | 6.0.2 | `<=7.0.2` | mocha |
+| `tmp` ^0.2.7 | 0.0.33 | `<=0.2.3` | hardhat → solc |
+| `undici` ^6.28.0 | 5.29.0 | `<6.23.0` | hardhat |
+| `uuid` ^11.1.1 | 8.3.2 | `<11.1.1` | hardhat |
+
+Three of those (`diff`, `serialize-javascript`, `brace-expansion`) are inside
+mocha, which is the contract test runner — so these overrides are load-bearing
+for the build, not cosmetic. They are verified: a clean recompile on them
+produces **byte-identical** bytecode, and 104/104 contract tests plus 140/140
+agent tests pass.
+
+### The 13 that remain
+
+All thirteen are one advisory — [GHSA-848j-6mx2-7j84](https://github.com/advisories/GHSA-848j-6mx2-7j84),
+`elliptic` "uses a cryptographic primitive with a risky implementation" (low,
+CVSS 5.6) — plus the twelve packages npm lists for containing it:
+`@ethersproject/{abi,abstract-provider,abstract-signer,hash,signing-key,transactions}`,
+`ethereum-cryptography`, `ethereumjs-util`, `secp256k1`, `hardhat`, and the two
+hardhat plugins.
+
+It cannot be fixed from here, for a concrete reason: the advisory covers
+`elliptic <=6.6.1` and **6.6.1 is the latest published release** — there is no
+patched version to pin. It arrives through `hardhat@2` → `@ethersproject/abi`,
+which ethers v5 (frozen) resolves to `elliptic`. npm agrees: the fix it proposes
+is `@nomicfoundation/hardhat-network-helpers@3.0.11`, i.e. **the Hardhat 3
+plugin line**.
+
+Hardhat 3.11 does drop the whole tree — no `@ethersproject/*`, no `undici` 5, no
+`@sentry/node` 5, no `mocha`. Migrating to it would reach a genuine zero. It is
+deliberately **not** done here: Hardhat 3 is a rewrite (ESM config, `plugins`
+array, no `hre` global, `network.connect()`, a different test runner), so it
+means rewriting the config and all 11 contract test files. Trading a verified
+104-test suite for a low-severity advisory in a tool that no longer ships is the
+wrong trade to make unprompted — but it is the route if a zero-tolerance policy
+requires it.
+
+`npm run audit` encodes the position: the production tree must be clean, and the
+full tree must be clean at moderate and above. A new advisory at any real
+severity therefore fails the check instead of hiding in the noise.

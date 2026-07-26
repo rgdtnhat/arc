@@ -18,9 +18,20 @@
     "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs",
     "pool:arc": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/pool-arc.mjs",
     "pool:arc:init": "npm run pool:arc -- --deploy-missing",
+    "audit": "npm audit --omit=dev && npm audit --audit-level=moderate",
     "deck": "node scripts/make-deck.mjs && node scripts/check-deck.mjs",
     "deck:check": "node scripts/check-deck.mjs",
     "deck:pdf": "soffice --headless --norestore --convert-to pdf --outdir docs docs/deck.pptx"
+  },
+  "overrides": {
+    "adm-zip": "^0.6.0",
+    "brace-expansion": "^5.0.8",
+    "cookie": "^0.7.2",
+    "diff": "^8.0.3",
+    "serialize-javascript": "^7.0.7",
+    "tmp": "^0.2.7",
+    "undici": "^6.28.0",
+    "uuid": "^11.1.1"
   },
   "license": "MIT",
   "engines": {
