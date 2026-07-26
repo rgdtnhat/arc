@@ -2986,9 +2986,12 @@ const $ = (id) => document.getElementById(id);
       const fmtWhenShort = (ms) => {
         const d = new Date(ms);
         if (isNaN(d)) return "—";
-        return d.toLocaleString(undefined, {
-          year: "2-digit", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit",
-        });
+        // Format the date and the time separately. Handing toLocaleString a
+        // day+2-digit-year combination produced "Jul 26, 26, 05:45" in en-US —
+        // the day and the year read as the same number and it looks like a bug.
+        const day = d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+        const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+        return `${day} · ${time}`;
       };
       const statusTag = (s) => {
         const cls = s === "success" || s === "approved" ? "ok" : s === "failed" ? "bad" : s === "declined" ? "warn" : "";

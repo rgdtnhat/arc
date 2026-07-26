@@ -1345,13 +1345,25 @@ async function main() {
     };
   };
 
-  /** A signed-in user's own history. */
+  /**
+   * A signed-in user's own history.
+   *
+   * NOTE ON ORDER: `/api/history/mine` must stay registered before the archive
+   * block's `/api/history/:id`, or "mine" gets matched as a record id. That bug
+   * has already bitten this file once (bulk delete silently 404'd), so both the
+   * literal routes here and the ones there come before their `:id` siblings.
+   */
   app.get("/api/history/mine", requireAuth, (req, res) => {
     mirrorAgentLedger();
     const id = identityOf(req)!;
     // An admin session has no wallet of its own, so it sees the agent wallet's
     // activity here — which is exactly whose funds its actions move.
-    const mine = id.address ?? (agentAccount.address as string);
+    //
+    // Lowercased to match how rows store `actor`. Returning a mixed-case address
+    // alongside lowercased rows made any client-side comparison against it fail
+    // silently, which is a nasty way for a scope check to look broken when it
+    // isn't.
+    const mine = (id.address ?? (agentAccount.address as string)).toLowerCase();
     const filter: TxFilter = { ...txFilterFrom(req), forceActor: mine };
     const { rows, total } = txlog.query(filter);
     res.json({ ok: true, rows, total, summary: txlog.summary(filter), facets: txlog.facets(mine), actor: mine });
@@ -1383,7 +1395,7 @@ async function main() {
    */
   app.post("/api/history/mine", requireAuth, (req, res) => {
     const id = identityOf(req)!;
-    const actor = id.address ?? (agentAccount.address as string);
+    const actor = (id.address ?? (agentAccount.address as string)).toLowerCase();
     const category = String(req.body?.category ?? "defi");
     if (!["defi", "agentic"].includes(category)) {
       res.status(400).json({ ok: false, error: "Unknown category." });

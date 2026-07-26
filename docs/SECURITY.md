@@ -206,6 +206,47 @@ anything else falls back to the default. Both paths are covered by browser tests
 that attempt injection. Reads are public — a maintenance warning nobody can see
 is worthless — and writes are operator-only.
 
+## Transaction history
+
+The history is an **activity log, not a ledger** — balances are always read from
+the contracts, never derived from it. Two access levels, and the boundary between
+them is the part that matters:
+
+- A signed-in user reads only their own entries. `forceActor` is pinned to the
+  session address **server-side and applied last**, so no query parameter can
+  widen the scope. The filter facets a scoped caller receives contain no other
+  users' addresses at all, so the list of who exists is not disclosed either.
+- An operator reads across every user, with filters and CSV export.
+
+Self-custody transactions are reported by the browser, because the server never
+sees them — it holds no key and is not in the signing path. That write can only
+ever land in the caller's own history, and a transaction hash is validated
+against `/^0x[0-9a-fA-F]{64}$/` before storage: a wallet's response is untrusted
+input. Every rendered field goes through `textContent`-equivalent escaping;
+browser tests plant `<img onerror>` and `<svg onload>` payloads in the detail and
+amount fields and assert that nothing executes and no element is injected.
+
+## Live market and news feeds
+
+Public reads, cached server-side. The security-relevant properties:
+
+| Property | Why |
+|---|---|
+| No fabricated numbers | An unreachable feed reports the reason. It never substitutes a plausible figure — someone might trade on it. |
+| Every panel names its source and age | A stale value stays visible but is labelled, rather than silently passing as current. |
+| RSS content is never rendered as markup | Titles and links come from third parties. Titles are escaped; links are validated as `http(s)` and carry `rel="noopener noreferrer"`. |
+| Hard timeouts on every upstream fetch | A hung upstream cannot hang a request to this server. |
+| Only the visible tab polls | Keeps the app inside upstream rate limits, so the panel does not degrade itself. |
+
+## Route ordering
+
+Express matches in registration order, so a literal path registered *after* a
+`:id` sibling is unreachable. This produced a real bug once —
+`/api/notices/delete` was matched as a notice with the id `"delete"`, so bulk
+delete silently 404'd. Every collection endpoint now registers its literal
+routes first (`/delete`, `/merge`, `/archive`, `/mine`, `/transactions`) with an
+explanatory comment, and the API test suite exercises each one.
+
 ## Design assumptions (not bugs, but worth stating)
 
 - **Trusted admin/deployer key.** Whoever holds the pool owner / deployer key can
