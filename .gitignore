@@ -20,3 +20,5 @@ deployments/arc.local.json
 .tessera-config.json
 .tessera-profiles.json
 deployments/arc.history.json
+# Scratch directory for local QA scripts; never part of the app.
+.tmpqa/

@@ -57,6 +57,8 @@ import { OwnerClient } from "./owner.js";
 import { NoticeStore, NOTICE_LIMITS } from "./notices.js";
 import { ArchiveStore, ARCHIVE_LIMITS, type ArchiveKind } from "./history.js";
 import { ArchiveScanner } from "./archive-chain.js";
+import { TxLog, toCsv, TX_LIMITS, type TxCategory, type TxStatus, type TxFilter } from "./txlog.js";
+import * as feeds from "./feeds.js";
 import type { Faucet } from "./circle/faucet.js";
 
 const APP_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../..");
@@ -785,9 +787,14 @@ async function main() {
         : a === "repay" ? await p.repay(asset, amount)
         : null;
       if (txHash === null) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
+      logTx(req, { category: "defi", action: a, status: "success", assetAddress: asset, raw: amount, txHash });
       invalidateAll();
       res.json({ ok: true, txHash });
     } catch (e) {
+      logTx(req, {
+        category: "defi", action: req.params.action, status: "failed",
+        assetAddress: asset, raw: amount, detail: friendlyError(e),
+      });
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
@@ -1049,9 +1056,17 @@ async function main() {
         res.status(400).json({ ok: false, error: "unknown action" });
         return;
       }
+      logTx(req, {
+        category: "defi", action: `amm ${req.params.action}`, status: "success",
+        txHash, detail: pool.name,
+      });
       invalidateAll();
       res.json({ ok: true, txHash });
     } catch (e) {
+      logTx(req, {
+        category: "defi", action: `amm ${req.params.action}`, status: "failed",
+        detail: friendlyError(e),
+      });
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
@@ -1148,9 +1163,22 @@ async function main() {
         : a === "withdraw" ? await vaultClient.withdrawShares(shares)
         : null;
       if (txHash === null) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
+      logTx(req, {
+        category: "defi", action: `vault ${a}`, status: "success",
+        assetAddress: (liveDeployment.vaultAsset as string) ?? usdcAddress,
+        raw: a === "deposit" ? amount : undefined,
+        detail: a === "withdraw" ? `${shares} shares` : undefined,
+        txHash,
+      });
       invalidateAll();
       res.json({ ok: true, txHash });
     } catch (e) {
+      logTx(req, {
+        category: "defi", action: `vault ${req.params.action}`, status: "failed",
+        assetAddress: (liveDeployment.vaultAsset as string) ?? usdcAddress,
+        raw: req.params.action === "deposit" ? amount : undefined,
+        detail: friendlyError(e),
+      });
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
@@ -1192,6 +1220,210 @@ async function main() {
     if (w) return { key: w.address.toLowerCase(), kind: "wallet", address: w.address };
     return null;
   };
+
+  /* --- Transaction history --------------------------------------------------
+   *
+   * An activity log, not an accounting ledger: balances always come from the
+   * contracts. Two access levels, and the difference matters —
+   *
+   *  - a signed-in user reads **only their own** entries, enforced by pinning
+   *    `forceActor` to their session address server-side so no query parameter
+   *    can widen it;
+   *  - an operator reads everything, with filters.
+   */
+  const txlog = new TxLog(statePath(".tessera-txlog.json"));
+
+  /** Best-effort USD value for a raw amount, using the price the pool reports. */
+  const usdValue = (assetAddr: string | undefined, raw: bigint): number | undefined => {
+    if (!assetAddr) return undefined;
+    const a = (lastLending?.assets ?? []).find((x) => x.address.toLowerCase() === assetAddr.toLowerCase());
+    if (!a) return undefined;
+    const price = Number(a.priceUsd);
+    if (!Number.isFinite(price) || price <= 0) return undefined;
+    return (Number(raw) / 10 ** a.decimals) * price;
+  };
+
+  /** Record an action against whoever actually signed for it. */
+  function logTx(
+    req: express.Request,
+    entry: {
+      category: TxCategory;
+      action: string;
+      status: TxStatus;
+      asset?: string;
+      assetAddress?: string;
+      raw?: bigint;
+      txHash?: string;
+      detail?: string;
+    },
+  ) {
+    const who = identityOf(req);
+    const meta = entry.assetAddress ? assetMeta(entry.assetAddress as Hex) : undefined;
+    const amount =
+      entry.raw !== undefined && meta ? `${formatUnits(entry.raw, meta.decimals)} ${meta.symbol}` : undefined;
+    try {
+      txlog.record({
+        // An operator action spends the agent wallet, so attribute it there
+        // rather than to the anonymous "operator" session.
+        actor: who?.address ?? (agentAccount.address as string),
+        category: entry.category,
+        action: entry.action,
+        status: entry.status,
+        amount,
+        valueRaw: entry.raw?.toString(),
+        valueUsd: entry.raw !== undefined ? usdValue(entry.assetAddress, entry.raw) : undefined,
+        asset: entry.asset ?? meta?.symbol,
+        txHash: entry.txHash,
+        detail: entry.detail,
+      });
+    } catch (e) {
+      // Losing a log line must never fail the transaction it describes.
+      console.error(`[txlog] record failed: ${String(e).slice(0, 120)}`);
+    }
+  }
+
+  /**
+   * Mirror the agent's own ledger into the transaction log.
+   *
+   * The agent keeps its ledger in memory, keyed by resource; this copies each
+   * entry across once so agentic activity shows up in the same history as DeFi
+   * activity. Keyed by `paymentId` (falling back to resource + status) so a
+   * re-run or a status change doesn't duplicate a row.
+   */
+  const mirroredLedger = new Set<string>();
+  function mirrorAgentLedger() {
+    const statusOf = (s: string): TxStatus =>
+      s === "settled" ? "success"
+      : s === "refunded" ? "declined"
+      : s === "skipped" ? "declined"
+      : s === "failed" ? "failed"
+      : "pending";
+    for (const e of ledgerRef) {
+      const key = `${e.paymentId ?? e.resource}:${e.status}`;
+      if (mirroredLedger.has(key)) continue;
+      mirroredLedger.add(key);
+      try {
+        txlog.record({
+          actor: agentAccount.address as string,
+          category: "agentic",
+          action: e.status === "refunded" ? "refund" : e.status === "skipped" ? "skip" : "settle",
+          status: statusOf(e.status),
+          amount: `${formatUsdc(e.price)} USDC`,
+          valueRaw: e.price.toString(),
+          valueUsd: Number(formatUsdc(e.price)),
+          asset: "USDC",
+          txHash: e.txs?.settle ?? e.txs?.refund ?? e.txs?.open,
+          detail: `${e.name} — ${e.reason}`.slice(0, 200),
+        });
+      } catch {
+        /* a log line is never worth failing over */
+      }
+    }
+  }
+
+  /** Parse the shared filter shape from a query string. */
+  const txFilterFrom = (req: express.Request): TxFilter => {
+    const num = (v: unknown) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+    return {
+      actor: str(req.query.actor),
+      category: str(req.query.category) as TxFilter["category"],
+      status: str(req.query.status) as TxFilter["status"],
+      action: str(req.query.action),
+      asset: str(req.query.asset),
+      from: num(req.query.from),
+      to: num(req.query.to),
+      minUsd: num(req.query.minUsd),
+      maxUsd: num(req.query.maxUsd),
+      q: str(req.query.q),
+      limit: num(req.query.limit),
+      offset: num(req.query.offset),
+      sort: str(req.query.sort) as TxFilter["sort"],
+    };
+  };
+
+  /** A signed-in user's own history. */
+  app.get("/api/history/mine", requireAuth, (req, res) => {
+    mirrorAgentLedger();
+    const id = identityOf(req)!;
+    // An admin session has no wallet of its own, so it sees the agent wallet's
+    // activity here — which is exactly whose funds its actions move.
+    const mine = id.address ?? (agentAccount.address as string);
+    const filter: TxFilter = { ...txFilterFrom(req), forceActor: mine };
+    const { rows, total } = txlog.query(filter);
+    res.json({ ok: true, rows, total, summary: txlog.summary(filter), facets: txlog.facets(mine), actor: mine });
+  });
+
+  /** Every user's history, with filters. Operator only. */
+  app.get("/api/history/transactions", requireOperator, (req, res) => {
+    mirrorAgentLedger();
+    const filter = txFilterFrom(req);
+    const { rows, total } = txlog.query(filter);
+    res.json({ ok: true, rows, total, summary: txlog.summary(filter), facets: txlog.facets(), limits: TX_LIMITS });
+  });
+
+  /** CSV of the current filter. Operator only — it can span every user. */
+  app.get("/api/history/transactions.csv", requireOperator, (req, res) => {
+    const { rows } = txlog.query({ ...txFilterFrom(req), limit: TX_LIMITS.maxStored });
+    res.setHeader("content-type", "text/csv; charset=utf-8");
+    res.setHeader("content-disposition", 'attachment; filename="tessera-transactions.csv"');
+    res.send(toCsv(rows));
+  });
+
+  /**
+   * Let the browser report a self-custody transaction it signed.
+   *
+   * The server cannot see these — the wallet signs and broadcasts directly — so
+   * without this the user's own history would be missing exactly the actions
+   * they took with their own funds. `forceActor` on read means a caller can only
+   * ever write into their own history, and the hash is validated before storage.
+   */
+  app.post("/api/history/mine", requireAuth, (req, res) => {
+    const id = identityOf(req)!;
+    const actor = id.address ?? (agentAccount.address as string);
+    const category = String(req.body?.category ?? "defi");
+    if (!["defi", "agentic"].includes(category)) {
+      res.status(400).json({ ok: false, error: "Unknown category." });
+      return;
+    }
+    const status = String(req.body?.status ?? "success");
+    if (!["success", "failed", "pending"].includes(status)) {
+      res.status(400).json({ ok: false, error: "Unknown status." });
+      return;
+    }
+    const row = txlog.record({
+      actor,
+      category: category as TxCategory,
+      action: String(req.body?.action ?? "").slice(0, 40),
+      status: status as TxStatus,
+      amount: req.body?.amount ? String(req.body.amount).slice(0, 40) : undefined,
+      asset: req.body?.asset ? String(req.body.asset).slice(0, 20) : undefined,
+      valueUsd: Number.isFinite(Number(req.body?.valueUsd)) ? Number(req.body.valueUsd) : undefined,
+      txHash: req.body?.txHash,
+      detail: req.body?.detail ? String(req.body.detail) : undefined,
+    });
+    res.json({ ok: true, id: row.id });
+  });
+
+  /* --- Live market & news feeds ---------------------------------------------
+   * Public reads: this is public information, and gating it behind a sign-in
+   * would make the workspace useless to a visitor. Everything is cached
+   * server-side, and a feed that cannot be reached says so rather than showing
+   * a number nobody can stand behind. */
+  app.get("/api/feeds/fx", async (_req, res) => res.json(await feeds.fx()));
+  app.get("/api/feeds/crypto", async (_req, res) => res.json(await feeds.crypto()));
+  app.get("/api/feeds/stocks", async (_req, res) => res.json(await feeds.stocks()));
+  app.get("/api/feeds/commodities", async (_req, res) => res.json(await feeds.commodities()));
+  app.get("/api/feeds/analysis", async (_req, res) => res.json(await feeds.analysis()));
+  app.get("/api/feeds/news", async (req, res) => {
+    const raw = String(req.query.topics ?? "").trim();
+    const topics = raw && raw !== "all" ? raw.split(",").map((t) => t.trim()).filter(Boolean) : [];
+    res.json(await feeds.news(topics));
+  });
+  app.get("/api/feeds/topics", (_req, res) => res.json({ ok: true, topics: Object.keys(feeds.NEWS_TOPICS) }));
 
   /* --- Contract history & fund recovery -------------------------------------
    *
@@ -1973,9 +2205,20 @@ async function main() {
       const amountIn = BigInt((req.query.amountIn as string) ?? "0");
       const minOut = BigInt((req.query.minOut as string) ?? "0");
       const txHash = await swapClient.execute(tokenIn, tokenOut, amountIn, minOut);
+      logTx(req, {
+        category: "defi", action: "swap", status: "success",
+        assetAddress: tokenIn, raw: amountIn, txHash,
+        detail: `${assetMeta(tokenIn).symbol} → ${assetMeta(tokenOut).symbol}`,
+      });
       invalidateAll();
       res.json({ ok: true, txHash });
     } catch (e) {
+      logTx(req, {
+        category: "defi", action: "swap", status: "failed",
+        assetAddress: req.query.tokenIn as string,
+        raw: BigInt((req.query.amountIn as string) ?? "0"),
+        detail: friendlyError(e),
+      });
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });

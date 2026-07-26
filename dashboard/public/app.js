@@ -58,6 +58,22 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
+      /* The header is fixed, so everything that sits under it needs to know how
+       * tall it actually is. Measuring beats hard-coding: the height changes with
+       * the platform's font metrics, a zoom level, and whether the drawer is open. */
+      (function trackHeaderHeight() {
+        const bar = document.querySelector(".topbar .inner");
+        if (!bar) return;
+        const apply = () => {
+          const h = Math.round(bar.getBoundingClientRect().height);
+          if (h > 0) document.documentElement.style.setProperty("--headerH", h + "px");
+        };
+        apply();
+        if (window.ResizeObserver) new ResizeObserver(apply).observe(bar);
+        window.addEventListener("orientationchange", () => setTimeout(apply, 250));
+        window.addEventListener("resize", apply, { passive: true });
+      })();
+
       /* ====================================================================
        * Router — landing page ⇄ in-app tabs, with no page reload.
        * The hash drives it (#/dashboard, #/defi, …) so links and the browser
@@ -65,11 +81,11 @@ const $ = (id) => document.getElementById(id);
        * ==================================================================== */
       const TABS = ["dashboard", "defi", "agents", "other"];
       const NAV_LABELS = {
-        home: "🏠 Home",
-        dashboard: "📊 Dashboard",
-        defi: "💠 DeFi",
-        agents: "🤖 Agent transactions",
-        other: "🧰 Treasury & system",
+        home: "◈ Home",
+        dashboard: "◫ Dashboard",
+        defi: "◇ DeFi",
+        agents: "◎ Agent workspace",
+        other: "⬡ Treasury & system",
       };
       const NAV_OPEN_KEY = "tessera_nav_open";
       /** Open/close the menu drawer, remembering the choice across visits. */
@@ -204,7 +220,8 @@ const $ = (id) => document.getElementById(id);
         el.textContent = text;
       }
 
-      const short = (a) => (a ? a.slice(0, 6) + "…" + a.slice(-4) : "—");
+      // Tolerates a short value (e.g. "operator") rather than mangling it.
+      const short = (a) => (!a ? "—" : a.length > 14 ? a.slice(0, 6) + "…" + a.slice(-4) : a);
       const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
@@ -439,6 +456,10 @@ const $ = (id) => document.getElementById(id);
         }
 
         window.__ledger = s.ledger || [];
+        // Kept for the account-status sheet, which renders from the same state
+        // rather than issuing its own reads.
+        window.__lastState = s;
+        window.__explorer = (s.live && s.live.explorer) || "";
 
         // ---- Dashboard tab + landing stat strip -------------------------------
         // Same numbers in both places, so the landing page shows real live state.
@@ -454,6 +475,7 @@ const $ = (id) => document.getElementById(id);
         setAll("dashVaultTvl", vaultTvl);
         setAll("landTvl", vaultTvl);
         setAll("dashBuffer", s.vault && s.vault.ready ? s.vault.bufferPct + "%" : "—");
+        setAll("dashAmmPools", s.amm && s.amm.ready ? String((s.amm.pools || []).length) : "—");
 
         if (s.lending && s.lending.ready && s.lending.assets.length) {
           // Headline the pool on its USDC reserve, falling back to the first asset.
@@ -650,7 +672,39 @@ const $ = (id) => document.getElementById(id);
         });
       }
       bindEye("authEye", "authPw");
-      bindEye("authEye2", "authPw2");
+      // One toggle for both new-password boxes — they always hold the same
+      // secret, so revealing one and not the other is just confusing.
+      (function bindNewPasswordEye() {
+        const b = $("authEye2"), a = $("authPw2"), c = $("authPw3");
+        if (!b || !a || !c) return;
+        b.addEventListener("click", () => {
+          const show = a.type === "password";
+          a.type = c.type = show ? "text" : "password";
+          b.textContent = show ? "🙈" : "👁";
+          b.setAttribute("aria-label", show ? "Hide password" : "Show password");
+          a.focus();
+        });
+      })();
+
+      /** Live match feedback, so a typo is visible before submitting. */
+      function syncPwMatch() {
+        const a = $("authPw2"), c = $("authPw3"), out = $("authPwMatch");
+        if (!a || !c || !out) return;
+        if (!a.value && !c.value) { out.style.display = "none"; return; }
+        out.style.display = "block";
+        if (!c.value) {
+          out.style.color = "var(--muted)";
+          out.textContent = "Type the new password again to confirm it.";
+        } else if (a.value === c.value) {
+          out.style.color = "var(--good)";
+          out.textContent = "Both entries match.";
+        } else {
+          out.style.color = "var(--warn)";
+          out.textContent = "The two entries don't match yet.";
+        }
+      }
+      if ($("authPw2")) $("authPw2").addEventListener("input", syncPwMatch);
+      if ($("authPw3")) $("authPw3").addEventListener("input", syncPwMatch);
 
       let authResolve = null;
       /**
@@ -662,7 +716,7 @@ const $ = (id) => document.getElementById(id);
         const isChange = mode === "change";
         $("authTitle").textContent = isChange ? "Change password" : "Operator sign-in";
         $("authHint").textContent = isChange
-          ? "Enter your current password, then the new one (min 8 characters)."
+          ? "Enter your current password, then the new one twice (min 8 characters)."
           : "Enter your admin id and password.";
         // Target labels/inputs by id — the password input sits inside .pwRow, so
         // previousElementSibling is null there and would throw before the dialog
@@ -672,10 +726,13 @@ const $ = (id) => document.getElementById(id);
         $("authPwLabel").textContent = isChange ? "Current password" : "Password";
         $("authPw2Row").style.display = isChange ? "" : "none";
         $("authPw2Label").style.display = isChange ? "" : "none";
+        $("authPw3Row").style.display = isChange ? "" : "none";
+        $("authPw3Label").style.display = isChange ? "" : "none";
+        $("authPwMatch").style.display = "none";
         $("authSubmit").textContent = isChange ? "Change password" : "Sign in";
         $("authMsg").style.display = "none";
-        $("authId").value = ""; $("authPw").value = ""; $("authPw2").value = "";
-        $("authPw").type = "password"; $("authPw2").type = "password";
+        $("authId").value = ""; $("authPw").value = ""; $("authPw2").value = ""; $("authPw3").value = "";
+        $("authPw").type = "password"; $("authPw2").type = "password"; $("authPw3").type = "password";
         $("authEye").textContent = "👁"; $("authEye2").textContent = "👁";
         wrap.hidden = false;
         setTimeout(() => (isChange ? $("authPw") : $("authId")).focus(), 40);
@@ -695,9 +752,13 @@ const $ = (id) => document.getElementById(id);
       $("authSubmit").addEventListener("click", () => {
         const isChange = $("authPw2Row").style.display !== "none";
         if (isChange) {
-          const current = $("authPw").value, next = $("authPw2").value;
-          if (!current || !next) return authError("Fill in both passwords.");
+          const current = $("authPw").value, next = $("authPw2").value, again = $("authPw3").value;
+          if (!current || !next) return authError("Fill in your current and new password.");
           if (next.length < 8) return authError("The new password must be at least 8 characters.");
+          // Checked here as well as live, because a paste can fill both boxes
+          // without ever firing the input handler in some browsers.
+          if (next !== again) return authError("The two new-password entries don't match.");
+          if (next === current) return authError("The new password is the same as the current one.");
           closeAuth({ current, next });
         } else {
           const id = $("authId").value.trim(), password = $("authPw").value;
@@ -2527,25 +2588,9 @@ const $ = (id) => document.getElementById(id);
             })).json();
             alert(r.ok ? "Password changed." : "Failed: " + r.error);
           } else if (what === "status") {
-            const v = window.__vault, l = window.__lending;
-            const lines = [
-              profileState && profileState.kind === "admin" ? "Signed in as operator" : "Wallet " + ((profileState && profileState.address) || "—"),
-              "",
-              "Agent wallet: " + (window.__agentUsdc || "—") + " USDC",
-              "Vault TVL: " + (v ? v.totalAssets + " USDC" : "—") + "  ·  vault position: " + (v ? v.yourAssets + " USDC" : "—"),
-              "Lending supplied: " + (l && l.account ? "$" + l.account.suppliedUsd : "—") +
-                "  ·  borrowed: " + (l && l.account ? "$" + l.account.borrowedUsd : "—"),
-              "Health factor: " + (l && l.account ? l.account.healthFactor : "—"),
-            ];
-            alert(lines.join("\n"));
+            openAcctSheet();
           } else if (what === "history") {
-            // The ledger already holds every settled/refunded purchase.
-            const led = window.__ledger || [];
-            if (!led.length) { alert("No transactions yet."); return; }
-            alert(
-              "Recent transactions\n\n" +
-                led.slice(-12).map((e) => `${e.status.toUpperCase()} · ${e.name} · ${e.priceUsdc} USDC`).join("\n")
-            );
+            openTxSheet();
           } else if (what === "signout") {
             await postAuthed("/api/admin/logout").catch(() => {});
             localStorage.removeItem("tessera_token");
@@ -2555,6 +2600,736 @@ const $ = (id) => document.getElementById(id);
           }
         });
       });
+
+      /* ====================================================================
+       * Agent workspace — live market and news feeds.
+       *
+       * Every figure here comes from a named upstream source via the server,
+       * which caches and never fabricates. When a feed is unreachable the panel
+       * says so; it does not fall back to a stale number dressed up as current,
+       * because someone might act on it.
+       *
+       * Tabs load lazily and refresh only while visible: polling six feeds for a
+       * tab nobody is looking at is pure waste, and would burn the upstream rate
+       * limits that the whole panel depends on.
+       * ==================================================================== */
+      const AG_PANES = {
+        operations: "agOperations",
+        news: "agNews",
+        fx: "agFx",
+        crypto: "agCrypto",
+        analysis: "agAnalysis",
+        stocks: "agStocks",
+        commodities: "agCommodities",
+        marketplace: "agMarketplace",
+      };
+      const AG_TAB_KEY = "tessera_ag_tab";
+      let agTab = "operations";
+      let agTimer = null;
+
+      /** Exchange-style colour: green up, red down, muted flat. */
+      const moveClass = (v) => (v === null || v === undefined ? "flat" : v > 0 ? "up" : v < 0 ? "down" : "flat");
+      const pctCell = (v) =>
+        v === null || v === undefined
+          ? `<td class="num flat">—</td>`
+          : `<td class="num ${moveClass(v)}">${v >= 0 ? "+" : ""}${v.toFixed(2)}%</td>`;
+      const absCell = (v, dp = 2) =>
+        v === null || v === undefined
+          ? `<td class="num flat">—</td>`
+          : `<td class="num ${moveClass(v)}">${v >= 0 ? "+" : ""}${v.toFixed(dp)}</td>`;
+      /** Sensible precision: a 0.85 FX rate and a 64,000 price need different dp. */
+      const money = (v, cur) => {
+        if (!Number.isFinite(v)) return "—";
+        const dp = v >= 1000 ? 2 : v >= 1 ? 4 : 6;
+        const n = v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: dp });
+        return cur && cur !== "USD" ? `${n} ${cur}` : `$${n}`;
+      };
+      const compact = (v) =>
+        !Number.isFinite(v) ? "—"
+        : v >= 1e12 ? (v / 1e12).toFixed(2) + "T"
+        : v >= 1e9 ? (v / 1e9).toFixed(2) + "B"
+        : v >= 1e6 ? (v / 1e6).toFixed(2) + "M"
+        : v.toLocaleString();
+
+      /** One place to say where a number came from and how old it is. */
+      function feedNote(id, r) {
+        const el = $(id);
+        if (!el) return;
+        if (r.error) {
+          el.className = "feedNote bad";
+          el.textContent = r.error;
+          return;
+        }
+        const age = r.ageSeconds < 60 ? `${r.ageSeconds}s` : `${Math.round(r.ageSeconds / 60)}m`;
+        el.className = r.warning ? "feedNote bad" : "feedNote";
+        el.textContent =
+          `Source: ${r.source} · fetched ${age} ago` + (r.warning ? ` · ${r.warning}` : "");
+      }
+      const emptyRow = (cols, text) =>
+        `<tr><td colspan="${cols}" style="color:var(--muted);padding:16px">${esc(text)}</td></tr>`;
+
+      async function feed(path) {
+        const res = await fetch(path);
+        return res.json();
+      }
+
+      async function loadFx() {
+        const body = $("fxRows");
+        body.innerHTML = emptyRow(3, "Loading…");
+        try {
+          const r = await feed("/api/feeds/fx");
+          feedNote("fxNote", r);
+          const rates = (r.items && r.items.rates) || [];
+          body.innerHTML = rates.length
+            ? rates
+                .map(
+                  (x) =>
+                    `<tr><td><b>${esc(x.pair)}</b></td>` +
+                    `<td class="num">${esc(x.rate.toFixed(x.rate >= 100 ? 3 : 5))}</td>` +
+                    pctCell(x.changePct) +
+                    `</tr>`,
+                )
+                .join("")
+            : emptyRow(3, r.error || "No rates available.");
+        } catch {
+          body.innerHTML = emptyRow(3, "Couldn't reach the server.");
+        }
+      }
+
+      async function loadCryptoFeed() {
+        const body = $("cryptoRows");
+        body.innerHTML = emptyRow(7, "Loading…");
+        try {
+          const r = await feed("/api/feeds/crypto");
+          feedNote("cryptoNote", r);
+          const rows = r.items || [];
+          body.innerHTML = rows.length
+            ? rows
+                .map(
+                  (x) =>
+                    `<tr><td><b>${esc(x.symbol)}</b> <span style="color:var(--muted)">${esc(x.name)}</span></td>` +
+                    `<td class="num">${esc(money(x.price))}</td>` +
+                    pctCell(x.changeDay) + pctCell(x.changeWeek) + pctCell(x.changeMonth) + pctCell(x.changeYear) +
+                    `<td class="num">${esc(compact(x.marketCap))}</td></tr>`,
+                )
+                .join("")
+            : emptyRow(7, r.error || "No prices available.");
+        } catch {
+          body.innerHTML = emptyRow(7, "Couldn't reach the server.");
+        }
+      }
+
+      async function loadStocks() {
+        const idx = $("indexRows"), st = $("stockRows");
+        idx.innerHTML = emptyRow(5, "Loading…");
+        st.innerHTML = emptyRow(6, "Loading…");
+        try {
+          const r = await feed("/api/feeds/stocks");
+          feedNote("stocksNote", r);
+          const q = r.items || {};
+          idx.innerHTML = (q.indices || []).length
+            ? q.indices
+                .map(
+                  (x) =>
+                    `<tr><td><b>${esc(x.name)}</b></td>` +
+                    `<td class="num">${esc(x.price.toLocaleString(undefined, { maximumFractionDigits: 2 }))}</td>` +
+                    absCell(x.changeAbs) + pctCell(x.changePct) +
+                    `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
+                )
+                .join("")
+            : emptyRow(5, r.error || "No index data available.");
+          st.innerHTML = (q.stocks || []).length
+            ? q.stocks
+                .map(
+                  (x) =>
+                    `<tr><td><b>${esc(x.name)}</b></td><td>${esc(x.symbol)}</td>` +
+                    `<td class="num">${esc(money(x.price, x.currency))}</td>` +
+                    absCell(x.changeAbs) + pctCell(x.changePct) +
+                    `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
+                )
+                .join("")
+            : emptyRow(6, r.error || "No stock data available.");
+        } catch {
+          idx.innerHTML = emptyRow(5, "Couldn't reach the server.");
+          st.innerHTML = emptyRow(6, "Couldn't reach the server.");
+        }
+      }
+
+      async function loadCommodities() {
+        const body = $("commodityRows");
+        body.innerHTML = emptyRow(5, "Loading…");
+        try {
+          const r = await feed("/api/feeds/commodities");
+          feedNote("commoditiesNote", r);
+          const rows = r.items || [];
+          body.innerHTML = rows.length
+            ? rows
+                .map(
+                  (x) =>
+                    `<tr><td><b>${esc(x.name)}</b></td>` +
+                    `<td class="num">${esc(money(x.price, x.currency))}</td>` +
+                    absCell(x.changeAbs) + pctCell(x.changePct) +
+                    `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
+                )
+                .join("")
+            : emptyRow(5, r.error || "No commodity data available.");
+        } catch {
+          body.innerHTML = emptyRow(5, "Couldn't reach the server.");
+        }
+      }
+
+      async function loadAnalysis() {
+        const host = $("analysisList");
+        host.innerHTML = `<div style="color:var(--muted)">Loading…</div>`;
+        try {
+          const r = await feed("/api/feeds/analysis");
+          feedNote("analysisNote", r);
+          const lines = (r.items && r.items.lines) || [];
+          host.innerHTML = lines.length
+            ? lines
+                .map((l) => {
+                  const mark = l.tone === "up" ? "▲" : l.tone === "down" ? "▼" : l.tone === "flat" ? "▬" : "ⓘ";
+                  return (
+                    `<div style="display:flex;gap:10px;align-items:flex-start">` +
+                    `<span class="${esc(l.tone === "info" ? "flat" : moveClass(l.tone === "up" ? 1 : l.tone === "down" ? -1 : 0))}" ` +
+                    `style="font-size:13px;line-height:1.5">${mark}</span>` +
+                    `<span><b>${esc(l.label)}</b><span style="display:block;color:var(--muted);font-size:12.5px;line-height:1.55">${esc(l.detail)}</span></span></div>`
+                  );
+                })
+                .join("")
+            : `<div style="color:var(--warn)">${esc(r.error || "Nothing to analyse.")}</div>`;
+        } catch {
+          host.innerHTML = `<div style="color:var(--warn)">Couldn't reach the server.</div>`;
+        }
+      }
+
+      /* ---- news ---- */
+      const NEWS_KEY = "tessera_news_topics";
+      let newsTopics = [];
+      let newsSelected = new Set();
+
+      function renderNewsTopics() {
+        const host = $("newsTopics");
+        if (!host) return;
+        host.innerHTML = newsTopics
+          .map(
+            (t) =>
+              `<button class="sheetTab ${newsSelected.has(t) ? "active" : ""}" data-topic="${esc(t)}">` +
+              `${esc(t.charAt(0).toUpperCase() + t.slice(1))}</button>`,
+          )
+          .join("");
+        host.querySelectorAll("[data-topic]").forEach((b) =>
+          b.addEventListener("click", () => {
+            const t = b.dataset.topic;
+            if (newsSelected.has(t)) newsSelected.delete(t);
+            else newsSelected.add(t);
+            try { localStorage.setItem(NEWS_KEY, JSON.stringify([...newsSelected])); } catch {}
+            renderNewsTopics();
+          }),
+        );
+      }
+
+      async function loadNewsTopics() {
+        if (newsTopics.length) return;
+        try {
+          const r = await feed("/api/feeds/topics");
+          newsTopics = r.topics || [];
+          try {
+            const saved = JSON.parse(localStorage.getItem(NEWS_KEY) || "[]");
+            newsSelected = new Set(saved.filter((t) => newsTopics.includes(t)));
+          } catch { newsSelected = new Set(); }
+          // Default to a useful spread rather than everything at once.
+          if (!newsSelected.size) newsSelected = new Set(["general", "economic", "technology", "crypto"].filter((t) => newsTopics.includes(t)));
+          renderNewsTopics();
+        } catch { /* the note below will explain */ }
+      }
+
+      const ago = (ms) => {
+        const m = Math.round((Date.now() - ms) / 60000);
+        if (!Number.isFinite(m) || m < 0) return "";
+        if (m < 60) return `${m}m ago`;
+        const h = Math.round(m / 60);
+        return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+      };
+
+      async function loadNews() {
+        const host = $("newsList");
+        host.innerHTML = `<div style="color:var(--muted);padding:8px 0">Loading headlines…</div>`;
+        const topics = newsSelected.size ? [...newsSelected].join(",") : "all";
+        try {
+          const r = await feed("/api/feeds/news?topics=" + encodeURIComponent(topics));
+          feedNote("newsNote", r);
+          const items = r.items || [];
+          host.innerHTML = items.length
+            ? items
+                .map(
+                  (n) =>
+                    `<div style="padding:9px 0;border-bottom:1px solid var(--line)">` +
+                    // rel=noopener so a publisher's page can't touch this one.
+                    `<a href="${esc(n.link)}" target="_blank" rel="noopener noreferrer" style="font-size:13.5px;font-weight:600">${esc(n.title)}</a>` +
+                    `<span style="display:block;color:var(--muted);font-size:11.5px;margin-top:3px">` +
+                    `<span class="tag">${esc(n.topic)}</span> ${esc(n.source)} · ${esc(ago(n.publishedAt))}</span></div>`,
+                )
+                .join("")
+            : `<div style="color:var(--warn);padding:8px 0">${esc(r.error || "No headlines available.")}</div>`;
+        } catch {
+          host.innerHTML = `<div style="color:var(--warn);padding:8px 0">Couldn't reach the server.</div>`;
+        }
+      }
+
+      const AG_LOADERS = {
+        news: loadNews,
+        fx: loadFx,
+        crypto: loadCryptoFeed,
+        analysis: loadAnalysis,
+        stocks: loadStocks,
+        commodities: loadCommodities,
+      };
+      /** Refresh cadence per tab. Prices move; news does not, minute to minute. */
+      const AG_REFRESH = { fx: 120_000, crypto: 60_000, stocks: 90_000, commodities: 90_000, analysis: 120_000, news: 600_000 };
+
+      function setAgTab(tab, opts) {
+        if (!(tab in AG_PANES)) tab = "operations";
+        agTab = tab;
+        try { localStorage.setItem(AG_TAB_KEY, tab); } catch {}
+        for (const [name, id] of Object.entries(AG_PANES)) {
+          const el = $(id);
+          if (el) el.hidden = name !== tab;
+        }
+        document.querySelectorAll("[data-agtab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.agtab === tab));
+
+        clearInterval(agTimer);
+        agTimer = null;
+        const load = AG_LOADERS[tab];
+        if (!load) return;
+        if (tab === "news") loadNewsTopics().then(load);
+        else if (!opts || opts.load !== false) load();
+        // Only the visible tab polls.
+        const every = AG_REFRESH[tab];
+        if (every) {
+          agTimer = setInterval(() => {
+            if ($("paneAgents").hidden || agTab !== tab) return;
+            load();
+          }, every);
+        }
+      }
+
+      if ($("agTabs")) {
+        document.querySelectorAll("[data-agtab]").forEach((b) =>
+          b.addEventListener("click", () => setAgTab(b.dataset.agtab)));
+        $("newsApply").addEventListener("click", loadNews);
+        $("newsAll").addEventListener("click", () => {
+          newsSelected = new Set(newsTopics);
+          try { localStorage.setItem(NEWS_KEY, JSON.stringify([...newsSelected])); } catch {}
+          renderNewsTopics();
+          loadNews();
+        });
+        $("newsNone").addEventListener("click", () => {
+          newsSelected = new Set();
+          try { localStorage.setItem(NEWS_KEY, "[]"); } catch {}
+          renderNewsTopics();
+        });
+        // Restore the last tab, but don't fetch until the section is actually shown.
+        let saved = "operations";
+        try { saved = localStorage.getItem(AG_TAB_KEY) || "operations"; } catch {}
+        setAgTab(saved, { load: false });
+        // Load on first reveal, so opening the app on the Dashboard costs nothing.
+        let agLoadedOnce = false;
+        const revealCheck = setInterval(() => {
+          if (agLoadedOnce || !$("paneAgents") || $("paneAgents").hidden) return;
+          agLoadedOnce = true;
+          setAgTab(agTab);
+        }, 500);
+        window.addEventListener("beforeunload", () => clearInterval(revealCheck));
+      }
+
+      /* ====================================================================
+       * Large sheets: transaction history and account status.
+       *
+       * These are overlays, not routes. Nothing reloads, the page underneath
+       * keeps its scroll position and state, and closing returns you exactly
+       * where you were. Escape and the backdrop both close.
+       * ==================================================================== */
+      function openSheet(id) {
+        const el = $(id);
+        if (!el) return;
+        el.hidden = false;
+        // Stop the page behind from scrolling while a sheet is open — on iOS a
+        // scrollable body under a fixed overlay is what causes the "rubber band
+        // steals my scroll" problem.
+        document.body.style.overflow = "hidden";
+        const focusable = el.querySelector("button, select, input");
+        if (focusable) setTimeout(() => focusable.focus(), 60);
+      }
+      function closeSheet(id) {
+        const el = $(id);
+        if (!el) return;
+        el.hidden = true;
+        if (document.querySelectorAll(".sheetWrap:not([hidden])").length === 0) {
+          document.body.style.overflow = "";
+        }
+      }
+      document.querySelectorAll(".sheetWrap").forEach((w) => {
+        w.addEventListener("click", (e) => { if (e.target === w) closeSheet(w.id); });
+      });
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        const open = [...document.querySelectorAll(".sheetWrap:not([hidden])")];
+        if (open.length) closeSheet(open[open.length - 1].id);
+      });
+
+      /* ---- transaction history ------------------------------------------- */
+      const TX_PAGE = 40;
+      let txState = { tab: "all", offset: 0, total: 0, isOperator: false, actor: "" };
+
+      const fmtWhenShort = (ms) => {
+        const d = new Date(ms);
+        if (isNaN(d)) return "—";
+        return d.toLocaleString(undefined, {
+          year: "2-digit", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit",
+        });
+      };
+      const statusTag = (s) => {
+        const cls = s === "success" || s === "approved" ? "ok" : s === "failed" ? "bad" : s === "declined" ? "warn" : "";
+        return `<span class="tag ${cls}">${esc(s)}</span>`;
+      };
+
+      /** Build the query string from the filter controls plus the active tab. */
+      function txQuery() {
+        const q = new URLSearchParams();
+        // The tab is a category filter, except "everyone" which only widens the
+        // actor scope (and is operator-only, enforced server-side).
+        if (["defi", "agentic", "admin"].includes(txState.tab)) q.set("category", txState.tab);
+        const pick = (id, key) => { const v = $(id) && $(id).value; if (v && v !== "all") q.set(key, v); };
+        pick("txStatus", "status");
+        pick("txAction", "action");
+        pick("txAsset", "asset");
+        pick("txSort", "sort");
+        if (txState.tab === "everyone") pick("txActor", "actor");
+        if ($("txFrom").value) q.set("from", String(Date.parse($("txFrom").value + "T00:00:00")));
+        // Inclusive of the whole "to" day — a date picker means the day.
+        if ($("txTo").value) q.set("to", String(Date.parse($("txTo").value + "T23:59:59.999")));
+        if ($("txMin").value !== "") q.set("minUsd", $("txMin").value);
+        if ($("txMax").value !== "") q.set("maxUsd", $("txMax").value);
+        if ($("txQ").value.trim()) q.set("q", $("txQ").value.trim());
+        q.set("limit", String(TX_PAGE));
+        q.set("offset", String(txState.offset));
+        return q;
+      }
+
+      async function loadTx() {
+        const scope = txState.tab === "everyone" ? "transactions" : "mine";
+        const url = `/api/history/${scope}?` + txQuery().toString();
+        const rows = $("txRows");
+        rows.innerHTML = `<tr><td colspan="8" style="color:var(--muted);padding:16px">Loading…</td></tr>`;
+        try {
+          const r = await (await fetch(url, { headers: authHeaders() })).json();
+          if (!r.ok) {
+            rows.innerHTML = "";
+            $("txEmpty").textContent = r.error || "Couldn't load history.";
+            return;
+          }
+          txState.total = r.total;
+          if (r.actor) txState.actor = r.actor;
+
+          // Summary strip.
+          const sm = r.summary || {};
+          $("txSummary").innerHTML = [
+            ["Matching", String(sm.total ?? 0)],
+            ["Succeeded", String(sm.success ?? 0)],
+            ["Failed", String(sm.failed ?? 0)],
+            ["Declined", String(sm.declined ?? 0)],
+            ["DeFi", String(sm.defi ?? 0)],
+            ["Agentic", String(sm.agentic ?? 0)],
+            ["Value", "$" + (Number(sm.volumeUsd ?? 0)).toFixed(2)],
+          ]
+            .map(([k, v]) => `<div class="metric"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`)
+            .join("");
+
+          // Filter option lists, from what is actually present.
+          const fill = (id, values, label) => {
+            const sel = $(id);
+            if (!sel) return;
+            const sig = values.join(",");
+            if (sel.dataset.sig === sig) return;
+            const keep = sel.value;
+            sel.innerHTML =
+              `<option value="all">${esc(label)}</option>` +
+              values.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+            if (values.includes(keep)) sel.value = keep;
+            sel.dataset.sig = sig;
+          };
+          const f = r.facets || {};
+          fill("txAction", f.actions || [], "Any");
+          fill("txAsset", f.assets || [], "Any");
+          if (txState.tab === "everyone") fill("txActor", f.actors || [], "Everyone");
+
+          const showUser = txState.tab === "everyone";
+          $("txThUser").hidden = !showUser;
+          rows.innerHTML = (r.rows || [])
+            .map((x) => {
+              const link = x.txHash
+                ? `<a href="${esc(window.__explorer || "")}/tx/${esc(x.txHash)}" target="_blank" rel="noopener">${esc(x.txHash.slice(0, 10))}…</a>`
+                : "—";
+              return (
+                `<tr><td>${esc(fmtWhenShort(x.at))}</td>` +
+                `<td>${esc(x.action)}</td>` +
+                (showUser ? `<td title="${esc(x.actor)}">${esc(short(x.actor))}</td>` : "") +
+                `<td class="num">${esc(x.amount || "—")}</td>` +
+                `<td class="num">${x.valueUsd === undefined ? "—" : "$" + Number(x.valueUsd).toFixed(2)}</td>` +
+                `<td>${statusTag(x.status)}</td>` +
+                `<td>${esc(x.detail || "")}</td>` +
+                `<td>${link}</td></tr>`
+              );
+            })
+            .join("");
+          $("txEmpty").textContent = (r.rows || []).length ? "" : "Nothing matches these filters.";
+          const from = r.total ? txState.offset + 1 : 0;
+          const to = Math.min(txState.offset + TX_PAGE, r.total);
+          $("txPageInfo").textContent = r.total ? `${from}–${to} of ${r.total}` : "no results";
+          $("txPrev").disabled = txState.offset === 0;
+          $("txNext").disabled = to >= r.total;
+        } catch {
+          rows.innerHTML = "";
+          $("txEmpty").textContent = "Couldn't reach the server.";
+        }
+      }
+
+      function setTxTab(tab) {
+        txState.tab = tab;
+        txState.offset = 0;
+        document.querySelectorAll("[data-txtab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.txtab === tab));
+        $("txActorWrap").hidden = tab !== "everyone";
+        loadTx();
+      }
+
+      async function openTxSheet() {
+        // The operator-only tabs appear only for an operator; the server enforces
+        // the same boundary, so this is presentation rather than protection.
+        const isOp = !!(profileState && profileState.isOperator);
+        txState.isOperator = isOp;
+        $("txTabEveryone").hidden = !isOp;
+        $("txTabAdmin").hidden = !isOp;
+        $("txWho").textContent = isOp
+          ? "Operator view — your own activity, or everyone's"
+          : profileState && profileState.address
+            ? "Your activity · " + short(profileState.address)
+            : "Your activity";
+        $("txExport").hidden = !isOp;
+        openSheet("txSheet");
+        setTxTab("all");
+      }
+
+      if ($("txSheet")) {
+        document.querySelectorAll("[data-txtab]").forEach((b) =>
+          b.addEventListener("click", () => setTxTab(b.dataset.txtab)));
+        $("txClose").addEventListener("click", () => closeSheet("txSheet"));
+        $("txRefresh").addEventListener("click", loadTx);
+        $("txApply").addEventListener("click", () => { txState.offset = 0; loadTx(); });
+        $("txReset").addEventListener("click", () => {
+          ["txStatus", "txAction", "txAsset", "txSort", "txActor"].forEach((id) => {
+            if ($(id)) $(id).selectedIndex = 0;
+          });
+          ["txFrom", "txTo", "txMin", "txMax", "txQ"].forEach((id) => { if ($(id)) $(id).value = ""; });
+          txState.offset = 0;
+          loadTx();
+        });
+        $("txPrev").addEventListener("click", () => {
+          txState.offset = Math.max(0, txState.offset - TX_PAGE);
+          loadTx();
+        });
+        $("txNext").addEventListener("click", () => {
+          if (txState.offset + TX_PAGE < txState.total) { txState.offset += TX_PAGE; loadTx(); }
+        });
+        // Typing in the search box filters without needing Apply.
+        let txQTimer = null;
+        $("txQ").addEventListener("input", () => {
+          clearTimeout(txQTimer);
+          txQTimer = setTimeout(() => { txState.offset = 0; loadTx(); }, 350);
+        });
+        $("txExport").addEventListener("click", async () => {
+          // Fetch with the auth header, then hand the browser a blob — a plain
+          // link can't carry a bearer token.
+          try {
+            const res = await fetch("/api/history/transactions.csv?" + txQuery().toString(), { headers: authHeaders() });
+            if (!res.ok) { alert("Export failed."); return; }
+            const url = URL.createObjectURL(await res.blob());
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "tessera-transactions.csv";
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 4000);
+          } catch { alert("Export failed."); }
+        });
+      }
+
+      /* ---- account status ------------------------------------------------- */
+      let acctTab = "identity";
+      function setAcctTab(tab) {
+        acctTab = tab;
+        document.querySelectorAll("[data-acctab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.acctab === tab));
+        renderAcct();
+      }
+      function openAcctSheet() {
+        openSheet("acctSheet");
+        setAcctTab("identity");
+      }
+
+      const row = (k, v, note) =>
+        `<div class="cfgRow" style="padding:8px 0"><span>${esc(k)}</span>` +
+        `<span style="text-align:right"><b>${esc(v)}</b>` +
+        `${note ? `<span style="display:block;color:var(--muted);font-size:11.5px;font-weight:400">${esc(note)}</span>` : ""}` +
+        `</span></div>`;
+      const section = (title, body) =>
+        `<div class="card compact"><h2>${esc(title)}</h2>${body}</div>`;
+
+      function renderAcct() {
+        const host = $("acctBody");
+        if (!host) return;
+        const p = profileState || {};
+        const s = window.__lastState || {};
+        const v = window.__vault, l = window.__lending, am = window.__amm, sw = window.__swap;
+
+        if (acctTab === "identity") {
+          host.innerHTML =
+            section("Who you are", [
+              row("Signed in as", p.kind === "admin" ? "Operator" : p.address ? "Connected wallet" : "Not signed in"),
+              row("Display name", p.name || "— not set —", "Set it from Edit profile"),
+              row("Address", p.address || "—", p.kind === "admin" ? "An operator session has no wallet of its own" : ""),
+              row("Can change password", p.canChangePassword ? "Yes" : "No — this is a wallet login"),
+              row("Operator privileges", p.isOperator ? "Yes" : "No"),
+            ].join("")) +
+            section("What that lets you do", [
+              row("Read everything", "Yes", "All balances, pools, quotes and market data are public"),
+              row("Transact with your own funds", p.address ? "Yes, via your wallet" : "Connect a wallet first"),
+              row("Spend the app's agent wallet", p.isOperator ? "Yes" : "No — operator only"),
+              row("Publish notices / change config", p.isOperator ? "Yes" : "No — operator only"),
+            ].join(""));
+          return;
+        }
+
+        if (acctTab === "positions") {
+          const lnRows = ((l && l.assets) || [])
+            .map((a) =>
+              row(
+                a.symbol,
+                `${a.position.supplied} supplied · ${a.position.borrowed} borrowed`,
+                `wallet ${a.position.wallet} · ${a.reserve.supplyApr}% supply APR` +
+                  (a.frozen ? " · some actions frozen" : "") +
+                  (a.priceOk === false ? " · price feed unavailable" : ""),
+              ),
+            )
+            .join("");
+          const ammRows = ((am && am.pools) || [])
+            .map((x) => row(x.name, `${x.mySharePct}% of the pool`, x.assets.map((y) => `${y.myBalance} ${y.symbol}`).join(" · ")))
+            .join("");
+          host.innerHTML =
+            section("Vault", v && v.ready
+              ? [
+                  row("Your balance", v.yourAssets + " USDC"),
+                  row("Wallet available", (v.walletUsdc || "0") + " USDC"),
+                  row("Vault TVL", v.totalAssets + " USDC"),
+                  row("APR", v.supplyApr + "%", `${v.reserveRatioPct}% held liquid · app takes ${v.performanceFeePct}% of yield only`),
+                ].join("")
+              : row("Vault", "not available")) +
+            section("Lending & borrowing", l && l.account
+              ? [
+                  row("Supplied", "$" + l.account.suppliedUsd),
+                  row("Borrowed", "$" + l.account.borrowedUsd),
+                  row("Borrow limit", "$" + l.account.borrowLimitUsd),
+                  row("Health factor", l.account.healthFactor, "Above 1.0 is safe; below it a position can be liquidated"),
+                ].join("") + lnRows
+              : row("Lending", "not available")) +
+            section("Liquidity pools", ammRows || row("AMM", "no position")) +
+            section("Swap desk", sw && sw.ready
+              ? sw.assets.map((a) => row(a.symbol, a.inventory + " available", "≈ $" + a.priceUsd)).join("")
+              : row("Swap", "not available"));
+          return;
+        }
+
+        if (acctTab === "activity") {
+          const sum = s.summary || {};
+          const t = s.treasury || {};
+          host.innerHTML =
+            section("Agent activity", [
+              row("Settled purchases", String(sum.settled ?? 0)),
+              row("Refunded", String(sum.refunded ?? 0), "SLA breach reclaimed automatically"),
+              row("Skipped", String(sum.skipped ?? 0), "Declined by policy or reputation"),
+              row("Spent", (sum.spentUsdc ?? "0") + " USDC"),
+            ].join("")) +
+            section("Agent wallet", [
+              row("Balance", (t.balanceUsdc ?? "—") + " USDC"),
+              row("Health", t.healthy ? "Above the low-water mark" : "Low — top it up", `low-water ${t.lowWaterUsdc ?? "—"} USDC`),
+              row("Estimated runway", String(t.runwayCalls ?? "—") + " calls"),
+            ].join("")) +
+            `<div class="card compact"><h2>Full history</h2>` +
+            `<div style="font-size:13px;color:var(--muted);margin-bottom:10px">` +
+            `Every transaction, filterable and exportable.</div>` +
+            `<button class="btn primary" id="acctOpenTx">Open transaction history</button></div>`;
+          const btn = $("acctOpenTx");
+          if (btn) btn.addEventListener("click", () => { closeSheet("acctSheet"); openTxSheet(); });
+          return;
+        }
+
+        if (acctTab === "network") {
+          const live = s.live || {};
+          const c = (k, addr) =>
+            addr
+              ? `<div class="cfgRow" style="padding:8px 0"><span>${esc(k)}</span>` +
+                `<span class="mono" style="font-size:12px"><a href="${esc(live.explorer || "")}/address/${esc(addr)}" target="_blank" rel="noopener">${esc(short(addr))}</a></span></div>`
+              : row(k, "not deployed");
+          host.innerHTML =
+            section("Network", [
+              row("Chain", (s.meta && s.meta.chain) || "Arc testnet"),
+              row("Chain id", String(live.chainId ?? "—")),
+              row("Gas token", "USDC", "Arc settles gas in USDC, so no separate gas asset is needed"),
+              row("Explorer", live.explorer || "—"),
+            ].join("")) +
+            section("Contracts", [
+              c("Escrow", live.tesseraEscrow),
+              c("Nanopayment tabs", live.tesseraTab),
+              c("Lending pool", live.tesseraPool),
+              c("Vault", live.tesseraVault),
+              c("Swap desk", live.tesseraSwap),
+              c("AMM", live.tesseraAmm),
+              c("Fee collector", live.tesseraFeeCollector),
+              c("AMM fee collector", live.tesseraAmmFeeCollector),
+            ].join(""));
+          return;
+        }
+
+        // security
+        host.innerHTML =
+          section("This session", [
+            row("Login type", p.kind === "admin" ? "Password (operator)" : p.address ? "Wallet signature (SIWE)" : "Not signed in"),
+            row("Session expiry", "12 hours", "Both operator and wallet sessions expire and must be renewed"),
+            row("Who can move your funds", p.address ? "Only you — your wallet signs" : "—",
+              "The server never holds your key. Self-custody transactions are built in your browser and signed by your wallet."),
+          ].join("")) +
+          section("What the app protects", [
+            row("Vault liquid reserve", "80% floor", "Fixed in the contract; no admin can lower it"),
+            row("Vault fee", "on yield only", "Capped at 30%; principal is never charged"),
+            row("AMM provider share", "50% floor", "A constant in the contract — not an admin setting"),
+            row("Freeze controls", "per action", "Withdraw and repay can stay open while other actions are halted"),
+            row("Price feeds", "validated", "A stale or broken feed pauses the market rather than pricing wrongly"),
+            row("Position transfers", "impossible", "No contract function can move someone else's position"),
+          ].join("")) +
+          section("Honest limits", [
+            row("Audited", "No", "Unaudited testnet software — do not use with real funds"),
+            row("Operator key", "Trusted", "The deployer can set fees within caps, freeze actions and set prices where no feed is wired"),
+            row("Impermanent loss", "Not eliminated", "Inherent to any constant-product AMM"),
+          ].join(""));
+      }
+
+      if ($("acctSheet")) {
+        document.querySelectorAll("[data-acctab]").forEach((b) =>
+          b.addEventListener("click", () => setAcctTab(b.dataset.acctab)));
+        $("acctClose").addEventListener("click", () => closeSheet("acctSheet"));
+        $("acctRefresh").addEventListener("click", async () => { await tick(); renderAcct(); });
+      }
 
       /* ---- App Config (operator only) ------------------------------------ */
       let cfgCadences = {};

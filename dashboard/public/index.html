@@ -69,16 +69,21 @@
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
       /* ---- top bar ------------------------------------------------------- */
+      /* The header is `fixed`, not `sticky`: sticky still participates in flow,
+         so on a short viewport it could scroll away before its containing block
+         ended. Fixed pins it for good, and `body` gets matching top padding so
+         nothing hides underneath. */
       .topbar {
-        position: sticky; top: 0; z-index: 80;
+        position: fixed; top: 0; left: 0; right: 0; z-index: 90;
         backdrop-filter: saturate(160%) blur(16px);
         -webkit-backdrop-filter: saturate(160%) blur(16px);
-        background: color-mix(in srgb, var(--bg) 78%, transparent);
+        background: color-mix(in srgb, var(--bg) 84%, transparent);
         border-bottom: 1px solid var(--line);
       }
+      body { padding-top: var(--headerH, 56px); }
       .topbar .inner {
-        max-width: var(--maxw); margin: 0 auto; padding: 10px 22px;
-        display: flex; align-items: center; gap: 10px;
+        max-width: var(--maxw); margin: 0 auto; padding: 8px 22px;
+        display: flex; align-items: center; gap: 7px;
       }
       .brand {
         display: flex; align-items: center; gap: 10px; cursor: pointer;
@@ -102,18 +107,68 @@
         background: linear-gradient(135deg, var(--accent), var(--accent-2));
         border-color: transparent; color: #fff; font-weight: 650;
       }
+      /* Header controls are icons with an accessible label rather than text, so
+         the bar still fits on a phone. The label reappears on wide screens where
+         there is room for it, because an icon alone is a guessing game. */
+      .iconBtn {
+        display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+        border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
+        width: 38px; height: 38px; padding: 0; border-radius: 11px;
+        font: inherit; font-size: 15px; cursor: pointer; white-space: nowrap;
+        transition: border-color .16s ease, background .16s ease, transform .12s ease;
+      }
+      .iconBtn:hover { border-color: var(--accent); }
+      .iconBtn:active { transform: translateY(1px); }
+      .iconBtn .lbl { display: none; font-size: 13px; }
+      .iconBtn svg { width: 18px; height: 18px; flex: 0 0 auto; }
+      @media (min-width: 1080px) {
+        .iconBtn { width: auto; padding: 0 13px; }
+        .iconBtn .lbl { display: inline; }
+      }
+      /* Primary action (connect wallet) always reads as the primary action. */
+      .iconBtn.primary {
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        border-color: transparent; color: #fff;
+      }
+      .iconBtn[aria-expanded="true"] { border-color: var(--accent); background: var(--panel-2); }
+
       .themesel {
         border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
-        border-radius: 12px; padding: 8px 10px; font: inherit; font-size: 13px; cursor: pointer;
+        border-radius: 11px; padding: 0 8px; height: 38px; font: inherit; font-size: 13px; cursor: pointer;
       }
 
-      /* Start button — centred, floats, hides on scroll-down, returns on scroll-up */
+      /* Start button — centred, floats, hides on scroll-down, returns on scroll-up.
+         It arrives blurred and slightly translucent and resolves into focus, so
+         it reads as floating above the page rather than pasted onto it. */
       .startDock {
-        position: fixed; left: 50%; top: 62px; transform: translate(-50%, 0);
-        z-index: 75; transition: opacity .25s ease, transform .25s ease;
+        position: fixed; left: 50%; top: calc(var(--headerH, 56px) + 10px); transform: translate(-50%, 0);
+        z-index: 75; opacity: .88;
+        transition: opacity .45s cubic-bezier(.2,.7,.2,1), transform .45s cubic-bezier(.2,.7,.2,1),
+                    filter .55s cubic-bezier(.2,.7,.2,1);
+        animation: startIn .85s cubic-bezier(.2,.7,.2,1) both;
       }
-      .startDock.hide { opacity: 0; transform: translate(-50%, -18px); pointer-events: none; }
-      .startDock .btn { padding: 11px 22px; font-size: 14.5px; box-shadow: var(--shadow); }
+      @keyframes startIn {
+        from { opacity: 0; filter: blur(14px) saturate(.6); transform: translate(-50%, -12px) scale(.965); }
+        60%  { opacity: .7; filter: blur(3px) saturate(.9); }
+        to   { opacity: .88; filter: blur(0) saturate(1); transform: translate(-50%, 0) scale(1); }
+      }
+      .startDock:hover { opacity: 1; filter: blur(0); }
+      .startDock.hide {
+        opacity: 0; filter: blur(10px); transform: translate(-50%, -16px) scale(.97); pointer-events: none;
+      }
+      .startDock .btn {
+        padding: 11px 24px; font-size: 14.5px; box-shadow: var(--shadow);
+        /* Translucent so the page shows through, with a blur behind the glass. */
+        background: color-mix(in srgb, var(--accent) 72%, transparent);
+        backdrop-filter: blur(10px) saturate(150%);
+        -webkit-backdrop-filter: blur(10px) saturate(150%);
+        border: 1px solid color-mix(in srgb, #fff 28%, transparent);
+        color: #fff; font-weight: 650;
+      }
+      .startDock:hover .btn { background: color-mix(in srgb, var(--accent) 92%, transparent); }
+      @media (prefers-reduced-motion: reduce) {
+        .startDock { animation: none; opacity: .9; }
+      }
 
       /* ---- navigation ------------------------------------------------------
          One control, not two. The previous build had a ☰ drawer *and* a tab
@@ -127,6 +182,14 @@
       }
       .navDrawer.open { max-height: 320px; border-bottom-color: var(--line); }
       .navDrawer .inner { max-width: var(--maxw); margin: 0 auto; padding: 12px 22px 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+      /* Geometric glyphs rather than emoji: emoji render at wildly different
+         sizes and weights per platform, which made the menu look ragged on
+         Windows and Android. These inherit the text colour and metrics. */
+      .navIco {
+        display: inline-block; width: 1.1em; text-align: center; margin-right: 2px;
+        opacity: .8; font-size: 1.05em; line-height: 1;
+      }
+      .navDrawer .btn[aria-current="page"] .navIco { opacity: 1; color: var(--accent); }
       .navDrawer .btn[aria-current="page"] {
         color: var(--text); background: var(--panel); border-color: var(--accent); font-weight: 650;
       }
@@ -137,7 +200,7 @@
       }
       /* Sticky strip showing where you are once the drawer is closed. */
       .crumbBar {
-        position: sticky; top: 57px; z-index: 60; padding: 10px 0;
+        position: sticky; top: var(--headerH, 56px); z-index: 60; padding: 10px 0;
         backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
         background: color-mix(in srgb, var(--bg) 82%, transparent);
         border-bottom: 1px solid var(--line);
@@ -150,7 +213,7 @@
          Under the header, above the navigation. Transparent background so it
          overlays rather than shifting the page, with the text running across. */
       .noticeBar {
-        position: sticky; top: 57px; z-index: 70; overflow: hidden;
+        position: sticky; top: var(--headerH, 56px); z-index: 70; overflow: hidden;
         background: transparent; border-bottom: 1px solid transparent;
         display: flex; align-items: center; gap: 10px; padding: 7px 22px;
       }
@@ -476,19 +539,113 @@
         display: none !important; visibility: hidden; pointer-events: none;
       }
 
+      /* ---- full-screen sheet ------------------------------------------------
+         Transaction history and account status open in one of these: a large
+         panel over the page, never a navigation. Nothing reloads, the page
+         underneath keeps its state, and Escape or the X closes it.
+
+         Sized in `dvh` rather than `vh` so a mobile browser's collapsing address
+         bar doesn't leave the footer of the sheet unreachable — the classic
+         iOS/Android bug with 100vh panels. `env(safe-area-inset-*)` keeps it
+         clear of a notch and the iOS home indicator. */
+      .sheetWrap {
+        position: fixed; inset: 0; z-index: 140; display: flex; align-items: center; justify-content: center;
+        background: rgba(4, 7, 14, .66);
+        backdrop-filter: blur(7px); -webkit-backdrop-filter: blur(7px);
+        padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right))
+                 max(14px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+        animation: fade .18s ease both;
+      }
+      .sheetWrap[hidden] { display: none; }
+      .sheet {
+        display: flex; flex-direction: column; min-height: 0;
+        width: min(1180px, 100%); height: min(88dvh, 100%);
+        border: 1px solid var(--line-strong); border-radius: 20px;
+        background: var(--bg-soft); box-shadow: var(--shadow); overflow: hidden;
+        animation: sheetIn .26s cubic-bezier(.2,.7,.2,1) both;
+      }
+      @keyframes sheetIn {
+        from { opacity: 0; transform: translateY(14px) scale(.985); filter: blur(6px); }
+        to { opacity: 1; transform: none; filter: blur(0); }
+      }
+      .sheetHead {
+        flex: 0 0 auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+        padding: 14px 18px 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+      }
+      .sheetHead h3 { margin: 0; font-size: 16px; letter-spacing: -0.02em; }
+      .sheetHead .spacer { flex: 1; }
+      .sheetTabs {
+        flex: 0 0 auto; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none;
+        padding: 10px 18px; border-bottom: 1px solid var(--line);
+      }
+      .sheetTabs::-webkit-scrollbar { display: none; }
+      .sheetTab {
+        border: 1px solid transparent; background: transparent; color: var(--muted);
+        padding: 7px 13px; border-radius: 999px; font: inherit; font-size: 13px;
+        cursor: pointer; white-space: nowrap;
+      }
+      .sheetTab:hover { color: var(--text); background: var(--panel-2); }
+      .sheetTab.active { color: var(--text); background: var(--panel); border-color: var(--line-strong); font-weight: 650; }
+      .sheetBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px 18px 24px; }
+      .sheetFilters {
+        display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        padding: 0 0 14px; align-items: end;
+      }
+      .sheetFilters label { display: block; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+      .sheetFilters .field, .sheetFilters select, .sheetFilters input { width: 100%; }
+      @media (max-width: 560px) {
+        .sheet { width: 100%; height: 100%; border-radius: 0; border: 0; }
+        .sheetHead, .sheetTabs { padding-left: 14px; padding-right: 14px; }
+        .sheetBody { padding: 14px 14px 28px; }
+      }
+
+      /* ---- data table (history, market rows) ------------------------------- */
+      .tblWrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      table.data { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 520px; }
+      table.data th, table.data td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+      table.data th {
+        position: sticky; top: 0; z-index: 1; background: var(--bg-soft);
+        font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 650;
+      }
+      table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
+      table.data tbody tr:hover { background: var(--panel-2); }
+      /* Exchange-style colouring: green up, red down, muted flat. */
+      .up { color: var(--good); }
+      .down { color: var(--bad); }
+      .flat { color: var(--muted); }
+      .tag {
+        display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+        border: 1px solid var(--line-strong); background: var(--panel-2); white-space: nowrap;
+      }
+      .tag.ok { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+      .tag.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+      .tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+      .feedNote { font-size: 11.5px; color: var(--muted); margin: 0 0 12px; }
+      .feedNote.bad { color: var(--warn); }
+
+      /* ---- compact dashboard ------------------------------------------------
+         Tessera has a lot of panels now. Metrics render tighter so more fits on
+         one screen without scrolling past the thing you came for. */
+      .metrics.tight { gap: 12px 18px; }
+      .metrics.tight .metric .k { font-size: 10.5px; }
+      .metrics.tight .metric .v { font-size: 15px; }
+      .card.compact { padding: 14px 16px; margin-bottom: 12px; }
+      .card.compact > h2 { margin-bottom: 10px; font-size: 11px; }
+
       /* ---- responsiveness ------------------------------------------------- */
       @media (max-width: 720px) {
         .wrap { padding: 0 14px; }
-        .topbar .inner { padding: 8px 14px; gap: 7px; flex-wrap: wrap; }
-        .brand .name { font-size: 15.5px; }
+        .topbar .inner { padding: 7px 12px; gap: 6px; }
+        .brand .name { display: none; }
         .btn { padding: 7px 11px; font-size: 13px; }
         .card { padding: 15px 15px; border-radius: 15px; }
-        .metrics { gap: 15px; }
+        .metrics { gap: 14px; }
         .metric .v { font-size: 15.5px; }
         .balance { font-size: 27px; }
         .hero { padding: 52px 0 30px; }
-        .tabsBar { top: 52px; }
-        .startDock { top: 56px; }
+        .crumbBar { top: var(--headerH, 52px); }
+        .noticeBar { top: var(--headerH, 52px); }
+        .startDock { top: calc(var(--headerH, 52px) + 8px); }
         .row-actions { gap: 7px; }
         .row-actions .field, .row-actions .btn { flex: 1 1 auto; }
         #lnAmount, #vAmount, #swAmount { width: 100% !important; }
@@ -513,11 +670,21 @@
         </button>
         <span class="spacer"></span>
 
-        <button class="btn" id="navToggle" title="Navigate" aria-expanded="false">☰ Menu</button>
+        <!-- Header controls are icons: on a phone there is no room for five
+             labelled buttons, and the labels come back at >=1080px. The old
+             "signed in" indicator is gone — the profile icon appearing at all
+             is what says you are signed in, so a second signal was noise. -->
+        <button class="iconBtn" id="navToggle" title="Menu" aria-label="Menu" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16"/>
+          </svg><span class="lbl">Menu</span>
+        </button>
 
         <span class="menuWrap bellWrap" id="bellWrap">
-          <button class="btn" id="bellBtn" title="Notifications" aria-haspopup="true" aria-expanded="false">
-            🔔<span class="bellDot" id="bellDot" hidden></span>
+          <button class="iconBtn" id="bellBtn" title="Notifications" aria-label="Notifications" aria-haspopup="true" aria-expanded="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M18 9a6 6 0 1 0-12 0c0 5-2 6-2 6h16s-2-1-2-6"/><path d="M10.3 20a2 2 0 0 0 3.4 0"/>
+            </svg><span class="bellDot" id="bellDot" hidden></span>
           </button>
           <div class="bellPanel" id="bellPanel" role="menu">
             <div class="menuHead">Notifications</div>
@@ -533,33 +700,48 @@
           </div>
         </span>
 
-        <button class="btn" id="walletBtn">Connect Wallet</button>
-        <button class="btn" id="adminBtn">Admin</button>
+        <button class="iconBtn primary" id="walletBtn" title="Connect wallet" aria-label="Connect wallet">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2.5" y="6" width="19" height="13" rx="3"/><path d="M2.5 10h19"/><circle cx="17" cy="14.5" r="1.3" fill="currentColor" stroke="none"/>
+          </svg><span class="lbl">Connect</span>
+        </button>
+
+        <button class="iconBtn" id="adminBtn" title="Operator sign-in" aria-label="Operator sign-in">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3l7 3v5.5c0 4.3-2.9 7.6-7 9.5-4.1-1.9-7-5.2-7-9.5V6l7-3z"/><path d="M9.4 12.2l1.9 1.9 3.4-3.6"/>
+          </svg><span class="lbl">Admin</span>
+        </button>
 
         <span class="menuWrap" id="profileWrap" style="display:none">
-          <button class="btn" id="profileBtn" title="Your profile" aria-haspopup="true" aria-expanded="false">
-            👤 <span id="profileLabel">Profile</span> ▾
+          <button class="iconBtn" id="profileBtn" title="Your profile" aria-label="Your profile" aria-haspopup="true" aria-expanded="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="8.2" r="3.6"/><path d="M4.5 20c1.3-3.6 4-5.4 7.5-5.4S18.2 16.4 19.5 20"/>
+            </svg><span class="lbl" id="profileLabel">Profile</span>
           </button>
           <div class="menuPanel" id="profileMenu" role="menu">
             <div class="menuHead" id="profileWho">Signed in</div>
-            <button class="menuItem" data-prof="edit" role="menuitem">✏️ Edit profile (set name)</button>
-            <button class="menuItem" data-prof="password" role="menuitem" id="profPassword">🔑 Change password</button>
-            <button class="menuItem" data-prof="status" role="menuitem">📊 Account status</button>
-            <button class="menuItem" data-prof="history" role="menuitem">🧾 Transaction history</button>
+            <button class="menuItem" data-prof="edit" role="menuitem">&#9998; Edit profile (set name)</button>
+            <button class="menuItem" data-prof="password" role="menuitem" id="profPassword">&#128273; Change password</button>
+            <button class="menuItem" data-prof="status" role="menuitem">&#128202; Account status</button>
+            <button class="menuItem" data-prof="history" role="menuitem">&#129534; Transaction history</button>
             <div class="menuSep"></div>
-            <button class="menuItem" data-prof="signout" role="menuitem" style="color:var(--bad)">↩ Sign out</button>
+            <button class="menuItem" data-prof="signout" role="menuitem" style="color:var(--bad)">&#8617; Sign out</button>
           </div>
         </span>
 
         <span class="menuWrap" id="cfgWrap" style="display:none">
-          <button class="btn" id="cfgBtn" title="App Config (operator only)" aria-haspopup="dialog" aria-expanded="false">⚙️ Config</button>
+          <button class="iconBtn" id="cfgBtn" title="App Config (operator only)" aria-label="App Config" aria-haspopup="dialog" aria-expanded="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3.1"/>
+              <path d="M12 2.8v2.3M12 18.9v2.3M4.5 4.5l1.6 1.6M17.9 17.9l1.6 1.6M2.8 12h2.3M18.9 12h2.3M4.5 19.5l1.6-1.6M17.9 6.1l1.6-1.6"/>
+            </svg><span class="lbl">Config</span>
+          </button>
         </span>
 
-
         <select class="themesel" id="themeSel" title="Theme" aria-label="Theme">
-          <option value="system">◐ System</option>
-          <option value="light">☀ Light</option>
-          <option value="dark">☾ Dark</option>
+          <option value="system">&#9686; System</option>
+          <option value="light">&#9728; Light</option>
+          <option value="dark">&#9790; Dark</option>
         </select>
       </div>
 
@@ -567,11 +749,11 @@
            state and the current section are both remembered. -->
       <div class="navDrawer" id="navDrawer">
         <div class="inner">
-          <button class="btn" data-nav="home">🏠 Home</button>
-          <button class="btn" data-nav="dashboard">📊 Dashboard</button>
-          <button class="btn" data-nav="defi">💠 DeFi</button>
-          <button class="btn" data-nav="agents">🤖 Agent transactions</button>
-          <button class="btn" data-nav="other">🧰 Treasury &amp; system</button>
+          <button class="btn" data-nav="home"><span class="navIco">◈</span> Home</button>
+          <button class="btn" data-nav="dashboard"><span class="navIco">◫</span> Dashboard</button>
+          <button class="btn" data-nav="defi"><span class="navIco">◇</span> DeFi</button>
+          <button class="btn" data-nav="agents"><span class="navIco">◎</span> Agent workspace</button>
+          <button class="btn" data-nav="other"><span class="navIco">⬡</span> Treasury &amp; system</button>
         </div>
       </div>
     </header>
@@ -684,7 +866,7 @@
       <div class="wrap view">
         <!-- ---------- DASHBOARD ---------- -->
         <div class="tabPane" id="paneDashboard">
-          <div class="card">
+          <div class="card compact">
             <h2>Status</h2>
             <div class="row-actions">
               <span class="pill blue" id="brainPill">brain: —</span>
@@ -692,22 +874,40 @@
               <span class="pill" id="chainPill">chain: —</span>
               <span class="pill live"><span class="dot"></span> live</span>
             </div>
+            <!-- What Tessera actually is, now that it is more than the escrow
+                 rail it started as. Kept to one line per capability so it stays
+                 readable and stays honest about what each part does. -->
+            <div style="font-size:12.5px;color:var(--muted);line-height:1.75;margin-top:12px">
+              <b style="color:var(--text)">Tessera</b> is trustless pay-per-use commerce for AI agents,
+              plus the DeFi rails that fund it — all settled in USDC on Arc.
+              <div style="display:grid;gap:4px 18px;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));margin-top:9px">
+                <span><b style="color:var(--text)">Escrow &amp; SLA refunds</b> — an agent pays a service it has never met, and reclaims automatically if the service breaks its promise.</span>
+                <span><b style="color:var(--text)">Nanopayment tabs</b> — one deposit, then gasless signed vouchers per call, settled once.</span>
+                <span><b style="color:var(--text)">Lending &amp; borrowing</b> — supply for yield or borrow against collateral, with per-action freeze controls.</span>
+                <span><b style="color:var(--text)">Yield vault</b> — 80% held liquid by contract floor; the app's fee touches yield only, never principal.</span>
+                <span><b style="color:var(--text)">Swap desk</b> — oracle-priced swaps between pool assets.</span>
+                <span><b style="color:var(--text)">Liquidity pools (AMM)</b> — provide liquidity, keep at least 50% of every swap fee.</span>
+                <span><b style="color:var(--text)">Agent workspace</b> — live news, FX, crypto, stocks, commodities and derived market analysis.</span>
+                <span><b style="color:var(--text)">Operator controls</b> — fee allocation, notices, price feeds, contract history and fund recovery.</span>
+              </div>
+            </div>
           </div>
 
-          <div class="card">
+          <div class="card compact">
             <h2>Value locked</h2>
-            <div class="metrics">
+            <div class="metrics tight">
               <div class="metric"><div class="k">Vault TVL</div><div class="v" id="dashVaultTvl">—</div></div>
               <div class="metric"><div class="k">Pool liquidity</div><div class="v" id="dashPoolCash">—</div></div>
               <div class="metric"><div class="k">Pool borrowed</div><div class="v" id="dashPoolBorrows">—</div></div>
               <div class="metric"><div class="k">Swap inventory</div><div class="v" id="dashSwapInv">—</div></div>
               <div class="metric"><div class="k">Vault liquid buffer</div><div class="v" id="dashBuffer">—</div></div>
+              <div class="metric"><div class="k">AMM pools</div><div class="v" id="dashAmmPools">—</div></div>
             </div>
           </div>
 
-          <div class="card">
-            <h2>Agent transactions</h2>
-            <div class="metrics">
+          <div class="card compact">
+            <h2>Agent activity</h2>
+            <div class="metrics tight">
               <div class="metric"><div class="k">Settled</div><div class="v" id="dashSettled" style="color:var(--good)">—</div></div>
               <div class="metric"><div class="k">Refunded</div><div class="v" id="dashRefunded" style="color:var(--warn)">—</div></div>
               <div class="metric"><div class="k">Skipped</div><div class="v" id="dashSkipped" style="color:var(--skip)">—</div></div>
@@ -789,11 +989,11 @@
             <div class="grid2">
               <div>
                 <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Pool reserves</div>
-                <div class="metrics" id="amReserves"></div>
+                <div class="metrics tight" id="amReserves"></div>
               </div>
               <div>
                 <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Your position</div>
-                <div class="metrics" id="amPosition"></div>
+                <div class="metrics tight" id="amPosition"></div>
               </div>
             </div>
 
@@ -828,7 +1028,7 @@
               Pool not deployed yet — run <span class="mono">npm run pool:arc</span> to create the
               USDC / EURC / cirBTC reserves. Live values appear here automatically once it's on-chain.
             </div>
-            <div class="metrics" style="margin-bottom:16px">
+            <div class="metrics tight" style="margin-bottom:14px">
               <div class="metric"><div class="k">Supplied</div><div class="v" id="lnSupplied">—</div></div>
               <div class="metric"><div class="k">Borrowed</div><div class="v" id="lnBorrowed">—</div></div>
               <div class="metric"><div class="k">Borrow limit</div><div class="v" id="lnLimit">—</div></div>
@@ -885,7 +1085,7 @@
               (an 80% floor is fixed in the contract) and the rest earns the pool's supply APR.
               You keep the yield; the app takes a <b id="vFee">—</b>% performance fee on yield only — never principal.
             </div>
-            <div class="metrics" style="margin-bottom:16px">
+            <div class="metrics tight" style="margin-bottom:14px">
               <div class="metric"><div class="k">Vault TVL</div><div class="v" id="vTvl">—</div></div>
               <div class="metric"><div class="k">Your balance</div><div class="v" id="vYours">—</div></div>
               <div class="metric"><div class="k">Wallet available</div><div class="v" id="vWallet">—</div></div>
@@ -908,7 +1108,122 @@
 
         <!-- ---------- AGENT TRANSACTIONS ---------- -->
         <div class="tabPane" id="paneAgents" hidden>
-          <div class="card">
+          <!-- ================= AGENT WORKSPACE =================
+               Redesigned from a single task readout into a working surface: the
+               agent's own operations sit alongside the live information a person
+               would actually want it acting on. Child tabs keep each domain in
+               its own column layout instead of forcing one table to serve all. -->
+          <div class="card compact">
+            <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+              <h2 style="margin:0">◎ Agent workspace</h2>
+              <span style="font-size:12.5px;color:var(--muted)">
+                Live market and news feeds, alongside the agent's own pay-per-call operations.
+              </span>
+            </div>
+            <div class="sheetTabs" id="agTabs" role="tablist" style="border-bottom:0;padding:12px 0 0;margin:0 -2px">
+              <button class="sheetTab active" data-agtab="operations" role="tab">⬡ Operations</button>
+              <button class="sheetTab" data-agtab="news" role="tab">▤ News</button>
+              <button class="sheetTab" data-agtab="fx" role="tab">⇄ FX</button>
+              <button class="sheetTab" data-agtab="crypto" role="tab">◈ Crypto</button>
+              <button class="sheetTab" data-agtab="analysis" role="tab">◪ Market analysis</button>
+              <button class="sheetTab" data-agtab="stocks" role="tab">▮ Stocks</button>
+              <button class="sheetTab" data-agtab="commodities" role="tab">⬢ Commodities</button>
+              <button class="sheetTab" data-agtab="marketplace" role="tab">⧉ Marketplace</button>
+            </div>
+          </div>
+
+          <!-- ---- News ---- -->
+          <div class="agPane" id="agNews" hidden>
+            <div class="card compact">
+              <h2>▤ News by topic</h2>
+              <div style="font-size:12.5px;color:var(--muted);margin-bottom:10px">
+                Pick topics to combine, or show everything. Headlines come from public feeds and link
+                straight to the publisher — nothing here is generated or summarised.
+              </div>
+              <div id="newsTopics" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px"></div>
+              <div style="display:flex;gap:7px;flex-wrap:wrap">
+                <button class="btn" id="newsAll">Select all</button>
+                <button class="btn" id="newsNone">Clear</button>
+                <button class="btn primary" id="newsApply">Show headlines</button>
+              </div>
+            </div>
+            <div class="card compact">
+              <p class="feedNote" id="newsNote"></p>
+              <div id="newsList" style="display:flex;flex-direction:column;gap:1px"></div>
+            </div>
+          </div>
+
+          <!-- ---- FX ---- -->
+          <div class="agPane" id="agFx" hidden>
+            <div class="card compact">
+              <h2>⇄ Foreign exchange</h2>
+              <p class="feedNote" id="fxNote"></p>
+              <div class="tblWrap"><table class="data">
+                <thead><tr><th>Pair</th><th class="num">Rate</th><th class="num">Change</th></tr></thead>
+                <tbody id="fxRows"></tbody>
+              </table></div>
+            </div>
+          </div>
+
+          <!-- ---- Crypto ---- -->
+          <div class="agPane" id="agCrypto" hidden>
+            <div class="card compact">
+              <h2>◈ Crypto prices</h2>
+              <p class="feedNote" id="cryptoNote"></p>
+              <div class="tblWrap"><table class="data">
+                <thead><tr>
+                  <th>Asset</th><th class="num">Price</th>
+                  <th class="num">Day</th><th class="num">Week</th><th class="num">Month</th><th class="num">Year</th>
+                  <th class="num">Market cap</th>
+                </tr></thead>
+                <tbody id="cryptoRows"></tbody>
+              </table></div>
+            </div>
+          </div>
+
+          <!-- ---- Market analysis ---- -->
+          <div class="agPane" id="agAnalysis" hidden>
+            <div class="card compact">
+              <h2>◪ Market analysis</h2>
+              <p class="feedNote" id="analysisNote"></p>
+              <div id="analysisList" style="display:flex;flex-direction:column;gap:10px"></div>
+            </div>
+          </div>
+
+          <!-- ---- Stocks ---- -->
+          <div class="agPane" id="agStocks" hidden>
+            <div class="card compact">
+              <h2>▮ Indices</h2>
+              <p class="feedNote" id="stocksNote"></p>
+              <div class="tblWrap"><table class="data">
+                <thead><tr><th>Index</th><th class="num">Level</th><th class="num">Change</th><th class="num">%</th><th>Market</th></tr></thead>
+                <tbody id="indexRows"></tbody>
+              </table></div>
+            </div>
+            <div class="card compact">
+              <h2>▮ Popular stocks</h2>
+              <div class="tblWrap"><table class="data">
+                <thead><tr><th>Company</th><th>Symbol</th><th class="num">Price</th><th class="num">Change</th><th class="num">%</th><th>Market</th></tr></thead>
+                <tbody id="stockRows"></tbody>
+              </table></div>
+            </div>
+          </div>
+
+          <!-- ---- Commodities ---- -->
+          <div class="agPane" id="agCommodities" hidden>
+            <div class="card compact">
+              <h2>⬢ Commodities</h2>
+              <p class="feedNote" id="commoditiesNote"></p>
+              <div class="tblWrap"><table class="data">
+                <thead><tr><th>Commodity</th><th class="num">Price</th><th class="num">Change</th><th class="num">%</th><th>Market</th></tr></thead>
+                <tbody id="commodityRows"></tbody>
+              </table></div>
+            </div>
+          </div>
+
+          <!-- ---- Operations (the agent's own work) ---- -->
+          <div class="agPane" id="agOperations">
+          <div class="card compact">
             <h2>Agent task</h2>
             <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;justify-content:space-between">
               <div style="min-width:0">
@@ -928,12 +1243,24 @@
             <div id="approvals" style="display:flex;flex-direction:column;gap:10px"></div>
           </div>
 
-          <div class="card">
-            <h2>🛒 Marketplace providers · on-chain reputation</h2>
+          <div class="card compact">
+            <h2>Autonomous activity — agent ⇄ providers ⇄ Arc</h2>
+            <div class="log" id="log"></div>
+          </div>
+          </div><!-- /agOperations -->
+
+          <!-- ---- Marketplace (moved out of Operations so each has room) ---- -->
+          <div class="agPane" id="agMarketplace" hidden>
+          <div class="card compact">
+            <h2>⧉ Marketplace providers · on-chain reputation</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:10px">
+              Every provider bonds USDC stake. An SLA breach slashes it and compensates the agent, so
+              the counterparty carries real downside — which is what lets an agent pay a stranger.
+            </div>
             <div class="prov" id="providers"></div>
           </div>
 
-          <div class="card">
+          <div class="card compact">
             <h2>Purchase ledger</h2>
             <div class="tableScroll">
               <table>
@@ -954,15 +1281,11 @@
             </div>
           </div>
 
-          <div class="card">
+          <div class="card compact">
             <h2>Contacts — the agent's own memory</h2>
             <div id="contacts" style="font-size:13px;color:var(--muted)">No dealings yet…</div>
           </div>
-
-          <div class="card">
-            <h2>Autonomous activity — agent ⇄ providers ⇄ Arc</h2>
-            <div class="log" id="log"></div>
-          </div>
+          </div><!-- /agMarketplace -->
         </div>
 
         <!-- ---------- OTHER ---------- -->
@@ -1299,6 +1622,99 @@
       </div>
     </div>
 
+    <!-- ============ Transaction history (large sheet, no reload) ============
+         Opened from the profile menu. Split into DeFi / Agentic / All so the two
+         very different kinds of activity don't have to share one column layout.
+         Operators get an extra tab spanning every user, with filters. -->
+    <div class="sheetWrap" id="txSheet" hidden>
+      <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="txSheetTitle">
+        <div class="sheetHead">
+          <h3 id="txSheetTitle">Transaction history</h3>
+          <span class="spacer"></span>
+          <span class="kv" id="txWho" style="font-size:12px"></span>
+          <button class="btn" id="txExport" title="Download the current view as CSV">&#8681; CSV</button>
+          <button class="btn" id="txRefresh">Refresh</button>
+          <button class="btn" id="txClose" aria-label="Close">&#10005;</button>
+        </div>
+        <div class="sheetTabs" id="txTabs" role="tablist">
+          <button class="sheetTab active" data-txtab="all" role="tab">All</button>
+          <button class="sheetTab" data-txtab="defi" role="tab">DeFi</button>
+          <button class="sheetTab" data-txtab="agentic" role="tab">Agentic</button>
+          <button class="sheetTab" data-txtab="admin" role="tab" id="txTabAdmin" hidden>Admin actions</button>
+          <button class="sheetTab" data-txtab="everyone" role="tab" id="txTabEveryone" hidden>Everyone (operator)</button>
+        </div>
+        <div class="sheetBody">
+          <div class="metrics tight" id="txSummary" style="margin-bottom:14px"></div>
+          <div class="sheetFilters" id="txFilters">
+            <div id="txActorWrap" hidden><label for="txActor">User</label>
+              <select id="txActor" class="field"></select></div>
+            <div><label for="txStatus">Outcome</label>
+              <select id="txStatus" class="field">
+                <option value="all">Any</option>
+                <option value="success">Success</option>
+                <option value="failed">Failed</option>
+                <option value="pending">Pending</option>
+                <option value="declined">Declined</option>
+                <option value="approved">Approved</option>
+              </select></div>
+            <div><label for="txAction">Action</label>
+              <select id="txAction" class="field"><option value="all">Any</option></select></div>
+            <div><label for="txAsset">Asset</label>
+              <select id="txAsset" class="field"><option value="all">Any</option></select></div>
+            <div><label for="txFrom">From</label><input type="date" id="txFrom" class="field" /></div>
+            <div><label for="txTo">To</label><input type="date" id="txTo" class="field" /></div>
+            <div><label for="txMin">Min value (USD)</label><input type="number" id="txMin" class="field" min="0" step="0.01" /></div>
+            <div><label for="txMax">Max value (USD)</label><input type="number" id="txMax" class="field" min="0" step="0.01" /></div>
+            <div><label for="txQ">Search</label><input type="search" id="txQ" class="field" placeholder="action, asset, hash…" /></div>
+            <div><label for="txSort">Sort</label>
+              <select id="txSort" class="field">
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="largest">Largest value</option>
+                <option value="smallest">Smallest value</option>
+              </select></div>
+            <div style="display:flex;gap:7px;align-items:end">
+              <button class="btn primary" id="txApply">Apply</button>
+              <button class="btn" id="txReset">Reset</button>
+            </div>
+          </div>
+          <div class="tblWrap"><table class="data" id="txTable">
+            <thead><tr>
+              <th>When</th><th>Action</th><th id="txThUser" hidden>User</th>
+              <th class="num">Amount</th><th class="num">USD</th><th>Outcome</th><th>Detail</th><th>Tx</th>
+            </tr></thead>
+            <tbody id="txRows"></tbody>
+          </table></div>
+          <div id="txEmpty" style="padding:20px;text-align:center;color:var(--muted);font-size:13px"></div>
+          <div style="display:flex;gap:8px;align-items:center;justify-content:center;padding:14px 0">
+            <button class="btn" id="txPrev">&#8592; Newer</button>
+            <span id="txPageInfo" style="font-size:12.5px;color:var(--muted)"></span>
+            <button class="btn" id="txNext">Older &#8594;</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ Account status (large sheet, no reload) ============ -->
+    <div class="sheetWrap" id="acctSheet" hidden>
+      <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="acctSheetTitle">
+        <div class="sheetHead">
+          <h3 id="acctSheetTitle">Account status</h3>
+          <span class="spacer"></span>
+          <button class="btn" id="acctRefresh">Refresh</button>
+          <button class="btn" id="acctClose" aria-label="Close">&#10005;</button>
+        </div>
+        <div class="sheetTabs" id="acctTabs" role="tablist">
+          <button class="sheetTab active" data-acctab="identity" role="tab">Identity</button>
+          <button class="sheetTab" data-acctab="positions" role="tab">Positions</button>
+          <button class="sheetTab" data-acctab="activity" role="tab">Activity</button>
+          <button class="sheetTab" data-acctab="network" role="tab">Network &amp; contracts</button>
+          <button class="sheetTab" data-acctab="security" role="tab">Security</button>
+        </div>
+        <div class="sheetBody" id="acctBody"></div>
+      </div>
+    </div>
+
     <!-- Sign-in dialog: masked password with a reveal toggle -->
     <div id="authModal" class="modalWrap" hidden>
       <div class="modalCard" role="dialog" aria-modal="true" aria-labelledby="authTitle">
@@ -1316,8 +1732,17 @@
         <label class="fLabel" for="authPw2" id="authPw2Label" style="margin-top:10px;display:none">New password</label>
         <div class="pwRow" id="authPw2Row" style="display:none">
           <input id="authPw2" class="field fWide" type="password" autocomplete="new-password" />
-          <button class="btn pwEye" id="authEye2" type="button" aria-label="Show password" title="Show password">👁</button>
+          <button class="btn pwEye" id="authEye2" type="button" aria-label="Show password" title="Show password">&#128065;</button>
         </div>
+        <!-- Second line for the new password. A typo in a masked field you can
+             only enter once locks you out of your own account, and the eye
+             toggle is not a substitute: it reveals what you typed, not whether
+             you meant it. Both boxes share one reveal toggle. -->
+        <label class="fLabel" for="authPw3" id="authPw3Label" style="margin-top:10px;display:none">Confirm new password</label>
+        <div class="pwRow" id="authPw3Row" style="display:none">
+          <input id="authPw3" class="field fWide" type="password" autocomplete="new-password" />
+        </div>
+        <div id="authPwMatch" style="margin-top:6px;font-size:12px;display:none"></div>
         <div class="kv" id="authMsg" style="margin-top:10px;display:none"></div>
         <div style="display:flex;gap:9px;margin-top:16px">
           <button class="btn primary" id="authSubmit" style="flex:1">Sign in</button>
