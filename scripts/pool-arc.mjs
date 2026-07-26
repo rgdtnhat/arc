@@ -26,12 +26,22 @@ import {
 const RPC = process.env.ARC_RPC_URL ?? "https://rpc.testnet.arc.network";
 const deployer = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
 const agent = privateKeyToAccount(process.env.AGENT_PRIVATE_KEY);
-const pub = createPublicClient({ chain: arcTestnet, transport: pacedHttp(RPC) });
-const dWallet = createWalletClient({ account: deployer, chain: arcTestnet, transport: pacedHttp(RPC) });
-const aWallet = createWalletClient({ account: agent, chain: arcTestnet, transport: pacedHttp(RPC) });
+
+// Breathing room between on-chain sends, because the public Arc RPC throttles.
+// Configurable so an operator with a private endpoint isn't forced to wait, and
+// so a test against a local fake node runs at full speed.
+const PACE_MS = Number(process.env.TESSERA_PACE_MS ?? 6000);
+// Lowering the pacing is a statement that this endpoint is fast, so receipt
+// polling follows it down. Left alone it stays at viem's default, which is
+// tuned for a shared public node.
+const POLL_MS = PACE_MS >= 6000 ? undefined : Math.max(50, Math.round(PACE_MS / 4) || 50);
+
+const pub = createPublicClient({ chain: arcTestnet, transport: pacedHttp(RPC), pollingInterval: POLL_MS });
+const dWallet = createWalletClient({ account: deployer, chain: arcTestnet, transport: pacedHttp(RPC), pollingInterval: POLL_MS });
+const aWallet = createWalletClient({ account: agent, chain: arcTestnet, transport: pacedHttp(RPC), pollingInterval: POLL_MS });
 
 const USD = 10n ** 8n;
-const pace = (ms = 6000) => new Promise((r) => setTimeout(r, ms));
+const pace = (ms = PACE_MS) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 const metaAbi = [{ type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] }];
 const bal = async (who, token = ARC_USDC_ADDRESS) =>
   pub.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [who] });
@@ -77,7 +87,7 @@ async function codeStatus(address) {
       return c && c !== "0x" ? "yes" : "no";
     } catch (e) {
       lastErr = e;
-      await pace(3000);
+      await pace(Math.min(3000, PACE_MS));
     }
   }
   console.warn(`   could not read code at ${address}: ${String(lastErr?.shortMessage ?? lastErr?.message).slice(0, 90)}`);
@@ -156,7 +166,41 @@ async function adopt(label, recorded, fresh, deployFn, { custodial = false } = {
   return { address, reused: false };
 }
 
+/**
+ * Every step this run chose not to do, and why. Printed as a block at the end so
+ * a skip is visible rather than buried in the scroll.
+ */
+const skipped = [];
+
+/**
+ * Run a step whose failure must not stop the deployment.
+ *
+ * This exists because the script kept dying at the wrong altitude. Seeding
+ * inventory, opening the agent's demo position, topping up pool liquidity —
+ * none of those are the deployment. They are decoration on top of it. But an
+ * uncaught revert in any one of them aborted `main()` before later contracts
+ * were deployed, so a run that failed to move 2 USDC of swap inventory left the
+ * AMM undeployed and the app showing "AMM not deployed yet".
+ *
+ * The rule now: a step is fatal only if a later step depends on it. Deploying a
+ * contract, registering reserves and persisting the record are fatal. Moving
+ * tokens around is not.
+ */
+async function optional(label, fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    const why = String(e?.shortMessage ?? e?.message ?? e).split("\n")[0].slice(0, 110);
+    console.warn(`   ⚠ skipped ${label}: ${why}`);
+    skipped.push(`${label} — ${why}`);
+    return undefined;
+  }
+}
+
 async function main() {
+  // A version marker, so it is obvious from the log whether a host is running
+  // this build or an older checkout that still aborts on an optional step.
+  console.log("pool:arc — optional steps are non-fatal (deploy-resilient build)");
   console.log("deployer", deployer.address, formatUsdc(await bal(deployer.address)), "USDC");
   console.log("agent   ", agent.address, formatUsdc(await bal(agent.address)), "USDC");
   if (ONLY_CHECK) return;
@@ -222,7 +266,7 @@ async function main() {
       }
       r.registered = await isRegistered(r.address);
       if (r.registered) break;
-      await pace(8000); // give the throttled RPC room before retrying
+      await pace(PACE_MS ? 8000 : 0); // give the throttled RPC room before retrying
     }
     console.log(`   ${r.symbol}: ${r.registered ? "registered ✓" : "NOT registered ✗ (omitted from the deployment)"}`);
   }
@@ -230,13 +274,16 @@ async function main() {
   if (!LIVE_RESERVES.length) throw new Error("No reserves registered — aborting before writing a deployment.");
 
   // 3) Seed liquidity from the deployer's real balances (skip what it can't fund).
+  //     Per reserve, so one frozen or misbehaving asset costs only its own row.
   for (const r of LIVE_RESERVES) {
     const held = await bal(deployer.address, r.address);
     const seed = r.seed < held ? r.seed : held;
     if (seed > 0n) {
-      console.log(`→ seeding ${seed} ${r.symbol} liquidity…`);
-      await dSend(r.address, erc20Abi, "approve", [pool, maxUint256]);
-      await dSend(pool, tesseraPoolAbi, "supply", [r.address, seed]);
+      await optional(`seeding ${r.symbol} pool liquidity`, async () => {
+        console.log(`→ seeding ${seed} ${r.symbol} liquidity…`);
+        await dSend(r.address, erc20Abi, "approve", [pool, maxUint256]);
+        await dSend(pool, tesseraPoolAbi, "supply", [r.address, seed]);
+      });
     } else {
       console.log(`   (skip seeding ${r.symbol} — deployer holds none; fund it, then supply from the dashboard)`);
     }
@@ -246,9 +293,7 @@ async function main() {
   const cirHeldByDeployer = await bal(deployer.address, CIRBTC_ADDRESS);
   const collateral = cirHeldByDeployer >= 40_000n ? 40_000n : cirHeldByDeployer; // ~0.0004 cirBTC
   if (collateral > 0n) {
-    // Also best-effort: an already-open position, or a frozen reserve, must not
-    // stop the contracts that come after this from being deployed.
-    try {
+    await optional("the agent's starting position", async () => {
       console.log(`→ funding agent ${collateral} cirBTC + opening its position…`);
       await dSend(CIRBTC_ADDRESS, erc20Abi, "transfer", [agent.address, collateral]);
       await aSend(CIRBTC_ADDRESS, erc20Abi, "approve", [pool, maxUint256]);
@@ -257,9 +302,7 @@ async function main() {
       if (usdcLiquidity >= 1_000_000n) {
         await aSend(pool, tesseraPoolAbi, "borrow", [ARC_USDC_ADDRESS, 1_000_000n]); // 1 USDC
       }
-    } catch (e) {
-      console.warn(`   (skip agent position: ${String(e.shortMessage ?? e.message).slice(0, 80)})`);
-    }
+    });
   } else {
     console.log("   (skip agent position — no cirBTC to use as collateral; supply from the dashboard once funded)");
   }
@@ -298,26 +341,36 @@ async function main() {
     return addr;
   }, { custodial: true });
   const swap = swapRes.address;
+
   // Seed the swap desk with a slice of each asset the deployer still holds.
   //
-  // Best-effort on purpose. `seed` is owner-only, and on any run after the first
-  // the fee collector owns the swap desk — so this reverts, and when it was
-  // un-caught it aborted the whole script before the AMM was ever deployed.
-  // Inventory is a nice-to-have; the deployment is not.
-  for (const r of LIVE_RESERVES) {
-    const held = await bal(deployer.address, r.address);
-    const want = r.symbol === "cirBTC" ? 10_000n : 2_000_000n; // 0.0001 cirBTC or 2 units
-    const seed = want < held ? want : held;
-    if (seed > 0n) {
-      try {
-        await dSend(r.address, erc20Abi, "approve", [swap, maxUint256]);
-        await dSend(swap, tesseraSwapAbi, "seed", [r.address, seed]);
-        console.log(`   seeded swap ${seed} ${r.symbol}`);
-      } catch (e) {
-        console.warn(
-          `   (skip seeding swap ${r.symbol}: ${String(e.shortMessage ?? e.message).slice(0, 70)}` +
-            ` — the collector owns the desk, so seed from its allocation instead)`,
-        );
+  // `seed` is `onlyOwner`, and step 6b hands the desk to the fee collector on the
+  // first run — so from the second run onwards the deployer cannot call it. Ask
+  // who owns the desk before trying, rather than firing a call that is certain to
+  // revert: a revert here used to abort the whole script (leaving the AMM
+  // undeployed), and even caught it dumps a wall of ABI at the operator for a
+  // step that was never going to work.
+  const swapOwner = await optional("reading the swap desk owner", () =>
+    pub.readContract({ address: swap, abi: tesseraSwapAbi, functionName: "owner" }),
+  );
+  const canSeedSwap = swapOwner && String(swapOwner).toLowerCase() === deployer.address.toLowerCase();
+  if (!canSeedSwap) {
+    console.log(
+      `   (skip swap inventory — the desk is owned by ${swapOwner ?? "an unknown address"}, ` +
+        `not the deployer. That is the steady state: the fee collector owns it and funds it ` +
+        `from its own swap allocation.)`,
+    );
+  } else {
+    for (const r of LIVE_RESERVES) {
+      const held = await bal(deployer.address, r.address);
+      const want = r.symbol === "cirBTC" ? 10_000n : 2_000_000n; // 0.0001 cirBTC or 2 units
+      const seed = want < held ? want : held;
+      if (seed > 0n) {
+        await optional(`seeding swap inventory in ${r.symbol}`, async () => {
+          await dSend(r.address, erc20Abi, "approve", [swap, maxUint256]);
+          await dSend(swap, tesseraSwapAbi, "seed", [r.address, seed]);
+          console.log(`   seeded swap ${seed} ${r.symbol}`);
+        });
       }
     }
   }
@@ -344,11 +397,11 @@ async function main() {
     // Each is best-effort: on a reused deployment these may already be set, and
     // a revert here must not abort the whole run.
     for (const [label, fn] of [
-      ["swap ownership", () => dSend(swap, tesseraSwapAbi, "transferOwnership", [feeCollector])],
-      ["pool treasury", () => dSend(pool, tesseraPoolAbi, "setTreasury", [feeCollector])],
-      ["vault treasury", () => dSend(vault, tesseraVaultAbi, "setTreasury", [feeCollector])],
+      ["handing the swap desk to the fee collector", () => dSend(swap, tesseraSwapAbi, "transferOwnership", [feeCollector])],
+      ["pointing the pool's treasury at the fee collector", () => dSend(pool, tesseraPoolAbi, "setTreasury", [feeCollector])],
+      ["pointing the vault's treasury at the fee collector", () => dSend(vault, tesseraVaultAbi, "setTreasury", [feeCollector])],
     ]) {
-      try { await fn(); } catch (e) { console.warn(`   ${label} not set: ${String(e.shortMessage ?? e.message).slice(0, 80)}`); }
+      await optional(label, fn);
     }
   }
 
@@ -389,25 +442,25 @@ async function main() {
   // happened to deploy the AMM. A previous run could have deployed the contract
   // and then died before creating any pool — reusing that address and skipping
   // this block would leave a permanently empty AMM that no later run repairs.
-  let ammPools = 0n;
-  try {
-    ammPools = await pub.readContract({ address: amm, abi: tesseraAmmAbi, functionName: "poolCount" });
-  } catch (e) {
-    console.warn(`   AMM pool count unreadable: ${String(e.shortMessage ?? e.message).slice(0, 80)}`);
-  }
-  if (ammPools === 0n) {
+  const ammPools = await optional("reading the AMM pool count", () =>
+    pub.readContract({ address: amm, abi: tesseraAmmAbi, functionName: "poolCount" }),
+  );
+  if (ammPools === undefined) {
+    // Unknown, not zero. Creating pools on a failed read would duplicate
+    // whatever is already there, and a duplicate pool splits liquidity.
+    console.log("   (skip AMM pool creation — the pool count could not be read, so creating would risk duplicates)");
+  } else if (ammPools === 0n) {
     // One pool per non-USDC reserve, paired against USDC: 0.30% fee, 50% to LPs.
     for (const r of LIVE_RESERVES.filter((x) => x.address.toLowerCase() !== ARC_USDC_ADDRESS.toLowerCase())) {
-      try {
+      await optional(`creating the AMM pool USDC / ${r.symbol}`, async () => {
         await dSend(amm, tesseraAmmAbi, "createPool", [[ARC_USDC_ADDRESS, r.address], 30, 5000, `USDC / ${r.symbol}`]);
         console.log(`   AMM pool USDC / ${r.symbol}`);
-      } catch (e) {
-        console.warn(`   AMM pool USDC / ${r.symbol} not created: ${String(e.shortMessage ?? e.message).slice(0, 80)}`);
-      }
+      });
     }
     // Point the AMM collector's swap leg at pool 0 so app fees cycle back in.
-    try { await dSend(ammFeeCollector, tesseraFeeCollectorAbi, "setAmm", [amm, 0n]); }
-    catch (e) { console.warn(`   AMM collector not linked: ${String(e.shortMessage ?? e.message).slice(0, 80)}`); }
+    await optional("linking the AMM collector to pool 0", () =>
+      dSend(ammFeeCollector, tesseraFeeCollectorAbi, "setAmm", [amm, 0n]),
+    );
   } else {
     console.log(`   AMM already has ${ammPools} pool(s)`);
   }
@@ -439,6 +492,20 @@ async function main() {
   console.log("   amm fees ", ammFeeCollector);
   for (const r of LIVE_RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
   console.log("   explorer ", `https://testnet.arcscan.app/address/${pool}`);
+
+  if (skipped.length) {
+    console.log(`\n⚠  ${skipped.length} optional step(s) skipped — the deployment above is complete regardless:`);
+    for (const s of skipped) console.log(`   · ${s}`);
+    console.log("   Anything here can be done from the dashboard once the wallets are funded.");
+  }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  // A fatal error means a contract could not be deployed or the record could not
+  // be written. Lead with the one-line reason: the full viem error that follows
+  // includes the whole ABI, which buries it.
+  console.error(`\n❌ pool:arc failed: ${String(e?.shortMessage ?? e?.message ?? e).split("\n")[0]}`);
+  if (skipped.length) console.error(`   (${skipped.length} optional step(s) had already been skipped)`);
+  console.error(e);
+  process.exit(1);
+});

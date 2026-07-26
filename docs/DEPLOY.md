@@ -10,6 +10,47 @@ and you get a public URL.
 > then pass `AGENT_PRIVATE_KEY`, `PROVIDER_PRIVATE_KEY`, and `ARC_RPC_URL` to the
 > container. Give it **~512 MB–1 GB RAM** (a "starter"/"hobby" instance).
 
+## Reading a `pool:arc` run
+
+`pool:arc` is re-runnable. It adopts contracts that are already live rather than
+replacing them, and it separates steps that matter from steps that don't:
+
+- **Fatal** — deploying a contract, registering a reserve, writing the deployment
+  record. These stop the run, because everything after them depends on them.
+- **Optional** — moving tokens: seeding pool liquidity, the agent's starting
+  position, swap-desk inventory. A revert here prints `⚠ skipped …` and the run
+  continues. Each one is listed again in a block at the end.
+
+A line like this is **normal, not an error**:
+
+```
+(skip swap inventory — the desk is owned by 0x… , not the deployer.
+ That is the steady state: the fee collector owns it and funds it from
+ its own swap allocation.)
+```
+
+`TesseraSwap.seed` is `onlyOwner`, and the first run hands the desk to the fee
+collector — so from the second run on, the deployer cannot seed it and does not
+try. (An earlier build *did* try, and the uncaught revert aborted the script
+before `TesseraAMM` was deployed, which is why the app then reported "AMM not
+deployed yet". `agent/test/pool-arc.test.ts` runs the script against a fake node
+that reverts `seed`, and asserts the AMM still deploys.)
+
+The run has succeeded when you see:
+
+```
+✅ Pool + Vault + Swap live on Arc:
+   pool / vault / swap / fees / amm / amm fees   0x…
+```
+
+A failure now leads with a single line — `❌ pool:arc failed: <reason>` — before
+the full viem error, which is otherwise a wall of ABI.
+
+Two knobs for a slow or private RPC: `TESSERA_PACE_MS` (wait between sends,
+default 6000) and `ARC_RPC_MIN_INTERVAL_MS` (minimum gap between any two RPC
+calls, default 180). Lower both on a private endpoint; raise the first if the
+public node throttles you.
+
 ## Option A — Render (one click, uses `render.yaml`)
 
 1. Push this repo to GitHub (already at `github.com/rgdtnhat/arc`).

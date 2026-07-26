@@ -22,3 +22,7 @@ deployments/arc.local.json
 deployments/arc.history.json
 # Scratch directory for local QA scripts; never part of the app.
 .tmpqa/
+
+# Scratch trees created by agent/test/pool-arc.test.ts. They are removed when
+# the test finishes; this catches the case where a run is interrupted.
+.pool-arc-test-*/
