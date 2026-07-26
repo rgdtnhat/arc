@@ -1,203 +1,28 @@
 #!/usr/bin/env node
 /**
- * Generate `docs/deck.pptx` from the slide data below.
+ * Generate `docs/deck.pptx` — the PowerPoint twin of `docs/deck.html`.
  *
- * The previous PowerPoint export was produced ad hoc and never committed as a
- * script, so it could not be regenerated when the app gained features — which is
- * exactly what happened. This is the reproducible version: edit `SLIDES`, run
- * `npm run deck`, and the deck matches the app again.
+ * Content lives in `scripts/deck-content.mjs`; this file is the renderer. It
+ * reproduces the HTML deck's **light** theme: a soft gradient stage, a blue
+ * accent rule before each eyebrow, white cards with hairline borders, outcome
+ * pills, transaction badges and large stat figures. Blocks are measured and then
+ * vertically centred, which is what `justify-content: center` does in the HTML
+ * and what stops slides looking top-heavy.
  *
- * A .pptx is a ZIP of OOXML parts. Everything here is written by hand rather
- * than through a library: the deck needs title/body text, bullets and a dark
- * theme, and a hand-rolled writer keeps the repo dependency-free (which also
- * means the deck still builds in a sandbox with no registry access).
+ * ## Why the skeleton is borrowed
+ * The first version wrote every OOXML part by hand. LibreOffice opened it and
+ * python-pptx read it back, but PowerPoint refused it — a package needs
+ * `presProps.xml`, `viewProps.xml`, `tableStyles.xml` and a `p:txStyles` block in
+ * the master, none of which lenient readers care about. So `deck-skeleton.mjs`
+ * holds those parts verbatim from a real PowerPoint template and only the slides
+ * are generated here. `npm run deck` validates the result; `npm run deck:pdf`
+ * renders it through LibreOffice for a second opinion.
  */
 import { deflateRawSync } from "node:zlib";
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as SK from "./deck-skeleton.mjs";
-
-// --- deck content -----------------------------------------------------------
-
-const BRAND = { accent: "2F6BE0", accent2: "38BDF8", bg: "0B0F17", panel: "121826", text: "E6EDF7", muted: "93A4BF" };
-
-/**
- * Each slide is `{ label, title, lede?, bullets?, columns?, note }`.
- * `note` becomes the speaker note — what to actually say, not a restatement.
- */
-const SLIDES = [
-  {
-    label: "TESSERA",
-    kicker: "Live on Arc testnet · USDC-native",
-    title: "Money for machines.",
-    lede:
-      "Trustless pay-per-use commerce for AI agents — plus the DeFi rails that fund it. " +
-      "Settled on Arc in USDC.",
-    note:
-      "Open on the problem, not the product. An agent today can only buy from a service a human " +
-      "already set up an account and a card for. Tessera is the trust layer that removes that step.",
-  },
-  {
-    label: "THE PROBLEM",
-    title: "Agents can't pay strangers.",
-    lede: "An agent can only buy from a service a human already onboarded.",
-    bullets: [
-      ["Trust runs both ways", "The service can't tell the agent will pay. The agent can't tell the service will deliver."],
-      ["So: pre-funded vendors only", "Agents are boxed into a hand-curated list of pre-approved suppliers."],
-      ["That isn't an economy", "Machine-to-machine commerce needs strangers to transact safely."],
-    ],
-    note:
-      "Solve only one side of the trust problem and you still have a curated vendor list. Both sides " +
-      "have to be solved at once, and that is what escrow plus a delivery guarantee does.",
-  },
-  {
-    label: "THE INSIGHT",
-    title: "The missing primitive isn't “send USDC.” It's escrow + SLA + reputation.",
-    lede:
-      "A raw transfer doesn't make a stranger safe to deal with. Programmable escrow — with a delivery " +
-      "guarantee and staked reputation attached — does.",
-    note:
-      "This is the whole pitch in one line. Anyone can move USDC. What is missing is the ability to " +
-      "get it back automatically when the other side fails to deliver.",
-  },
-  {
-    label: "HOW IT WORKS",
-    title: "402 → decide → escrow → settle or refund",
-    bullets: [
-      ["01 Quote", "Agent hits a paid endpoint → HTTP 402 plus an EIP-712 signed USDC price and SLA."],
-      ["02 Decide", "Rules (optionally an LLM) weigh budget, on-chain reputation, bonded stake and the agent's own memory."],
-      ["03 Escrow", "Locks a nano-sized USDC payment in TesseraEscrow on Arc."],
-      ["04 Settle / refund", "Delivered → released. SLA breach → reclaimed, and the provider's stake is slashed."],
-    ],
-    lede:
-      "USDC is Arc's gas token, so the agent funds one asset for both the toll and the fees — and " +
-      "sub-second finality lets a payment settle inside the request.",
-    note:
-      "Walk the four steps. The one that matters is step four: the refund is enforced by the contract, " +
-      "not by a dispute process or by trusting the counterparty.",
-  },
-  {
-    label: "WHAT MAKES IT REAL",
-    title: "Guarantees, not promises.",
-    bullets: [
-      ["Escrow + auto-refund", "Delivery releases funds; an SLA breach reclaims them. Enforced by the contract."],
-      ["Provider staking and slashing", "Providers bond USDC. A breach slashes it to compensate the agent — real downside."],
-      ["Nanopayment tabs", "One deposit, many zero-gas signed vouchers, one settlement. Streams at nano-scale."],
-      ["Guardian + trust memory", "Large buys pause for a human co-signer; a provider that failed this agent is declined next time."],
-    ],
-    note:
-      "Each of these is running end to end, not stubbed. The staking one is the answer to “why would " +
-      "an agent trust an unknown provider” — because the provider has money at risk.",
-  },
-  {
-    label: "THE DEFI STACK",
-    title: "The rails that fund the agent.",
-    lede: "An agent needs working capital. Tessera provides it natively rather than assuming a funded wallet.",
-    bullets: [
-      ["Lending & borrowing", "Supply for yield or borrow against collateral. Kinked-utilisation interest, health-factor liquidation, per-action freeze controls."],
-      ["Yield vault", "80% held liquid by a contract floor no admin can lower. The app's fee touches yield only — never principal."],
-      ["Swap desk", "Oracle-priced swaps between pool assets, with the fee split configurable."],
-      ["Liquidity pools (AMM)", "Multi-asset pools where providers keep at least 50% of every swap fee — a constant in the contract, not a setting."],
-    ],
-    note:
-      "The point of this slide is that the DeFi is not decoration. An agent that earns fees needs " +
-      "somewhere to put them and somewhere to borrow from when it is short.",
-  },
-  {
-    label: "GUARDRAILS",
-    title: "What an operator cannot do.",
-    lede: "The safety properties that matter are the ones written as constants, not as policy.",
-    bullets: [
-      ["Vault reserve floor", "80% liquid is a contract constant. Raising it is allowed; lowering it is not."],
-      ["AMM provider share", "50% of swap fees to liquidity providers, enforced on every configuration path."],
-      ["No position transfers", "No function anywhere lets an operator move someone else's position. Migration pays in on their behalf instead."],
-      ["Oracle validation", "A stale, negative, unfinished or carried-over price pauses the market rather than pricing wrongly."],
-      ["Freeze, not trap", "Freezing is per action — withdraw and repay can stay open, and liquidation is never frozen."],
-    ],
-    note:
-      "This is the slide a technical judge will care about. Every line is a thing that cannot be done " +
-      "even with the deployer key, which is what makes the trust assumption bounded.",
-  },
-  {
-    label: "AGENT WORKSPACE",
-    title: "Live information the agent can act on.",
-    lede:
-      "News across 21 topics, FX, crypto, stocks, indices, commodities, and market analysis derived " +
-      "from those prices.",
-    bullets: [
-      ["Named sources", "ECB reference rates, CoinGecko, Yahoo Finance, public RSS. Each panel names its source and its age."],
-      ["Never a fabricated number", "An unreachable feed says so. It does not fall back to a stale figure someone might trade on."],
-      ["Analysis, not opinion", "Breadth, leaders, laggards, volatility, dollar direction — arithmetic on the prices shown, no forecasts."],
-      ["Full transaction history", "Filter by user, date, range, value, outcome and type; export to CSV."],
-    ],
-    note:
-      "Worth saying out loud: the analysis tab computes from the prices in the other tabs and says so. " +
-      "We deliberately did not generate market commentary, because that would be invented.",
-  },
-  {
-    label: "LIVE RUN",
-    title: "One autonomous run, four outcomes.",
-    lede: "Nothing here is scripted — this is what the agent decided on its own.",
-    bullets: [
-      ["Settled", "Weather and FX-quote calls delivered against their SLA and released automatically."],
-      ["Refunded + slashed", "A news service returned junk. The agent reclaimed its USDC and slashed the provider's bond."],
-      ["Guardian pause", "A premium call exceeded the per-call policy cap, so a human co-signed before it settled."],
-      ["Declined from memory", "A later invoice from the provider that had failed it was declined without asking anyone."],
-    ],
-    note:
-      "The refund and the slash are the two to point at. Everything else a payment rail can do; " +
-      "getting the money back and taking it out of the counterparty's bond is the part that is new.",
-  },
-  {
-    label: "ON-CHAIN PROOF",
-    title: "Deployed and transacting on Arc testnet.",
-    bullets: [
-      ["Chain", "Arc testnet, chainId 5042002, bound to native USDC at 0x3600…0000."],
-      ["Contracts", "Escrow, nanopayment tabs, lending pool, vault, swap desk, AMM, and two fee collectors."],
-      ["Verified transactions", "Settle, refund (SLA breach reclaimed), and a tab settled in one on-chain claim."],
-      ["Real assets", "USDC, EURC and cirBTC — Circle's own tokens on Arc, not mocks."],
-    ],
-    note:
-      "Have the explorer open. The refund transaction is the one to show — it is the differentiator " +
-      "made concrete.",
-  },
-  {
-    label: "WHY ARC",
-    title: "The chain makes the product possible.",
-    bullets: [
-      ["USDC as gas", "One asset funds both the purchase and the fee. No separate gas token to manage."],
-      ["Sub-second finality", "A payment can settle inside the HTTP request that triggered it."],
-      ["Stablecoin-native", "Prices in the unit the invoice is denominated in — no FX exposure between quote and settlement."],
-      ["Config, not fork", "Chain id, RPC, explorer and USDC address are all env-driven; mainnet is a configuration change."],
-    ],
-    note:
-      "The gas-token point is the one people miss. On a normal chain an agent needs two assets and a " +
-      "top-up strategy for the one it does not earn.",
-  },
-  {
-    label: "EXECUTION",
-    title: "Every feature runs end to end.",
-    bullets: [
-      ["225 automated tests", "104 contract tests on Hardhat plus 121 agent unit tests, in CI on every push."],
-      ["Browser and API QA", "Interaction, responsiveness across five viewport widths, and a security sweep of every endpoint."],
-      ["Security posture documented", "Findings, fixes, guardrails, and the residual risks stated plainly in docs/SECURITY.md."],
-      ["Self-custody by default", "Calldata is built in the browser and signed by the user's wallet. The server never holds a user key."],
-    ],
-    note:
-      "Close the credibility gap here. The honest caveat belongs in this slide too: unaudited testnet " +
-      "software, and we say so in the app itself.",
-  },
-  {
-    label: "THE VISION",
-    title: "The settlement rail for agent-to-agent commerce.",
-    lede:
-      "When agents transact continuously, the bottleneck is not intelligence — it is trust between " +
-      "strangers. Tessera is that layer, and it settles in USDC on Arc.",
-    note:
-      "End on the market, not the feature list. Every agent that buys anything needs this, and today " +
-      "each of them re-implements a worse version of it.",
-  },
-];
+import { SLIDES, C } from "./deck-content.mjs";
 
 // --- minimal ZIP writer -----------------------------------------------------
 
@@ -285,7 +110,7 @@ function zip(entries) {
   return Buffer.concat([...chunks, cdBuf, end]);
 }
 
-// --- OOXML ------------------------------------------------------------------
+// --- OOXML primitives -------------------------------------------------------
 
 const esc = (s) =>
   String(s)
@@ -294,246 +119,597 @@ const esc = (s) =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 
-// 16:9 at 12192000 x 6858000 EMU.
+/** 16:9 at 1280x720 px. Everything below is authored in px and converted here. */
 const W = 12192000;
 const H = 6858000;
-const EMU = 914400 / 96; // px -> EMU at 96dpi
-const px = (n) => Math.round(n * EMU);
+const PX = 9525;
+const px = (n) => Math.round(n * PX);
+/** px -> hundredths of a point, which is how DrawingML sizes text. */
+const pt = (cssPx) => Math.round(cssPx * 0.75 * 100);
 
-function textBox({ x, y, w, h, runs, align = "l", anchor = "t" }) {
-  const paras = runs
-    .map((p) => {
-      const spc = p.spaceBefore ? `<a:spcBef><a:spcPts val="${p.spaceBefore}"/></a:spcBef>` : "";
-      const bullet = p.bullet
-        ? `<a:buFont typeface="Arial"/><a:buChar char="▪"/>`
-        : `<a:buNone/>`;
-      const indent = p.bullet ? ` marL="228600" indent="-228600"` : "";
-      const segs = (Array.isArray(p.text) ? p.text : [{ t: p.text }])
-        .map(
-          (seg) =>
-            `<a:r><a:rPr lang="en-US" sz="${p.size}" b="${p.bold ? 1 : 0}" dirty="0">` +
-            `<a:solidFill><a:srgbClr val="${seg.color || p.color || BRAND.text}"/></a:solidFill>` +
-            `<a:latin typeface="Segoe UI" pitchFamily="34" charset="0"/>` +
-            `</a:rPr><a:t>${esc(seg.t)}</a:t></a:r>`,
-        )
-        .join("");
-      return (
-        `<a:p><a:pPr algn="${p.align || align}"${indent}>${spc}${bullet}</a:pPr>${segs}</a:p>`
-      );
-    })
-    .join("");
+let uid = 1;
+const nextId = () => ++uid;
+
+/** Solid, gradient or radial fill, with optional alpha. */
+function fill(spec) {
+  if (!spec) return `<a:noFill/>`;
+  if (typeof spec === "string") return `<a:solidFill><a:srgbClr val="${spec}"/></a:solidFill>`;
+  if (spec.alpha !== undefined) {
+    return `<a:solidFill><a:srgbClr val="${spec.color}"><a:alpha val="${Math.round(spec.alpha * 100000)}"/></a:srgbClr></a:solidFill>`;
+  }
+  if (spec.radial) {
+    // A path gradient is how PowerPoint expresses a radial glow. The outer stop
+    // is fully transparent so it fades into the stage instead of edging.
+    return (
+      `<a:gradFill rotWithShape="0"><a:gsLst>` +
+      `<a:gs pos="0"><a:srgbClr val="${spec.from}"><a:alpha val="${Math.round((spec.fromAlpha ?? 1) * 100000)}"/></a:srgbClr></a:gs>` +
+      `<a:gs pos="100000"><a:srgbClr val="${spec.from}"><a:alpha val="0"/></a:srgbClr></a:gs>` +
+      `</a:gsLst><a:path path="circle"><a:fillToRect l="50000" t="50000" r="50000" b="50000"/></a:path></a:gradFill>`
+    );
+  }
+  // Linear. `ang` is in 60000ths of a degree; 5400000 is top-to-bottom.
   return (
-    `<p:sp><p:nvSpPr><p:cNvPr id="${textBox.id = (textBox.id || 1) + 1}" name="tx"/>` +
-    `<p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>` +
-    `<p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>` +
-    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>` +
-    `<p:txBody><a:bodyPr wrap="square" anchor="${anchor}"><a:normAutofit/></a:bodyPr>` +
-    `<a:lstStyle/>${paras}</p:txBody></p:sp>`
+    `<a:gradFill rotWithShape="1"><a:gsLst>` +
+    `<a:gs pos="0"><a:srgbClr val="${spec.from}"/></a:gs>` +
+    `<a:gs pos="100000"><a:srgbClr val="${spec.to}"/></a:gs>` +
+    `</a:gsLst><a:lin ang="${spec.ang ?? 5400000}" scaled="0"/></a:gradFill>`
   );
 }
 
-/** Rounded panel. `adj` is the corner radius as a fraction of the short side. */
-function rect({ x, y, w, h, fill, line, round = 0, opacity }) {
-  const geom = round
-    ? `<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val ${Math.round(round * 100000)}"/></a:avLst></a:prstGeom>`
-    : `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>`;
-  const alpha = opacity === undefined ? "" : `<a:alpha val="${Math.round(opacity * 100000)}"/>`;
+/** A shape: rectangle, rounded rectangle or ellipse. */
+function shape({ x, y, w, h, bg, line, lineW = 12700, round, geom = "rect" }) {
+  const g =
+    round !== undefined
+      ? `<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val ${Math.round(round * 100000)}"/></a:avLst></a:prstGeom>`
+      : `<a:prstGeom prst="${geom}"><a:avLst/></a:prstGeom>`;
   return (
-    `<p:sp><p:nvSpPr><p:cNvPr id="${(rect.id = (rect.id || 900) + 1)}" name="panel"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
-    `<p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>${geom}` +
-    `<a:solidFill><a:srgbClr val="${fill}">${alpha}</a:srgbClr></a:solidFill>` +
-    (line ? `<a:ln w="12700"><a:solidFill><a:srgbClr val="${line}"/></a:solidFill></a:ln>` : `<a:ln><a:noFill/></a:ln>`) +
+    `<p:sp><p:nvSpPr><p:cNvPr id="${nextId()}" name="shape"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="${px(x)}" y="${px(y)}"/><a:ext cx="${px(w)}" cy="${px(h)}"/></a:xfrm>${g}` +
+    fill(bg) +
+    (line ? `<a:ln w="${lineW}"><a:solidFill><a:srgbClr val="${line}"/></a:solidFill></a:ln>` : `<a:ln><a:noFill/></a:ln>`) +
     `</p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>`
   );
 }
 
 /**
- * Slide layout.
+ * A text box. `paras` is a list of paragraphs; each `text` may be a string or a
+ * list of `{t, color, bold}` segments so a single line can mix colours the way
+ * the HTML deck's accent spans do.
  *
- * The whole deck is composed from three primitives — a full-bleed background, a
- * rounded panel, and a text box — laid out on a 1280x720 grid so the geometry is
- * readable in px and converted to EMU at the edges. Bullets become *cards*
- * rather than a list: a wall of dashes is what makes a generated deck look
- * generated, and cards also stop long lines from running the full slide width.
+ * Autofit is off deliberately. With `normAutofit` a renderer shrinks text to fit
+ * its box, so two cards side by side ended up at different sizes purely because
+ * one body wrapped to three lines and the other to two — and their headings no
+ * longer lined up. Boxes are measured to fit instead.
  */
-function slideXml(s, index, total) {
-  const shapes = [];
-  const M = 72;                 // page margin, px
-  const CW = 1280 - M * 2;      // content width, px
-  const isTitle = index === 0;
-  const isQuote = !s.bullets && !!s.lede && !isTitle;
-
-  // Background plus a hairline accent rule along the top edge.
-  //
-  // An earlier version put large translucent "wash" shapes in the corners for
-  // depth. They render as hard-edged blocks — PowerPoint has no soft radial
-  // shape, and a stadium at 9% opacity just looks like a stray panel. Removed:
-  // the accent rule, the title bar and the cards carry the design on their own.
-  shapes.push(rect({ x: 0, y: 0, w: W, h: H, fill: BRAND.bg }));
-  shapes.push(rect({ x: 0, y: 0, w: W, h: px(5), fill: BRAND.accent }));
-
-  // A slide that is only a statement (no cards) gets its block centred, rather
-  // than pinned to the top with two thirds of the slide empty below it.
-  let y = M + 18;
-  if (isQuote) {
-    const tLen = s.title.length;
-    const tPer = tLen > 64 ? 40 : tLen > 42 ? 46 : 54;
-    const tLines = Math.ceil(tLen / (tLen > 64 ? 63 : tLen > 42 ? 51 : 40));
-    const lLines = Math.ceil(s.lede.length / 58);
-    const blockH = 34 + tLines * tPer + 10 + lLines * 30 + 8;
-    y = Math.max(M + 18, (720 - 44 - blockH) / 2);
-  }
-
-  // Eyebrow: the running section label.
-  shapes.push(
-    textBox({
-      x: px(M), y: px(y), w: px(CW), h: px(24),
-      runs: [{ text: s.label, size: 1050, bold: true, color: BRAND.accent2 }],
-    }),
+function textBoxAt({ x, y, w, h, paras, align = "l", anchor = "t" }) {
+  const body = paras
+    .map((p) => {
+      const spc = p.gap ? `<a:spcBef><a:spcPts val="${Math.round(p.gap * 100)}"/></a:spcBef>` : "";
+      const line = p.lineHeight ? `<a:lnSpc><a:spcPct val="${Math.round(p.lineHeight * 100000)}"/></a:lnSpc>` : "";
+      const segs = (Array.isArray(p.text) ? p.text : [{ t: p.text }])
+        .map((s) => {
+          const sz = pt(s.size ?? p.size ?? 16);
+          const spacing = p.tracking ? ` spc="${Math.round(p.tracking * 100)}"` : "";
+          return (
+            `<a:r><a:rPr lang="en-US" sz="${sz}" b="${(s.bold ?? p.bold) ? 1 : 0}"${spacing} dirty="0">` +
+            `<a:solidFill><a:srgbClr val="${s.color ?? p.color ?? C.ink}"/></a:solidFill>` +
+            `<a:latin typeface="${p.mono ? "Consolas" : "Segoe UI"}" pitchFamily="34" charset="0"/>` +
+            `</a:rPr><a:t>${esc(s.t)}</a:t></a:r>`
+          );
+        })
+        .join("");
+      return `<a:p><a:pPr algn="${p.align ?? align}">${line}${spc}<a:buNone/></a:pPr>${segs}</a:p>`;
+    })
+    .join("");
+  return (
+    `<p:sp><p:nvSpPr><p:cNvPr id="${nextId()}" name="text"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="${px(x)}" y="${px(y)}"/><a:ext cx="${px(w)}" cy="${px(h)}"/></a:xfrm>` +
+    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>` +
+    `<p:txBody><a:bodyPr wrap="square" lIns="0" tIns="0" rIns="0" bIns="0" anchor="${anchor}"><a:noAutofit/></a:bodyPr>` +
+    `<a:lstStyle/>${body}</p:txBody></p:sp>`
   );
-  y += 34;
+}
 
-  if (s.kicker) {
-    shapes.push(
-      textBox({ x: px(M), y: px(y), w: px(CW), h: px(24), runs: [{ text: s.kicker, size: 1200, color: BRAND.muted }] }),
-    );
-    y += 32;
+// --- text measurement -------------------------------------------------------
+
+/**
+ * Estimated wrapped height, in px.
+ *
+ * Per-character widths rather than one average, because an average is wrong in
+ * the cases that matter. "402 → decide → escrow → settle or refund" is only 40
+ * characters, but the arrows and spaces are far wider than an average glyph, so
+ * an averaged estimate said one line, the box was sized for one line, and the
+ * second line ended up drawn *underneath* the cards placed below it.
+ *
+ * The table is approximate em-widths for Segoe UI. It only has to be good enough
+ * to get the line count right; blocks are centred from the result, so being one
+ * line out is visible.
+ */
+const WIDE = new Set([..."WMQ@%&—–→←↔≈"]);
+const NARROW = new Set([..."iljtfrI.,:;'’|!()[]/\\ "]);
+/**
+ * Per-character width, deliberately calibrated to the **wider** of the two faces
+ * this deck can be rendered in (DejaVu Sans, which Linux substitutes for the
+ * requested Segoe UI). That makes every estimate an upper bound: PowerPoint may
+ * occasionally leave one line of slack, which is harmless because blocks are
+ * centred, whereas under-estimating put a title's second line underneath the
+ * cards drawn below it.
+ */
+function textWidth(str, size, bold) {
+  const base = size * (bold ? 0.63 : 0.585);
+  let w = 0;
+  for (const ch of str) {
+    if (WIDE.has(ch)) w += base * 1.55;
+    else if (NARROW.has(ch)) w += base * 0.55;
+    else if (ch >= "A" && ch <= "Z") w += base * 1.15;
+    else w += base;
   }
+  return w;
+}
+/**
+ * Safety factor on the available width.
+ *
+ * The deck specifies Segoe UI, which is not installed on Linux — so the
+ * LibreOffice render used for verification substitutes a wider face, and a title
+ * that fits one line in PowerPoint wraps to two there. Rather than tune for one
+ * font and break in the other, measure against a slightly narrower column: the
+ * layout then holds whichever face is used, at the cost of wrapping a hair
+ * earlier than strictly necessary.
+ */
+const SAFE_WIDTH = 0.96;
+function measure(content, size, widthRaw, { bold = false, lineHeight = 1.3 } = {}) {
+  const width = widthRaw * SAFE_WIDTH;
+  const str = Array.isArray(content) ? content.map((s) => s.t).join("") : String(content ?? "");
+  let lines = 0;
+  for (const para of str.split("\n")) {
+    // Wrap on word boundaries, as a renderer does — breaking mid-word would
+    // undercount lines for text with long words.
+    let cur = 0, used = 1;
+    for (const word of para.split(" ")) {
+      const ww = textWidth(word + " ", size, bold);
+      if (cur > 0 && cur + ww > width) { used++; cur = ww; } else cur += ww;
+    }
+    lines += used;
+  }
+  return Math.ceil(lines * size * lineHeight);
+}
 
-  // Title. Three sizes so a long line wraps to two rather than shrinking to
-  // unreadable, and the title slide gets the largest treatment.
-  const len = s.title.length;
-  const titleSize = isTitle ? 5200 : len > 64 ? 2800 : len > 42 ? 3400 : 4200;
-  // Height tracks how many lines the title will actually take, so a one-line
-  // title doesn't leave a hole under it.
-  // Calibrated against the rendered widths: at 1136px of content, roughly
-  // 40 chars fit at 42pt, 51 at 34pt and 63 at 28pt. Under-estimating here left
-  // the accent bar hanging below a title that actually fit on one line.
-  const perLine = isTitle ? 62 : len > 64 ? 40 : len > 42 ? 46 : 54;
-  const charsPerLine = isTitle ? 24 : len > 64 ? 63 : len > 42 ? 51 : 40;
-  const titleH = Math.max(perLine, Math.ceil(len / charsPerLine) * perLine) + 10;
-  shapes.push(rect({ x: px(M), y: px(y + 6), w: px(4), h: px(titleH - 14), fill: BRAND.accent2, round: 0.5 }));
-  shapes.push(
-    textBox({
-      x: px(M + 18), y: px(y), w: px((isTitle ? CW * 0.86 : CW) - 18), h: px(titleH),
-      runs: [{ text: s.title, size: titleSize, bold: true }],
+// --- composed components ----------------------------------------------------
+
+const M = 84;               // page margin
+const CW = 1280 - M * 2;    // content width
+const TOP = 30;             // progress rail
+const FOOT = 690;           // footer rail baseline
+
+/** Eyebrow: a short accent rule, then mono uppercase label. */
+function eyebrow(label, y) {
+  const rule = 40, gapAfter = 12, size = 15;
+  return [
+    shape({ x: M, y: y + size * 0.45, w: rule, h: 2.5, bg: C.accent, round: 0.5 }),
+    textBoxAt({
+      x: M + rule + gapAfter, y, w: CW - rule - gapAfter, h: size * 1.5,
+      paras: [{ text: String(label).toUpperCase(), size, bold: true, color: C.accent, mono: true, tracking: 2.6 }],
     }),
-  );
-  y += titleH + 8;
+  ];
+}
+const EYEBROW_H = 30;
 
-  if (s.lede) {
-    const ledeW = isTitle ? CW * 0.64 : isQuote ? CW * 0.74 : CW * 0.82;
-    const big = isTitle || isQuote;
-    // Same idea as the title: estimate the wrap so the gap below matches the
-    // text rather than a fixed guess.
-    const cpl = big ? 58 : 96;
-    const lh = big ? 30 : 24;
-    const ledeH = Math.ceil(s.lede.length / cpl) * lh + 8;
-    shapes.push(
-      textBox({
-        x: px(M + 18), y: px(y), w: px(ledeW), h: px(ledeH),
-        runs: [{ text: s.lede, size: big ? 1700 : 1400, color: BRAND.muted }],
+/** Card: white surface, hairline border, bold key over muted body. */
+function card(x, y, w, [k, v, tint], { keySize = 17, bodySize = 14, pad = 18 } = {}) {
+  const bodyH = measure(v, bodySize, w - pad * 2, { lineHeight: 1.4 });
+  const h = pad * 2 + keySize * 1.3 + 6 + bodyH;
+  return {
+    h,
+    xml: [
+      shape({ x, y, w, h, bg: C.surface, line: C.line, round: 14 / Math.min(w, h) }),
+      textBoxAt({
+        x: x + pad, y: y + pad, w: w - pad * 2, h: h - pad * 2,
+        paras: [
+          { text: k, size: keySize, bold: true, color: tint ?? C.ink, lineHeight: 1.3 },
+          { text: v, size: bodySize, color: C.muted, lineHeight: 1.4, gap: 5 },
+        ],
+      }),
+    ].join(""),
+  };
+}
+
+/** Card height without emitting it — needed to centre a block before drawing. */
+function cardH(w, [, v], { keySize = 17, bodySize = 14, pad = 18 } = {}) {
+  return pad * 2 + keySize * 1.3 + 6 + measure(v, bodySize, w - pad * 2, { lineHeight: 1.4 });
+}
+
+/** The tesserae mark from the HTML deck: a 3x3 mosaic of small tiles. */
+function mosaic(x, y, size) {
+  const gap = 3;
+  const t = (size - gap * 2) / 3;
+  const on = [0, 4, 8], good = [2, 6];
+  const out = [];
+  for (let i = 0; i < 9; i++) {
+    const bg = on.includes(i) ? C.accent : good.includes(i) ? C.good : C.surface2;
+    out.push(
+      shape({
+        x: x + (i % 3) * (t + gap), y: y + Math.floor(i / 3) * (t + gap), w: t, h: t,
+        bg, line: on.includes(i) || good.includes(i) ? null : C.line, round: 0.22,
       }),
     );
-    y += ledeH + 18;
   }
+  return out.join("");
+}
 
-  if (s.bullets && s.bullets.length) {
-    const n = s.bullets.length;
-    const cols = n >= 4 ? 2 : 1;
-    const gap = 16;
-    const pad = 15;
-    const cardW = (CW - gap * (cols - 1)) / cols;
-
-    /** Estimated card height from the text it holds, so none sits half empty. */
-    const heightFor = ([k, v]) => {
-      const cpl = Math.floor((cardW - pad * 2) / 5.6); // ~5.6px per char at 10.5pt
-      const bodyLines = Math.max(1, Math.ceil(v.length / cpl));
-      return pad * 2 + 8 + 22 + bodyLines * 17;
-    };
-
-    // Lay out row by row rather than column by column: with an odd count the
-    // last card then spans the full width instead of leaving a hole beside it.
-    const rowsOf = [];
-    for (let i = 0; i < n; i += cols) rowsOf.push(s.bullets.slice(i, i + cols));
-
-    const avail = 720 - y - 56;
-    const natural = rowsOf.reduce((t, r) => t + Math.max(...r.map(heightFor)), 0) + gap * (rowsOf.length - 1);
-    // Scale down only if the natural heights would overflow the slide.
-    const scale = natural > avail ? avail / natural : 1;
-
-    // Centre the block in the space left below the lede. Top-aligning it left
-    // every slide bottom-heavy with dead space, which reads as unfinished.
-    let cy = y + Math.max(0, (avail - natural * scale) / 2);
-    for (const row of rowsOf) {
-      const rowH = Math.max(...row.map(heightFor)) * scale;
-      const full = row.length === 1 && cols === 2;
-      row.forEach(([k, v], c) => {
-        const w = full ? CW : cardW;
-        const cx = px(M + c * (cardW + gap));
-        shapes.push(rect({ x: cx, y: px(cy), w: px(w), h: px(rowH), fill: BRAND.panel, line: "1E2A3F", round: 0.07 }));
-        shapes.push(rect({ x: cx + px(pad), y: px(cy + pad - 1), w: px(20), h: px(3), fill: BRAND.accent2, round: 0.5 }));
-        shapes.push(
-          textBox({
-            x: cx + px(pad), y: px(cy + pad + 7), w: px(w - pad * 2), h: px(rowH - pad * 2 - 7),
-            runs: [
-              { text: k, size: 1300, bold: true, color: BRAND.text },
-              { text: v, size: 1050, color: BRAND.muted, spaceBefore: 350 },
-            ],
-          }),
-        );
-      });
-      cy += rowH + gap;
-    }
-  }
-
-  // Title slide: three facts along the bottom, so the lower two thirds carries
-  // something instead of reading as an unfinished slide.
-  if (isTitle) {
-    const chips = [
-      ["Live on Arc testnet", "chainId 5042002 · USDC as gas"],
-      ["8 contracts deployed", "escrow, tabs, pool, vault, swap, AMM, 2 collectors"],
-      ["225 automated tests", "104 contract · 121 agent · CI on every push"],
-    ];
-    const gap = 16;
-    const w = (CW - gap * 2) / 3;
-    chips.forEach(([k, v], i) => {
-      const cx = px(M + i * (w + gap));
-      const cy = px(720 - 200);
-      shapes.push(rect({ x: cx, y: cy, w: px(w), h: px(104), fill: BRAND.panel, line: "1E2A3F", round: 0.09 }));
-      shapes.push(rect({ x: cx + px(15), y: cy + px(14), w: px(20), h: px(3), fill: BRAND.accent2, round: 0.5 }));
-      shapes.push(
-        textBox({
-          x: cx + px(15), y: cy + px(22), w: px(w - 30), h: px(70),
-          runs: [
-            { text: k, size: 1350, bold: true, color: BRAND.text },
-            { text: v, size: 1000, color: BRAND.muted, spaceBefore: 350 },
-          ],
-        }),
-      );
-    });
-  }
-
-  // Footer: brand left, position right, hairline above.
-  shapes.push(rect({ x: px(M), y: px(720 - 44), w: px(CW), h: px(1), fill: "1E2A3F" }));
-  shapes.push(
-    textBox({
-      x: px(M), y: px(720 - 34), w: px(CW / 2), h: px(22),
-      runs: [{ text: "TESSERA  ·  Arc testnet  ·  USDC-native", size: 950, color: BRAND.muted }],
-    }),
+/** Outcome pill: tinted fill, matching border, uppercase mono label. */
+function pill(x, y, w, h, label, tint) {
+  return (
+    shape({ x, y, w, h, bg: { color: tint, alpha: 0.13 }, line: tint, lineW: 9525, round: 0.5 }) +
+    textBoxAt({
+      x, y: y + h / 2 - 6.5, w, h: 14, align: "ctr",
+      paras: [{ text: label.toUpperCase(), size: 11, bold: true, color: tint, mono: true, tracking: 0.5 }],
+    })
   );
-  shapes.push(
-    textBox({
-      x: px(M + CW / 2), y: px(720 - 34), w: px(CW / 2), h: px(22), align: "r",
-      runs: [
-        {
-          text: `${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`,
-          size: 950, color: BRAND.muted,
-        },
+}
+
+/** Progress rail: one tile per slide, the current one wider and solid accent. */
+function rail(index, total) {
+  const out = [];
+  let x = M;
+  for (let i = 0; i < total; i++) {
+    const cur = i === index;
+    const w = cur ? 34 : 18;
+    out.push(shape({
+      x, y: TOP, w, h: 5,
+      bg: cur ? C.accent : i < index ? { color: C.accent, alpha: 0.45 } : C.line,
+      round: 0.5,
+    }));
+    x += w + 6;
+  }
+  out.push(textBoxAt({
+    x: M, y: TOP - 4, w: CW, h: 16, align: "r",
+    paras: [{
+      text: `${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`,
+      size: 12, color: C.faint, mono: true, tracking: 1.2,
+    }],
+  }));
+  return out.join("");
+}
+
+/** Footer rail: running label left, wordmark right, hairline above. */
+function footer(label) {
+  return [
+    shape({ x: M, y: FOOT - 14, w: CW, h: 1, bg: C.line }),
+    textBoxAt({
+      x: M, y: FOOT, w: CW / 2, h: 16,
+      paras: [{ text: String(label).toUpperCase(), size: 12, color: C.faint, mono: true, tracking: 1.2 }],
+    }),
+    textBoxAt({
+      x: M + CW / 2, y: FOOT, w: CW / 2, h: 16, align: "r",
+      paras: [{ text: "TESSERA · ARC TESTNET · USDC-NATIVE", size: 12, color: C.faint, mono: true, tracking: 1.2 }],
+    }),
+  ].join("");
+}
+
+/** The stage: soft vertical gradient plus an accent glow at the top right. */
+function stage() {
+  return [
+    shape({ x: 0, y: 0, w: 1280, h: 720, bg: { from: C.ground2, to: C.ground } }),
+    shape({ x: 700, y: -300, w: 900, h: 700, bg: { radial: true, from: C.accent, fromAlpha: 0.13 }, geom: "ellipse" }),
+  ].join("");
+}
+
+// --- slide layouts ----------------------------------------------------------
+
+const TITLE_SIZE = 84;
+const H2_SIZE = 51;
+const LEDE_SIZE = 24;
+const QUOTE_SIZE = 50;
+
+/** Vertical band available between the rails. */
+const BAND_TOP = 92;
+const BAND_BOTTOM = FOOT - 26;
+const centreY = (blockH) => Math.max(BAND_TOP, BAND_TOP + (BAND_BOTTOM - BAND_TOP - blockH) / 2);
+
+function layoutTitle(s) {
+  const brand = 64;
+  const titleH = measure(s.title, TITLE_SIZE, CW * 0.9, { bold: true, lineHeight: 1 });
+  const ledeH = measure(s.lede, LEDE_SIZE, CW * 0.62, { lineHeight: 1.4 });
+  const statH = 96;
+  const block = EYEBROW_H + brand + 24 + titleH + 18 + ledeH + 46 + statH;
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  y += EYEBROW_H;
+  out.push(mosaic(M, y, brand));
+  out.push(textBoxAt({
+    x: M + brand + 20, y: y + brand / 2 - 22, w: CW, h: 46,
+    paras: [{ text: "Tessera", size: 34, bold: true, color: C.ink }],
+  }));
+  y += brand + 24;
+  out.push(textBoxAt({ x: M, y, w: CW * 0.9, h: titleH + 8, paras: [{ text: s.title, size: TITLE_SIZE, bold: true, lineHeight: 1 }] }));
+  y += titleH + 18;
+  out.push(textBoxAt({ x: M, y, w: CW * 0.62, h: ledeH + 8, paras: [{ text: s.lede, size: LEDE_SIZE, color: C.muted, lineHeight: 1.4 }] }));
+  y += ledeH + 46;
+  const gap = 16, w = (CW - gap * 2) / 3;
+  s.stats.forEach(([k, v], i) => {
+    const x = M + i * (w + gap);
+    out.push(shape({ x, y, w, h: statH, bg: C.surface, line: C.line, round: 14 / Math.min(w, statH) }));
+    out.push(shape({ x: x + 18, y: y + 17, w: 22, h: 3, bg: C.accent, round: 0.5 }));
+    out.push(textBoxAt({
+      x: x + 18, y: y + 27, w: w - 36, h: statH - 40,
+      paras: [
+        { text: k, size: 17, bold: true, lineHeight: 1.3 },
+        { text: v, size: 13, color: C.muted, lineHeight: 1.4, gap: 5 },
       ],
-    }),
-  );
+    }));
+  });
+  return out.join("");
+}
 
+function layoutSplit(s) {
+  const colGap = 56;
+  const lw = (CW - colGap) * 0.52, rw = CW - colGap - lw;
+  const titleH = measure(s.title, H2_SIZE, lw, { bold: true, lineHeight: 1.05 });
+  const ledeH = s.lede ? measure(s.lede, LEDE_SIZE, lw, { lineHeight: 1.4 }) : 0;
+  const cardGap = 12;
+  const cardsH = s.cards.reduce((t, c) => t + cardH(rw, c), 0) + cardGap * (s.cards.length - 1);
+  const leftH = EYEBROW_H + titleH + (ledeH ? 18 + ledeH : 0);
+  const block = Math.max(leftH, cardsH + EYEBROW_H);
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  // Left column sits against the top of the band; the card stack is centred
+  // against it so the two columns read as one composition.
+  let ly = y + EYEBROW_H + Math.max(0, (block - leftH) / 2);
+  out.push(textBoxAt({ x: M, y: ly, w: lw, h: titleH + 8, paras: [{ text: s.title, size: H2_SIZE, bold: true, lineHeight: 1.05 }] }));
+  if (ledeH) {
+    out.push(textBoxAt({ x: M, y: ly + titleH + 18, w: lw, h: ledeH + 8, paras: [{ text: s.lede, size: LEDE_SIZE, color: C.muted, lineHeight: 1.4 }] }));
+  }
+  let cy = y + EYEBROW_H + Math.max(0, (block - cardsH) / 2);
+  for (const c of s.cards) {
+    const built = card(M + lw + colGap, cy, rw, c);
+    out.push(built.xml);
+    cy += built.h + cardGap;
+  }
+  return out.join("");
+}
+
+function layoutQuote(s) {
+  const qw = CW * 0.82;
+  const qH = measure(s.quote, QUOTE_SIZE, qw, { bold: true, lineHeight: 1.12 });
+  const ledeH = measure(s.lede, LEDE_SIZE, CW * 0.62, { lineHeight: 1.4 });
+  // 26px of clearance, not 16: the lede's descenders were touching the address
+  // line whenever it wrapped to three lines.
+  const addrH = s.addr ? 26 + 22 : 0;
+  const block = EYEBROW_H + qH + 22 + ledeH + addrH;
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  y += EYEBROW_H;
+  out.push(textBoxAt({ x: M, y, w: qw, h: qH + 8, paras: [{ text: s.quote, size: QUOTE_SIZE, bold: true, lineHeight: 1.12 }] }));
+  y += qH + 22;
+  out.push(textBoxAt({ x: M, y, w: CW * 0.62, h: ledeH + 8, paras: [{ text: s.lede, size: LEDE_SIZE, color: C.muted, lineHeight: 1.4 }] }));
+  if (s.addr) {
+    out.push(textBoxAt({
+      x: M, y: y + ledeH + 26, w: CW, h: 22,
+      paras: [{ text: s.addr, size: 15, color: C.accent, mono: true }],
+    }));
+  }
+  return out.join("");
+}
+
+function layoutFlow(s) {
+  const titleH = measure(s.title, H2_SIZE, CW, { bold: true, lineHeight: 1.05 });
+  const gap = 13;
+  const sw = (CW - gap * (s.steps.length - 1)) / s.steps.length;
+  const stepH = 150;
+  const ledeH = measure(s.lede, LEDE_SIZE * 0.8, CW * 0.72, { lineHeight: 1.4 });
+  const block = EYEBROW_H + titleH + 26 + stepH + 24 + ledeH;
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  y += EYEBROW_H;
+  out.push(textBoxAt({ x: M, y, w: CW, h: titleH + 8, paras: [{ text: s.title, size: H2_SIZE, bold: true, lineHeight: 1.05 }] }));
+  y += titleH + 26;
+  s.steps.forEach(([n, t, d], i) => {
+    const x = M + i * (sw + gap);
+    out.push(shape({ x, y, w: sw, h: stepH, bg: C.surface, line: C.line, round: 13 / Math.min(sw, stepH) }));
+    out.push(textBoxAt({
+      x: x + 18, y: y + 18, w: sw - 36, h: stepH - 36,
+      paras: [
+        { text: n, size: 13, color: C.faint, mono: true, tracking: 1.2 },
+        { text: t, size: 21, bold: true, lineHeight: 1.2, gap: 7 },
+        { text: d, size: 14, color: C.muted, lineHeight: 1.4, gap: 7 },
+      ],
+    }));
+  });
+  y += stepH + 24;
+  out.push(textBoxAt({ x: M, y, w: CW * 0.72, h: ledeH + 8, paras: [{ text: s.lede, size: LEDE_SIZE * 0.8, color: C.muted, lineHeight: 1.4 }] }));
+  return out.join("");
+}
+
+function layoutCards(s) {
+  const titleH = measure(s.title, H2_SIZE, CW, { bold: true, lineHeight: 1.05 });
+  const ledeH = s.lede ? measure(s.lede, LEDE_SIZE, CW * 0.78, { lineHeight: 1.4 }) : 0;
+  const gap = 16, cw = (CW - gap) / 2;
+  const rows = [];
+  for (let i = 0; i < s.cards.length; i += 2) rows.push(s.cards.slice(i, i + 2));
+  const rowHs = rows.map((r) => Math.max(...r.map((c) => cardH(cw, c))));
+  const cardsH = rowHs.reduce((a, b) => a + b, 0) + gap * (rows.length - 1);
+  const block = EYEBROW_H + titleH + (ledeH ? 16 + ledeH : 0) + 26 + cardsH;
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  y += EYEBROW_H;
+  out.push(textBoxAt({ x: M, y, w: CW, h: titleH + 8, paras: [{ text: s.title, size: H2_SIZE, bold: true, lineHeight: 1.05 }] }));
+  y += titleH + (ledeH ? 16 : 0);
+  if (ledeH) {
+    out.push(textBoxAt({ x: M, y, w: CW * 0.78, h: ledeH + 8, paras: [{ text: s.lede, size: LEDE_SIZE, color: C.muted, lineHeight: 1.4 }] }));
+    y += ledeH;
+  }
+  y += 26;
+  rows.forEach((row, r) => {
+    row.forEach((c, i) => {
+      // Drawn directly rather than via card(), because every card in a row is
+      // padded to the tallest so the grid lines up.
+      out.push(shape({ x: M + i * (cw + gap), y, w: cw, h: rowHs[r], bg: C.surface, line: C.line, round: 14 / Math.min(cw, rowHs[r]) }));
+      out.push(textBoxAt({
+        x: M + i * (cw + gap) + 18, y: y + 18, w: cw - 36, h: rowHs[r] - 36,
+        paras: [
+          { text: c[0], size: 17, bold: true, color: c[2] ?? C.ink, lineHeight: 1.3 },
+          { text: c[1], size: 14, color: C.muted, lineHeight: 1.4, gap: 5 },
+        ],
+      }));
+    });
+    y += rowHs[r] + gap;
+  });
+  return out.join("");
+}
+
+function layoutStack(s) {
+  const titleH = measure(s.title, H2_SIZE, CW, { bold: true, lineHeight: 1.05 });
+  const ledeH = s.lede ? measure(s.lede, LEDE_SIZE, CW * 0.74, { lineHeight: 1.4 }) : 0;
+  const head = EYEBROW_H + titleH + (ledeH ? 16 + ledeH : 0) + 24;
+
+  // Fit the stack to the band instead of letting it run past the footer. Five
+  // cards at full padding overflowed a 16:9 slide, and the last one collided
+  // with the footer rail — so step the spacing down until it fits.
+  const budget = BAND_BOTTOM - BAND_TOP - head;
+  let gap = 11;
+  let opts = { keySize: 16, bodySize: 13.5, pad: 15 };
+  let hs = s.cards.map((c) => cardH(CW, c, opts));
+  let cardsH = hs.reduce((a, b) => a + b, 0) + gap * (s.cards.length - 1);
+  for (const step of [
+    { gap: 9, pad: 13, keySize: 15.5, bodySize: 13 },
+    { gap: 8, pad: 11, keySize: 15, bodySize: 12.5 },
+    { gap: 7, pad: 10, keySize: 14, bodySize: 12 },
+  ]) {
+    if (cardsH <= budget) break;
+    gap = step.gap;
+    opts = { keySize: step.keySize, bodySize: step.bodySize, pad: step.pad };
+    hs = s.cards.map((c) => cardH(CW, c, opts));
+    cardsH = hs.reduce((a, b) => a + b, 0) + gap * (s.cards.length - 1);
+  }
+  const block = head + cardsH;
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  y += EYEBROW_H;
+  out.push(textBoxAt({ x: M, y, w: CW, h: titleH + 8, paras: [{ text: s.title, size: H2_SIZE, bold: true, lineHeight: 1.05 }] }));
+  y += titleH + (ledeH ? 16 : 0);
+  if (ledeH) {
+    out.push(textBoxAt({ x: M, y, w: CW * 0.74, h: ledeH + 8, paras: [{ text: s.lede, size: LEDE_SIZE, color: C.muted, lineHeight: 1.4 }] }));
+    y += ledeH;
+  }
+  y += 24;
+  s.cards.forEach((c, i) => {
+    const built = card(M, y, CW, c, opts);
+    out.push(built.xml);
+    y += hs[i] + gap;
+  });
+  return out.join("");
+}
+
+function layoutLedger(s) {
+  const colGap = 44;
+  const lw = (CW - colGap) * 0.56, rw = CW - colGap - lw;
+  const rowH = 46, rowGap = 9;
+  const rowsH = s.rows.length * rowH + (s.rows.length - 1) * rowGap;
+  const cardGap = 11;
+  const opts = { keySize: 16, bodySize: 13.5, pad: 15 };
+  const cardHs = s.cards.map((c) => cardH(rw, c, opts));
+  const cardsH = cardHs.reduce((a, b) => a + b, 0) + cardGap * (s.cards.length - 1);
+  const block = EYEBROW_H + Math.max(rowsH, cardsH);
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  const top = y + EYEBROW_H;
+  let ry = top + Math.max(0, (Math.max(rowsH, cardsH) - rowsH) / 2);
+  for (const [name, amt, outcome] of s.rows) {
+    const tint = outcome === "refunded" ? C.warn : C.good;
+    out.push(shape({ x: M, y: ry, w: lw, h: rowH, bg: C.surface, line: C.line, round: 11 / Math.min(lw, rowH) }));
+    out.push(textBoxAt({
+      x: M + 16, y: ry + rowH / 2 - 10, w: lw * 0.58, h: 22,
+      paras: [{ text: name, size: 16, bold: true, lineHeight: 1.2 }],
+    }));
+    out.push(textBoxAt({
+      x: M + lw * 0.58, y: ry + rowH / 2 - 8, w: lw * 0.2, h: 20, align: "r",
+      paras: [{ text: amt, size: 14, color: C.muted, mono: true }],
+    }));
+    out.push(pill(M + lw - 100, ry + rowH / 2 - 11, 84, 22, outcome, tint));
+    ry += rowH + rowGap;
+  }
+  let cy = top + Math.max(0, (Math.max(rowsH, cardsH) - cardsH) / 2);
+  s.cards.forEach((c, i) => {
+    const built = card(M + lw + colGap, cy, rw, c, opts);
+    out.push(built.xml);
+    cy += cardHs[i] + cardGap;
+  });
+  return out.join("");
+}
+
+function layoutProof(s) {
+  const rowH = 66, gap = 11;
+  const rowsH = s.txs.length * rowH + (s.txs.length - 1) * gap;
+  const block = EYEBROW_H + rowsH + 26;
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  y += EYEBROW_H;
+  for (const [glyph, label, sub, hash, tint] of s.txs) {
+    out.push(shape({ x: M, y, w: CW, h: rowH, bg: C.surface, line: C.line, round: 12 / Math.min(CW, rowH) }));
+    out.push(shape({ x: M + 16, y: y + rowH / 2 - 21, w: 42, h: 42, bg: { color: tint, alpha: 0.14 }, round: 0.24 }));
+    out.push(textBoxAt({
+      x: M + 16, y: y + rowH / 2 - 12, w: 42, h: 24, align: "ctr",
+      paras: [{ text: glyph, size: 21, bold: true, color: tint }],
+    }));
+    out.push(textBoxAt({
+      x: M + 74, y: y + 15, w: CW - 74 - 200, h: rowH - 24,
+      paras: [
+        { text: label, size: 19, bold: true, lineHeight: 1.25 },
+        { text: sub, size: 13.5, color: C.muted, lineHeight: 1.3, gap: 3 },
+      ],
+    }));
+    out.push(textBoxAt({
+      x: M + CW - 200, y: y + rowH / 2 - 9, w: 184, h: 20, align: "r",
+      paras: [{ text: hash, size: 13, color: C.accent, mono: true }],
+    }));
+    y += rowH + gap;
+  }
+  out.push(textBoxAt({
+    x: M, y: y + 12, w: CW, h: 20,
+    paras: [{ text: s.addr, size: 14, color: C.muted, mono: true }],
+  }));
+  return out.join("");
+}
+
+function layoutStats(s) {
+  const titleH = measure(s.title, H2_SIZE, CW * 0.7, { bold: true, lineHeight: 1.05 });
+  const gap = 18, w = (CW - gap * 3) / 4, h = 150;
+  const block = EYEBROW_H + titleH + 32 + h;
+  let y = centreY(block);
+  const out = [...eyebrow(s.eyebrow, y)];
+  y += EYEBROW_H;
+  out.push(textBoxAt({ x: M, y, w: CW * 0.7, h: titleH + 8, paras: [{ text: s.title, size: H2_SIZE, bold: true, lineHeight: 1.05 }] }));
+  y += titleH + 32;
+  s.stats.forEach(([num, cap, tint], i) => {
+    const x = M + i * (w + gap);
+    out.push(shape({ x, y, w, h, bg: C.surface, line: C.line, round: 14 / Math.min(w, h) }));
+    out.push(textBoxAt({
+      x: x + 20, y: y + 24, w: w - 40, h: 62,
+      paras: [{ text: num, size: 51, bold: true, color: tint ?? C.ink, lineHeight: 1 }],
+    }));
+    out.push(textBoxAt({
+      x: x + 20, y: y + 96, w: w - 40, h: h - 110,
+      paras: cap.split("\n").map((l, j) => ({ text: l, size: 13.5, color: C.muted, lineHeight: 1.35, gap: j ? 2 : 0 })),
+    }));
+  });
+  return out.join("");
+}
+
+const LAYOUTS = {
+  title: layoutTitle,
+  split: layoutSplit,
+  quote: layoutQuote,
+  flow: layoutFlow,
+  cards: layoutCards,
+  stack: layoutStack,
+  ledger: layoutLedger,
+  proof: layoutProof,
+  stats: layoutStats,
+};
+
+function slideXml(s, index, total) {
+  uid = 1;
+  const body = stage() + rail(index, total) + (LAYOUTS[s.type] ?? layoutCards)(s) + footer(s.label);
   return (
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
     `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ` +
@@ -542,12 +718,12 @@ function slideXml(s, index, total) {
     `<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>` +
     `<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>` +
     `<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>` +
-    shapes.join("") +
+    body +
     `</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`
   );
 }
 
-function notesXml(text) {
+function notesXml(t) {
   return (
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
     `<p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ` +
@@ -558,7 +734,7 @@ function notesXml(text) {
     `<p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/>` +
     `<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>` +
     `<p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" dirty="0"/>` +
-    `<a:t>${esc(text)}</a:t></a:r></a:p></p:txBody></p:sp>` +
+    `<a:t>${esc(t)}</a:t></a:r></a:p></p:txBody></p:sp>` +
     `</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:notes>`
   );
 }

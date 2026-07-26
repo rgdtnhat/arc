@@ -162,19 +162,51 @@ for (const n of slides) {
 }
 check(!idProblems.length, "shape ids unique and non-zero per slide", idProblems.join("; "));
 
-// Nothing may sit outside the canvas — a shape off-slide is a layout bug.
+// Content must stay on the canvas. Decorative shapes are allowed to bleed off
+// the edge on purpose — the accent glow does — so this checks *text* boxes,
+// where going off-slide always means something unreadable.
 const W = 12192000, H = 6858000;
 const offCanvas = [];
 for (const n of slides) {
-  const x = parts.get(n);
-  const offs = [...x.matchAll(/<a:off x="(-?\d+)" y="(-?\d+)"\/><a:ext cx="(\d+)" cy="(\d+)"\/>/g)];
-  for (const m of offs) {
+  for (const sp of parts.get(n).split("<p:sp>").slice(1)) {
+    if (!sp.includes("<a:t>")) continue; // no text, decorative
+    const m = sp.match(/<a:off x="(-?\d+)" y="(-?\d+)"\/><a:ext cx="(\d+)" cy="(\d+)"\/>/);
+    if (!m) continue;
     const [ox, oy, cx, cy] = m.slice(1).map(Number);
-    if (cx === 0 && cy === 0) continue; // the group shape's empty extent
-    if (ox < 0 || oy < 0 || ox + cx > W + 1 || oy + cy > H + 1) offCanvas.push(n);
+    if (ox < 0 || oy < 0 || ox + cx > W + 1 || oy + cy > H + 1) {
+      offCanvas.push(`${n}: ${(sp.match(/<a:t>([^<]{0,24})/) || [, "?"])[1]}`);
+    }
   }
 }
-check(!offCanvas.length, "no shape extends past the canvas", [...new Set(offCanvas)].join(", "));
+check(!offCanvas.length, "no text box extends past the canvas", offCanvas.join("; "));
+
+// Content must also clear the footer rail. This is the failure the canvas check
+// misses: a block that overflows its band collides with the footer while staying
+// technically on the slide, and it looks broken.
+// Content must end above 674px; the footer's own boxes start at 690px. Exempt
+// by position rather than by matching their text — an earlier attempt keyed off
+// the label and mis-flagged "ON-CHAIN PROOF" for containing a hyphen.
+const CONTENT_FLOOR = Math.round(674 * 9525);
+const FOOTER_TOP = Math.round(686 * 9525);
+const collide = [];
+for (const n of slides) {
+  for (const sp of parts.get(n).split("<p:sp>").slice(1)) {
+    if (!sp.includes("<a:t>")) continue;
+    const m = sp.match(/<a:off x="(-?\d+)" y="(-?\d+)"\/><a:ext cx="(\d+)" cy="(\d+)"\/>/);
+    if (!m) continue;
+    const oy = Number(m[2]), cy = Number(m[4]);
+    if (oy >= FOOTER_TOP) continue; // the footer rail itself
+    if (oy + cy > CONTENT_FLOOR) {
+      collide.push(`${n}: ${(sp.match(/<a:t>([^<]{0,26})/) || [, "?"])[1]}`);
+    }
+  }
+}
+check(!collide.length, "no content collides with the footer rail", collide.join("; "));
+
+// Autofit must stay off: with it on, a renderer silently shrinks text and two
+// cards side by side stop matching.
+const autofit = slides.filter((n) => parts.get(n).includes("<a:normAutofit"));
+check(!autofit.length, "no text box relies on autofit", autofit.join(", "));
 
 console.log("");
 console.log(fails ? `${fails} FAILURE(S)` : "ALL CHECKS PASSED");
