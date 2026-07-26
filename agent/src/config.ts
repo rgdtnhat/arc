@@ -46,6 +46,14 @@ export interface AppConfig {
   /** Swap fee (bps) and the app's share of it (bps of the fee). */
   swapFeeBps: number;
   swapAppFeeShareBps: number;
+  /**
+   * How many lending reserves and AMM pools the app lists at once. 0 means "no
+   * limit". Purely presentational: a capped list never hides a reserve or pool
+   * the viewer holds a position in, because a user must always be able to reach
+   * their own funds.
+   */
+  maxVisibleReserves: number;
+  maxVisibleAmmPools: number;
 }
 
 export const CADENCES: Record<string, number> = {
@@ -70,6 +78,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   feeTimeUtc: "09:00",
   swapFeeBps: 30,
   swapAppFeeShareBps: 5_000,
+  maxVisibleReserves: 0,
+  maxVisibleAmmPools: 0,
 };
 
 /** Hard limits mirrored from the contracts so the API rejects bad input early. */
@@ -80,6 +90,7 @@ export const LIMITS = {
   swapFeeMax: 500,
   feeIntervalMin: 1,
   feeIntervalMax: 31_536_000,
+  maxVisibleMax: 50,
 };
 
 export class AppConfigStore {
@@ -165,6 +176,15 @@ export class AppConfigStore {
     }
     if (!Number.isInteger(next.swapAppFeeShareBps) || next.swapAppFeeShareBps < 0 || next.swapAppFeeShareBps > 10_000) {
       return { ok: false, error: "The app's share of the swap fee must be between 0% and 100%." };
+    }
+    for (const [field, label] of [
+      ["maxVisibleReserves", "reserves"],
+      ["maxVisibleAmmPools", "AMM pools"],
+    ] as const) {
+      const v = (next as unknown as Record<string, number>)[field];
+      if (!Number.isInteger(v) || v < 0 || v > LIMITS.maxVisibleMax) {
+        return { ok: false, error: `How many ${label} to show must be 0 (all) to ${LIMITS.maxVisibleMax}.` };
+      }
     }
 
     this.cfg = next;

@@ -15,7 +15,13 @@ import {
   tesseraAmmAbi,
   tesseraPoolAbi,
   tesseraVaultAbi,
+  tesseraSwapAbi,
   erc20Abi,
+  tesseraPoolBytecode,
+  tesseraVaultBytecode,
+  tesseraSwapBytecode,
+  tesseraFeeCollectorBytecode,
+  tesseraAmmBytecode,
 } from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { faucetFromEnv } from "./circle/faucet.js";
@@ -706,6 +712,15 @@ async function main() {
         }
       : lastLending?.account ?? null;
 
+    // Same rule as the AMM: an operator can shorten the list, but never past a
+    // reserve the caller holds a position in.
+    const rcap = appConfig.get().maxVisibleReserves;
+    const shownAssets =
+      rcap > 0
+        ? assets.filter(
+            (a, i) => i < rcap || Number(a.position.supplied) > 0 || Number(a.position.borrowed) > 0,
+          )
+        : assets;
     return {
       // `deployed` is derived from the recorded address, never from whether the
       // reads succeeded — a throttled RPC must not make a live pool look absent.
@@ -713,7 +728,7 @@ async function main() {
       poolAddress: poolDeployment.poolAddress,
       ready: assets.length > 0 && account !== null,
       account,
-      assets,
+      assets: shownAssets,
     };
   }
 
@@ -959,12 +974,17 @@ async function main() {
         }),
       };
     });
+    // Operator cap on how many pools the app lists. A pool the caller has a
+    // position in is always kept, whatever the cap: presentation must never
+    // stand between someone and their own liquidity.
+    const cap = appConfig.get().maxVisibleAmmPools;
+    const shown = cap > 0 ? pools.filter((p, i) => i < cap || p.myShares !== "0") : pools;
     return {
       deployed: true,
       ready: snap.ok,
       address: ammClient!.amm,
       maxAssetsPerPool: snap.maxAssetsPerPool,
-      pools,
+      pools: shown,
     };
   }
   function ammSnapshot(): AmmSnap | null {
@@ -1456,6 +1476,132 @@ async function main() {
       }
       await refreshAll();
       res.json({ ok: true, moved, record: archive.summary(archive.get(rec.id)!) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Deploy a replacement pool / vault / swap desk / collector / AMM.
+   *
+   * The contract being replaced is archived **first**. If archiving fails the
+   * deployment doesn't happen at all: a new contract with no record of the old
+   * one is precisely the situation where people's funds become unreachable, and
+   * it is the whole reason this feature exists.
+   *
+   * The new address is written to `deployments/arc.local.json` but the running
+   * process keeps using the old clients until it restarts. That is deliberate —
+   * hot-swapping the contract a live request might be halfway through reading is
+   * a much worse failure than asking the operator to restart.
+   */
+  app.post("/api/admin/deploy", requireOperator, async (req, res) => {
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    const kind = String(req.body?.kind ?? "") as ArchiveKind;
+    const current: Record<string, Hex | null> = {
+      pool: (poolDeployment?.poolAddress as Hex) ?? null,
+      vault: (vaultClient?.vault as Hex) ?? null,
+      swap: (swapClient?.swap as Hex) ?? null,
+      collector: (liveDeployment.tesseraFeeCollector as Hex) ?? null,
+      amm: (ammClient?.amm as Hex) ?? null,
+    };
+    if (!(kind in current)) { res.status(400).json({ ok: false, error: "Unknown contract kind." }); return; }
+
+    try {
+      // 1) Archive what we're about to replace, unless it's already recorded.
+      let archived: string | null = null;
+      const old = current[kind];
+      if (old && !archive.all().some((r) => r.kind === kind && r.address === old.toLowerCase())) {
+        const scan = await scanner.scan(kind, old, {
+          assets: archiveAssets({}),
+          poolId: 0,
+          treasury: (liveDeployment.tesseraFeeCollector as Hex) ?? (agentAccount.address as Hex),
+        });
+        const rec = archive.add({
+          kind,
+          address: old,
+          label: `${kind} replaced ${new Date().toISOString().slice(0, 10)}`,
+          note: scan.partial
+            ? "Log scan was incomplete — some holders may be missing. Re-read before paying out."
+            : "Archived automatically when a replacement was deployed.",
+          assets: scan.assets,
+          holders: scan.holders,
+          snapshotBlock: scan.block,
+        });
+        if (!rec.ok) { res.status(500).json({ ok: false, error: `Could not archive the existing ${kind}: ${rec.error}` }); return; }
+        archived = rec.record.id;
+      }
+
+      // 2) Deploy the replacement.
+      let address: Hex;
+      if (kind === "vault") {
+        address = await owner.deploy(tesseraVaultAbi, tesseraVaultBytecode, [
+          (liveDeployment.vaultAsset as Hex) ?? usdcAddress,
+          poolDeployment?.poolAddress ?? usdcAddress,
+          (liveDeployment.tesseraFeeCollector as Hex) ?? owner.account.address,
+          Number(req.body?.reserveRatioBps ?? 8000),
+          Number(req.body?.performanceFeeBps ?? 1500),
+        ]);
+      } else if (kind === "pool") {
+        address = await owner.deploy(tesseraPoolAbi, tesseraPoolBytecode, [
+          (liveDeployment.tesseraFeeCollector as Hex) ?? owner.account.address,
+        ]);
+      } else if (kind === "swap") {
+        address = await owner.deploy(tesseraSwapAbi, tesseraSwapBytecode, [
+          poolDeployment?.poolAddress ?? usdcAddress,
+          (liveDeployment.tesseraFeeCollector as Hex) ?? owner.account.address,
+          Number(req.body?.swapFeeBps ?? 30),
+          Number(req.body?.appFeeShareBps ?? 5000),
+        ]);
+      } else if (kind === "collector") {
+        address = await owner.deploy(tesseraFeeCollectorAbi, tesseraFeeCollectorBytecode, [
+          usdcAddress,
+          agentAccount.address as Hex,
+          poolDeployment?.poolAddress ?? usdcAddress,
+          (vaultClient?.vault as Hex) ?? usdcAddress,
+          (swapClient?.swap as Hex) ?? "0x0000000000000000000000000000000000000000",
+        ]);
+      } else {
+        address = await owner.deploy(tesseraAmmAbi, tesseraAmmBytecode, [
+          (liveDeployment.tesseraAmmFeeCollector as Hex) ??
+            (liveDeployment.tesseraFeeCollector as Hex) ??
+            owner.account.address,
+        ]);
+      }
+
+      // 3) Record it where the app reads addresses from. arc.local.json is
+      //    gitignored and wins over arc.json, so a later `git reset --hard`
+      //    can't revert a running server to the contract it just replaced.
+      const key = {
+        pool: "tesseraPool",
+        vault: "tesseraVault",
+        swap: "tesseraSwap",
+        collector: "tesseraFeeCollector",
+        amm: "tesseraAmm",
+      }[kind];
+      let wrote = false;
+      try {
+        const dir = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../deployments");
+        const file = path.join(dir, "arc.local.json");
+        const next = { ...liveDeployment, [key]: address };
+        delete (next as Record<string, unknown>).explorer;
+        writeFileSync(file, JSON.stringify(next, null, 2) + "\n");
+        wrote = true;
+      } catch (e) {
+        console.error(`[deploy] could not write arc.local.json: ${String(e).slice(0, 140)}`);
+      }
+
+      res.json({
+        ok: true,
+        kind,
+        address,
+        archived,
+        wrote,
+        note: wrote
+          ? `Deployed and recorded. Restart the app to start using it — the running process keeps ` +
+            `the previous ${kind} until then, on purpose.` +
+            (archived ? ` The previous ${kind} was archived first; its holders can still be paid out or migrated.` : "")
+          : `Deployed at ${address}, but the deployment file could not be written — set it by hand before restarting.`,
+      });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }

@@ -60,6 +60,28 @@ export class OwnerClient {
     return this.send(address, abi, functionName, args);
   }
 
+  /**
+   * Deploy a contract from the deployer key and wait for it to land.
+   *
+   * Used by the admin "create a replacement" flow. It returns the address only
+   * once the receipt confirms one, so a caller can never end up recording a
+   * contract that isn't actually there.
+   */
+  async deploy(abi: unknown, bytecode: Hex, args: unknown[]): Promise<Hex> {
+    const hash = await this.wallet.deployContract({
+      abi: abi as never,
+      bytecode,
+      args: args as never,
+      account: this.account,
+      chain: this.chain,
+    } as never);
+    const receipt = await this.pub.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success" || !receipt.contractAddress) {
+      throw new Error("Deployment reverted — nothing was created.");
+    }
+    return receipt.contractAddress as Hex;
+  }
+
   /** Is this account actually the owner of `contract`? */
   async isOwnerOf(contract: Hex, abi: unknown): Promise<boolean> {
     try {

@@ -2226,6 +2226,23 @@ const $ = (id) => document.getElementById(id);
           } catch { cfgHiMsg("Request failed.", false); }
         });
 
+        $("cfgDeploy").addEventListener("click", async () => {
+          const kind = $("cfgDeployKind").value;
+          if (
+            !confirm(
+              `Deploy a brand-new ${kind}?\n\n` +
+                `The current one is archived first so its holders can still be paid out or migrated. ` +
+                `The app keeps using the existing ${kind} until you restart it.`,
+            )
+          ) return;
+          cfgHiMsg(`Archiving the current ${kind}, then deploying…`, true);
+          try {
+            const r = await (await postJson("/api/admin/deploy", { kind })).json();
+            cfgHiMsg(r.ok ? r.note : r.error, !!r.ok);
+            if (r.ok) loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
         $("cfgHiDeleteAll").addEventListener("click", async () => {
           if (!confirm("Delete every history record, including any with funds still outstanding?")) return;
           try {
@@ -2560,6 +2577,8 @@ const $ = (id) => document.getElementById(id);
           $("cfgMode").value = c.feeScheduleMode || "interval";
           $("cfgWeekday").value = String(c.feeWeekday ?? 1);
           $("cfgTime").value = c.feeTimeUtc || "09:00";
+          if ($("cfgMaxReserves")) $("cfgMaxReserves").value = String(c.maxVisibleReserves ?? 0);
+          if ($("cfgMaxAmmPools")) $("cfgMaxAmmPools").value = String(c.maxVisibleAmmPools ?? 0);
           syncScheduleRows(r.schedule && r.schedule.nextRunUtc);
           $("cfgNote").textContent =
             ((r.enforced && r.enforced.note) || "") +
@@ -2612,6 +2631,8 @@ const $ = (id) => document.getElementById(id);
             feeScheduleMode: $("cfgMode").value,
             feeWeekday: Number($("cfgWeekday").value),
             feeTimeUtc: $("cfgTime").value || "09:00",
+            maxVisibleReserves: Math.max(0, parseInt($("cfgMaxReserves").value || "0", 10)),
+            maxVisibleAmmPools: Math.max(0, parseInt($("cfgMaxAmmPools").value || "0", 10)),
           };
           msg.style.display = "block";
           try {

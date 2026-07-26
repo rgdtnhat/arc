@@ -1109,6 +1109,22 @@
             their exposure while you investigate; liquidation is never frozen, so bad debt can still be
             cleared. Hiding is presentation only and never blocks anyone's exit.
           </div>
+          <div class="cfgRow"><span>Show at most</span>
+            <span style="display:flex;gap:6px;align-items:center">
+              <input id="cfgMaxReserves" type="number" min="0" max="50" step="1" style="width:64px" />
+              <span style="font-size:11.5px;color:var(--muted)">reserves (0 = all)</span>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Show at most</span>
+            <span style="display:flex;gap:6px;align-items:center">
+              <input id="cfgMaxAmmPools" type="number" min="0" max="50" step="1" style="width:64px" />
+              <span style="font-size:11.5px;color:var(--muted)">AMM pools (0 = all)</span>
+            </span>
+          </div>
+          <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
+            A shortened list never hides something a viewer holds a position in — presentation must
+            never stand between someone and their own funds. Use <b>Save</b> above to apply.
+          </div>
           <div class="cfgRow"><span>Reserve</span>
             <select id="cfgLnAsset" style="min-width:190px"></select>
           </div>
@@ -1201,6 +1217,23 @@
               <button class="btn" id="cfgHiDelete">Delete selected</button>
               <button class="btn" id="cfgHiDeleteAll">Delete all</button>
             </span>
+          </div>
+          <div class="cfgRow"><span>Deploy a replacement</span>
+            <span style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+              <select id="cfgDeployKind" style="width:112px">
+                <option value="vault">Vault</option>
+                <option value="pool">Pool</option>
+                <option value="swap">Swap desk</option>
+                <option value="collector">Fee collector</option>
+                <option value="amm">AMM</option>
+              </select>
+              <button class="btn" id="cfgDeploy">Deploy new</button>
+            </span>
+          </div>
+          <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
+            The contract being replaced is archived first — if that fails, nothing is deployed. The new
+            address is written to the deployment file, but the running app keeps using the old contract
+            until you restart it, so no request is caught mid-read.
           </div>
           <div class="cfgRow" id="cfgHiMsg" style="display:none;font-size:12px"><span></span><span></span></div>
           <div style="padding:4px 20px 12px">

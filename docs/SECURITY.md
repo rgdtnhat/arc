@@ -122,23 +122,98 @@ The vault is deliberately conservative:
    four fifths of TVL is always redeemable instantly, so this can only bite a
    withdrawal of more than 80% of TVL during full utilisation. Funds are not
    lost — they're illiquid.
-2. **Admin-set prices.** Both the pool and the swap desk price from
-   `TesseraPool`'s owner-set oracle. A stale price lets an arbitrageur drain the
-   underpriced side of the **swap inventory**. Wire a live oracle before mainnet.
+2. **Prices with no feed wired.** Where no oracle is configured, the pool and
+   the swap desk fall back to the operator-set price, and a stale one lets an
+   arbitrageur drain the underpriced side of the swap inventory. Wiring a
+   Chainlink-compatible feed per asset removes this (see below); until one is
+   wired for a given asset, the risk stands for that asset.
 3. **Trusted operator key.** The owner can change fees (within caps), prices, the
    treasury, and can withdraw swap inventory. This is a custodial trust
    assumption, not a trustless design.
 4. **Unaudited.** No third-party audit has been performed. Do not use with real
    funds until one has.
 
+## Price oracle
+
+Each reserve may be pointed at a **Chainlink-compatible aggregator**
+(`AggregatorV3Interface` — the same interface Aave and Compound consume, and the
+one Chronicle, Pyth's `PythAggregatorV3` wrapper and RedStone's classic adapter
+all expose). Once a feed is wired it is the **only** price source for that asset;
+the operator-set price is ignored.
+
+Every reading is validated before use:
+
+| Check | Why it is there |
+|---|---|
+| `answer > 0` | A broken or de-registered feed answers zero or negative. |
+| `updatedAt != 0` | An unfinished round has no usable answer yet. |
+| `answeredInRound >= roundId` | Catches an answer carried over from an earlier round. |
+| `block.timestamp <= updatedAt + staleAfter` | A stale price is what lets someone borrow against a mispriced asset. |
+| Feed decimals normalised to 1e8 | An 18-decimal feed read as 8-decimal is a 10-billion-times mispricing. |
+
+**A failed check pauses the market; it never falls back.** Falling back to a
+manual price on oracle failure is the tempting choice and the wrong one — it
+converts a visible outage into a silent mispricing. An operator who wants the
+manual price back must clear the feed deliberately. `priceOk(asset)` answers the
+same question without reverting, so the UI can say "paused" instead of blanking.
+A bad feed address is rejected at configuration time by test-reading it, rather
+than surfacing at someone's next withdrawal.
+
+## Freeze controls
+
+`frozenActions` is a per-reserve bitmask over supply / withdraw / borrow / repay
+rather than a single paused flag, because the incident it exists for — a
+suspicious position under investigation — calls for stopping *new* risk while
+letting people reduce exposure. **Liquidation is never frozen**: blocking it
+during a freeze would let bad debt compound against the very depositors the
+freeze protects. `supplyFor` is subject to the same masks, so migration is not a
+route around a halt.
+
+Hiding a reserve is presentation only. It does not freeze anything, and the
+dashboard keeps showing any reserve the viewer holds a position in — a shortened
+list must never stand between someone and their own funds. The same rule governs
+the "show at most N" caps.
+
+## Contract history and fund recovery
+
+Two properties do the work here:
+
+1. **The archive is an index, not a ledger.** Holder *sets* come from event logs;
+   every *amount* is read live from the contract, and re-read immediately before
+   any payout or migration. A stored snapshot only decides who to look at. Stale
+   snapshots are flagged, and an incomplete log scan is reported rather than
+   hidden — it under-reports *who*, never *how much*, which is the safe direction
+   to fail.
+2. **Nothing can move a user's position.** There is deliberately no function in
+   any of these contracts that lets an operator reassign someone's shares. That
+   primitive is a rug pull regardless of intent, so it does not exist. Migration
+   works through `supplyFor` / `depositFor` / `addLiquidityFor`, where the caller
+   pays and the beneficiary receives; naming someone as beneficiary cannot pull
+   from their wallet. Their claim on the old contract is left intact, so they end
+   up able to withdraw from either.
+
+A holder is marked settled only when every asset leg landed — a half-paid holder
+that reads as "done" is the failure mode that actually loses people money — and a
+refresh preserves settlement marks so re-reading the chain cannot re-open
+completed work.
+
+## Notices
+
+Notice text is stored raw and rendered with `textContent`, never `innerHTML`.
+Colour is the one field that reaches a `style` attribute, so it is validated
+server-side against `#rgb` / `#rrggbb` and a fixed list of theme variables;
+anything else falls back to the default. Both paths are covered by browser tests
+that attempt injection. Reads are public — a maintenance warning nobody can see
+is worthless — and writes are operator-only.
+
 ## Design assumptions (not bugs, but worth stating)
 
-- **Trusted price oracle.** `TesseraPool.setPrice()` is owner-only; the pool
-  trusts admin-set prices for health/liquidation. Replace with a real oracle
-  before mainnet.
 - **Trusted admin/deployer key.** Whoever holds the pool owner / deployer key can
-  add reserves, set prices, and set the treasury. Keep it in an HSM / DCW for
-  production.
+  add reserves, set prices where no feed is wired, freeze actions, and set the
+  treasury. Keep it in an HSM / DCW for production.
+- **Operator-funded recovery.** "Return funds" and "Migrate" spend the app's own
+  wallet. They are payouts, not seizures, and both depend on that wallet holding
+  enough — there is no mechanism that conjures the funds from users.
 
 ## Hardening added (highest-level dashboard security)
 
@@ -165,7 +240,18 @@ The vault is deliberately conservative:
 - **SIWE** uses viem `verifyMessage` with single-use server nonces and
   UUID session tokens; replay-protected.
 - **No XSS**: dashboard renders server-generated state or uses `textContent`; no
-  untrusted input reaches `innerHTML`.
+  untrusted input reaches `innerHTML`. Wallet-supplied transaction hashes are
+  validated against `/^0x[0-9a-fA-F]{64}$/` before being put in a link, and
+  operator notice text and colours are covered by injection tests.
+- **Route shadowing**: literal API routes are registered before their `:id`
+  siblings. This was a real bug — `/api/notices/delete` was being matched as a
+  notice with the id `"delete"`, so bulk delete silently 404'd — and it is now
+  covered by API tests for every collection endpoint.
+- **AMM invariant**: swap pricing runs on the input net of the whole fee, and the
+  pool is credited everything except the app's cut, so `k` strictly grows by the
+  LP fee on every swap. Asserted by test against real balances, not just reasoning.
+- **Fee rounding direction**: the app's cut is rounded down and the LP cut takes
+  the remainder, so an odd wei always lands with liquidity providers.
 
 ## Secrets policy
 
