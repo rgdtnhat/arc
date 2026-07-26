@@ -328,97 +328,205 @@ function textBox({ x, y, w, h, runs, align = "l", anchor = "t" }) {
   );
 }
 
-function rect({ x, y, w, h, fill, line }) {
+/** Rounded panel. `adj` is the corner radius as a fraction of the short side. */
+function rect({ x, y, w, h, fill, line, round = 0, opacity }) {
+  const geom = round
+    ? `<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val ${Math.round(round * 100000)}"/></a:avLst></a:prstGeom>`
+    : `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>`;
+  const alpha = opacity === undefined ? "" : `<a:alpha val="${Math.round(opacity * 100000)}"/>`;
   return (
-    `<p:sp><p:nvSpPr><p:cNvPr id="${rect.id = (rect.id || 500) + 1}" name="bg"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
-    `<p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>` +
-    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>` +
-    `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>` +
+    `<p:sp><p:nvSpPr><p:cNvPr id="${(rect.id = (rect.id || 900) + 1)}" name="panel"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>${geom}` +
+    `<a:solidFill><a:srgbClr val="${fill}">${alpha}</a:srgbClr></a:solidFill>` +
     (line ? `<a:ln w="12700"><a:solidFill><a:srgbClr val="${line}"/></a:solidFill></a:ln>` : `<a:ln><a:noFill/></a:ln>`) +
     `</p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>`
   );
 }
 
+/**
+ * Slide layout.
+ *
+ * The whole deck is composed from three primitives — a full-bleed background, a
+ * rounded panel, and a text box — laid out on a 1280x720 grid so the geometry is
+ * readable in px and converted to EMU at the edges. Bullets become *cards*
+ * rather than a list: a wall of dashes is what makes a generated deck look
+ * generated, and cards also stop long lines from running the full slide width.
+ */
 function slideXml(s, index, total) {
   const shapes = [];
-  // Full-bleed background plus an accent rule, so the deck reads as designed
-  // rather than as default PowerPoint.
+  const M = 72;                 // page margin, px
+  const CW = 1280 - M * 2;      // content width, px
+  const isTitle = index === 0;
+  const isQuote = !s.bullets && !!s.lede && !isTitle;
+
+  // Background plus a hairline accent rule along the top edge.
+  //
+  // An earlier version put large translucent "wash" shapes in the corners for
+  // depth. They render as hard-edged blocks — PowerPoint has no soft radial
+  // shape, and a stadium at 9% opacity just looks like a stray panel. Removed:
+  // the accent rule, the title bar and the cards carry the design on their own.
   shapes.push(rect({ x: 0, y: 0, w: W, h: H, fill: BRAND.bg }));
-  shapes.push(rect({ x: 0, y: 0, w: W, h: px(6), fill: BRAND.accent }));
+  shapes.push(rect({ x: 0, y: 0, w: W, h: px(5), fill: BRAND.accent }));
 
-  const left = px(80);
-  const contentW = W - px(160);
-  let y = px(70);
+  // A slide that is only a statement (no cards) gets its block centred, rather
+  // than pinned to the top with two thirds of the slide empty below it.
+  let y = M + 18;
+  if (isQuote) {
+    const tLen = s.title.length;
+    const tPer = tLen > 64 ? 40 : tLen > 42 ? 46 : 54;
+    const tLines = Math.ceil(tLen / (tLen > 64 ? 63 : tLen > 42 ? 51 : 40));
+    const lLines = Math.ceil(s.lede.length / 58);
+    const blockH = 34 + tLines * tPer + 10 + lLines * 30 + 8;
+    y = Math.max(M + 18, (720 - 44 - blockH) / 2);
+  }
 
-  // Eyebrow / running label.
+  // Eyebrow: the running section label.
   shapes.push(
     textBox({
-      x: left, y, w: contentW, h: px(30),
-      runs: [{ text: s.label, size: 1100, bold: true, color: BRAND.accent2 }],
+      x: px(M), y: px(y), w: px(CW), h: px(24),
+      runs: [{ text: s.label, size: 1050, bold: true, color: BRAND.accent2 }],
     }),
   );
-  y += px(46);
+  y += 34;
 
   if (s.kicker) {
     shapes.push(
-      textBox({ x: left, y, w: contentW, h: px(28), runs: [{ text: s.kicker, size: 1200, color: BRAND.muted }] }),
+      textBox({ x: px(M), y: px(y), w: px(CW), h: px(24), runs: [{ text: s.kicker, size: 1200, color: BRAND.muted }] }),
     );
-    y += px(38);
+    y += 32;
   }
 
-  // Title. Sized down when long so it never overflows the box.
-  const titleSize = s.title.length > 62 ? 2800 : s.title.length > 40 ? 3400 : 4400;
+  // Title. Three sizes so a long line wraps to two rather than shrinking to
+  // unreadable, and the title slide gets the largest treatment.
+  const len = s.title.length;
+  const titleSize = isTitle ? 5200 : len > 64 ? 2800 : len > 42 ? 3400 : 4200;
+  // Height tracks how many lines the title will actually take, so a one-line
+  // title doesn't leave a hole under it.
+  // Calibrated against the rendered widths: at 1136px of content, roughly
+  // 40 chars fit at 42pt, 51 at 34pt and 63 at 28pt. Under-estimating here left
+  // the accent bar hanging below a title that actually fit on one line.
+  const perLine = isTitle ? 62 : len > 64 ? 40 : len > 42 ? 46 : 54;
+  const charsPerLine = isTitle ? 24 : len > 64 ? 63 : len > 42 ? 51 : 40;
+  const titleH = Math.max(perLine, Math.ceil(len / charsPerLine) * perLine) + 10;
+  shapes.push(rect({ x: px(M), y: px(y + 6), w: px(4), h: px(titleH - 14), fill: BRAND.accent2, round: 0.5 }));
   shapes.push(
     textBox({
-      x: left, y, w: contentW, h: px(150),
+      x: px(M + 18), y: px(y), w: px((isTitle ? CW * 0.86 : CW) - 18), h: px(titleH),
       runs: [{ text: s.title, size: titleSize, bold: true }],
     }),
   );
-  y += px(s.title.length > 62 ? 150 : 120);
+  y += titleH + 8;
 
   if (s.lede) {
+    const ledeW = isTitle ? CW * 0.64 : isQuote ? CW * 0.74 : CW * 0.82;
+    const big = isTitle || isQuote;
+    // Same idea as the title: estimate the wrap so the gap below matches the
+    // text rather than a fixed guess.
+    const cpl = big ? 58 : 96;
+    const lh = big ? 30 : 24;
+    const ledeH = Math.ceil(s.lede.length / cpl) * lh + 8;
     shapes.push(
       textBox({
-        x: left, y, w: Math.round(contentW * 0.78), h: px(90),
-        runs: [{ text: s.lede, size: 1500, color: BRAND.muted }],
+        x: px(M + 18), y: px(y), w: px(ledeW), h: px(ledeH),
+        runs: [{ text: s.lede, size: big ? 1700 : 1400, color: BRAND.muted }],
       }),
     );
-    y += px(100);
+    y += ledeH + 18;
   }
 
   if (s.bullets && s.bullets.length) {
-    // Two columns when there are four or more points, so nothing needs to shrink
-    // to unreadable size to fit.
-    const twoCol = s.bullets.length >= 4;
-    const colW = twoCol ? Math.round((contentW - px(50)) / 2) : contentW;
-    const perCol = twoCol ? Math.ceil(s.bullets.length / 2) : s.bullets.length;
-    const availH = H - y - px(90);
-    for (let c = 0; c < (twoCol ? 2 : 1); c++) {
-      const slice = s.bullets.slice(c * perCol, (c + 1) * perCol);
-      if (!slice.length) continue;
-      const runs = [];
-      for (const [k, v] of slice) {
-        runs.push({ text: k, size: 1400, bold: true, color: BRAND.text, spaceBefore: runs.length ? 700 : 0 });
-        runs.push({ text: v, size: 1150, color: BRAND.muted });
-      }
-      shapes.push(
-        textBox({ x: left + c * (colW + px(50)), y, w: colW, h: availH, runs }),
-      );
+    const n = s.bullets.length;
+    const cols = n >= 4 ? 2 : 1;
+    const gap = 16;
+    const pad = 15;
+    const cardW = (CW - gap * (cols - 1)) / cols;
+
+    /** Estimated card height from the text it holds, so none sits half empty. */
+    const heightFor = ([k, v]) => {
+      const cpl = Math.floor((cardW - pad * 2) / 5.6); // ~5.6px per char at 10.5pt
+      const bodyLines = Math.max(1, Math.ceil(v.length / cpl));
+      return pad * 2 + 8 + 22 + bodyLines * 17;
+    };
+
+    // Lay out row by row rather than column by column: with an odd count the
+    // last card then spans the full width instead of leaving a hole beside it.
+    const rowsOf = [];
+    for (let i = 0; i < n; i += cols) rowsOf.push(s.bullets.slice(i, i + cols));
+
+    const avail = 720 - y - 56;
+    const natural = rowsOf.reduce((t, r) => t + Math.max(...r.map(heightFor)), 0) + gap * (rowsOf.length - 1);
+    // Scale down only if the natural heights would overflow the slide.
+    const scale = natural > avail ? avail / natural : 1;
+
+    // Centre the block in the space left below the lede. Top-aligning it left
+    // every slide bottom-heavy with dead space, which reads as unfinished.
+    let cy = y + Math.max(0, (avail - natural * scale) / 2);
+    for (const row of rowsOf) {
+      const rowH = Math.max(...row.map(heightFor)) * scale;
+      const full = row.length === 1 && cols === 2;
+      row.forEach(([k, v], c) => {
+        const w = full ? CW : cardW;
+        const cx = px(M + c * (cardW + gap));
+        shapes.push(rect({ x: cx, y: px(cy), w: px(w), h: px(rowH), fill: BRAND.panel, line: "1E2A3F", round: 0.07 }));
+        shapes.push(rect({ x: cx + px(pad), y: px(cy + pad - 1), w: px(20), h: px(3), fill: BRAND.accent2, round: 0.5 }));
+        shapes.push(
+          textBox({
+            x: cx + px(pad), y: px(cy + pad + 7), w: px(w - pad * 2), h: px(rowH - pad * 2 - 7),
+            runs: [
+              { text: k, size: 1300, bold: true, color: BRAND.text },
+              { text: v, size: 1050, color: BRAND.muted, spaceBefore: 350 },
+            ],
+          }),
+        );
+      });
+      cy += rowH + gap;
     }
   }
 
-  // Footer: brand on the left, position on the right.
+  // Title slide: three facts along the bottom, so the lower two thirds carries
+  // something instead of reading as an unfinished slide.
+  if (isTitle) {
+    const chips = [
+      ["Live on Arc testnet", "chainId 5042002 · USDC as gas"],
+      ["8 contracts deployed", "escrow, tabs, pool, vault, swap, AMM, 2 collectors"],
+      ["225 automated tests", "104 contract · 121 agent · CI on every push"],
+    ];
+    const gap = 16;
+    const w = (CW - gap * 2) / 3;
+    chips.forEach(([k, v], i) => {
+      const cx = px(M + i * (w + gap));
+      const cy = px(720 - 200);
+      shapes.push(rect({ x: cx, y: cy, w: px(w), h: px(104), fill: BRAND.panel, line: "1E2A3F", round: 0.09 }));
+      shapes.push(rect({ x: cx + px(15), y: cy + px(14), w: px(20), h: px(3), fill: BRAND.accent2, round: 0.5 }));
+      shapes.push(
+        textBox({
+          x: cx + px(15), y: cy + px(22), w: px(w - 30), h: px(70),
+          runs: [
+            { text: k, size: 1350, bold: true, color: BRAND.text },
+            { text: v, size: 1000, color: BRAND.muted, spaceBefore: 350 },
+          ],
+        }),
+      );
+    });
+  }
+
+  // Footer: brand left, position right, hairline above.
+  shapes.push(rect({ x: px(M), y: px(720 - 44), w: px(CW), h: px(1), fill: "1E2A3F" }));
   shapes.push(
     textBox({
-      x: left, y: H - px(58), w: Math.round(contentW / 2), h: px(28),
-      runs: [{ text: "TESSERA · Arc", size: 1000, color: BRAND.muted }],
+      x: px(M), y: px(720 - 34), w: px(CW / 2), h: px(22),
+      runs: [{ text: "TESSERA  ·  Arc testnet  ·  USDC-native", size: 950, color: BRAND.muted }],
     }),
   );
   shapes.push(
     textBox({
-      x: left + Math.round(contentW / 2), y: H - px(58), w: Math.round(contentW / 2), h: px(28),
-      align: "r",
-      runs: [{ text: `${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`, size: 1000, color: BRAND.muted }],
+      x: px(M + CW / 2), y: px(720 - 34), w: px(CW / 2), h: px(22), align: "r",
+      runs: [
+        {
+          text: `${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`,
+          size: 950, color: BRAND.muted,
+        },
+      ],
     }),
   );
 
