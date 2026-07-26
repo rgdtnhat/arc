@@ -185,6 +185,11 @@ export class TesseraPoolClient {
       { address: this.pool, abi: tesseraPoolAbi, functionName: "supplyBalance", args: [asset, who] } as const,
       { address: this.pool, abi: tesseraPoolAbi, functionName: "borrowBalance", args: [asset, who] } as const,
       { address: asset, abi: erc20Abi, functionName: "balanceOf", args: [who] } as const,
+      // Freeze mask + display name + hidden flag, and whether the price is
+      // currently usable. `priceOk` never reverts, so a dead oracle feed shows
+      // up in the UI as "price unavailable" rather than blanking the panel.
+      { address: this.pool, abi: tesseraPoolAbi, functionName: "reserveMeta", args: [asset] } as const,
+      { address: this.pool, abi: tesseraPoolAbi, functionName: "priceOk", args: [asset] } as const,
     ];
     const contracts = [
       { address: this.pool, abi: tesseraPoolAbi, functionName: "accountData", args: [who] } as const,
@@ -199,19 +204,29 @@ export class TesseraPoolClient {
             return { supplyValue: v[0], borrowValue: v[1], borrowLimit: v[2], healthFactor: v[3] };
           })()
         : null;
+    const FIELDS = 7;
     const perAsset = assets.map((asset, i) => {
-      const base = 1 + i * 5;
-      const [cfgR, dataR, supR, borR, walR] = res.slice(base, base + 5);
+      const base = 1 + i * FIELDS;
+      const [cfgR, dataR, supR, borR, walR, metaR, okR] = res.slice(base, base + FIELDS);
+      const meta = metaR?.status === "success"
+        ? (() => {
+            const m = metaR.result as readonly [number, boolean, string];
+            return { frozen: Number(m[0]), hidden: m[1], name: m[2] };
+          })()
+        : { frozen: 0, hidden: false, name: "" };
+      const priceOk = okR?.status === "success" ? Boolean(okR.result) : true;
       if (cfgR.status !== "success") return { asset, ok: false as const };
       const c = cfgR.result as readonly [boolean, boolean, number, number, number, number, bigint, bigint, bigint, bigint, bigint, bigint];
       const cfg = { enabled: c[0], borrowable: c[1], decimals: Number(c[2]), priceE8: c[6] };
-      if (!cfg.enabled) return { asset, ok: true as const, cfg, reserve: null, supplied: 0n, borrowed: 0n, wallet: 0n };
+      if (!cfg.enabled) return { asset, ok: true as const, cfg, meta, priceOk, reserve: null, supplied: 0n, borrowed: 0n, wallet: 0n };
       if (dataR.status !== "success") return { asset, ok: false as const };
       const d = dataR.result as readonly [bigint, bigint, bigint, bigint, bigint];
       return {
         asset,
         ok: true as const,
         cfg,
+        meta,
+        priceOk,
         reserve: { cash: d[0], totalBorrows: d[1], utilizationWad: d[2], borrowAprWad: d[3], supplyAprWad: d[4] },
         supplied: supR.status === "success" ? (supR.result as bigint) : 0n,
         borrowed: borR.status === "success" ? (borR.result as bigint) : 0n,

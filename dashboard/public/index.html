@@ -115,13 +115,89 @@
       .startDock.hide { opacity: 0; transform: translate(-50%, -18px); pointer-events: none; }
       .startDock .btn { padding: 11px 22px; font-size: 14.5px; box-shadow: var(--shadow); }
 
-      /* ---- nav drawer ---------------------------------------------------- */
+      /* ---- navigation ------------------------------------------------------
+         One control, not two. The previous build had a ☰ drawer *and* a tab
+         strip listing the same four sections, which could disagree about which
+         one you were on. The drawer is now the only navigation: it stays open
+         until you close it (remembered across visits) and highlights the
+         current section the way the tab strip used to. */
       .navDrawer {
         overflow: hidden; max-height: 0; transition: max-height .28s ease;
         border-bottom: 1px solid transparent;
       }
-      .navDrawer.open { max-height: 260px; border-bottom-color: var(--line); }
+      .navDrawer.open { max-height: 320px; border-bottom-color: var(--line); }
       .navDrawer .inner { max-width: var(--maxw); margin: 0 auto; padding: 12px 22px 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+      .navDrawer .btn[aria-current="page"] {
+        color: var(--text); background: var(--panel); border-color: var(--accent); font-weight: 650;
+      }
+      /* A left bar marks the current section without relying on colour alone. */
+      .navDrawer .btn[aria-current="page"]::before {
+        content: ""; display: inline-block; width: 3px; height: 13px; border-radius: 2px;
+        background: var(--accent); margin-right: 8px; vertical-align: -2px;
+      }
+      /* Sticky strip showing where you are once the drawer is closed. */
+      .crumbBar {
+        position: sticky; top: 57px; z-index: 60; padding: 10px 0;
+        backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+        background: color-mix(in srgb, var(--bg) 82%, transparent);
+        border-bottom: 1px solid var(--line);
+      }
+      .crumbBar .wrap { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .crumbNow { font-size: 13.5px; font-weight: 650; }
+      .crumbHint { font-size: 12px; color: var(--muted); }
+
+      /* ---- notice banner ---------------------------------------------------
+         Under the header, above the navigation. Transparent background so it
+         overlays rather than shifting the page, with the text running across. */
+      .noticeBar {
+        position: sticky; top: 57px; z-index: 70; overflow: hidden;
+        background: transparent; border-bottom: 1px solid transparent;
+        display: flex; align-items: center; gap: 10px; padding: 7px 22px;
+      }
+      .noticeBar[hidden] { display: none; }
+      .noticeBar.alert {
+        border-bottom-color: color-mix(in srgb, var(--bad) 45%, transparent);
+        background: color-mix(in srgb, var(--bad) 9%, transparent);
+      }
+      .noticeIcon { flex: 0 0 auto; font-size: 15px; }
+      .noticeBar.alert .noticeIcon { animation: pulse 1.3s ease-in-out infinite; }
+      @keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.22); opacity: .6; } }
+      .noticeTrack { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+      .noticeText {
+        display: inline-block; white-space: nowrap; font-size: 13px; font-weight: 600;
+        padding-left: 100%; animation: marquee var(--marquee, 18s) linear infinite;
+      }
+      @keyframes marquee { from { transform: translateX(0); } to { transform: translateX(-100%); } }
+      /* Respect a reduced-motion preference: hold the text still and let it wrap. */
+      @media (prefers-reduced-motion: reduce) {
+        .noticeText { animation: none; padding-left: 0; white-space: normal; }
+        .noticeBar.alert .noticeIcon { animation: none; }
+      }
+      .noticeClose {
+        flex: 0 0 auto; border: none; background: transparent; color: var(--muted);
+        cursor: pointer; font-size: 15px; line-height: 1; padding: 2px 4px;
+      }
+      .noticeClose:hover { color: var(--text); }
+
+      /* ---- notification bell ---------------------------------------------- */
+      .bellWrap { position: relative; }
+      .bellDot {
+        position: absolute; top: 2px; right: 2px; width: 8px; height: 8px; border-radius: 50%;
+        background: var(--bad); box-shadow: 0 0 0 2px var(--bg);
+      }
+      .bellDot[hidden] { display: none; }
+      .bellPanel {
+        position: absolute; right: 0; top: calc(100% + 8px); width: min(92vw, 380px);
+        border: 1px solid var(--line-strong); border-radius: 14px; background: var(--bg-soft);
+        box-shadow: var(--shadow); z-index: 130; padding: 10px 0; display: none;
+      }
+      .bellPanel.open { display: block; }
+      .bellRange { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; padding: 4px 14px 10px; }
+      .bellRange input { font-size: 12.5px; padding: 6px 8px; }
+      .bellList { max-height: 46vh; overflow-y: auto; overscroll-behavior: contain; }
+      .bellItem { padding: 9px 14px; border-top: 1px solid var(--line); font-size: 13px; }
+      .bellItem .when { display: block; font-size: 11px; color: var(--muted); margin-top: 3px; }
+      .bellEmpty { padding: 14px; color: var(--muted); font-size: 13px; text-align: center; }
 
       /* ---- landing ------------------------------------------------------- */
       .hero { padding: 76px 0 40px; text-align: center; }
@@ -438,6 +514,25 @@
         <span class="spacer"></span>
 
         <button class="btn" id="navToggle" title="Navigate" aria-expanded="false">☰ Menu</button>
+
+        <span class="menuWrap bellWrap" id="bellWrap">
+          <button class="btn" id="bellBtn" title="Notifications" aria-haspopup="true" aria-expanded="false">
+            🔔<span class="bellDot" id="bellDot" hidden></span>
+          </button>
+          <div class="bellPanel" id="bellPanel" role="menu">
+            <div class="menuHead">Notifications</div>
+            <div class="bellRange">
+              <label style="font-size:12px;color:var(--muted)">From</label>
+              <input type="date" id="bellFrom" class="field" />
+              <label style="font-size:12px;color:var(--muted)">To</label>
+              <input type="date" id="bellTo" class="field" />
+              <button class="btn" id="bellApply">Apply</button>
+              <button class="btn" id="bellClear">Recent</button>
+            </div>
+            <div class="bellList" id="bellList"></div>
+          </div>
+        </span>
+
         <button class="btn" id="walletBtn">Connect Wallet</button>
         <button class="btn" id="adminBtn">Admin</button>
 
@@ -468,7 +563,8 @@
         </select>
       </div>
 
-      <!-- Expand/collapse navigation -->
+      <!-- The app's only navigation. Stays open until you close it; the open
+           state and the current section are both remembered. -->
       <div class="navDrawer" id="navDrawer">
         <div class="inner">
           <button class="btn" data-nav="home">🏠 Home</button>
@@ -479,6 +575,13 @@
         </div>
       </div>
     </header>
+
+    <!-- Operator notice: transparent strip under the header, text running across -->
+    <div class="noticeBar" id="noticeBar" hidden role="status" aria-live="polite">
+      <span class="noticeIcon" id="noticeIcon">📣</span>
+      <span class="noticeTrack"><span class="noticeText" id="noticeText"></span></span>
+      <button class="noticeClose" id="noticeClose" title="Dismiss" aria-label="Dismiss notice">✕</button>
+    </div>
 
     <!-- Floating Start button (landing only) -->
     <div class="startDock" id="startDock">
@@ -569,14 +672,12 @@
 
     <!-- ================= APP ================= -->
     <div id="viewApp" hidden>
-      <div class="tabsBar">
+      <!-- Where you are. Navigation itself lives in the ☰ Menu drawer, which is
+           the single source of truth for the current section. -->
+      <div class="crumbBar">
         <div class="wrap">
-          <div class="tabs" role="tablist">
-            <button class="tab active" data-tab="dashboard" role="tab">📊 Dashboard</button>
-            <button class="tab" data-tab="defi" role="tab">💠 DeFi</button>
-            <button class="tab" data-tab="agents" role="tab">🤖 Agent transactions</button>
-            <button class="tab" data-tab="other" role="tab">🧰 Treasury &amp; system</button>
-          </div>
+          <span class="crumbNow" id="crumbNow">📊 Dashboard</span>
+          <span class="crumbHint" id="crumbHint">— open <b>☰ Menu</b> to switch section</span>
         </div>
       </div>
 
@@ -999,6 +1100,161 @@
           <div class="cfgRow"><span>Name</span><span><input id="cfgAmmNewName" class="field" placeholder="e.g. USDC / EURC" style="width:190px" /></span></div>
           <div class="cfgRow"><span></span><span><button class="btn primary" id="cfgAmmCreate">Create pool</button></span></div>
           <div class="cfgRow" id="cfgAmmMsg" style="display:none;font-size:12px"><span></span><span></span></div>
+
+          <div class="menuSep"></div>
+
+          <div class="menuHead">Lending reserves</div>
+          <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
+            Freezing is per action. Leaving <b>withdraw</b> and <b>repay</b> unfrozen lets people reduce
+            their exposure while you investigate; liquidation is never frozen, so bad debt can still be
+            cleared. Hiding is presentation only and never blocks anyone's exit.
+          </div>
+          <div class="cfgRow"><span>Reserve</span>
+            <select id="cfgLnAsset" style="min-width:190px"></select>
+          </div>
+          <div class="cfgRow"><span>Freeze</span>
+            <span style="display:flex;gap:12px;flex-wrap:wrap;font-size:12.5px">
+              <label><input type="checkbox" id="cfgFrSupply" /> Supply</label>
+              <label><input type="checkbox" id="cfgFrBorrow" /> Borrow</label>
+              <label><input type="checkbox" id="cfgFrWithdraw" /> Withdraw</label>
+              <label><input type="checkbox" id="cfgFrRepay" /> Repay</label>
+            </span>
+          </div>
+          <div class="cfgRow"><span></span>
+            <span style="display:flex;gap:7px;flex-wrap:wrap">
+              <button class="btn" id="cfgLnFreeze">Apply freeze</button>
+              <button class="btn" id="cfgLnUnfreeze">Unfreeze all</button>
+              <button class="btn" id="cfgLnFreezeAll">Freeze everything</button>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Display</span>
+            <span style="display:flex;gap:7px;flex-wrap:wrap">
+              <button class="btn" id="cfgLnRename">Rename…</button>
+              <button class="btn" id="cfgLnHide">Hide</button>
+              <button class="btn" id="cfgLnShow">Show</button>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Price feed</span>
+            <span style="display:flex;gap:7px;flex-wrap:wrap;align-items:center">
+              <input id="cfgOracleFeed" class="field" placeholder="0x… aggregator" style="width:190px" />
+              <input id="cfgOracleStale" type="number" min="60" max="604800" step="60" value="3600"
+                     title="Seconds before an answer is treated as stale" style="width:88px" />
+              <button class="btn" id="cfgOracleSet">Wire</button>
+              <button class="btn" id="cfgOracleClear">Clear</button>
+            </span>
+          </div>
+          <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
+            Any Chainlink-compatible aggregator works. Once wired it is the only price source for that
+            asset — a stale or broken feed pauses the market rather than falling back to a manual price.
+          </div>
+          <div class="cfgRow" id="cfgLnMsg" style="display:none;font-size:12px"><span></span><span></span></div>
+
+          <div class="menuSep"></div>
+
+          <div class="menuHead">Contract history &amp; fund recovery</div>
+          <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
+            Archive a retired contract to keep a record of who still holds funds in it. Balances are
+            re-read from the chain before any payout, so a stale record can't cause a wrong payment.
+            <b>Return</b> sends the app's own tokens to each holder; <b>Migrate</b> re-creates their
+            position in the replacement contract, also paid by the app. Neither moves a user's existing
+            position — no contract here has a function that can, by design — so their claim on the old
+            contract survives either way.
+          </div>
+          <div class="cfgRow"><span>Archive a contract</span>
+            <span style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+              <select id="cfgHiKind" style="width:112px">
+                <option value="pool">Pool</option>
+                <option value="vault">Vault</option>
+                <option value="amm">AMM</option>
+                <option value="swap">Swap desk</option>
+                <option value="collector">Fee collector</option>
+              </select>
+              <button class="btn" id="cfgHiUseCurrent" title="Fill in the address the app is using now">Use current</button>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Address</span>
+            <span><input id="cfgHiAddress" class="field" placeholder="0x…" style="width:210px" /></span>
+          </div>
+          <div class="cfgRow"><span>Label</span>
+            <span style="display:flex;gap:6px;flex-wrap:wrap">
+              <input id="cfgHiLabel" class="field" placeholder="e.g. Pool v1 (pre-upgrade)" style="width:150px" />
+              <button class="btn primary" id="cfgHiArchive">Archive</button>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Selected record</span>
+            <span style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn" id="cfgHiRefresh">Re-read balances</button>
+              <button class="btn" id="cfgHiActivate">Mark current</button>
+              <button class="btn" id="cfgHiReturn">Return funds</button>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Migrate to</span>
+            <span style="display:flex;gap:6px;flex-wrap:wrap">
+              <input id="cfgHiTarget" class="field" placeholder="new contract 0x…" style="width:150px" />
+              <button class="btn" id="cfgHiMigrate">Migrate</button>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Records</span>
+            <span style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn" id="cfgHiMerge">Merge selected</button>
+              <button class="btn" id="cfgHiSplit">Split off holders…</button>
+              <button class="btn" id="cfgHiDelete">Delete selected</button>
+              <button class="btn" id="cfgHiDeleteAll">Delete all</button>
+            </span>
+          </div>
+          <div class="cfgRow" id="cfgHiMsg" style="display:none;font-size:12px"><span></span><span></span></div>
+          <div style="padding:4px 20px 12px">
+            <div id="cfgHiList" style="font-size:12.5px;display:flex;flex-direction:column;gap:8px"></div>
+          </div>
+
+          <div class="menuSep"></div>
+
+          <div class="menuHead">Notifications</div>
+          <div class="cfgRow"><span>Message</span>
+            <span><input id="cfgNoText" class="field" placeholder="What should people see?" style="width:210px" /></span>
+          </div>
+          <div class="cfgRow"><span>Style</span>
+            <span style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+              <select id="cfgNoKind" style="width:104px">
+                <option value="normal">Normal</option>
+                <option value="alert">Alert</option>
+              </select>
+              <input id="cfgNoColor" type="color" value="#e6edf7" title="Text colour" style="width:44px;padding:2px" />
+            </span>
+          </div>
+          <div class="cfgRow"><span>Starts (local)</span><span><input id="cfgNoStart" type="datetime-local" /></span></div>
+          <div class="cfgRow"><span>Shows for</span>
+            <span style="display:flex;gap:6px;align-items:center">
+              <input id="cfgNoDurEvery" type="number" min="1" max="1000" step="1" value="30" style="width:64px" />
+              <select id="cfgNoDurUnit" style="width:98px">
+                <option value="second">Second</option><option value="minute">Minute</option>
+                <option value="hour">Hour</option><option value="day">Day</option>
+              </select>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Repeat every</span>
+            <span style="display:flex;gap:6px;align-items:center">
+              <input id="cfgNoRepEvery" type="number" min="0" max="1000" step="1" value="0"
+                     title="0 = show once" style="width:64px" />
+              <select id="cfgNoRepUnit" style="width:98px">
+                <option value="minute">Minute</option><option value="hour">Hour</option>
+                <option value="day">Day</option><option value="week">Week</option>
+              </select>
+            </span>
+          </div>
+          <div class="cfgRow"><span>Stop after (optional)</span><span><input id="cfgNoEnd" type="datetime-local" /></span></div>
+          <div class="cfgRow"><span></span>
+            <span style="display:flex;gap:7px;flex-wrap:wrap">
+              <button class="btn primary" id="cfgNoPublish">Publish</button>
+              <button class="btn" id="cfgNoRefresh">Refresh list</button>
+              <button class="btn" id="cfgNoDeleteSel">Delete selected</button>
+              <button class="btn" id="cfgNoDeleteAll">Delete all</button>
+            </span>
+          </div>
+          <div class="cfgRow" id="cfgNoMsg" style="display:none;font-size:12px"><span></span><span></span></div>
+          <div style="padding:4px 20px 12px">
+            <div id="cfgNoList" style="font-size:12.5px;display:flex;flex-direction:column;gap:6px"></div>
+          </div>
 
           <div class="menuSep"></div>
           <div style="padding:6px 20px 10px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>

@@ -7,7 +7,16 @@ import { privateKeyToAccount } from "viem/accounts";
 import { verifyMessage, formatUnits, toFunctionSelector } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID } from "node:crypto";
-import { formatUsdc, arcTestnet, ARC_USDC_ADDRESS, tesseraFeeCollectorAbi, tesseraAmmAbi } from "@tessera/shared";
+import {
+  formatUsdc,
+  arcTestnet,
+  ARC_USDC_ADDRESS,
+  tesseraFeeCollectorAbi,
+  tesseraAmmAbi,
+  tesseraPoolAbi,
+  tesseraVaultAbi,
+  erc20Abi,
+} from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { faucetFromEnv } from "./circle/faucet.js";
 import { createProviderApp, type ProviderEvent } from "@tessera/providers";
@@ -39,6 +48,9 @@ import { VaultClient, SwapClient, AmmClient } from "./defi.js";
 import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
 import { OwnerClient } from "./owner.js";
+import { NoticeStore, NOTICE_LIMITS } from "./notices.js";
+import { ArchiveStore, ARCHIVE_LIMITS, type ArchiveKind } from "./history.js";
+import { ArchiveScanner } from "./archive-chain.js";
 import type { Faucet } from "./circle/faucet.js";
 
 const APP_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../..");
@@ -634,11 +646,19 @@ async function main() {
           borrowMax = minB((headroomUsd * unit) / cfg.priceE8, r.cash); // headroom, capped by liquidity
         }
         return {
-          symbol: a.symbol,
+          // An operator-set name wins over the token symbol, so a renamed
+          // reserve reads the same everywhere the asset appears.
+          symbol: (row.meta?.name || "").trim() || a.symbol,
+          tokenSymbol: a.symbol,
           address: a.address,
           decimals: dec,
           enabled: true,
           borrowable: cfg.borrowable,
+          hidden: !!row.meta?.hidden,
+          frozen: Number(row.meta?.frozen ?? 0),
+          // False when a wired oracle feed is stale or broken: price-dependent
+          // actions will revert, so the UI must say so rather than quote on.
+          priceOk: row.priceOk !== false,
           priceUsd: (Number(cfg.priceE8) / 1e8).toFixed(2),
           reserve: {
             cash: fmtUnits(r.cash, dec),
@@ -1018,14 +1038,15 @@ async function main() {
 
   /** Admin: create an AMM pool over 2…maxAssetsPerPool assets. */
   app.post("/api/amm/admin/create", requireOperator, async (req, res) => {
+    const assetsIn = (req.body?.assets ?? []) as Hex[];
+    if (assetsIn.length < 2) { res.status(400).json({ ok: false, error: "An AMM pool needs at least two assets." }); return; }
     if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
     if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
     try {
-      const assets = (req.body?.assets ?? []) as Hex[];
+      const assets = assetsIn;
       const name = String(req.body?.name ?? "").slice(0, 40) || assets.map((a) => assetMeta(a).symbol).join(" / ");
       const swapFeeBps = Number(req.body?.swapFeeBps ?? 30);
       const lpShareBps = Number(req.body?.lpShareBps ?? 5000);
-      if (assets.length < 2) { res.status(400).json({ ok: false, error: "An AMM pool needs at least two assets." }); return; }
       const txHash = await owner.write(ammClient.amm, tesseraAmmAbi, "createPool", [assets, swapFeeBps, lpShareBps, name]);
       await refreshAmm();
       res.json({ ok: true, txHash });
@@ -1036,17 +1057,20 @@ async function main() {
 
   /** Admin: retune fees (one pool or many), freeze, or rename. */
   app.post("/api/amm/admin/configure", requireOperator, async (req, res) => {
+    // Validate the request before anything about deployment state: "you asked
+    // for something that isn't allowed" is a more useful answer than "no AMM
+    // here", and the 50% floor is the one rule an operator most needs told.
+    const ids = (req.body?.poolIds ?? []).map((v: unknown) => BigInt(Number(v)));
+    if (!ids.length) { res.status(400).json({ ok: false, error: "Select at least one pool." }); return; }
+    const swapFeeBps = Number(req.body?.swapFeeBps ?? 30);
+    const lpShareBps = Number(req.body?.lpShareBps ?? 5000);
+    if (!(lpShareBps >= 5000) || lpShareBps > 10000) {
+      res.status(400).json({ ok: false, error: "Liquidity providers always keep at least 50% of swap fees." });
+      return;
+    }
     if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
     if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
     try {
-      const ids = (req.body?.poolIds ?? []).map((v: unknown) => BigInt(Number(v)));
-      if (!ids.length) { res.status(400).json({ ok: false, error: "Select at least one pool." }); return; }
-      const swapFeeBps = Number(req.body?.swapFeeBps ?? 30);
-      const lpShareBps = Number(req.body?.lpShareBps ?? 5000);
-      if (lpShareBps < 5000) {
-        res.status(400).json({ ok: false, error: "Liquidity providers always keep at least 50% of swap fees." });
-        return;
-      }
       const txHash = await owner.write(ammClient.amm, tesseraAmmAbi, "configurePools", [ids, swapFeeBps, lpShareBps]);
       await refreshAmm();
       res.json({ ok: true, txHash });
@@ -1148,6 +1172,435 @@ async function main() {
     if (w) return { key: w.address.toLowerCase(), kind: "wallet", address: w.address };
     return null;
   };
+
+  /* --- Contract history & fund recovery -------------------------------------
+   *
+   * The archive records retired pool / vault / swap / collector contracts and
+   * the balances still sitting in them, so nobody's money becomes unreachable
+   * just because the app was repointed at a replacement.
+   *
+   * Two honesty constraints shape every endpoint below:
+   *
+   *  1. **The record is an index, not the ledger.** Before any payout or
+   *     migration, balances are re-read from the old contract and *those*
+   *     figures are used. A stored snapshot only decides who to look at.
+   *  2. **Nothing here can move a user's position.** There is no contract
+   *     function that lets an operator reassign someone's shares, by design.
+   *     "Return funds" sends the app's own tokens to the user; "migrate"
+   *     re-creates their position in the new contract by paying it in via
+   *     `supplyFor` / `depositFor` / `addLiquidityFor`. Their claim on the old
+   *     contract is left intact, which is the correct outcome — they end up
+   *     able to withdraw from either.
+   */
+  const archive = new ArchiveStore(statePath(".tessera-history.json"));
+  const scanner = new ArchiveScanner(chain, rpcUrl);
+
+  /** The asset list an archive scan should use for a given kind. */
+  const archiveAssets = (body: Record<string, unknown>) => {
+    const given = Array.isArray(body.assets) ? (body.assets as { address: Hex }[]) : null;
+    const list = given?.length
+      ? given.map((a) => ({ address: a.address, ...assetMeta(a.address) }))
+      : (poolDeployment?.assets ?? []).map((a) => ({ address: a.address, ...assetMeta(a.address) }));
+    return list.map((a) => ({ address: a.address as Hex, symbol: a.symbol, decimals: a.decimals }));
+  };
+
+  app.get("/api/history", requireOperator, (_req, res) => {
+    res.json({
+      ok: true,
+      records: archive.all().map((r) => archive.summary(r)),
+      limits: ARCHIVE_LIMITS,
+      // The addresses currently in use, so the UI can offer "archive the one
+      // this is replacing" without the operator copying hex by hand.
+      current: {
+        pool: poolDeployment?.poolAddress ?? null,
+        vault: vaultClient?.vault ?? null,
+        swap: swapClient?.swap ?? null,
+        collector: (liveDeployment.tesseraFeeCollector as Hex) ?? null,
+        amm: ammClient?.amm ?? null,
+      },
+    });
+  });
+
+  /**
+   * Archive a contract: scan it for holders, read their live balances, store it.
+   * This is what runs automatically when a replacement is deployed, and can be
+   * run by hand for anything already retired.
+   */
+  app.post("/api/history/archive", requireOperator, async (req, res) => {
+    try {
+      const kind = String(req.body?.kind ?? "") as ArchiveKind;
+      const address = String(req.body?.address ?? "") as Hex;
+      if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+        res.status(400).json({ ok: false, error: "That doesn't look like a contract address." });
+        return;
+      }
+      const scan = await scanner.scan(kind, address, {
+        assets: archiveAssets(req.body ?? {}),
+        poolId: Number(req.body?.poolId ?? 0),
+        treasury: (liveDeployment.tesseraFeeCollector as Hex) ?? (agentAccount.address as Hex),
+      });
+      const r = archive.add({
+        kind,
+        address,
+        label: req.body?.label,
+        note: scan.partial
+          ? "Log scan was incomplete — some holders may be missing. Refresh before paying out."
+          : req.body?.note,
+        assets: scan.assets,
+        holders: scan.holders,
+        snapshotBlock: scan.block,
+      });
+      if (!r.ok) { res.status(400).json({ ok: false, error: r.error }); return; }
+      res.json({ ok: true, record: archive.summary(r.record), partial: scan.partial });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Re-read balances from the archived contract. */
+  app.post("/api/history/:id/refresh", requireOperator, async (req, res) => {
+    const rec = archive.get(req.params.id);
+    if (!rec) { res.status(404).json({ ok: false, error: "No such record." }); return; }
+    try {
+      const scan = await scanner.scan(rec.kind, rec.address as Hex, {
+        assets: rec.assets.map((a) => ({ address: a.address as Hex, symbol: a.symbol, decimals: a.decimals })),
+        poolId: Number(req.body?.poolId ?? 0),
+        treasury: (liveDeployment.tesseraFeeCollector as Hex) ?? (agentAccount.address as Hex),
+      });
+      archive.refresh(rec.id, scan.holders, scan.block);
+      res.json({ ok: true, record: archive.summary(archive.get(rec.id)!), partial: scan.partial });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/history/delete", requireOperator, (req, res) => {
+    if (req.body?.all === true) { res.json({ ok: true, removed: archive.clear() }); return; }
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((v: unknown) => String(v)) : [];
+    if (!ids.length) { res.status(400).json({ ok: false, error: "Select at least one record." }); return; }
+    res.json({ ok: true, removed: archive.remove(ids) });
+  });
+
+  app.post("/api/history/merge", requireOperator, (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((v: unknown) => String(v)) : [];
+    const r = archive.merge(ids, req.body?.label);
+    if (!r.ok) { res.status(400).json({ ok: false, error: r.error }); return; }
+    res.json({ ok: true, record: archive.summary(r.record) });
+  });
+
+  /** Edit a record's label/note. Registered after every literal route above,
+   *  so a path segment like "delete" or "merge" can never be read as an id. */
+  app.post("/api/history/:id", requireOperator, (req, res) => {
+    const r = archive.update(req.params.id, {
+      label: req.body?.label,
+      note: req.body?.note,
+    });
+    if (!r.ok) { res.status(404).json({ ok: false, error: r.error }); return; }
+    res.json({ ok: true, record: archive.summary(archive.get(req.params.id)!) });
+  });
+
+  app.post("/api/history/:id/split", requireOperator, (req, res) => {
+    const addresses = Array.isArray(req.body?.addresses) ? req.body.addresses.map((v: unknown) => String(v)) : [];
+    const r = archive.split(req.params.id, addresses, req.body?.label);
+    if (!r.ok) { res.status(400).json({ ok: false, error: r.error }); return; }
+    res.json({ ok: true, record: archive.summary(r.record) });
+  });
+
+  /** Flag which archived contract of a kind the app is treating as current. */
+  app.post("/api/history/:id/activate", requireOperator, (req, res) => {
+    const r = archive.setActive(req.params.id);
+    if (!r.ok) { res.status(404).json({ ok: false, error: r.error }); return; }
+    res.json({
+      ok: true,
+      records: archive.all().map((x) => archive.summary(x)),
+      note:
+        "Marked as the current record. This is bookkeeping only — repoint the app by " +
+        "updating deployments/arc.local.json and restarting, so the change survives a rebuild.",
+    });
+  });
+
+  /**
+   * Return funds: send the app's own tokens to each outstanding holder, in the
+   * amounts the *live* contract says they hold. Runs one transfer per holder
+   * per asset so a single failure doesn't strand the rest.
+   */
+  app.post("/api/history/:id/return", requireOperator, async (req, res) => {
+    const rec = archive.get(req.params.id);
+    if (!rec) { res.status(404).json({ ok: false, error: "No such record." }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      // Re-read before paying. The stored snapshot decides who to look at; the
+      // chain decides how much.
+      const scan = await scanner.scan(rec.kind, rec.address as Hex, {
+        assets: rec.assets.map((a) => ({ address: a.address as Hex, symbol: a.symbol, decimals: a.decimals })),
+        poolId: Number(req.body?.poolId ?? 0),
+        treasury: (liveDeployment.tesseraFeeCollector as Hex) ?? (agentAccount.address as Hex),
+      });
+      archive.refresh(rec.id, scan.holders, scan.block);
+
+      const only = Array.isArray(req.body?.addresses)
+        ? new Set(req.body.addresses.map((a: unknown) => String(a).toLowerCase()))
+        : null;
+      const settledAlready = new Set(
+        archive.get(rec.id)!.holders.filter((h) => h.settled).map((h) => h.address),
+      );
+      const targets = scan.holders.filter(
+        (h) => (!only || only.has(h.address)) && !settledAlready.has(h.address),
+      );
+      if (!targets.length) { res.json({ ok: true, sent: [], note: "Nothing outstanding to return." }); return; }
+
+      const sent: { address: string; asset: string; amount: string; txHash?: string; error?: string }[] = [];
+      for (const h of targets) {
+        let allOk = true;
+        let lastHash: string | undefined;
+        for (const [asset, raw] of Object.entries(h.balances)) {
+          let amount = 0n;
+          try { amount = BigInt(raw); } catch { amount = 0n; }
+          if (amount <= 0n) continue;
+          try {
+            const txHash = await owner.write(asset as Hex, erc20Abi, "transfer", [h.address as Hex, amount]);
+            sent.push({ address: h.address, asset, amount: amount.toString(), txHash });
+            lastHash = txHash;
+          } catch (e) {
+            allOk = false;
+            sent.push({ address: h.address, asset, amount: amount.toString(), error: friendlyError(e) });
+          }
+        }
+        // Only mark someone settled when every leg landed — a half-paid holder
+        // that reads as "done" is the failure mode that loses people money.
+        if (allOk) archive.markSettled(rec.id, [h.address], "returned", lastHash);
+      }
+      res.json({ ok: true, sent, record: archive.summary(archive.get(rec.id)!) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Migrate: re-create each holder's position in the replacement contract, paid
+   * for by the operator via the `*For` entry points. The holder's claim on the
+   * old contract is deliberately left untouched.
+   */
+  app.post("/api/history/:id/migrate", requireOperator, async (req, res) => {
+    const rec = archive.get(req.params.id);
+    if (!rec) { res.status(404).json({ ok: false, error: "No such record." }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    const target = String(req.body?.target ?? "") as Hex;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(target)) {
+      res.status(400).json({ ok: false, error: "Give the replacement contract's address." });
+      return;
+    }
+    if (target.toLowerCase() === rec.address.toLowerCase()) {
+      res.status(400).json({ ok: false, error: "That's the same contract this record is for." });
+      return;
+    }
+    if (rec.kind !== "pool" && rec.kind !== "vault" && rec.kind !== "amm") {
+      res.status(400).json({
+        ok: false,
+        error: "Only pool, vault and AMM records hold user positions. Use Return funds for a swap desk or collector.",
+      });
+      return;
+    }
+    try {
+      const scan = await scanner.scan(rec.kind, rec.address as Hex, {
+        assets: rec.assets.map((a) => ({ address: a.address as Hex, symbol: a.symbol, decimals: a.decimals })),
+        poolId: Number(req.body?.poolId ?? 0),
+        treasury: agentAccount.address as Hex,
+      });
+      archive.refresh(rec.id, scan.holders, scan.block);
+
+      const only = Array.isArray(req.body?.addresses)
+        ? new Set(req.body.addresses.map((a: unknown) => String(a).toLowerCase()))
+        : null;
+      const settledAlready = new Set(archive.get(rec.id)!.holders.filter((h) => h.settled).map((h) => h.address));
+      const targets = scan.holders.filter((h) => (!only || only.has(h.address)) && !settledAlready.has(h.address));
+      if (!targets.length) { res.json({ ok: true, moved: [], note: "Nothing outstanding to migrate." }); return; }
+
+      const moved: { address: string; txHash?: string; error?: string }[] = [];
+      for (const h of targets) {
+        try {
+          let txHash: Hex | undefined;
+          if (rec.kind === "vault") {
+            const amount = BigInt(h.balances[rec.assets[0]?.address ?? ""] ?? "0");
+            if (amount <= 0n) continue;
+            await owner.write(rec.assets[0].address as Hex, erc20Abi, "approve", [target, amount]);
+            txHash = await owner.write(target, tesseraVaultAbi, "depositFor", [h.address as Hex, amount]);
+          } else if (rec.kind === "pool") {
+            for (const [asset, raw] of Object.entries(h.balances)) {
+              const amount = BigInt(raw || "0");
+              if (amount <= 0n) continue;
+              await owner.write(asset as Hex, erc20Abi, "approve", [target, amount]);
+              txHash = await owner.write(target, tesseraPoolAbi, "supplyFor", [asset as Hex, h.address as Hex, amount]);
+            }
+          } else {
+            const poolId = BigInt(Number(req.body?.targetPoolId ?? 0));
+            const amounts = rec.assets.map((a) => BigInt(h.balances[a.address] ?? "0"));
+            if (amounts.every((v) => v <= 0n)) continue;
+            for (let i = 0; i < rec.assets.length; i++) {
+              if (amounts[i] > 0n) await owner.write(rec.assets[i].address as Hex, erc20Abi, "approve", [target, amounts[i]]);
+            }
+            txHash = await owner.write(target, tesseraAmmAbi, "addLiquidityFor", [
+              poolId,
+              h.address as Hex,
+              amounts,
+              0n,
+            ]);
+          }
+          if (txHash) {
+            moved.push({ address: h.address, txHash });
+            archive.markSettled(rec.id, [h.address], "migrated", txHash, `to ${target}`);
+          }
+        } catch (e) {
+          moved.push({ address: h.address, error: friendlyError(e) });
+        }
+      }
+      await refreshAll();
+      res.json({ ok: true, moved, record: archive.summary(archive.get(rec.id)!) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* --- Lending-pool administration -----------------------------------------
+   * Freeze is per action, so an operator investigating suspicious activity can
+   * stop deposits and borrowing while leaving withdraw and repay open. The
+   * contract enforces the same masks; these endpoints are only the front door. */
+  const FREEZE_BITS: Record<string, number> = { supply: 1, withdraw: 2, borrow: 4, repay: 8 };
+
+  app.post("/api/lending/admin/freeze", requireOperator, async (req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      // Accept either a raw mask or a list of action names, whichever the
+      // caller finds clearer.
+      const actions: string[] = Array.isArray(req.body?.actions) ? req.body.actions : [];
+      const mask = actions.length
+        ? actions.reduce((m, a) => m | (FREEZE_BITS[String(a)] ?? 0), 0)
+        : Number(req.body?.mask ?? 0);
+      if (!Number.isInteger(mask) || mask < 0 || mask > 15) {
+        res.status(400).json({ ok: false, error: "Pick any of supply, withdraw, borrow, repay." });
+        return;
+      }
+      const assets: Hex[] = Array.isArray(req.body?.assets) && req.body.assets.length
+        ? req.body.assets
+        : [req.body?.asset as Hex];
+      if (!assets[0]) { res.status(400).json({ ok: false, error: "Select at least one asset." }); return; }
+      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setFrozenMany", [assets, mask]);
+      await refreshAll();
+      res.json({ ok: true, txHash, mask });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/lending/admin/rename", requireOperator, async (req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const name = String(req.body?.name ?? "").trim().slice(0, 40);
+      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "renameReserve", [
+        req.body?.asset as Hex,
+        name,
+      ]);
+      await refreshAll();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Show or hide a reserve in the app. Presentation only — never blocks exits. */
+  app.post("/api/lending/admin/visibility", requireOperator, async (req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setReserveHidden", [
+        req.body?.asset as Hex,
+        Boolean(req.body?.hidden),
+      ]);
+      await refreshAll();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Wire (or clear) a Chainlink-compatible price feed for a reserve. */
+  app.post("/api/lending/admin/oracle", requireOperator, async (req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const feed = String(req.body?.feed ?? "").trim() || "0x0000000000000000000000000000000000000000";
+      if (!/^0x[0-9a-fA-F]{40}$/.test(feed)) {
+        res.status(400).json({ ok: false, error: "That doesn't look like a contract address." });
+        return;
+      }
+      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setPriceFeed", [
+        req.body?.asset as Hex,
+        feed as Hex,
+        Number(req.body?.staleAfter ?? 3600),
+      ]);
+      await refreshAll();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      // The contract test-reads the feed on write, so a bad address fails here
+      // rather than silently at someone's next withdrawal.
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* --- Operator notices (banner + bell) ------------------------------------
+   * Reads are public: a maintenance warning is useless if only signed-in users
+   * can see it. Writes are operator-only. Text is stored raw and escaped by the
+   * client; colour is restricted server-side because it lands in a style
+   * attribute. */
+  const notices = new NoticeStore(statePath(".tessera-notices.json"));
+
+  app.get("/api/notices", (_req, res) => {
+    res.json({ ok: true, active: notices.active() });
+  });
+
+  app.get("/api/notices/feed", (req, res) => {
+    const num = (v: unknown) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    res.json({
+      ok: true,
+      notices: notices.feed({
+        from: num(req.query.from),
+        to: num(req.query.to),
+        limit: num(req.query.limit),
+      }),
+    });
+  });
+
+  /** Full list including scheduled and disabled ones — operator view. */
+  app.get("/api/notices/all", requireOperator, (_req, res) => {
+    res.json({ ok: true, notices: notices.all(), limits: NOTICE_LIMITS });
+  });
+
+  app.post("/api/notices", requireOperator, (req, res) => {
+    const r = notices.create(req.body ?? {});
+    if (!r.ok) { res.status(400).json({ ok: false, error: r.error }); return; }
+    res.json({ ok: true, notice: r.notice });
+  });
+
+  /** Delete one, several, or every notice. */
+  app.post("/api/notices/delete", requireOperator, (req, res) => {
+    if (req.body?.all === true) { res.json({ ok: true, removed: notices.clear() }); return; }
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((v: unknown) => String(v)) : [];
+    if (!ids.length) { res.status(400).json({ ok: false, error: "Select at least one notice." }); return; }
+    res.json({ ok: true, removed: notices.remove(ids) });
+  });
+
+  /** Edit in place. Registered after the literal routes above so a path
+   *  segment like "delete" can never be mistaken for a notice id. */
+  app.post("/api/notices/:id", requireOperator, (req, res) => {
+    const r = notices.update(req.params.id, req.body ?? {});
+    if (!r.ok) { res.status(404).json({ ok: false, error: r.error }); return; }
+    res.json({ ok: true, notice: r.notice });
+  });
 
   app.get("/api/profile", requireAuth, (req, res) => {
     const id = identityOf(req)!;

@@ -25,6 +25,10 @@ interface ISwapPool {
             uint256 totalBorrowAssets,
             uint64 lastAccrual
         );
+
+    /// @notice The pool's *effective* price: an oracle feed when one is wired,
+    ///         otherwise the operator-set price. Reverts on an unusable feed.
+    function price(address asset) external view returns (uint256);
 }
 
 /**
@@ -95,9 +99,16 @@ contract TesseraSwap {
 
     // --- pricing --------------------------------------------------------------
 
-    function priceOf(address token) public view returns (uint256 price, uint8 decimals) {
-        (, , uint8 d, , , , uint256 p, , , , , ) = pool.reserves(token);
-        return (p, d);
+    /**
+     * @notice Price + decimals for a token, taken from the pool.
+     * @dev Reads `pool.price()` rather than the raw `reserves()` slot, so a wired
+     *      oracle feed governs swap quotes too. Reading the stored slot would
+     *      have quietly kept the desk on a manual price while the pool itself had
+     *      moved on — the two must never disagree.
+     */
+    function priceOf(address token) public view returns (uint256 usdPrice, uint8 decimals) {
+        (, , uint8 d, , , , , , , , , ) = pool.reserves(token);
+        return (pool.price(token), d);
     }
 
     /// @notice Quote a swap: output after fee, the fee, and the app's cut of it.

@@ -174,6 +174,25 @@ contract TesseraVault {
     // --- user actions ---------------------------------------------------------
 
     function deposit(uint256 assets) external nonReentrant returns (uint256 shares) {
+        return _depositFor(msg.sender, assets);
+    }
+
+    /**
+     * @notice Deposit on someone else's behalf: **you** pay, **they** get the shares.
+     *
+     * This is what makes a migration honest. When a new vault replaces an old
+     * one, the operator re-creates each depositor's position here by paying the
+     * assets in themselves — there is deliberately no function anywhere in this
+     * contract that lets an admin move an existing holder's shares, because that
+     * is the same primitive as a rug pull. Anyone may call this; crediting a
+     * stranger with your own money can only ever help them.
+     */
+    function depositFor(address user, uint256 assets) external nonReentrant returns (uint256 shares) {
+        require(user != address(0), "zero user");
+        return _depositFor(user, assets);
+    }
+
+    function _depositFor(address user, uint256 assets) internal returns (uint256 shares) {
         require(assets > 0, "zero");
         _accrueFee();
         require(asset.transferFrom(msg.sender, address(this), assets), "transferFrom");
@@ -188,11 +207,11 @@ contract TesseraVault {
             shares = taBefore == 0 ? assets : (assets * totalShares) / taBefore;
         }
         require(shares > 0, "no shares");
-        sharesOf[msg.sender] += shares;
+        sharesOf[user] += shares;
         totalShares += shares;
         _rebalance();
         lastTotalAssets = totalAssets();
-        emit Deposit(msg.sender, assets, shares);
+        emit Deposit(user, assets, shares);
     }
 
     function withdraw(uint256 shares) external nonReentrant returns (uint256 assets) {

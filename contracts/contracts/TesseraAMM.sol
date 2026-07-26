@@ -171,6 +171,27 @@ contract TesseraAMM {
         nonReentrant
         returns (uint256 shares)
     {
+        return _addLiquidity(poolId, msg.sender, amounts, minShares);
+    }
+
+    /**
+     * @notice Add liquidity on someone else's behalf: **you** pay, **they** get
+     *         the shares. Used to re-create providers' positions when a pool is
+     *         replaced. There is no admin path that moves existing shares.
+     */
+    function addLiquidityFor(uint256 poolId, address to, uint256[] calldata amounts, uint256 minShares)
+        external
+        nonReentrant
+        returns (uint256 shares)
+    {
+        require(to != address(0), "zero to");
+        return _addLiquidity(poolId, to, amounts, minShares);
+    }
+
+    function _addLiquidity(uint256 poolId, address to, uint256[] calldata amounts, uint256 minShares)
+        internal
+        returns (uint256 shares)
+    {
         Pool storage p = pools[poolId];
         require(p.exists, "no pool");
         require(!p.frozen, "pool frozen");
@@ -207,12 +228,13 @@ contract TesseraAMM {
 
         for (uint256 i = 0; i < amounts.length; i++) {
             address a = p.assets[i];
+            // Funds always come from the caller, never from `to`.
             require(IERC20A(a).transferFrom(msg.sender, address(this), amounts[i]), "transferFrom");
             reserves[poolId][a] += amounts[i];
         }
-        sharesOf[poolId][msg.sender] += shares;
+        sharesOf[poolId][to] += shares;
         p.totalShares += shares;
-        emit LiquidityAdded(poolId, msg.sender, amounts, shares);
+        emit LiquidityAdded(poolId, to, amounts, shares);
     }
 
     /**

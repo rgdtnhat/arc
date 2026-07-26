@@ -64,6 +64,22 @@ const $ = (id) => document.getElementById(id);
        * back button work, and "#" (or no hash) is the landing page.
        * ==================================================================== */
       const TABS = ["dashboard", "defi", "agents", "other"];
+      const NAV_LABELS = {
+        home: "🏠 Home",
+        dashboard: "📊 Dashboard",
+        defi: "💠 DeFi",
+        agents: "🤖 Agent transactions",
+        other: "🧰 Treasury & system",
+      };
+      const NAV_OPEN_KEY = "tessera_nav_open";
+      /** Open/close the menu drawer, remembering the choice across visits. */
+      function setNavOpen(open, persist) {
+        $("navDrawer").classList.toggle("open", open);
+        $("navToggle").setAttribute("aria-expanded", open ? "true" : "false");
+        if (persist !== false) {
+          try { localStorage.setItem(NAV_OPEN_KEY, open ? "1" : "0"); } catch {}
+        }
+      }
       function showView(route) {
         const isApp = TABS.includes(route);
         $("viewLanding").hidden = isApp;
@@ -75,12 +91,18 @@ const $ = (id) => document.getElementById(id);
             const pane = $("pane" + t[0].toUpperCase() + t.slice(1));
             if (pane) pane.hidden = t !== route;
           }
-          document.querySelectorAll(".tab").forEach((b) =>
-            b.classList.toggle("active", b.dataset.tab === route));
+          if ($("crumbNow")) $("crumbNow").textContent = NAV_LABELS[route] || route;
         }
-        // Close the nav drawer on any navigation.
-        $("navDrawer").classList.remove("open");
-        $("navToggle").setAttribute("aria-expanded", "false");
+        // Highlight the current section in the drawer. This is the only place
+        // that marks "where you are" now that the tab strip is gone, so it has
+        // to stay right even when navigation came from a hash change or a
+        // landing-page card rather than from a click in here.
+        document.querySelectorAll("[data-nav]").forEach((b) => {
+          const on = b.dataset.nav === route;
+          b.setAttribute("aria-current", on ? "page" : "false");
+        });
+        // The drawer deliberately stays open across navigation — it is a menu
+        // the user chose to pin, not a popup.
       }
       function routeFromHash() {
         const h = (location.hash || "").replace(/^#\/?/, "");
@@ -104,8 +126,6 @@ const $ = (id) => document.getElementById(id);
         const el = $(id);
         if (el) el.addEventListener("click", () => navigate("dashboard"));
       });
-      document.querySelectorAll(".tab").forEach((b) =>
-        b.addEventListener("click", () => navigate(b.dataset.tab, { keepScroll: true })));
       // Landing capability cards deep-link into the panel that implements them:
       // "defi#vaultCard" switches to the DeFi tab, scrolls to the vault card and
       // flashes it so it's obvious where you landed.
@@ -132,11 +152,20 @@ const $ = (id) => document.getElementById(id);
       });
 
       document.querySelectorAll("[data-nav]").forEach((b) =>
-        b.addEventListener("click", () => navigate(b.dataset.nav)));
+        b.addEventListener("click", () => navigate(b.dataset.nav, { keepScroll: true })));
       $("navToggle").addEventListener("click", () => {
-        const open = $("navDrawer").classList.toggle("open");
-        $("navToggle").setAttribute("aria-expanded", open ? "true" : "false");
+        setNavOpen(!$("navDrawer").classList.contains("open"));
       });
+      // Restore the remembered drawer state without animating it on first paint.
+      (function restoreNav() {
+        let open = false;
+        try { open = localStorage.getItem(NAV_OPEN_KEY) === "1"; } catch {}
+        if (!open) return;
+        const d = $("navDrawer");
+        d.style.transition = "none";
+        setNavOpen(true, false);
+        requestAnimationFrame(() => { d.style.transition = ""; });
+      })();
 
       // Start button: hide while scrolling down, bring it back on scroll up.
       (function startButtonAutoHide() {
@@ -456,15 +485,23 @@ const $ = (id) => document.getElementById(id);
           $("lnHealth").textContent = ln.account.healthFactor;
           window.__lending = ln;
           const sel = $("lnAsset");
+          // Hidden reserves drop out of the picker, but only for people who
+          // hold nothing in them: hiding is presentation, and a supplier must
+          // always be able to reach their own funds.
+          const visible = ln.assets.filter(
+            (a) => !a.hidden || Number(a.position.supplied) > 0 || Number(a.position.borrowed) > 0,
+          );
+          const list = visible.length ? visible : ln.assets;
           // (Re)build the asset dropdown only when the set of symbols changes,
           // so it doesn't reset the user's selection on every poll.
-          const symbols = ln.assets.map((a) => a.symbol).join(",");
+          const symbols = list.map((a) => a.symbol).join(",");
           if (sel.dataset.symbols !== symbols) {
             const keep = sel.value;
-            sel.innerHTML = ln.assets.map((a) => `<option value="${esc(a.symbol)}">${esc(a.symbol)}</option>`).join("");
+            sel.innerHTML = list.map((a) => `<option value="${esc(a.symbol)}">${esc(a.symbol)}</option>`).join("");
             sel.dataset.symbols = symbols;
-            if (ln.assets.some((a) => a.symbol === keep)) sel.value = keep;
+            if (list.some((a) => a.symbol === keep)) sel.value = keep;
           }
+          renderCfgLending();
           if (window.renderLendingAsset) window.renderLendingAsset();
         }
 
@@ -814,6 +851,26 @@ const $ = (id) => document.getElementById(id);
           $("lnMaxHint").textContent = a.symbol + " isn't registered as a reserve in this pool — redeploy with pool:arc to add it.";
           return;
         }
+        // A frozen action or a dead oracle feed both make the transaction
+        // revert on-chain. Saying so here — and disabling Execute — is far
+        // kinder than letting someone pay gas to find out.
+        const FREEZE_BIT = { supply: 1, withdraw: 2, borrow: 4, repay: 8 };
+        const frozen = (Number(a.frozen || 0) & FREEZE_BIT[action]) !== 0;
+        const priceDown = a.priceOk === false;
+        const blocked = frozen || priceDown;
+        $("lnExecute").disabled = blocked;
+        $("lnExecute").style.opacity = blocked ? "0.5" : "";
+        if (priceDown) {
+          $("lnMaxHint").textContent =
+            "Price feed for " + a.symbol + " is stale or unavailable, so the market is paused until it recovers.";
+          return;
+        }
+        if (frozen) {
+          $("lnMaxHint").textContent =
+            action.charAt(0).toUpperCase() + action.slice(1) + " is frozen on " + a.symbol +
+            " by the operator. Unfrozen actions still work.";
+          return;
+        }
         $("lnMaxHint").textContent = "max " + action + ": " + max + " " + a.symbol +
           (action === "borrow" && !a.borrowable ? " (not borrowable)" : "");
       };
@@ -1085,6 +1142,132 @@ const $ = (id) => document.getElementById(id);
           msg.style.display = "block"; msg.textContent = "request failed"; msg.style.color = "var(--warn)";
         } finally { btn.disabled = false; tick(); }
       });
+
+      /* ===================================================================
+       * Operator notices — the running banner and the bell.
+       *
+       * The server decides what is active (a pure function of each notice's
+       * schedule), so the browser never has to run timers to decide visibility;
+       * it just polls and renders. A dismissed notice is remembered by id so it
+       * doesn't reappear on the next poll, but a *new* notice always shows.
+       * =================================================================== */
+      const DISMISSED_KEY = "tessera_notice_dismissed";
+      const dismissed = () => {
+        try { return new Set(JSON.parse(localStorage.getItem(DISMISSED_KEY) || "[]")); } catch { return new Set(); }
+      };
+      function dismiss(id) {
+        const s = dismissed();
+        s.add(id);
+        // Keep the list short — a dismissal only has to outlive the notice.
+        try { localStorage.setItem(DISMISSED_KEY, JSON.stringify([...s].slice(-100))); } catch {}
+      }
+
+      let noticeCurrent = null;
+      function renderNotice(list) {
+        const bar = $("noticeBar");
+        if (!bar) return;
+        const skip = dismissed();
+        const n = (list || []).find((x) => !skip.has(x.id)) || null;
+        if (!n) { bar.hidden = true; noticeCurrent = null; return; }
+        // Only repaint when the notice actually changes, so the marquee doesn't
+        // jump back to the start on every poll.
+        if (noticeCurrent && noticeCurrent.id === n.id && noticeCurrent.text === n.text) return;
+        noticeCurrent = n;
+        bar.hidden = false;
+        bar.classList.toggle("alert", n.kind === "alert");
+        $("noticeIcon").textContent = n.kind === "alert" ? "⚠️" : "📣";
+        const el = $("noticeText");
+        el.textContent = n.text; // text node, never innerHTML
+        el.style.color = n.color || "";
+        // Scroll speed proportional to length so long and short notices both
+        // read at a comfortable pace.
+        el.style.setProperty("--marquee", Math.max(12, Math.min(60, n.text.length * 0.35)) + "s");
+      }
+
+      async function pollNotices() {
+        try {
+          const r = await (await fetch("/api/notices")).json();
+          if (r && r.ok) {
+            renderNotice(r.active);
+            const skip = dismissed();
+            const unseen = (r.active || []).some((x) => !skip.has(x.id));
+            if ($("bellDot")) $("bellDot").hidden = !unseen;
+          }
+        } catch { /* a missing banner must never break the page */ }
+      }
+      if ($("noticeClose")) {
+        $("noticeClose").addEventListener("click", () => {
+          if (noticeCurrent) dismiss(noticeCurrent.id);
+          $("noticeBar").hidden = true;
+          noticeCurrent = null;
+          pollNotices();
+        });
+      }
+
+      const fmtWhen = (ms) => {
+        const d = new Date(ms);
+        return isNaN(d) ? "" : d.toLocaleString();
+      };
+      async function loadBell(from, to) {
+        const list = $("bellList");
+        if (!list) return;
+        const qs = new URLSearchParams();
+        if (from) qs.set("from", from);
+        if (to) qs.set("to", to);
+        qs.set("limit", "50");
+        try {
+          const r = await (await fetch("/api/notices/feed?" + qs.toString())).json();
+          const items = (r && r.notices) || [];
+          list.innerHTML = items.length
+            ? items
+                .map(
+                  (n) =>
+                    `<div class="bellItem">` +
+                    `<span style="color:${esc(n.color || "var(--text)")}">` +
+                    `${n.kind === "alert" ? "⚠️ " : ""}${esc(n.text)}</span>` +
+                    `<span class="when">${esc(fmtWhen(n.startAt))}${n.active ? " · showing now" : ""}</span>` +
+                    `</div>`,
+                )
+                .join("")
+            : `<div class="bellEmpty">Nothing in this range.</div>`;
+        } catch {
+          list.innerHTML = `<div class="bellEmpty">Couldn't load notifications.</div>`;
+        }
+      }
+
+      if ($("bellBtn")) {
+        const panel = $("bellPanel");
+        const closeBell = () => {
+          panel.classList.remove("open");
+          $("bellBtn").setAttribute("aria-expanded", "false");
+        };
+        $("bellBtn").addEventListener("click", (e) => {
+          e.stopPropagation();
+          const open = panel.classList.toggle("open");
+          $("bellBtn").setAttribute("aria-expanded", open ? "true" : "false");
+          if (open) {
+            $("bellDot").hidden = true;
+            loadBell();
+          }
+        });
+        panel.addEventListener("click", (e) => e.stopPropagation());
+        document.addEventListener("click", closeBell);
+        document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeBell(); });
+        $("bellApply").addEventListener("click", () => {
+          const from = $("bellFrom").value ? Date.parse($("bellFrom").value + "T00:00:00") : "";
+          // Include the whole of the "to" day — a date picker means the day, not
+          // the instant midnight begins.
+          const to = $("bellTo").value ? Date.parse($("bellTo").value + "T23:59:59.999") : "";
+          loadBell(from, to);
+        });
+        $("bellClear").addEventListener("click", () => {
+          $("bellFrom").value = "";
+          $("bellTo").value = "";
+          loadBell();
+        });
+      }
+      pollNotices();
+      setInterval(pollNotices, 20000);
 
       /* ===================================================================
        * AMM liquidity pools.
@@ -1696,7 +1879,444 @@ const $ = (id) => document.getElementById(id);
         $("cfgBtn").setAttribute("aria-expanded", "true");
         loadAppConfig();
         renderCfgAmm();
+        renderCfgLending();
+        loadCfgHistory();
+        loadCfgNotices();
         syncCfgDock();
+      }
+
+      /* ---- lending-reserve administration --------------------------------- */
+      function cfgLnMsg(text, good) {
+        const row = $("cfgLnMsg");
+        if (!row) return;
+        row.style.display = "flex";
+        row.style.color = good ? "var(--good)" : "var(--warn)";
+        row.lastElementChild.textContent = text;
+      }
+      const cfgLnAssets = () => (window.__lending && window.__lending.assets) || [];
+      function renderCfgLending() {
+        const sel = $("cfgLnAsset");
+        if (!sel) return;
+        const assets = cfgLnAssets();
+        const sig = assets.map((a) => `${a.address}:${a.symbol}:${a.frozen}:${a.hidden}`).join("|");
+        if (sel.dataset.sig !== sig) {
+          const keep = sel.value;
+          sel.innerHTML = assets
+            .map(
+              (a) =>
+                `<option value="${esc(a.address)}">${esc(a.symbol)}` +
+                `${a.hidden ? " · hidden" : ""}${a.frozen ? " · frozen" : ""}</option>`,
+            )
+            .join("");
+          if (keep && assets.some((a) => a.address === keep)) sel.value = keep;
+          sel.dataset.sig = sig;
+        }
+        syncFreezeBoxes();
+      }
+      /** Reflect the selected reserve's current freeze mask in the checkboxes. */
+      function syncFreezeBoxes() {
+        const a = cfgLnAssets().find((x) => x.address === $("cfgLnAsset").value);
+        const mask = a ? Number(a.frozen || 0) : 0;
+        $("cfgFrSupply").checked = !!(mask & 1);
+        $("cfgFrWithdraw").checked = !!(mask & 2);
+        $("cfgFrBorrow").checked = !!(mask & 4);
+        $("cfgFrRepay").checked = !!(mask & 8);
+      }
+
+      if ($("cfgLnAsset")) {
+        $("cfgLnAsset").addEventListener("change", syncFreezeBoxes);
+
+        const freeze = async (actions) => {
+          const asset = $("cfgLnAsset").value;
+          if (!asset) { cfgLnMsg("Pick a reserve first.", false); return; }
+          cfgLnMsg("Sending…", true);
+          try {
+            const r = await (await postJson("/api/lending/admin/freeze", { asset, actions })).json();
+            cfgLnMsg(
+              r.ok
+                ? actions.length
+                  ? `Frozen: ${actions.join(", ")} ✓`
+                  : "All actions unfrozen ✓"
+                : r.error,
+              !!r.ok,
+            );
+            if (r.ok) afterTx();
+          } catch { cfgLnMsg("Request failed.", false); }
+        };
+        $("cfgLnFreeze").addEventListener("click", () => {
+          const picked = [];
+          if ($("cfgFrSupply").checked) picked.push("supply");
+          if ($("cfgFrWithdraw").checked) picked.push("withdraw");
+          if ($("cfgFrBorrow").checked) picked.push("borrow");
+          if ($("cfgFrRepay").checked) picked.push("repay");
+          freeze(picked);
+        });
+        $("cfgLnUnfreeze").addEventListener("click", () => freeze([]));
+        $("cfgLnFreezeAll").addEventListener("click", () => {
+          if (!confirm("Freeze supply, withdraw, borrow and repay on this reserve?\n\nLiquidation stays available so bad debt can still be cleared.")) return;
+          freeze(["supply", "withdraw", "borrow", "repay"]);
+        });
+
+        $("cfgLnRename").addEventListener("click", async () => {
+          const asset = $("cfgLnAsset").value;
+          const cur = cfgLnAssets().find((a) => a.address === asset);
+          const name = prompt("Display name for this reserve (blank restores the token symbol):", cur ? cur.symbol : "");
+          if (name === null) return;
+          cfgLnMsg("Sending…", true);
+          try {
+            const r = await (await postJson("/api/lending/admin/rename", { asset, name: name.trim() })).json();
+            cfgLnMsg(r.ok ? "Renamed ✓" : r.error, !!r.ok);
+            if (r.ok) afterTx();
+          } catch { cfgLnMsg("Request failed.", false); }
+        });
+
+        const visibility = async (hidden) => {
+          cfgLnMsg("Sending…", true);
+          try {
+            const r = await (
+              await postJson("/api/lending/admin/visibility", { asset: $("cfgLnAsset").value, hidden })
+            ).json();
+            cfgLnMsg(
+              r.ok
+                ? hidden
+                  ? "Hidden from the asset list ✓ — existing positions are unaffected"
+                  : "Visible again ✓"
+                : r.error,
+              !!r.ok,
+            );
+            if (r.ok) afterTx();
+          } catch { cfgLnMsg("Request failed.", false); }
+        };
+        $("cfgLnHide").addEventListener("click", () => visibility(true));
+        $("cfgLnShow").addEventListener("click", () => visibility(false));
+
+        const oracle = async (feed) => {
+          cfgLnMsg("Sending…", true);
+          try {
+            const r = await (
+              await postJson("/api/lending/admin/oracle", {
+                asset: $("cfgLnAsset").value,
+                feed,
+                staleAfter: Number($("cfgOracleStale").value || 3600),
+              })
+            ).json();
+            cfgLnMsg(r.ok ? (feed ? "Feed wired ✓" : "Feed cleared — back to the manual price ✓") : r.error, !!r.ok);
+            if (r.ok) afterTx();
+          } catch { cfgLnMsg("Request failed.", false); }
+        };
+        $("cfgOracleSet").addEventListener("click", () => {
+          const feed = $("cfgOracleFeed").value.trim();
+          if (!/^0x[0-9a-fA-F]{40}$/.test(feed)) { cfgLnMsg("Enter a valid contract address.", false); return; }
+          oracle(feed);
+        });
+        $("cfgOracleClear").addEventListener("click", () => oracle(""));
+      }
+
+      /* ---- contract history & fund recovery --------------------------------
+       * Every destructive action confirms first and names what it will touch:
+       * these operations move real money to real people, and an accidental
+       * "Return funds" on the wrong record is not something you can take back. */
+      let historyState = { records: [], current: {} };
+      function cfgHiMsg(text, good) {
+        const row = $("cfgHiMsg");
+        if (!row) return;
+        row.style.display = "flex";
+        row.style.color = good ? "var(--good)" : "var(--warn)";
+        row.lastElementChild.textContent = text;
+      }
+      const cfgHiPicked = () => [...document.querySelectorAll(".cfgHiPick:checked")].map((c) => c.value);
+      const cfgHiOne = () => {
+        const ids = cfgHiPicked();
+        if (ids.length !== 1) { cfgHiMsg("Tick exactly one record for this.", false); return null; }
+        return historyState.records.find((r) => r.id === ids[0]) || null;
+      };
+      const shortAddr = (a) => String(a).slice(0, 8) + "…" + String(a).slice(-4);
+
+      async function loadCfgHistory() {
+        const host = $("cfgHiList");
+        if (!host) return;
+        try {
+          const r = await (await fetch("/api/history", { headers: authHeaders() })).json();
+          if (!r.ok) { host.innerHTML = `<span style="color:var(--warn)">${esc(r.error || "Couldn't load history.")}</span>`; return; }
+          historyState = r;
+          host.innerHTML = r.records.length
+            ? r.records
+                .map((rec) => {
+                  const totals = Object.entries(rec.totals || {})
+                    .map(([asset, raw]) => {
+                      const a = (rec.assets || []).find((x) => x.address === asset);
+                      return `${esc(fmtUnitsJs(raw, (a && a.decimals) || 6))} ${esc((a && a.symbol) || shortAddr(asset))}`;
+                    })
+                    .join(" · ");
+                  return (
+                    `<label style="display:flex;gap:8px;align-items:flex-start">` +
+                    `<input type="checkbox" class="cfgHiPick" value="${esc(rec.id)}" style="margin-top:3px" />` +
+                    `<span><b>${esc(rec.label)}</b> <span style="opacity:.7">(${esc(rec.kind)})</span>` +
+                    `${rec.active ? ' <span style="color:var(--accent)">· current</span>' : ""}` +
+                    `${rec.stale ? ' <span style="color:var(--warn)">· snapshot is stale</span>' : ""}` +
+                    `<span style="display:block;color:var(--muted);font-size:11px">${esc(shortAddr(rec.address))} · ` +
+                    `${rec.outstandingCount} of ${rec.holderCount} holders outstanding` +
+                    `${totals ? ` · owed ${totals}` : ""}</span>` +
+                    `${rec.note ? `<span style="display:block;color:var(--muted);font-size:11px">${esc(rec.note)}</span>` : ""}` +
+                    `</span></label>`
+                  );
+                })
+                .join("")
+            : `<span style="color:var(--muted)">No archived contracts yet.</span>`;
+        } catch {
+          host.innerHTML = `<span style="color:var(--warn)">Couldn't load history.</span>`;
+        }
+      }
+
+      if ($("cfgHiArchive")) {
+        $("cfgHiUseCurrent").addEventListener("click", () => {
+          const addr = (historyState.current || {})[$("cfgHiKind").value];
+          if (!addr) { cfgHiMsg("Nothing of that kind is deployed right now.", false); return; }
+          $("cfgHiAddress").value = addr;
+        });
+        $("cfgHiArchive").addEventListener("click", async () => {
+          const address = $("cfgHiAddress").value.trim();
+          if (!/^0x[0-9a-fA-F]{40}$/.test(address)) { cfgHiMsg("Enter the contract address.", false); return; }
+          cfgHiMsg("Scanning the contract for holders — this reads event logs, so give it a moment…", true);
+          try {
+            const r = await (
+              await postJson("/api/history/archive", {
+                kind: $("cfgHiKind").value,
+                address,
+                label: $("cfgHiLabel").value.trim(),
+              })
+            ).json();
+            cfgHiMsg(
+              r.ok
+                ? r.partial
+                  ? `Archived, but the log scan was incomplete — some holders may be missing. Re-read before paying out.`
+                  : `Archived ✓ — ${r.record.holderCount} holder(s) found`
+                : r.error,
+              !!r.ok && !r.partial,
+            );
+            if (r.ok) { $("cfgHiAddress").value = ""; $("cfgHiLabel").value = ""; loadCfgHistory(); }
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
+        $("cfgHiRefresh").addEventListener("click", async () => {
+          const rec = cfgHiOne();
+          if (!rec) return;
+          cfgHiMsg("Re-reading balances from chain…", true);
+          try {
+            const r = await (await postJson(`/api/history/${rec.id}/refresh`, {})).json();
+            cfgHiMsg(r.ok ? `Refreshed ✓ — ${r.record.outstandingCount} holder(s) outstanding` : r.error, !!r.ok);
+            if (r.ok) loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
+        $("cfgHiActivate").addEventListener("click", async () => {
+          const rec = cfgHiOne();
+          if (!rec) return;
+          try {
+            const r = await (await postJson(`/api/history/${rec.id}/activate`, {})).json();
+            cfgHiMsg(r.ok ? r.note : r.error, !!r.ok);
+            if (r.ok) loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
+        $("cfgHiReturn").addEventListener("click", async () => {
+          const rec = cfgHiOne();
+          if (!rec) return;
+          if (
+            !confirm(
+              `Send the app's own funds to every outstanding holder in "${rec.label}"?\n\n` +
+                `${rec.outstandingCount} holder(s) will be paid the amount the old contract currently ` +
+                `says they hold. Balances are re-read first. This spends real money and cannot be undone.`,
+            )
+          ) return;
+          cfgHiMsg("Re-reading balances, then paying out…", true);
+          try {
+            const r = await (await postJson(`/api/history/${rec.id}/return`, {})).json();
+            if (!r.ok) { cfgHiMsg(r.error, false); return; }
+            const failed = (r.sent || []).filter((s) => s.error);
+            cfgHiMsg(
+              failed.length
+                ? `${r.sent.length - failed.length} transfer(s) sent, ${failed.length} failed — re-run to retry the rest.`
+                : r.sent.length
+                  ? `Returned funds to ${new Set(r.sent.map((s) => s.address)).size} holder(s) ✓`
+                  : r.note || "Nothing outstanding.",
+              !failed.length,
+            );
+            loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
+        $("cfgHiMigrate").addEventListener("click", async () => {
+          const rec = cfgHiOne();
+          if (!rec) return;
+          const target = $("cfgHiTarget").value.trim();
+          if (!/^0x[0-9a-fA-F]{40}$/.test(target)) { cfgHiMsg("Enter the replacement contract's address.", false); return; }
+          if (
+            !confirm(
+              `Re-create ${rec.outstandingCount} holder position(s) from "${rec.label}" in ${shortAddr(target)}?\n\n` +
+                `The app pays this in from its own funds. Holders keep their claim on the old contract too — ` +
+                `nothing here moves their existing position.`,
+            )
+          ) return;
+          cfgHiMsg("Migrating…", true);
+          try {
+            const r = await (await postJson(`/api/history/${rec.id}/migrate`, { target })).json();
+            if (!r.ok) { cfgHiMsg(r.error, false); return; }
+            const failed = (r.moved || []).filter((m) => m.error);
+            cfgHiMsg(
+              failed.length
+                ? `${r.moved.length - failed.length} migrated, ${failed.length} failed — re-run to retry the rest.`
+                : r.moved.length
+                  ? `Migrated ${r.moved.length} position(s) ✓`
+                  : r.note || "Nothing outstanding.",
+              !failed.length,
+            );
+            loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
+        $("cfgHiMerge").addEventListener("click", async () => {
+          const ids = cfgHiPicked();
+          if (ids.length < 2) { cfgHiMsg("Tick at least two records of the same kind to merge.", false); return; }
+          const label = prompt("Name for the merged record:", "Merged records");
+          if (label === null) return;
+          try {
+            const r = await (await postJson("/api/history/merge", { ids, label })).json();
+            cfgHiMsg(r.ok ? "Merged ✓" : r.error, !!r.ok);
+            if (r.ok) loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
+        $("cfgHiSplit").addEventListener("click", async () => {
+          const rec = cfgHiOne();
+          if (!rec) return;
+          const raw = prompt(
+            "Addresses to move into a new record, comma-separated:\n\n" +
+              "Balances move whole. To split a partial amount, split the holder out first, then edit the amounts.",
+            "",
+          );
+          if (raw === null) return;
+          const addresses = raw.split(/[\s,]+/).filter(Boolean);
+          if (!addresses.length) { cfgHiMsg("No addresses given.", false); return; }
+          try {
+            const r = await (await postJson(`/api/history/${rec.id}/split`, { addresses })).json();
+            cfgHiMsg(r.ok ? `Split off ${r.record.holderCount} holder(s) ✓` : r.error, !!r.ok);
+            if (r.ok) loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
+        $("cfgHiDelete").addEventListener("click", async () => {
+          const ids = cfgHiPicked();
+          if (!ids.length) { cfgHiMsg("Tick the records to delete.", false); return; }
+          const outstanding = historyState.records
+            .filter((r) => ids.includes(r.id))
+            .reduce((n, r) => n + r.outstandingCount, 0);
+          if (
+            !confirm(
+              outstanding
+                ? `${outstanding} holder(s) across these records have NOT been settled.\n\n` +
+                    `Deleting loses the record of who is owed what. Delete anyway?`
+                : `Delete ${ids.length} record(s)?`,
+            )
+          ) return;
+          try {
+            const r = await (await postJson("/api/history/delete", { ids })).json();
+            cfgHiMsg(r.ok ? `Deleted ${r.removed} ✓` : r.error, !!r.ok);
+            if (r.ok) loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+
+        $("cfgHiDeleteAll").addEventListener("click", async () => {
+          if (!confirm("Delete every history record, including any with funds still outstanding?")) return;
+          try {
+            const r = await (await postJson("/api/history/delete", { all: true })).json();
+            cfgHiMsg(r.ok ? `Deleted ${r.removed} ✓` : r.error, !!r.ok);
+            if (r.ok) loadCfgHistory();
+          } catch { cfgHiMsg("Request failed.", false); }
+        });
+      }
+
+      /* ---- notice authoring ------------------------------------------------ */
+      const NOTICE_UNITS = { second: 1, minute: 60, hour: 3600, day: 86400, week: 604800 };
+      function cfgNoMsg(text, good) {
+        const row = $("cfgNoMsg");
+        if (!row) return;
+        row.style.display = "flex";
+        row.style.color = good ? "var(--good)" : "var(--warn)";
+        row.lastElementChild.textContent = text;
+      }
+      async function loadCfgNotices() {
+        const host = $("cfgNoList");
+        if (!host) return;
+        try {
+          const r = await (await fetch("/api/notices/all", { headers: authHeaders() })).json();
+          const items = (r && r.notices) || [];
+          host.innerHTML = items.length
+            ? items
+                .map(
+                  (n) =>
+                    `<label style="display:flex;gap:8px;align-items:flex-start">` +
+                    `<input type="checkbox" class="cfgNoPick" value="${esc(n.id)}" style="margin-top:3px" />` +
+                    `<span><span style="color:${esc(n.color || "var(--text)")}">` +
+                    `${n.kind === "alert" ? "⚠️ " : ""}${esc(n.text)}</span>` +
+                    `<span style="display:block;color:var(--muted);font-size:11px">` +
+                    `${esc(fmtWhen(n.startAt))}` +
+                    `${n.repeatSeconds ? ` · repeats every ${esc(String(n.repeatSeconds))}s` : " · once"}` +
+                    `${n.enabled ? "" : " · disabled"}</span></span></label>`,
+                )
+                .join("")
+            : `<span style="color:var(--muted)">No notices yet.</span>`;
+        } catch {
+          host.innerHTML = `<span style="color:var(--warn)">Couldn't load notices.</span>`;
+        }
+      }
+
+      if ($("cfgNoPublish")) {
+        $("cfgNoPublish").addEventListener("click", async () => {
+          const text = $("cfgNoText").value.trim();
+          if (!text) { cfgNoMsg("Write the message first.", false); return; }
+          const dur = Math.max(1, Number($("cfgNoDurEvery").value || 30)) * NOTICE_UNITS[$("cfgNoDurUnit").value];
+          const repEvery = Number($("cfgNoRepEvery").value || 0);
+          const repeat = repEvery > 0 ? repEvery * NOTICE_UNITS[$("cfgNoRepUnit").value] : 0;
+          if (repeat > 0 && repeat <= dur) {
+            cfgNoMsg("Repeat interval must be longer than the time it stays on screen.", false);
+            return;
+          }
+          const body = {
+            text,
+            kind: $("cfgNoKind").value,
+            color: $("cfgNoColor").value,
+            // datetime-local is local time; Date.parse gives the right epoch ms.
+            startAt: $("cfgNoStart").value ? Date.parse($("cfgNoStart").value) : Date.now(),
+            durationSeconds: dur,
+            repeatSeconds: repeat,
+            endAt: $("cfgNoEnd").value ? Date.parse($("cfgNoEnd").value) : 0,
+          };
+          cfgNoMsg("Publishing…", true);
+          try {
+            const r = await (await postJson("/api/notices", body)).json();
+            cfgNoMsg(r.ok ? "Published ✓" : r.error, !!r.ok);
+            if (r.ok) { $("cfgNoText").value = ""; loadCfgNotices(); pollNotices(); }
+          } catch { cfgNoMsg("Request failed.", false); }
+        });
+        $("cfgNoRefresh").addEventListener("click", loadCfgNotices);
+        $("cfgNoDeleteSel").addEventListener("click", async () => {
+          const ids = [...document.querySelectorAll(".cfgNoPick:checked")].map((c) => c.value);
+          if (!ids.length) { cfgNoMsg("Tick the notices to delete.", false); return; }
+          try {
+            const r = await (await postJson("/api/notices/delete", { ids })).json();
+            cfgNoMsg(r.ok ? `Deleted ${r.removed} ✓` : r.error, !!r.ok);
+            if (r.ok) { loadCfgNotices(); pollNotices(); }
+          } catch { cfgNoMsg("Request failed.", false); }
+        });
+        $("cfgNoDeleteAll").addEventListener("click", async () => {
+          if (!confirm("Delete every notice, including scheduled ones?")) return;
+          try {
+            const r = await (await postJson("/api/notices/delete", { all: true })).json();
+            cfgNoMsg(r.ok ? `Deleted ${r.removed} ✓` : r.error, !!r.ok);
+            if (r.ok) { loadCfgNotices(); pollNotices(); }
+          } catch { cfgNoMsg("Request failed.", false); }
+        });
       }
 
       /* ---- AMM administration inside App Config ---------------------------

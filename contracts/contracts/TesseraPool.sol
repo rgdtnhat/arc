@@ -9,6 +9,22 @@ interface IERC20 {
 }
 
 /**
+ * @notice Chainlink's `AggregatorV3Interface` — the de-facto open standard for
+ *         on-chain price feeds, and the one Aave and Compound both consume.
+ *         Declared here rather than imported so the build has no external
+ *         dependency; the selectors are what matter and any feed implementing
+ *         this interface (Chainlink, Chronicle's Chainlink-compatible adapter,
+ *         Pyth's `PythAggregatorV3` wrapper, RedStone's classic adapter) works.
+ */
+interface IAggregatorV3 {
+    function decimals() external view returns (uint8);
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
+/**
  * @title TesseraPool
  * @notice An isolated lending & borrowing pool (money market).
  *
@@ -62,8 +78,50 @@ contract TesseraPool is ReentrancyGuard {
     address public owner;
     address public treasury; // receives the reserveFactor cut (app-owner revenue)
 
+    /**
+     * @notice Per-action freeze flags, as a bitmask.
+     *
+     * A single "paused" boolean is the wrong shape for an incident: freezing
+     * deposits while a suspicious position is investigated should not also stop
+     * honest users repaying debt or pulling their funds out. So each action is
+     * frozen independently, and the two actions that *reduce* a user's exposure
+     * — withdraw and repay — are the ones an operator can leave open.
+     */
+    uint8 public constant FREEZE_SUPPLY = 1;
+    uint8 public constant FREEZE_WITHDRAW = 2;
+    uint8 public constant FREEZE_BORROW = 4;
+    uint8 public constant FREEZE_REPAY = 8;
+    /// @notice Everything frozen. Liquidation still works — see `setFrozen`.
+    uint8 public constant FREEZE_ALL = 15;
+
     address[] public reserveList;
     mapping(address => Reserve) public reserves;
+    /// @dev asset => bitmask of frozen actions.
+    mapping(address => uint8) public frozenActions;
+    /// @dev asset => operator-set display name; empty means "use the token symbol".
+    mapping(address => string) public reserveName;
+    /// @dev asset => hidden from the app's asset list (funds stay fully accessible).
+    mapping(address => bool) public reserveHidden;
+
+    /**
+     * @notice Optional Chainlink-compatible price feed per asset.
+     *
+     * When a feed is set it is the **only** source of truth for that asset: the
+     * stored `price` is ignored. A feed that answers with a non-positive price,
+     * an incomplete round, or an answer older than `feedStaleAfter` makes every
+     * price-dependent action revert rather than fall back to the operator-set
+     * number. Falling back would be the dangerous choice — a silently stale
+     * price is exactly what lets someone borrow against a mispriced asset — so
+     * the market pauses instead, and an operator who wants the manual price back
+     * must clear the feed deliberately.
+     *
+     * With no feed configured (`address(0)`) the operator-set `price` is used,
+     * which is how Arc testnet runs today while no production feeds exist there.
+     */
+    mapping(address => address) public priceFeed;
+    /// @dev asset => seconds after which a feed answer is considered stale.
+    mapping(address => uint32) public feedStaleAfter;
+    uint32 public constant DEFAULT_FEED_STALE_AFTER = 1 hours;
     mapping(address => mapping(address => uint256)) public supplyShares; // asset => user => shares
     mapping(address => mapping(address => uint256)) public borrowShares; // asset => user => shares
 
@@ -82,7 +140,15 @@ contract TesseraPool is ReentrancyGuard {
         uint256 seized
     );
 
+    event ReserveFrozen(address indexed asset, uint8 mask);
+    event ReserveRenamed(address indexed asset, string name);
+    event ReserveVisibility(address indexed asset, bool hidden);
+
+    event PriceFeedSet(address indexed asset, address feed, uint32 staleAfter);
+
     error NotOwner();
+    error ActionFrozen();
+    error BadOracle();
     error UnknownReserve();
     error NotBorrowable();
     error InsufficientLiquidity();
@@ -109,7 +175,7 @@ contract TesseraPool is ReentrancyGuard {
         uint16 reserveFactor,
         bool borrowable,
         uint8 decimals_,
-        uint256 price
+        uint256 usdPrice
     ) external onlyOwner {
         require(!reserves[asset].enabled, "exists");
         require(cFactor <= BPS && lFactor <= BPS && lFactor > 0 && reserveFactor < BPS, "factors");
@@ -120,7 +186,7 @@ contract TesseraPool is ReentrancyGuard {
             cFactor: cFactor,
             lFactor: lFactor,
             reserveFactor: reserveFactor,
-            price: price,
+            price: usdPrice,
             totalSupplyShares: 0,
             totalSupplyAssets: 0,
             totalBorrowShares: 0,
@@ -131,35 +197,181 @@ contract TesseraPool is ReentrancyGuard {
         emit ReserveAdded(asset, cFactor, lFactor, borrowable);
     }
 
-    function setPrice(address asset, uint256 price) external onlyOwner {
+    /// @notice Manual price, used only while `asset` has no feed configured.
+    function setPrice(address asset, uint256 usdPrice) external onlyOwner {
         if (!reserves[asset].enabled) revert UnknownReserve();
-        reserves[asset].price = price;
-        emit PriceSet(asset, price);
+        reserves[asset].price = usdPrice;
+        emit PriceSet(asset, usdPrice);
     }
 
     function setTreasury(address t) external onlyOwner {
         treasury = t;
     }
 
+    /**
+     * @notice Freeze some or all actions on a reserve.
+     * @param mask Bitwise OR of FREEZE_SUPPLY / FREEZE_WITHDRAW / FREEZE_BORROW /
+     *        FREEZE_REPAY; 0 unfreezes everything, FREEZE_ALL stops all four.
+     * @dev Liquidation is deliberately never frozen. A freeze stops new risk from
+     *      being taken on, but positions keep accruing interest, and blocking
+     *      liquidation during a freeze would let bad debt build with no way to
+     *      clear it — which harms the very depositors the freeze protects.
+     */
+    function setFrozen(address asset, uint8 mask) external onlyOwner {
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        require(mask <= FREEZE_ALL, "mask");
+        frozenActions[asset] = mask;
+        emit ReserveFrozen(asset, mask);
+    }
+
+    /// @notice Apply the same freeze mask to several reserves in one call.
+    function setFrozenMany(address[] calldata assets, uint8 mask) external onlyOwner {
+        require(mask <= FREEZE_ALL, "mask");
+        for (uint256 i = 0; i < assets.length; i++) {
+            if (!reserves[assets[i]].enabled) revert UnknownReserve();
+            frozenActions[assets[i]] = mask;
+            emit ReserveFrozen(assets[i], mask);
+        }
+    }
+
+    /// @notice Display name for a reserve. Cosmetic only — never affects accounting.
+    function renameReserve(address asset, string calldata name) external onlyOwner {
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        require(bytes(name).length <= 40, "name");
+        reserveName[asset] = name;
+        emit ReserveRenamed(asset, name);
+    }
+
+    /**
+     * @notice Hide a reserve from the app's asset list.
+     * @dev Presentation only: hiding does **not** freeze anything, and a hidden
+     *      reserve's suppliers keep full access to withdraw and repay. Use
+     *      `setFrozen` to actually stop activity.
+     */
+    function setReserveHidden(address asset, bool hidden) external onlyOwner {
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        reserveHidden[asset] = hidden;
+        emit ReserveVisibility(asset, hidden);
+    }
+
+    /// @notice Reserve presentation + freeze state, for the app's asset list.
+    function reserveMeta(address asset) external view returns (uint8 frozen, bool hidden, string memory name) {
+        return (frozenActions[asset], reserveHidden[asset], reserveName[asset]);
+    }
+
+    function _requireNotFrozen(address asset, uint8 action) internal view {
+        if (frozenActions[asset] & action != 0) revert ActionFrozen();
+    }
+
+    /**
+     * @notice Point an asset at a Chainlink-compatible feed, or clear it.
+     * @param feed Aggregator address; `address(0)` reverts to the manual price.
+     * @param staleAfter Seconds before an answer is rejected; 0 uses the default.
+     * @dev The feed is read once here so a wrong address fails now, loudly,
+     *      rather than at the moment someone tries to withdraw.
+     */
+    function setPriceFeed(address asset, address feed, uint32 staleAfter) external onlyOwner {
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        priceFeed[asset] = feed;
+        feedStaleAfter[asset] = staleAfter;
+        if (feed != address(0) && _feedPrice(asset) == 0) revert BadOracle();
+        emit PriceFeedSet(asset, feed, staleAfter);
+    }
+
+    /**
+     * @notice The price this pool actually uses, scaled to PRICE_SCALE (1e8).
+     * @dev Reverts when a configured feed is unusable — see `priceFeed`.
+     */
+    function price(address asset) public view returns (uint256) {
+        if (priceFeed[asset] == address(0)) return reserves[asset].price;
+        uint256 p = _feedPrice(asset);
+        if (p == 0) revert BadOracle();
+        return p;
+    }
+
+    /**
+     * @notice Read + validate a feed. Returns 0 for any unusable answer.
+     *
+     * The four checks are the ones every oracle post-mortem comes back to:
+     * a non-positive answer (a broken or de-registered feed), an unfinished
+     * round (`updatedAt == 0`), an answer carried over from an earlier round
+     * (`answeredInRound < roundId`), and an answer too old to trust.
+     */
+    function _feedPrice(address asset) internal view returns (uint256) {
+        address feed = priceFeed[asset];
+        try IAggregatorV3(feed).latestRoundData() returns (
+            uint80 roundId,
+            int256 answer,
+            uint256,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) {
+            if (answer <= 0) return 0;
+            if (updatedAt == 0 || answeredInRound < roundId) return 0;
+            uint32 maxAge = feedStaleAfter[asset] == 0 ? DEFAULT_FEED_STALE_AFTER : feedStaleAfter[asset];
+            if (block.timestamp > updatedAt + maxAge) return 0;
+            uint8 d;
+            try IAggregatorV3(feed).decimals() returns (uint8 fd) {
+                d = fd;
+            } catch {
+                return 0;
+            }
+            // Normalise the feed's own scale to PRICE_SCALE (1e8).
+            uint256 raw = uint256(answer);
+            if (d == 8) return raw;
+            return d < 8 ? raw * (10 ** (8 - d)) : raw / (10 ** (d - 8));
+        } catch {
+            return 0;
+        }
+    }
+
+    /// @notice Whether the price for `asset` is currently usable (never reverts).
+    function priceOk(address asset) external view returns (bool) {
+        if (priceFeed[asset] == address(0)) return reserves[asset].price > 0;
+        return _feedPrice(asset) > 0;
+    }
+
     // --- core actions ---------------------------------------------------------
 
     function supply(address asset, uint256 amount) external nonReentrant {
+        _supplyFor(asset, msg.sender, amount);
+    }
+
+    /**
+     * @notice Supply on someone else's behalf: **you** pay, **they** get the position.
+     *
+     * The counterpart to `repayFor`, and what a pool migration is built on: the
+     * operator re-creates each supplier's position in a replacement pool out of
+     * their own funds. There is deliberately no admin function that moves an
+     * existing supplier's shares — that primitive is indistinguishable from a
+     * rug pull, so it does not exist. Handing a stranger your own money can only
+     * help them, so this is permissionless.
+     */
+    function supplyFor(address asset, address user, uint256 amount) external nonReentrant {
+        if (user == address(0)) revert ZeroAmount();
+        _supplyFor(asset, user, amount);
+    }
+
+    function _supplyFor(address asset, address user, uint256 amount) internal {
         if (amount == 0) revert ZeroAmount();
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
+        _requireNotFrozen(asset, FREEZE_SUPPLY);
         _accrue(asset);
         uint256 shares = r.totalSupplyShares == 0 ? amount : (amount * r.totalSupplyShares) / r.totalSupplyAssets;
         if (shares == 0) revert ZeroAmount();
-        supplyShares[asset][msg.sender] += shares;
+        supplyShares[asset][user] += shares;
         r.totalSupplyShares += shares;
         r.totalSupplyAssets += amount;
+        // Funds always come from the caller, never from `user`.
         _pull(asset, msg.sender, amount);
-        emit Supply(asset, msg.sender, amount, shares);
+        emit Supply(asset, user, amount, shares);
     }
 
     function withdraw(address asset, uint256 amount) external nonReentrant {
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
+        _requireNotFrozen(asset, FREEZE_WITHDRAW);
         _accrueAll();
         uint256 bal = supplyBalance(asset, msg.sender);
         if (amount == 0 || amount > bal) revert ZeroAmount();
@@ -178,6 +390,7 @@ contract TesseraPool is ReentrancyGuard {
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
         if (!r.borrowable) revert NotBorrowable();
+        _requireNotFrozen(asset, FREEZE_BORROW);
         _accrueAll();
         if (amount > _available(r)) revert InsufficientLiquidity();
         uint256 shares = r.totalBorrowShares == 0 ? amount : (amount * r.totalBorrowShares) / r.totalBorrowAssets;
@@ -201,6 +414,7 @@ contract TesseraPool is ReentrancyGuard {
     function _repayFor(address asset, address user, uint256 amount) internal {
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
+        _requireNotFrozen(asset, FREEZE_REPAY);
         _accrue(asset);
         uint256 debt = borrowBalance(asset, user);
         uint256 pay = amount > debt ? debt : amount;
@@ -315,13 +529,11 @@ contract TesseraPool is ReentrancyGuard {
     }
 
     function _value(address asset, uint256 amount) internal view returns (uint256) {
-        Reserve storage r = reserves[asset];
-        return (amount * r.price) / (10 ** r.decimals);
+        return (amount * price(asset)) / (10 ** reserves[asset].decimals);
     }
 
     function _amountForValue(address asset, uint256 value) internal view returns (uint256) {
-        Reserve storage r = reserves[asset];
-        return (value * (10 ** r.decimals)) / r.price;
+        return (value * (10 ** reserves[asset].decimals)) / price(asset);
     }
 
     function _available(Reserve storage r) internal view returns (uint256) {
