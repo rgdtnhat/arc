@@ -142,10 +142,12 @@ async function adopt(label, recorded, fresh, deployFn, { custodial = false } = {
         return { address: addr, reused: true };
       }
       if (status === "unknown") {
-        throw new Error(
-          `Could not verify whether ${label} at ${addr} still exists (the RPC kept failing). ` +
-            `Refusing to deploy a replacement, because that would orphan the existing deployment and any funds in it. ` +
-            `Retry when the network settles, or pass --fresh to deliberately deploy new contracts.`,
+        throw operatorError(
+          `Could not verify whether ${label} at ${addr} still exists — the RPC kept failing.`,
+          [
+            "Deploying a replacement would orphan the existing contract and any funds in it, so this stops instead.",
+            "Wait for the network to settle and re-run, or pass --fresh to deliberately deploy new contracts.",
+          ],
         );
       }
     }
@@ -153,11 +155,16 @@ async function adopt(label, recorded, fresh, deployFn, { custodial = false } = {
     // Nothing known and nothing live: deploying is only safe if the operator
     // meant to. Fund-custody components demand an explicit opt-in.
     if (custodial && !process.argv.includes("--deploy-missing")) {
-      throw new Error(
-        `No ${label} is recorded or found in history, so a NEW one would be deployed. ` +
-          `${label} holds funds, so this needs an explicit opt-in: re-run with --deploy-missing ` +
-          `(first deployment) or --fresh (deliberately abandon the old one). If you expected an existing ` +
-          `${label}, restore deployments/arc.json (or arc.local.json) with its address first.`,
+      throw operatorError(
+        `${label} has never been deployed on this host, and it holds funds.`,
+        [
+          candidates.length
+            ? `${candidates.length} address(es) are known for it but none hold code, which is worth understanding before deploying over the top.`
+            : `Nothing is recorded for it in deployments/arc.json, arc.local.json or arc.history.json.`,
+          "First deployment?  npm run pool:arc:init      (adds --deploy-missing)",
+          "Replacing an old one on purpose?  npm run pool:arc -- --fresh",
+          `Expected an existing ${label}?  restore its address into deployments/arc.json first — do not deploy over it.`,
+        ],
       );
     }
   }
@@ -171,6 +178,20 @@ async function adopt(label, recorded, fresh, deployFn, { custodial = false } = {
  * a skip is visible rather than buried in the scroll.
  */
 const skipped = [];
+
+/**
+ * A stop that the operator can act on, as opposed to a crash.
+ *
+ * These carry the fix, and the top-level handler prints them without a stack
+ * trace — a stack tells you where in this file the check lives, which is not the
+ * question. The question is "what do I run now", and that is `next`.
+ */
+function operatorError(message, next) {
+  const e = new Error(message);
+  e.operator = true;
+  e.next = next;
+  return e;
+}
 
 /**
  * Run a step whose failure must not stop the deployment.
@@ -502,10 +523,19 @@ async function main() {
 
 main().catch((e) => {
   // A fatal error means a contract could not be deployed or the record could not
-  // be written. Lead with the one-line reason: the full viem error that follows
-  // includes the whole ABI, which buries it.
-  console.error(`\n❌ pool:arc failed: ${String(e?.shortMessage ?? e?.message ?? e).split("\n")[0]}`);
-  if (skipped.length) console.error(`   (${skipped.length} optional step(s) had already been skipped)`);
-  console.error(e);
+  // be written. Lead with the one-line reason: a raw viem error includes the
+  // whole ABI, which buries it.
+  console.error(`\n❌ pool:arc stopped: ${String(e?.shortMessage ?? e?.message ?? e).split("\n")[0]}`);
+  if (e?.operator) {
+    // A deliberate stop with a known fix. No stack — it would only point at the
+    // guard inside this script, which is not what the operator needs.
+    for (const line of e.next ?? []) console.error(`   ${line}`);
+  } else {
+    console.error(e);
+  }
+  if (skipped.length) {
+    console.error(`\n   ${skipped.length} optional step(s) had already been skipped before this:`);
+    for (const s of skipped) console.error(`   · ${s}`);
+  }
   process.exit(1);
 });

@@ -256,7 +256,17 @@ function scratchTree(record: Record<string, unknown>) {
   return dir;
 }
 
-async function runScript(node: FakeNode, dir: string, args: string[] = []) {
+async function runScript(node: FakeNode, dir: string, args: string[] = [], opts: { expectFail?: boolean } = {}) {
+  if (opts.expectFail) {
+    try {
+      const ok = await runScript(node, dir, args);
+      assert.fail(`expected the script to stop, but it succeeded:\n${ok.stdout}`);
+    } catch (e) {
+      const err = e as { code?: number; stdout?: string; stderr?: string };
+      assert.equal(err.code, 1, "exits non-zero");
+      return { stdout: err.stdout ?? "", stderr: err.stderr ?? "" };
+    }
+  }
   return run(
     process.execPath,
     ["--import", "tsx", path.join(dir, "scripts/pool-arc.mjs"), ...args],
@@ -363,6 +373,32 @@ test("an existing AMM with pools is not given duplicates", async (t) => {
 
   assert.match(stdout, /AMM already has 2 pool\(s\)/);
   assert.equal(node.sent.filter((n) => n === "createPool").length, 0, "no duplicate pools");
+});
+
+test("a fund-holding contract with no history stops with the command to run, not a stack", async (t) => {
+  // This is the gate that fires on a host where the AMM subsystem has never been
+  // deployed. It is *meant* to stop — deploying a fund-custody contract must be
+  // deliberate. What it must not do is bury the fix under a stack trace.
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree(BASE_RECORD);
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  // No --deploy-missing this time.
+  const { stdout, stderr } = await runScript(node, dir, [], { expectFail: true });
+  const out = stdout + stderr;
+
+  assert.match(out, /pool:arc stopped/);
+  assert.match(out, /TesseraAmmFeeCollector has never been deployed on this host/);
+  // The fix, by name.
+  assert.match(out, /npm run pool:arc:init/);
+  assert.match(out, /--fresh/);
+  // No stack trace: it would point at the guard, which is not the question.
+  assert.doesNotMatch(out, /at adopt \(/);
+  assert.doesNotMatch(out, /processTicksAndRejections/);
+
+  // Nothing was written, so a later run with the flag starts clean.
+  const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
+  assert.equal(record.tesseraAmm, undefined);
 });
 
 test("an unreadable pool count creates nothing rather than risking duplicates", async (t) => {

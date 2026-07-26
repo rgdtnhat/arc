@@ -303,3 +303,48 @@ explanatory comment, and the API test suite exercises each one.
   credential store.
 - Before real funds: rotate all keys, move signing to Circle DCW / an HSM, and
   commission a professional smart-contract audit.
+
+## Dependency advisories
+
+`npm audit` reports ~51 advisories at the repo root. Every one of them is in a
+**devDependency**, and none of them is in the tree that runs in production:
+
+```
+npm audit --omit=dev     →  found 0 vulnerabilities
+npm audit                →  51 (19 low, 9 moderate, 23 high)
+```
+
+They come from the Solidity toolchain — `hardhat` and its transitive tree
+(`solidity-coverage`, `eth-gas-reporter`, `sc-istanbul`, `mocha`, and the pinned
+ethers v5 `@ethersproject/*` packages). Hardhat 2.x vendors those versions, so
+they cannot be lifted from here; they clear when Hardhat's own tree moves.
+`npm audit fix` is applied (it took Hardhat to 2.29.0, verified byte-identical
+bytecode and 104/104 contract tests); `--force` is deliberately **not**, because
+it would install a new major of the toolchain that compiles the contracts.
+
+Two advisory packages do appear in the production tree, both at versions the
+advisories exclude:
+
+| Package | Production version | Advisory range | Status |
+|---|---|---|---|
+| `cookie` (via `express`) | 0.7.2 | `< 0.7.0` | not affected |
+| `ws` (via `viem` → `isows`) | 8.21.0 | `8.0.0 – 8.20.1` | not affected |
+
+The vulnerable copies of both are nested under the dev tree
+(`@ethersproject/providers/node_modules/ws`, and `cookie@0.4.2` under Hardhat).
+
+**What was actually wrong.** The count itself was not the problem — the
+`Dockerfile` was. It ran a plain `npm install`, so the whole dev toolchain was
+installed into the image that serves the site, even though nothing under
+`agent/`, `shared/` or `providers/` imports Hardhat and nothing reads its build
+artifacts. The build is now two stages: the builder compiles the contracts (which
+exports the ABIs and bytecode into `shared/src/`), and the runtime stage does a
+fresh `npm install --omit=dev`. That takes the shipped tree from 423 packages to
+95, drops the native build toolchain, and removes all 51 advisories from what
+runs — verified by installing the production-only tree and serving real requests
+from it (`/`, `/api/state`, `/api/feeds/*` all 200, live Arc reads intact).
+
+`tsx` is therefore a **production** dependency of the agent, not a dev one: the
+app is served straight from its TypeScript sources via `node --import tsx`, so it
+is a runtime loader here. Listing it under `devDependencies` would make an
+`--omit=dev` install unable to start.
