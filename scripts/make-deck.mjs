@@ -15,6 +15,7 @@
 import { deflateRawSync } from "node:zlib";
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import * as SK from "./deck-skeleton.mjs";
 
 // --- deck content -----------------------------------------------------------
 
@@ -234,7 +235,7 @@ function zip(entries) {
 
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4); // version needed
+    local.writeUInt16LE(20, 4); // version needed: 2.0 (deflate)
     local.writeUInt16LE(0, 6); // flags
     local.writeUInt16LE(useDeflate ? 8 : 0, 8);
     local.writeUInt16LE(0, 10); // time
@@ -248,7 +249,9 @@ function zip(entries) {
 
     const cd = Buffer.alloc(46);
     cd.writeUInt32LE(0x02014b50, 0);
-    cd.writeUInt16LE(20, 4);
+    // Version made by: 3.20 = Unix, ZIP 2.0 — what real archivers write. An
+    // unusual value here is the kind of thing a strict reader can baulk at.
+    cd.writeUInt16LE(0x0314, 4);
     cd.writeUInt16LE(20, 6);
     cd.writeUInt16LE(0, 8);
     cd.writeUInt16LE(useDeflate ? 8 : 0, 10);
@@ -262,7 +265,8 @@ function zip(entries) {
     cd.writeUInt16LE(0, 32);
     cd.writeUInt16LE(0, 34);
     cd.writeUInt16LE(0, 36);
-    cd.writeUInt32LE(0, 38);
+    // External attributes: regular file, 0644.
+    cd.writeUInt32LE((0o100644 << 16) >>> 0, 38);
     cd.writeUInt32LE(offset, 42);
     central.push(cd, nameBuf);
 
@@ -559,52 +563,17 @@ function notesXml(text) {
   );
 }
 
-const THEME = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Tessera">
-<a:themeElements>
-<a:clrScheme name="Tessera"><a:dk1><a:srgbClr val="${BRAND.bg}"/></a:dk1><a:lt1><a:srgbClr val="${BRAND.text}"/></a:lt1>
-<a:dk2><a:srgbClr val="${BRAND.panel}"/></a:dk2><a:lt2><a:srgbClr val="F2F6FC"/></a:lt2>
-<a:accent1><a:srgbClr val="${BRAND.accent}"/></a:accent1><a:accent2><a:srgbClr val="${BRAND.accent2}"/></a:accent2>
-<a:accent3><a:srgbClr val="34D399"/></a:accent3><a:accent4><a:srgbClr val="FBBF24"/></a:accent4>
-<a:accent5><a:srgbClr val="F87171"/></a:accent5><a:accent6><a:srgbClr val="A78BFA"/></a:accent6>
-<a:hlink><a:srgbClr val="${BRAND.accent2}"/></a:hlink><a:folHlink><a:srgbClr val="${BRAND.muted}"/></a:folHlink></a:clrScheme>
-<a:fontScheme name="Tessera"><a:majorFont><a:latin typeface="Segoe UI"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>
-<a:minorFont><a:latin typeface="Segoe UI"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme>
-<a:fmtScheme name="Tessera">
-<a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>
-<a:lnStyleLst><a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>
-<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>
-<a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst>
-</a:fmtScheme></a:themeElements></a:theme>`;
-
-const SLIDE_MASTER = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
-<p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr val="${BRAND.bg}"/></a:solidFill><a:effectLst/></p:bgPr></p:bg>
-<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
-<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
-</p:spTree></p:cSld><p:clrMap bg1="dk1" tx1="lt1" bg2="dk2" tx2="lt2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
-<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst></p:sldMaster>`;
-
-const SLIDE_LAYOUT = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="blank" preserve="1">
-<p:cSld name="Blank"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
-<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
-</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>`;
-
-const NOTES_MASTER = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<p:notesMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
-<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
-<p:grpSpPr/>
-<p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
-<p:spPr><a:xfrm><a:off x="685800" y="685800"/><a:ext cx="5486400" cy="6172200"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
-<p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
-</p:spTree></p:cSld><p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
-</p:notesMaster>`;
-
 function build() {
   const n = SLIDES.length;
   const files = [];
+  const rel = (id, type, target) =>
+    `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" Target="${target}"/>`;
+  const rels = (body) =>
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${body}</Relationships>`;
 
+  // --- content types ---
+  const CT = "application/vnd.openxmlformats-officedocument.presentationml";
   files.push({
     name: "[Content_Types].xml",
     data:
@@ -612,15 +581,19 @@ function build() {
       `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
       `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
       `<Default Extension="xml" ContentType="application/xml"/>` +
-      `<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>` +
-      `<Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>` +
-      `<Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>` +
-      `<Override PartName="/ppt/notesMasters/notesMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml"/>` +
+      `<Override PartName="/ppt/presentation.xml" ContentType="${CT}.presentation.main+xml"/>` +
+      `<Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="${CT}.slideMaster+xml"/>` +
+      `<Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="${CT}.slideLayout+xml"/>` +
+      `<Override PartName="/ppt/notesMasters/notesMaster1.xml" ContentType="${CT}.notesMaster+xml"/>` +
+      `<Override PartName="/ppt/presProps.xml" ContentType="${CT}.presProps+xml"/>` +
+      `<Override PartName="/ppt/viewProps.xml" ContentType="${CT}.viewProps+xml"/>` +
+      `<Override PartName="/ppt/tableStyles.xml" ContentType="${CT}.tableStyles+xml"/>` +
       `<Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>` +
+      `<Override PartName="/ppt/theme/theme2.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>` +
       SLIDES.map(
         (_, i) =>
-          `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>` +
-          `<Override PartName="/ppt/notesSlides/notesSlide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>`,
+          `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="${CT}.slide+xml"/>` +
+          `<Override PartName="/ppt/notesSlides/notesSlide${i + 1}.xml" ContentType="${CT}.notesSlide+xml"/>`,
       ).join("") +
       `<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>` +
       `<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>` +
@@ -629,16 +602,17 @@ function build() {
 
   files.push({
     name: "_rels/.rels",
-    data:
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>` +
+    data: rels(
+      rel("rId1", "officeDocument", "ppt/presentation.xml") +
       `<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>` +
-      `<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>` +
-      `</Relationships>`,
+      rel("rId3", "extended-properties", "docProps/app.xml"),
+    ),
   });
 
-  const sldIds = SLIDES.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 3}"/>`).join("");
+  // --- presentation ---
+  // Relationship ids: 1 master, 2 notesMaster, 3..n+2 slides, then the tail parts.
+  const slideRelBase = 3;
+  const tail = slideRelBase + n;
   files.push({
     name: "ppt/presentation.xml",
     data:
@@ -648,79 +622,84 @@ function build() {
       `xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" saveSubsetFonts="1">` +
       `<p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>` +
       `<p:notesMasterIdLst><p:notesMasterId r:id="rId2"/></p:notesMasterIdLst>` +
-      `<p:sldIdLst>${sldIds}</p:sldIdLst>` +
+      `<p:sldIdLst>` +
+      SLIDES.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${slideRelBase + i}"/>`).join("") +
+      `</p:sldIdLst>` +
       `<p:sldSz cx="${W}" cy="${H}"/><p:notesSz cx="6858000" cy="9144000"/>` +
+      // PowerPoint expects a default text style; without one it treats the
+      // package as incomplete.
+      `<p:defaultTextStyle><a:defPPr><a:defRPr lang="en-US"/></a:defPPr>` +
+      Array.from({ length: 9 }, (_, i) =>
+        `<a:lvl${i + 1}pPr marL="${i * 457200}" algn="l" defTabSz="914400" rtl="0" eaLnBrk="1" latinLnBrk="0" hangingPunct="1">` +
+        `<a:defRPr sz="1800" kern="1200"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill>` +
+        `<a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs typeface="+mn-cs"/></a:defRPr></a:lvl${i + 1}pPr>`,
+      ).join("") +
+      `</p:defaultTextStyle>` +
       `</p:presentation>`,
   });
 
   files.push({
     name: "ppt/_rels/presentation.xml.rels",
-    data:
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>` +
-      `<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster" Target="notesMasters/notesMaster1.xml"/>` +
-      SLIDES.map(
-        (_, i) =>
-          `<Relationship Id="rId${i + 3}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${i + 1}.xml"/>`,
-      ).join("") +
-      `<Relationship Id="rId${n + 3}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>` +
-      `</Relationships>`,
+    data: rels(
+      rel("rId1", "slideMaster", "slideMasters/slideMaster1.xml") +
+      rel("rId2", "notesMaster", "notesMasters/notesMaster1.xml") +
+      SLIDES.map((_, i) => rel(`rId${slideRelBase + i}`, "slide", `slides/slide${i + 1}.xml`)).join("") +
+      rel(`rId${tail}`, "presProps", "presProps.xml") +
+      rel(`rId${tail + 1}`, "viewProps", "viewProps.xml") +
+      rel(`rId${tail + 2}`, "theme", "theme/theme1.xml") +
+      rel(`rId${tail + 3}`, "tableStyles", "tableStyles.xml"),
+    ),
   });
 
-  files.push({ name: "ppt/theme/theme1.xml", data: THEME });
-  files.push({ name: "ppt/slideMasters/slideMaster1.xml", data: SLIDE_MASTER });
+  // --- skeleton parts, verbatim from a PowerPoint-authored template ---
+  files.push({ name: "ppt/presProps.xml", data: SK.presProps });
+  files.push({ name: "ppt/viewProps.xml", data: SK.viewProps });
+  files.push({ name: "ppt/tableStyles.xml", data: SK.tableStyles });
+  files.push({ name: "ppt/theme/theme1.xml", data: SK.theme });
+  files.push({ name: "ppt/theme/theme2.xml", data: SK.notesTheme });
+
+  files.push({ name: "ppt/slideMasters/slideMaster1.xml", data: SK.slideMaster });
   files.push({
     name: "ppt/slideMasters/_rels/slideMaster1.xml.rels",
-    data:
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>` +
-      `<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>` +
-      `</Relationships>`,
-  });
-  files.push({ name: "ppt/slideLayouts/slideLayout1.xml", data: SLIDE_LAYOUT });
-  files.push({
-    name: "ppt/slideLayouts/_rels/slideLayout1.xml.rels",
-    data:
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>` +
-      `</Relationships>`,
-  });
-  files.push({ name: "ppt/notesMasters/notesMaster1.xml", data: NOTES_MASTER });
-  files.push({
-    name: "ppt/notesMasters/_rels/notesMaster1.xml.rels",
-    data:
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>` +
-      `</Relationships>`,
+    data: rels(
+      rel("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml") +
+      rel("rId2", "theme", "../theme/theme1.xml"),
+    ),
   });
 
+  files.push({ name: "ppt/slideLayouts/slideLayout1.xml", data: SK.slideLayout });
+  files.push({
+    name: "ppt/slideLayouts/_rels/slideLayout1.xml.rels",
+    data: rels(rel("rId1", "slideMaster", "../slideMasters/slideMaster1.xml")),
+  });
+
+  files.push({ name: "ppt/notesMasters/notesMaster1.xml", data: SK.notesMaster });
+  files.push({
+    name: "ppt/notesMasters/_rels/notesMaster1.xml.rels",
+    data: rels(rel("rId1", "theme", "../theme/theme2.xml")),
+  });
+
+  // --- slides + notes ---
   SLIDES.forEach((s, i) => {
     files.push({ name: `ppt/slides/slide${i + 1}.xml`, data: slideXml(s, i, n) });
     files.push({
       name: `ppt/slides/_rels/slide${i + 1}.xml.rels`,
-      data:
-        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-        `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-        `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>` +
-        `<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide${i + 1}.xml"/>` +
-        `</Relationships>`,
+      data: rels(
+        rel("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml") +
+        rel("rId2", "notesSlide", `../notesSlides/notesSlide${i + 1}.xml`),
+      ),
     });
     files.push({ name: `ppt/notesSlides/notesSlide${i + 1}.xml`, data: notesXml(s.note || "") });
     files.push({
       name: `ppt/notesSlides/_rels/notesSlide${i + 1}.xml.rels`,
-      data:
-        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-        `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-        `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster" Target="../notesMasters/notesMaster1.xml"/>` +
-        `<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="../slides/slide${i + 1}.xml"/>` +
-        `</Relationships>`,
+      data: rels(
+        rel("rId1", "notesMaster", "../notesMasters/notesMaster1.xml") +
+        rel("rId2", "slide", `../slides/slide${i + 1}.xml`),
+      ),
     });
   });
 
+  // --- doc props ---
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   files.push({
     name: "docProps/core.xml",
@@ -741,10 +720,11 @@ function build() {
       `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
       `<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" ` +
       `xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">` +
-      `<Application>Tessera deck generator</Application><Slides>${n}</Slides>` +
+      `<Application>Microsoft Office PowerPoint</Application>` +
+      `<PresentationFormat>Widescreen</PresentationFormat><Slides>${n}</Slides><Paragraphs>${n * 4}</Paragraphs>` +
       `<TitlesOfParts><vt:vector size="${n}" baseType="lpstr">` +
       SLIDES.map((s) => `<vt:lpstr>${esc(s.label)}</vt:lpstr>`).join("") +
-      `</vt:vector></TitlesOfParts></Properties>`,
+      `</vt:vector></TitlesOfParts><Company></Company><AppVersion>16.0000</AppVersion></Properties>`,
   });
 
   return zip(files);

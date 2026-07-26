@@ -17,7 +17,9 @@
     "start": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx agent/src/dashboard.ts",
     "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs",
     "pool:arc": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/pool-arc.mjs",
-    "deck": "node scripts/make-deck.mjs"
+    "deck": "node scripts/make-deck.mjs && node scripts/check-deck.mjs",
+    "deck:check": "node scripts/check-deck.mjs",
+    "deck:pdf": "soffice --headless --norestore --convert-to pdf --outdir docs docs/deck.pptx"
   },
   "license": "MIT",
   "engines": {
