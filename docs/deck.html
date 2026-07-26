@@ -278,6 +278,46 @@
       </div>
     </section>
 
+    <!-- ============ SLIDE 6 — THE DEFI STACK ============ -->
+    <section class="slide">
+      <div class="eyebrow">The DeFi stack</div>
+      <h2>The rails that fund the agent.</h2>
+      <p class="lede" style="max-width:52ch">An agent needs working capital. Tessera provides it natively rather than assuming a funded wallet.</p>
+      <div class="row2" style="margin-top:6px">
+        <div class="card"><div class="k"><span class="accent">◆</span> Lending &amp; borrowing</div><div class="v">Supply for yield or borrow against collateral. Kinked-utilisation interest, health-factor liquidation, per-action freeze controls.</div></div>
+        <div class="card"><div class="k"><span class="good">◆</span> Yield vault</div><div class="v">80% held liquid by a contract floor no admin can lower. The app's fee touches yield only — never principal.</div></div>
+        <div class="card"><div class="k"><span class="warn">◆</span> Swap desk</div><div class="v">Oracle-priced swaps between pool assets, with a configurable fee split.</div></div>
+        <div class="card"><div class="k"><span class="accent">◆</span> Liquidity pools (AMM)</div><div class="v">Multi-asset pools where providers keep at least 50% of every swap fee — a constant in the contract, not a setting.</div></div>
+      </div>
+    </section>
+
+    <!-- ============ SLIDE 7 — GUARDRAILS ============ -->
+    <section class="slide">
+      <div class="eyebrow">Guardrails</div>
+      <h2>What an operator <span class="accent">cannot</span> do.</h2>
+      <p class="lede" style="max-width:50ch">The safety properties that matter are the ones written as constants, not as policy.</p>
+      <div class="stack" style="margin-top:6px">
+        <div class="card"><div class="k">Vault reserve floor</div><div class="v">80% liquid is a contract constant. Raising it is allowed; lowering it is not.</div></div>
+        <div class="card"><div class="k">AMM provider share</div><div class="v">50% of swap fees to liquidity providers, enforced on every configuration path.</div></div>
+        <div class="card"><div class="k accent">No position transfers</div><div class="v">No function anywhere lets an operator move someone else's position. Migration pays in on their behalf instead.</div></div>
+        <div class="card"><div class="k">Oracle validation</div><div class="v">A stale, negative, unfinished or carried-over price pauses the market rather than pricing wrongly.</div></div>
+        <div class="card"><div class="k">Freeze, not trap</div><div class="v">Freezing is per action — withdraw and repay can stay open, and liquidation is never frozen.</div></div>
+      </div>
+    </section>
+
+    <!-- ============ SLIDE 8 — AGENT WORKSPACE ============ -->
+    <section class="slide">
+      <div class="eyebrow">Agent workspace</div>
+      <h2>Live information the agent can act on.</h2>
+      <p class="lede" style="max-width:54ch">News across 21 topics, FX, crypto, stocks, indices, commodities, and market analysis derived from those prices.</p>
+      <div class="row2" style="margin-top:6px">
+        <div class="card"><div class="k">Named sources</div><div class="v">ECB reference rates, CoinGecko, Yahoo Finance, public RSS. Each panel names its source and its age.</div></div>
+        <div class="card"><div class="k bad">Never a fabricated number</div><div class="v">An unreachable feed says so. It does not fall back to a stale figure someone might trade on.</div></div>
+        <div class="card"><div class="k">Analysis, not opinion</div><div class="v">Breadth, leaders, laggards, volatility, dollar direction — arithmetic on the prices shown, no forecasts.</div></div>
+        <div class="card"><div class="k">Full transaction history</div><div class="v">Filter by user, date, range, value, outcome and type; export to CSV.</div></div>
+      </div>
+    </section>
+
     <!-- ============ SLIDE 6 — LIVE RUN ============ -->
     <section class="slide">
       <div class="eyebrow">Live run · one autonomous run</div>
@@ -326,7 +366,7 @@
     <!-- ============ SLIDE 9 — TRACTION / QUALITY ============ -->
     <section class="slide">
       <div class="eyebrow">Execution &amp; quality</div>
-      <h2 style="max-width:20ch">Quality over surface area — every feature runs end to end.</h2>
+      <h2 style="max-width:20ch">Every feature runs end to end — 225 automated tests.</h2>
       <div class="stat-row" style="margin-top:10px">
         <div class="stat"><div class="num">64</div><div class="cap">automated tests<br>(21 contract · 43 agent)</div></div>
         <div class="stat"><div class="num good">CI</div><div class="cap">full agentic scenario<br>on every push</div></div>
@@ -364,7 +404,7 @@
     var slides = Array.prototype.slice.call(document.querySelectorAll(".slide"));
     var total = slides.length;
     var i = 0;
-    var labels = ["TESSERA","THE PROBLEM","THE INSIGHT","HOW IT WORKS","DIFFERENTIATORS","LIVE RUN","ON-CHAIN PROOF","WHY ARC","EXECUTION","THE VISION"];
+    var labels = ["TESSERA","THE PROBLEM","THE INSIGHT","HOW IT WORKS","DIFFERENTIATORS","THE DEFI STACK","GUARDRAILS","AGENT WORKSPACE","LIVE RUN","ON-CHAIN PROOF","WHY ARC","EXECUTION","THE VISION"];
 
     var tiles = document.getElementById("tiles");
     for (var t = 0; t < total; t++) {

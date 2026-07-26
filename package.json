@@ -16,7 +16,8 @@
     "compile": "npm run compile --workspace contracts",
     "start": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx agent/src/dashboard.ts",
     "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs",
-    "pool:arc": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/pool-arc.mjs"
+    "pool:arc": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/pool-arc.mjs",
+    "deck": "node scripts/make-deck.mjs"
   },
   "license": "MIT",
   "engines": {
