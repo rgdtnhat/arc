@@ -49,7 +49,7 @@ export const SLIDES = [
     stats: [
       ["Live on Arc testnet", "chainId 5042002 · USDC as gas"],
       ["8 contracts deployed", "escrow, tabs, pool, vault, swap, AMM, 2 collectors"],
-      ["225 automated tests", "104 contract · 121 agent · CI on every push"],
+      ["238 automated tests", "104 contract · 134 agent · CI on every push"],
     ],
     note:
       "Open on the problem, not the product. An agent today can only buy from a service a human " +
@@ -160,11 +160,13 @@ export const SLIDES = [
     label: "AGENT WORKSPACE",
     eyebrow: "Agent workspace",
     title: "Live information the agent can act on.",
-    lede: "News across 21 topics, FX, crypto, stocks, indices, commodities, and market analysis derived from those prices.",
+    lede:
+      "News across 21 topics, 46 FX pairs, 52 crypto assets, 36 stocks, 16 indices, 18 commodities, " +
+      "central bank policy rates and balance sheets — plus analysis derived from those figures.",
     cards: [
-      ["Named sources", "ECB reference rates, CoinGecko, Yahoo Finance, public RSS. Each panel names its source and its age."],
+      ["Named sources", "ECB reference rates, CoinGecko, Yahoo Finance, FRED (St. Louis Fed), public RSS. Each panel names its source and its age."],
       ["Never a fabricated number", "An unreachable feed says so. It does not fall back to a stale figure someone might trade on.", C.bad],
-      ["Analysis, not opinion", "Breadth, leaders, laggards, volatility, dollar direction — arithmetic on the prices shown, no forecasts."],
+      ["Analysis, not opinion", "Breadth, volatility, dollar direction, policy rates, QE/QT — arithmetic on published figures. A rate change is dated by finding where the series moved, not by reading a statement."],
       ["Full transaction history", "Filter by user, date, range, value, outcome and type; export to CSV."],
     ],
     note:
@@ -225,7 +227,7 @@ export const SLIDES = [
     eyebrow: "Execution & quality",
     title: "Every feature runs end to end.",
     stats: [
-      ["225", "automated tests\n104 contract · 121 agent"],
+      ["238", "automated tests\n104 contract · 134 agent"],
       ["CI", "full agentic scenario\non every push", C.good],
       ["1", "command to deploy live\nbootstrap:arc"],
       ["Live", "deployed & transacting\non Arc testnet", C.accent],

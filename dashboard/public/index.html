@@ -81,6 +81,10 @@
         border-bottom: 1px solid var(--line);
       }
       body { padding-top: var(--headerH, 56px); }
+      /* Anything scrolled to — a deep link from a landing card, an in-page
+         anchor, a focused control — must stop below the fixed header rather
+         than underneath it, where it is both unreadable and unclickable. */
+      [id], :target { scroll-margin-top: calc(var(--headerH, 56px) + 14px); }
       .topbar .inner {
         max-width: var(--maxw); margin: 0 auto; padding: 8px 22px;
         display: flex; align-items: center; gap: 7px;
@@ -131,43 +135,62 @@
         border-color: transparent; color: #fff;
       }
       .iconBtn[aria-expanded="true"] { border-color: var(--accent); background: var(--panel-2); }
+      /* An active operator session tints the shield icon. Deliberately *not* a
+         text label: swapping the button's contents for "Signed in ⚙" widened it
+         past the space the bar has on a phone and pushed the controls next to it
+         off the edge. The tint says the same thing in zero extra pixels, and the
+         profile icon appearing at all is the primary signal anyway. */
+      .iconBtn.on { border-color: var(--good); color: var(--good); }
+      .iconBtn.on svg { stroke: var(--good); }
 
+      /* Theme picker: an icon that opens the native menu. The <select> is still
+         the control — it is stretched over the icon at zero opacity — so the
+         dropdown keeps its readable "System / Light / Dark" labels and its
+         keyboard behaviour while costing one icon's width in the bar. */
+      .themeWrap {
+        position: relative; display: inline-flex; align-items: center; justify-content: center;
+        width: 38px; height: 38px; flex: 0 0 auto;
+        border: 1px solid var(--line-strong); background: var(--panel); border-radius: 11px;
+        color: var(--text); transition: border-color .16s ease;
+      }
+      .themeWrap:hover, .themeWrap:focus-within { border-color: var(--accent); }
+      .themeWrap svg { width: 18px; height: 18px; }
       .themesel {
-        border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
-        border-radius: 11px; padding: 0 8px; height: 38px; font: inherit; font-size: 13px; cursor: pointer;
+        position: absolute; inset: 0; width: 100%; height: 100%;
+        opacity: 0; border: 0; padding: 0; margin: 0; cursor: pointer;
+        font: inherit; -webkit-appearance: none; appearance: none;
       }
 
-      /* Start button — centred, floats, hides on scroll-down, returns on scroll-up.
-         It arrives blurred and slightly translucent and resolves into focus, so
-         it reads as floating above the page rather than pasted onto it. */
+      /* Start button — floats over the landing page, appears on scroll-up and
+         leaves on scroll-down. It arrives blurred and resolves into focus, so it
+         reads as floating above the page rather than pasted onto it. The fill is
+         the same gradient as "Launch the app", because it is the same action —
+         a translucent variant just read as a washed-out copy of that button. */
       .startDock {
         position: fixed; left: 50%; top: calc(var(--headerH, 56px) + 10px); transform: translate(-50%, 0);
-        z-index: 75; opacity: .88;
-        transition: opacity .45s cubic-bezier(.2,.7,.2,1), transform .45s cubic-bezier(.2,.7,.2,1),
-                    filter .55s cubic-bezier(.2,.7,.2,1);
-        animation: startIn .85s cubic-bezier(.2,.7,.2,1) both;
+        z-index: 75; opacity: 1;
+        transition: opacity .42s cubic-bezier(.2,.7,.2,1), transform .42s cubic-bezier(.2,.7,.2,1),
+                    filter .5s cubic-bezier(.2,.7,.2,1);
       }
-      @keyframes startIn {
-        from { opacity: 0; filter: blur(14px) saturate(.6); transform: translate(-50%, -12px) scale(.965); }
-        60%  { opacity: .7; filter: blur(3px) saturate(.9); }
-        to   { opacity: .88; filter: blur(0) saturate(1); transform: translate(-50%, 0) scale(1); }
-      }
-      .startDock:hover { opacity: 1; filter: blur(0); }
+      /* `.hide` is the resting state: the dock only shows once you have scrolled
+         down past the hero's own CTA and then scrolled back up. */
       .startDock.hide {
-        opacity: 0; filter: blur(10px); transform: translate(-50%, -16px) scale(.97); pointer-events: none;
+        opacity: 0; filter: blur(12px); transform: translate(-50%, -16px) scale(.97); pointer-events: none;
       }
       .startDock .btn {
         padding: 11px 24px; font-size: 14.5px; box-shadow: var(--shadow);
-        /* Translucent so the page shows through, with a blur behind the glass. */
-        background: color-mix(in srgb, var(--accent) 72%, transparent);
-        backdrop-filter: blur(10px) saturate(150%);
-        -webkit-backdrop-filter: blur(10px) saturate(150%);
-        border: 1px solid color-mix(in srgb, #fff 28%, transparent);
-        color: #fff; font-weight: 650;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        border: 1px solid transparent; color: #fff; font-weight: 650;
+        animation: startIn .6s cubic-bezier(.2,.7,.2,1) both;
       }
-      .startDock:hover .btn { background: color-mix(in srgb, var(--accent) 92%, transparent); }
+      @keyframes startIn {
+        from { filter: blur(12px) saturate(.6); opacity: .2; }
+        60%  { filter: blur(3px) saturate(.9); opacity: .8; }
+        to   { filter: blur(0) saturate(1); opacity: 1; }
+      }
+      .startDock .btn:hover { filter: brightness(1.08); }
       @media (prefers-reduced-motion: reduce) {
-        .startDock { animation: none; opacity: .9; }
+        .startDock, .startDock .btn { animation: none; transition: opacity .2s linear; }
       }
 
       /* ---- navigation ------------------------------------------------------
@@ -182,13 +205,17 @@
       }
       .navDrawer.open { max-height: 320px; border-bottom-color: var(--line); }
       .navDrawer .inner { max-width: var(--maxw); margin: 0 auto; padding: 12px 22px 16px; display: flex; flex-wrap: wrap; gap: 8px; }
-      /* Geometric glyphs rather than emoji: emoji render at wildly different
-         sizes and weights per platform, which made the menu look ragged on
-         Windows and Android. These inherit the text colour and metrics. */
+      .navDrawer .btn { display: inline-flex; align-items: center; gap: 9px; }
+      /* Line icons drawn as SVG, not glyphs. The previous ◈ ◫ ◇ ◎ ⬡ set had to
+         borrow whatever face the platform had for those code points, so the row
+         came out at five different weights and optical sizes. These are one
+         stroke weight, they inherit `currentColor`, and they look the same
+         everywhere. */
       .navIco {
-        display: inline-block; width: 1.1em; text-align: center; margin-right: 2px;
-        opacity: .8; font-size: 1.05em; line-height: 1;
+        display: inline-flex; flex: 0 0 auto; width: 17px; height: 17px;
+        opacity: .75; transition: opacity .16s ease;
       }
+      .navIco svg { width: 100%; height: 100%; }
       .navDrawer .btn[aria-current="page"] .navIco { opacity: 1; color: var(--accent); }
       .navDrawer .btn[aria-current="page"] {
         color: var(--text); background: var(--panel); border-color: var(--accent); font-weight: 650;
@@ -196,18 +223,8 @@
       /* A left bar marks the current section without relying on colour alone. */
       .navDrawer .btn[aria-current="page"]::before {
         content: ""; display: inline-block; width: 3px; height: 13px; border-radius: 2px;
-        background: var(--accent); margin-right: 8px; vertical-align: -2px;
+        background: var(--accent); margin-right: 2px; flex: 0 0 auto;
       }
-      /* Sticky strip showing where you are once the drawer is closed. */
-      .crumbBar {
-        position: sticky; top: var(--headerH, 56px); z-index: 60; padding: 10px 0;
-        backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-        background: color-mix(in srgb, var(--bg) 82%, transparent);
-        border-bottom: 1px solid var(--line);
-      }
-      .crumbBar .wrap { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-      .crumbNow { font-size: 13.5px; font-weight: 650; }
-      .crumbHint { font-size: 12px; color: var(--muted); }
 
       /* ---- notice banner ---------------------------------------------------
          Under the header, above the navigation. Transparent background so it
@@ -449,6 +466,21 @@
         transition: opacity .18s ease, transform .18s ease;
       }
       .menuPanel.open { opacity: 1; transform: none; pointer-events: auto; }
+      /* Below this width the anchor button is nowhere near the right edge of the
+         screen, so a panel pinned to `right: 0` of that button and 92vw wide has
+         its left edge off-canvas. Pin these to the viewport instead — the header
+         is fixed, so there is a known top to hang them from.
+         This block sits *after* both panel definitions on purpose: a media query
+         adds no specificity, so placing it earlier let the later `.menuPanel`
+         rule win and the profile menu kept hanging off the left edge. */
+      @media (max-width: 720px) {
+        .bellPanel, .menuPanel {
+          position: fixed; top: calc(var(--headerH, 52px) + 6px);
+          left: 10px; right: 10px; width: auto; min-width: 0; max-width: none;
+          max-height: calc(100dvh - var(--headerH, 52px) - 22px);
+          overflow-y: auto; overscroll-behavior: contain;
+        }
+      }
       .menuItem {
         display: block; width: 100%; text-align: left; padding: 9px 11px; border: 0;
         border-radius: 10px; background: transparent; color: var(--text); font: inherit; font-size: 13.5px; cursor: pointer;
@@ -580,12 +612,18 @@
       }
       .sheetTabs::-webkit-scrollbar { display: none; }
       .sheetTab {
+        display: inline-flex; align-items: center; gap: 7px;
         border: 1px solid transparent; background: transparent; color: var(--muted);
         padding: 7px 13px; border-radius: 999px; font: inherit; font-size: 13px;
         cursor: pointer; white-space: nowrap;
       }
       .sheetTab:hover { color: var(--text); background: var(--panel-2); }
       .sheetTab.active { color: var(--text); background: var(--panel); border-color: var(--line-strong); font-weight: 650; }
+      /* Same reasoning as the drawer: one stroke weight, inherits currentColor,
+         identical on every platform. */
+      .tabIco { display: inline-flex; flex: 0 0 auto; width: 15px; height: 15px; opacity: .8; }
+      .tabIco svg { width: 100%; height: 100%; }
+      .sheetTab.active .tabIco { opacity: 1; color: var(--accent); }
       .sheetBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px 18px 24px; }
       .sheetFilters {
         display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -599,14 +637,51 @@
         .sheetBody { padding: 14px 14px 28px; }
       }
 
-      /* ---- data table (history, market rows) ------------------------------- */
-      .tblWrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-      table.data { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 520px; }
-      table.data th, table.data td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
-      table.data th {
-        position: sticky; top: 0; z-index: 1; background: var(--bg-soft);
-        font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 650;
+      /* ---- data table (history, market rows) -------------------------------
+         The wrapper is a scroll box in *both* axes with a bounded height. That
+         bound is what makes `position: sticky` on the header actually do
+         something: sticky resolves against the nearest scrolling ancestor, so
+         with `overflow-x: auto` alone the ancestor was a box exactly as tall as
+         the table and the header had nowhere to stick to. Now a long asset list
+         scrolls inside the card and its column labels stay put. */
+      .tblWrap {
+        overflow: auto; -webkit-overflow-scrolling: touch;
+        max-height: min(64vh, 560px); overscroll-behavior: contain;
       }
+      /* Short tables shouldn't grow a scrollbar they don't need. */
+      .tblWrap.auto { max-height: none; overflow: visible; overflow-x: auto; }
+      table.data { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; min-width: 520px; }
+      table.data th, table.data td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+      /* A flat `min-width` sized every table for the widest one, so a three
+         column FX table needed sideways scrolling to reach its own Rate column
+         on a phone. Let narrow tables size to their content instead: cells stop
+         wrapping, the table grows only as wide as it needs, and the wrapper
+         still scrolls for the genuinely wide ones. */
+      @media (max-width: 720px) {
+        table.data { min-width: 0; }
+        table.data th, table.data td { white-space: nowrap; padding: 8px 8px; }
+        table.data tbody tr.grp td { white-space: normal; }
+      }
+      table.data th {
+        position: sticky; top: 0; z-index: 3;
+        /* Opaque, not translucent: rows scroll underneath this. */
+        background: var(--bg-soft);
+        box-shadow: inset 0 -1px 0 var(--line);
+        /* An explicit line-height fixes the header at exactly --thH, which the
+           sticky section bands below hang off. */
+        font-size: 11px; line-height: 18px; height: var(--thH, 34px);
+        letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 650;
+      }
+      /* Section bands inside the body ("Majors", "Energy", …). They stick just
+         under the column labels, so on a long list you can always see both which
+         group you are in and what the columns mean. */
+      table.data tbody tr.grp td {
+        position: sticky; top: var(--thH, 34px); z-index: 2;
+        background: var(--panel-2); backdrop-filter: blur(8px);
+        font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase;
+        color: var(--muted); font-weight: 700; padding: 5px 10px;
+      }
+      table.data tbody tr.grp:hover td { background: var(--panel-2); }
       table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
       table.data tbody tr:hover { background: var(--panel-2); }
       /* Exchange-style colouring: green up, red down, muted flat. */
@@ -643,17 +718,25 @@
         .metric .v { font-size: 15.5px; }
         .balance { font-size: 27px; }
         .hero { padding: 52px 0 30px; }
-        .crumbBar { top: var(--headerH, 52px); }
         .noticeBar { top: var(--headerH, 52px); }
         .startDock { top: calc(var(--headerH, 52px) + 8px); }
+        .tblWrap { max-height: min(58vh, 460px); }
         .row-actions { gap: 7px; }
         .row-actions .field, .row-actions .btn { flex: 1 1 auto; }
         #lnAmount, #vAmount, #swAmount { width: 100% !important; }
       }
+      @media (max-width: 720px) {
+        /* The drawer is remembered open, so on a phone it is permanently
+           spending screen. Two compact columns instead of five tall rows keeps
+           the whole menu under a third of the viewport. */
+        .navDrawer .inner { padding: 9px 12px 12px; gap: 6px; }
+        .navDrawer .inner .btn {
+          flex: 1 1 calc(50% - 3px); min-width: 0; padding: 9px 10px; font-size: 12.5px;
+        }
+      }
       @media (max-width: 420px) {
         .hero h1 { font-size: 30px; }
         .stat .v { font-size: 19px; }
-        .navDrawer .inner .btn { flex: 1 1 100%; }
       }
       /* Never let a control overflow its card on any width. */
       .row-actions > * { max-width: 100%; }
@@ -738,22 +821,49 @@
           </button>
         </span>
 
-        <select class="themesel" id="themeSel" title="Theme" aria-label="Theme">
-          <option value="system">&#9686; System</option>
-          <option value="light">&#9728; Light</option>
-          <option value="dark">&#9790; Dark</option>
-        </select>
+        <!-- Icon-only theme picker: the icon is what you see, the <select> is
+             stretched invisibly over it so the menu keeps real labels. -->
+        <span class="themeWrap" id="themeWrap" title="Theme">
+          <span id="themeIco" aria-hidden="true"></span>
+          <select class="themesel" id="themeSel" title="Theme" aria-label="Theme">
+            <option value="system">System theme</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </span>
       </div>
 
       <!-- The app's only navigation. Stays open until you close it; the open
            state and the current section are both remembered. -->
       <div class="navDrawer" id="navDrawer">
         <div class="inner">
-          <button class="btn" data-nav="home"><span class="navIco">◈</span> Home</button>
-          <button class="btn" data-nav="dashboard"><span class="navIco">◫</span> Dashboard</button>
-          <button class="btn" data-nav="defi"><span class="navIco">◇</span> DeFi</button>
-          <button class="btn" data-nav="agents"><span class="navIco">◎</span> Agent workspace</button>
-          <button class="btn" data-nav="other"><span class="navIco">⬡</span> Treasury &amp; system</button>
+          <button class="btn" data-nav="home">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3.5 10.6 12 3.8l8.5 6.8V20a1 1 0 0 1-1 1h-4.6v-6H9.1v6H4.5a1 1 0 0 1-1-1z"/>
+            </svg></span> Home
+          </button>
+          <button class="btn" data-nav="dashboard">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3.2" y="3.2" width="7.4" height="8.6" rx="2"/><rect x="13.4" y="3.2" width="7.4" height="5.4" rx="2"/>
+              <rect x="13.4" y="12.2" width="7.4" height="8.6" rx="2"/><rect x="3.2" y="15.4" width="7.4" height="5.4" rx="2"/>
+            </svg></span> Dashboard
+          </button>
+          <button class="btn" data-nav="defi">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="8.6" cy="12" r="5.4"/><path d="M14.2 6.9a5.4 5.4 0 0 1 0 10.2"/><path d="M8.6 9.6v4.8M6.9 11h3.4"/>
+            </svg></span> DeFi
+          </button>
+          <button class="btn" data-nav="agents">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="4" y="8" width="16" height="11" rx="3"/><path d="M12 8V4.6M10.4 3.4h3.2"/>
+              <circle cx="9.2" cy="13.4" r="1.1" fill="currentColor" stroke="none"/><circle cx="14.8" cy="13.4" r="1.1" fill="currentColor" stroke="none"/>
+            </svg></span> Agent workspace
+          </button>
+          <button class="btn" data-nav="other">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3.4 9.4 12 4.2l8.6 5.2"/><path d="M5.4 10.6v7M9.8 10.6v7M14.2 10.6v7M18.6 10.6v7"/><path d="M3.4 20.2h17.2"/>
+            </svg></span> Treasury &amp; system
+          </button>
         </div>
       </div>
     </header>
@@ -854,15 +964,10 @@
 
     <!-- ================= APP ================= -->
     <div id="viewApp" hidden>
-      <!-- Where you are. Navigation itself lives in the ☰ Menu drawer, which is
-           the single source of truth for the current section. -->
-      <div class="crumbBar">
-        <div class="wrap">
-          <span class="crumbNow" id="crumbNow">📊 Dashboard</span>
-          <span class="crumbHint" id="crumbHint">— open <b>☰ Menu</b> to switch section</span>
-        </div>
-      </div>
-
+      <!-- No breadcrumb strip. It sat under a fixed header and above a sticky
+           notice bar, and on a phone the three stacked into each other. The ☰
+           Menu drawer already highlights the current section, so the strip was
+           repeating what the navigation says while costing a band of screen. -->
       <div class="wrap view">
         <!-- ---------- DASHBOARD ---------- -->
         <div class="tabPane" id="paneDashboard">
@@ -1121,14 +1226,49 @@
               </span>
             </div>
             <div class="sheetTabs" id="agTabs" role="tablist" style="border-bottom:0;padding:12px 0 0;margin:0 -2px">
-              <button class="sheetTab active" data-agtab="operations" role="tab">⬡ Operations</button>
-              <button class="sheetTab" data-agtab="news" role="tab">▤ News</button>
-              <button class="sheetTab" data-agtab="fx" role="tab">⇄ FX</button>
-              <button class="sheetTab" data-agtab="crypto" role="tab">◈ Crypto</button>
-              <button class="sheetTab" data-agtab="analysis" role="tab">◪ Market analysis</button>
-              <button class="sheetTab" data-agtab="stocks" role="tab">▮ Stocks</button>
-              <button class="sheetTab" data-agtab="commodities" role="tab">⬢ Commodities</button>
-              <button class="sheetTab" data-agtab="marketplace" role="tab">⧉ Marketplace</button>
+              <button class="sheetTab active" data-agtab="operations" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 16.5 9 11l3.6 3.6L20 7"/><path d="M15.4 7H20v4.6"/>
+                </svg></span>Operations
+              </button>
+              <button class="sheetTab" data-agtab="news" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 5.5h11.5v13H5.5A1.5 1.5 0 0 1 4 17z"/><path d="M15.5 9H20v8a1.5 1.5 0 0 1-1.5 1.5"/>
+                  <path d="M7 9h5.5M7 12.4h5.5M7 15.4h3.5"/>
+                </svg></span>News
+              </button>
+              <button class="sheetTab" data-agtab="fx" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 8.5h13.5l-3-3M20 15.5H6.5l3 3"/>
+                </svg></span>FX
+              </button>
+              <button class="sheetTab" data-agtab="crypto" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="8.2"/><path d="M9.6 8.4h3.9a2 2 0 0 1 0 4H9.6h4.1a2 2 0 0 1 0 4H9.6"/>
+                  <path d="M9.6 8.4v7.6M11.4 6.6v1.8M11.4 16v1.8"/>
+                </svg></span>Crypto
+              </button>
+              <button class="sheetTab" data-agtab="analysis" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 19.4V4.6M4 19.4h15.4"/><rect x="7" y="12" width="3" height="5"/><rect x="12" y="8.6" width="3" height="8.4"/><rect x="17" y="5.6" width="3" height="11.4"/>
+                </svg></span>Market analysis
+              </button>
+              <button class="sheetTab" data-agtab="stocks" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3.6 15.4 8.4 9.8l3.6 3.4 4-5.2 4.4 4.8"/><path d="M3.6 19.6h16.8"/>
+                </svg></span>Stocks
+              </button>
+              <button class="sheetTab" data-agtab="commodities" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3.2 20 7.6v8.8L12 20.8 4 16.4V7.6z"/><path d="M4 7.6 12 12l8-4.4M12 12v8.8"/>
+                </svg></span>Commodities
+              </button>
+              <button class="sheetTab" data-agtab="marketplace" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4.4 9h15.2l-1 9.2a1.5 1.5 0 0 1-1.5 1.3H6.9a1.5 1.5 0 0 1-1.5-1.3z"/>
+                  <path d="M8.6 9V7.2a3.4 3.4 0 0 1 6.8 0V9"/>
+                </svg></span>Marketplace
+              </button>
             </div>
           </div>
 
@@ -1187,6 +1327,47 @@
               <h2>◪ Market analysis</h2>
               <p class="feedNote" id="analysisNote"></p>
               <div id="analysisList" style="display:flex;flex-direction:column;gap:10px"></div>
+            </div>
+
+            <!-- Monetary policy. Shown as tables as well as prose so the numbers
+                 the analysis above is computed from are on screen next to it. -->
+            <div class="card compact">
+              <h2>◈ Central bank policy rates</h2>
+              <p class="feedNote" id="ratesNote"></p>
+              <div class="tblWrap auto"><table class="data">
+                <thead><tr>
+                  <th>Central bank</th><th>Instrument</th><th class="num">Current</th>
+                  <th class="num">Last move</th><th>Effective</th><th class="num">Held</th>
+                </tr></thead>
+                <tbody id="policyRows"></tbody>
+              </table></div>
+              <p class="feedNote" style="margin:10px 0 0">
+                “Last move” is derived from the published series: the step onto the current level, and
+                the first date the series carried it. It is not read from a policy statement.
+              </p>
+            </div>
+
+            <div class="card compact">
+              <h2>◫ Balance sheets — quantitative easing / tightening</h2>
+              <div class="tblWrap auto"><table class="data">
+                <thead><tr>
+                  <th>Holder</th><th>Measure</th><th class="num">Latest</th>
+                  <th class="num">4 weeks</th><th class="num">13 weeks</th><th class="num">52 weeks</th><th>Stance</th>
+                </tr></thead>
+                <tbody id="sheetRows"></tbody>
+              </table></div>
+              <p class="feedNote" style="margin:10px 0 0">
+                Stance is the sign of the 13-week change in total assets, with anything inside ±0.5%
+                treated as flat — reinvestment noise rather than a policy decision.
+              </p>
+            </div>
+
+            <div class="card compact">
+              <h2>⇅ Rates the market sets</h2>
+              <div class="tblWrap auto"><table class="data">
+                <thead><tr><th>Measure</th><th class="num">Level</th><th class="num">Change</th><th>What it is</th></tr></thead>
+                <tbody id="marketRateRows"></tbody>
+              </table></div>
             </div>
           </div>
 

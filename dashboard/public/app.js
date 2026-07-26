@@ -6,7 +6,24 @@ const $ = (id) => document.getElementById(id);
       }
 
       // --- Theme: System / Light / Dark (persisted) ---
+      // The control is icon-only in the header, so the icon has to carry the
+      // whole message: which mode is selected, and — for "system" — which way
+      // the OS has currently resolved it.
       const themeSel = $("themeSel");
+      const THEME_ICONS = {
+        light:
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">' +
+          '<circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.6M12 18.8v2.6M2.6 12h2.6M18.8 12h2.6' +
+          'M5.4 5.4l1.9 1.9M16.7 16.7l1.9 1.9M5.4 18.6l1.9-1.9M16.7 7.3l1.9-1.9"/></svg>',
+        dark:
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+          '<path d="M20 14.4A8.4 8.4 0 0 1 9.6 4a8.4 8.4 0 1 0 10.4 10.4z"/></svg>',
+        // Half-filled disc: the "follow the system" state, tilted to whichever
+        // side the system is actually on.
+        system:
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">' +
+          '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg>',
+      };
       function applyTheme() {
         const pref = localStorage.getItem("tessera_theme") || "system";
         themeSel.value = pref;
@@ -17,6 +34,13 @@ const $ = (id) => document.getElementById(id);
               : "light"
             : pref;
         document.documentElement.setAttribute("data-theme", resolved);
+        const ico = $("themeIco");
+        if (ico) ico.innerHTML = THEME_ICONS[pref] || THEME_ICONS.system;
+        const wrap = $("themeWrap");
+        if (wrap) {
+          wrap.title =
+            pref === "system" ? `Theme: follow system (currently ${resolved})` : `Theme: ${pref}`;
+        }
       }
       themeSel.addEventListener("change", () => {
         localStorage.setItem("tessera_theme", themeSel.value);
@@ -60,9 +84,16 @@ const $ = (id) => document.getElementById(id);
 
       /* The header is fixed, so everything that sits under it needs to know how
        * tall it actually is. Measuring beats hard-coding: the height changes with
-       * the platform's font metrics, a zoom level, and whether the drawer is open. */
+       * the platform's font metrics, a zoom level, and whether the drawer is open.
+       *
+       * The whole `.topbar` is measured, drawer included — not just the button
+       * row. The drawer is remembered across visits, so measuring only the row
+       * left an open drawer floating over the first ~90px of the page: the top
+       * card, and on the Agent workspace the tab strip, were covered and
+       * unclickable. Since a ResizeObserver fires per frame, the body's padding
+       * follows the drawer's open/close animation rather than jumping. */
       (function trackHeaderHeight() {
-        const bar = document.querySelector(".topbar .inner");
+        const bar = document.querySelector(".topbar");
         if (!bar) return;
         const apply = () => {
           const h = Math.round(bar.getBoundingClientRect().height);
@@ -80,12 +111,14 @@ const $ = (id) => document.getElementById(id);
        * back button work, and "#" (or no hash) is the landing page.
        * ==================================================================== */
       const TABS = ["dashboard", "defi", "agents", "other"];
+      // Plain names: the icons live in the drawer markup as SVG now, so the
+      // labels no longer smuggle a glyph that would end up in the tab title.
       const NAV_LABELS = {
-        home: "◈ Home",
-        dashboard: "◫ Dashboard",
-        defi: "◇ DeFi",
-        agents: "◎ Agent workspace",
-        other: "⬡ Treasury & system",
+        home: "Home",
+        dashboard: "Dashboard",
+        defi: "DeFi",
+        agents: "Agent workspace",
+        other: "Treasury & system",
       };
       const NAV_OPEN_KEY = "tessera_nav_open";
       /** Open/close the menu drawer, remembering the choice across visits. */
@@ -107,8 +140,13 @@ const $ = (id) => document.getElementById(id);
             const pane = $("pane" + t[0].toUpperCase() + t.slice(1));
             if (pane) pane.hidden = t !== route;
           }
-          if ($("crumbNow")) $("crumbNow").textContent = NAV_LABELS[route] || route;
         }
+        // The document title is now the only "where am I" indicator besides the
+        // drawer's own highlight, which is deliberate — the breadcrumb strip it
+        // replaces was a third band competing for the top of a phone screen.
+        document.title = isApp
+          ? `${NAV_LABELS[route] || route} · Tessera`
+          : "Tessera — agentic payments on Arc";
         // Highlight the current section in the drawer. This is the only place
         // that marks "where you are" now that the tab strip is gone, so it has
         // to stay right even when navigation came from a hash change or a
@@ -183,20 +221,29 @@ const $ = (id) => document.getElementById(id);
         requestAnimationFrame(() => { d.style.transition = ""; });
       })();
 
-      // Start button: hide while scrolling down, bring it back on scroll up.
+      // Start button: hidden at rest, appears on scroll-up, leaves on scroll-down.
+      //
+      // Hidden at rest matters. At the top of the landing page the hero's own
+      // "Launch the app" button is right there, so a floating duplicate pinned
+      // under the header was covering the page for no gain. The dock exists for
+      // the case where you have read down the page and want back to the top of
+      // the funnel — which is exactly the scroll-up gesture.
       (function startButtonAutoHide() {
         const dock = $("startDock");
+        const REVEAL_AFTER = 260; // roughly past the hero CTA
+        const JITTER = 6; // ignore sub-pixel/rubber-band noise
         let last = window.scrollY;
-        window.addEventListener(
-          "scroll",
-          () => {
-            const y = window.scrollY;
-            if (y > last && y > 90) dock.classList.add("hide");
-            else dock.classList.remove("hide");
-            last = y;
-          },
-          { passive: true },
-        );
+        dock.classList.add("hide");
+        const onScroll = () => {
+          const y = Math.max(0, window.scrollY);
+          const dy = y - last;
+          if (Math.abs(dy) < JITTER) return;
+          // Scrolling up, and far enough down that the hero CTA is gone.
+          if (dy < 0 && y > REVEAL_AFTER) dock.classList.remove("hide");
+          else dock.classList.add("hide");
+          last = y;
+        };
+        window.addEventListener("scroll", onScroll, { passive: true });
       })();
 
       // Reveal landing sections as they enter the viewport.
@@ -775,16 +822,20 @@ const $ = (id) => document.getElementById(id);
 
       // --- Admin login (id + password) ---
       // The admin id is a secret: it is never pre-filled, never defaulted, and
-      // never rendered in the UI. A signed-in operator only sees a neutral
-      // "Signed in" state, so the id can't be read off the screen.
+      // never rendered in the UI. A signed-in operator only sees a tinted shield,
+      // so the id can't be read off the screen.
       let adminId = null;
       function setAdmin(id) {
         adminId = id;
         const b = $("adminBtn");
-        b.textContent = id ? "Signed in ⚙" : "Admin";
+        // Tint the existing icon rather than replacing the button's contents.
+        // Writing textContent here blew away the SVG and left a wide "Signed in ⚙"
+        // label that shoved the buttons beside it off a narrow screen.
+        b.classList.toggle("on", !!id);
+        const lbl = b.querySelector(".lbl");
+        if (lbl) lbl.textContent = id ? "Operator" : "Admin";
         b.title = id ? "Operator session active — click to change password or sign out" : "Operator sign-in";
-        b.style.borderColor = id ? "var(--good)" : "";
-        b.style.color = id ? "var(--good)" : "";
+        b.setAttribute("aria-label", b.title);
       }
       async function adminFlow() {
         // Already signed in? The profile menu owns change-password and sign-out,
@@ -2668,6 +2719,28 @@ const $ = (id) => document.getElementById(id);
       const emptyRow = (cols, text) =>
         `<tr><td colspan="${cols}" style="color:var(--muted);padding:16px">${esc(text)}</td></tr>`;
 
+      /**
+       * Render rows with a sticky section band whenever `key` changes.
+       *
+       * The lists are long now — 40-odd FX pairs, 36 stocks — and a flat run of
+       * rows with only a frozen header tells you what the columns are but not
+       * where you are in the list. Bands are emitted in the order the server
+       * sent the rows, so the server's ordering stays the source of truth.
+       */
+      function groupedRows(rows, cols, key, render) {
+        let current = null;
+        const out = [];
+        for (const row of rows) {
+          const k = key(row) || "";
+          if (k && k !== current) {
+            current = k;
+            out.push(`<tr class="grp"><td colspan="${cols}">${esc(k)}</td></tr>`);
+          }
+          out.push(render(row));
+        }
+        return out.join("");
+      }
+
       async function feed(path) {
         const res = await fetch(path);
         return res.json();
@@ -2681,15 +2754,16 @@ const $ = (id) => document.getElementById(id);
           feedNote("fxNote", r);
           const rates = (r.items && r.items.rates) || [];
           body.innerHTML = rates.length
-            ? rates
-                .map(
-                  (x) =>
-                    `<tr><td><b>${esc(x.pair)}</b></td>` +
-                    `<td class="num">${esc(x.rate.toFixed(x.rate >= 100 ? 3 : 5))}</td>` +
-                    pctCell(x.changePct) +
-                    `</tr>`,
-                )
-                .join("")
+            ? groupedRows(
+                rates,
+                3,
+                (x) => x.group,
+                (x) =>
+                  `<tr><td><b>${esc(x.pair)}</b></td>` +
+                  `<td class="num">${esc(x.rate.toFixed(x.rate >= 100 ? 3 : 5))}</td>` +
+                  pctCell(x.changePct) +
+                  `</tr>`,
+              )
             : emptyRow(3, r.error || "No rates available.");
         } catch {
           body.innerHTML = emptyRow(3, "Couldn't reach the server.");
@@ -2728,26 +2802,28 @@ const $ = (id) => document.getElementById(id);
           feedNote("stocksNote", r);
           const q = r.items || {};
           idx.innerHTML = (q.indices || []).length
-            ? q.indices
-                .map(
-                  (x) =>
-                    `<tr><td><b>${esc(x.name)}</b></td>` +
-                    `<td class="num">${esc(x.price.toLocaleString(undefined, { maximumFractionDigits: 2 }))}</td>` +
-                    absCell(x.changeAbs) + pctCell(x.changePct) +
-                    `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
-                )
-                .join("")
+            ? groupedRows(
+                q.indices,
+                5,
+                (x) => x.sector,
+                (x) =>
+                  `<tr><td><b>${esc(x.name)}</b></td>` +
+                  `<td class="num">${esc(x.price.toLocaleString(undefined, { maximumFractionDigits: 2 }))}</td>` +
+                  absCell(x.changeAbs) + pctCell(x.changePct) +
+                  `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
+              )
             : emptyRow(5, r.error || "No index data available.");
           st.innerHTML = (q.stocks || []).length
-            ? q.stocks
-                .map(
-                  (x) =>
-                    `<tr><td><b>${esc(x.name)}</b></td><td>${esc(x.symbol)}</td>` +
-                    `<td class="num">${esc(money(x.price, x.currency))}</td>` +
-                    absCell(x.changeAbs) + pctCell(x.changePct) +
-                    `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
-                )
-                .join("")
+            ? groupedRows(
+                q.stocks,
+                6,
+                (x) => x.sector,
+                (x) =>
+                  `<tr><td><b>${esc(x.name)}</b></td><td>${esc(x.symbol)}</td>` +
+                  `<td class="num">${esc(money(x.price, x.currency))}</td>` +
+                  absCell(x.changeAbs) + pctCell(x.changePct) +
+                  `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
+              )
             : emptyRow(6, r.error || "No stock data available.");
         } catch {
           idx.innerHTML = emptyRow(5, "Couldn't reach the server.");
@@ -2763,15 +2839,16 @@ const $ = (id) => document.getElementById(id);
           feedNote("commoditiesNote", r);
           const rows = r.items || [];
           body.innerHTML = rows.length
-            ? rows
-                .map(
-                  (x) =>
-                    `<tr><td><b>${esc(x.name)}</b></td>` +
-                    `<td class="num">${esc(money(x.price, x.currency))}</td>` +
-                    absCell(x.changeAbs) + pctCell(x.changePct) +
-                    `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
-                )
-                .join("")
+            ? groupedRows(
+                rows,
+                5,
+                (x) => x.sector,
+                (x) =>
+                  `<tr><td><b>${esc(x.name)}</b></td>` +
+                  `<td class="num">${esc(money(x.price, x.currency))}</td>` +
+                  absCell(x.changeAbs) + pctCell(x.changePct) +
+                  `<td><span class="tag">${esc(x.marketState || "—")}</span></td></tr>`,
+              )
             : emptyRow(5, r.error || "No commodity data available.");
         } catch {
           body.innerHTML = emptyRow(5, "Couldn't reach the server.");
@@ -2800,6 +2877,87 @@ const $ = (id) => document.getElementById(id);
             : `<div style="color:var(--warn)">${esc(r.error || "Nothing to analyse.")}</div>`;
         } catch {
           host.innerHTML = `<div style="color:var(--warn)">Couldn't reach the server.</div>`;
+        }
+        await loadRatesFeed();
+      }
+
+      /**
+       * Central bank policy rates, balance sheets and market-set rates.
+       *
+       * Rendered as tables under the analysis prose so the figures those lines
+       * are computed from are visible on the same screen — the point of the
+       * "no invented numbers" rule is that a reader can check the arithmetic.
+       */
+      async function loadRatesFeed() {
+        const pol = $("policyRows"), sh = $("sheetRows"), mk = $("marketRateRows");
+        if (!pol) return;
+        pol.innerHTML = emptyRow(6, "Loading…");
+        sh.innerHTML = emptyRow(7, "Loading…");
+        mk.innerHTML = emptyRow(4, "Loading…");
+        try {
+          const r = await feed("/api/feeds/rates");
+          feedNote("ratesNote", r);
+          const it = r.items || {};
+          const bp = (v) =>
+            v === null || v === undefined
+              ? `<td class="num flat">—</td>`
+              : `<td class="num ${v < 0 ? "up" : v > 0 ? "down" : "flat"}">${v > 0 ? "+" : ""}${v} bp</td>`;
+          pol.innerHTML = (it.policy || []).length
+            ? groupedRows(
+                it.policy,
+                6,
+                (x) => x.bank,
+                (x) =>
+                  `<tr><td><b>${esc(x.bank)}</b></td><td>${esc(x.instrument)}</td>` +
+                  `<td class="num"><b>${esc(x.display)}</b></td>` +
+                  bp(x.moveBps) +
+                  `<td>${esc(x.since || "—")}</td>` +
+                  `<td class="num">${x.heldDays === null ? "—" : esc(x.heldDays + "d")}</td></tr>`,
+              )
+            : emptyRow(6, r.error || "No policy rate data available.");
+          // Balance sheets are published in millions; trillions is the readable unit.
+          const tn = (v) =>
+            v === null || v === undefined
+              ? `<td class="num flat">—</td>`
+              : `<td class="num ${v > 0 ? "up" : v < 0 ? "down" : "flat"}">${v >= 0 ? "+" : "−"}${(Math.abs(v) / 1e6).toFixed(3)}tn</td>`;
+          sh.innerHTML = (it.sheets || []).length
+            ? groupedRows(
+                it.sheets,
+                7,
+                (x) => x.bank,
+                (x) =>
+                  `<tr><td><b>${esc(x.bank)}</b></td><td>${esc(x.label)}</td>` +
+                  `<td class="num"><b>${esc((x.latest / 1e6).toFixed(3))}tn ${esc(x.unit.split(" ")[0])}</b></td>` +
+                  tn(x.change4w) + tn(x.change13w) + tn(x.change52w) +
+                  `<td><span class="tag ${x.stance === "expanding" ? "ok" : x.stance === "contracting" ? "warn" : ""}">` +
+                  `${esc(x.stance)}</span></td></tr>`,
+              )
+            : emptyRow(7, r.error || "No balance sheet data available.");
+          mk.innerHTML = (it.market || []).length
+            ? it.market
+                .map(
+                  (x) =>
+                    `<tr><td><b>${esc(x.label)}</b></td>` +
+                    `<td class="num">${esc(x.value.toLocaleString(undefined, { maximumFractionDigits: 3 }))} ${esc(x.unit)}</td>` +
+                    // The comparison date is shown, not assumed: these series
+                    // have different frequencies, so "a week" is approximate and
+                    // for the monthly ones it is really the previous month.
+                    (x.change === null || x.change === undefined
+                      ? `<td class="num flat">—</td>`
+                      : `<td class="num ${x.change > 0 ? "up" : x.change < 0 ? "down" : "flat"}">` +
+                        `${x.change >= 0 ? "+" : "−"}${Math.abs(x.change).toFixed(2)}` +
+                        (x.changeFrom
+                          ? `<span style="display:block;font-size:10.5px;color:var(--muted);font-weight:400">vs ${esc(x.changeFrom)}</span>`
+                          : "") +
+                        `</td>`) +
+                    `<td style="color:var(--muted);font-size:12px">${esc(x.note)}</td></tr>`,
+                )
+                .join("")
+            : emptyRow(4, r.error || "No market rate data available.");
+        } catch {
+          pol.innerHTML = emptyRow(6, "Couldn't reach the server.");
+          sh.innerHTML = emptyRow(7, "Couldn't reach the server.");
+          mk.innerHTML = emptyRow(4, "Couldn't reach the server.");
         }
       }
 

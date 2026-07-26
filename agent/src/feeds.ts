@@ -14,6 +14,13 @@
  *    payload carries the reference date and the UI shows it.
  *  - **Crypto** — CoinGecko public API, including 24h/7d/30d/1y changes.
  *  - **Stocks / indices / commodities** — Yahoo Finance chart API.
+ *  - **Policy rates & central-bank balance sheets** — FRED (Federal Reserve
+ *    Bank of St. Louis) series, read as CSV. Rate *decisions* are derived from
+ *    the series itself: the effective date of the current setting is the day
+ *    after the last day the series held a different value, and the size of the
+ *    move is that difference. QE/QT direction is the sign of the change in total
+ *    assets over 4/13/52 weeks. Both are arithmetic on published data — no
+ *    forecast, no editorial reading of a statement.
  *  - **News** — public RSS feeds, one or more per topic.
  *
  * ## Caching
@@ -127,13 +134,60 @@ export interface FxRate {
   rate: number;
   /** Percentage change vs the previous published reference rate. */
   changePct: number | null;
+  /** Grouping for the table, so a long list stays navigable. */
+  group: string;
 }
 
-const FX_PAIRS: [string, string][] = [
-  ["EUR", "USD"], ["GBP", "USD"], ["USD", "JPY"], ["AUD", "USD"],
-  ["USD", "CHF"], ["USD", "CAD"], ["NZD", "USD"], ["USD", "CNY"],
-  ["USD", "SGD"], ["USD", "INR"],
+/**
+ * Pairs are grouped the way a dealing desk groups them, and every currency here
+ * is one the ECB actually publishes a reference rate for — asking Frankfurter
+ * for a currency outside its table would silently drop the row.
+ */
+const FX_GROUPS: { group: string; pairs: [string, string][] }[] = [
+  {
+    group: "Majors",
+    pairs: [
+      ["EUR", "USD"], ["GBP", "USD"], ["USD", "JPY"], ["AUD", "USD"],
+      ["USD", "CHF"], ["USD", "CAD"], ["NZD", "USD"],
+    ],
+  },
+  {
+    group: "Crosses",
+    pairs: [
+      ["EUR", "GBP"], ["EUR", "JPY"], ["GBP", "JPY"], ["EUR", "CHF"],
+      ["AUD", "JPY"], ["EUR", "AUD"], ["EUR", "CAD"], ["CHF", "JPY"],
+      ["GBP", "AUD"], ["EUR", "NZD"],
+    ],
+  },
+  {
+    group: "Europe & Nordics",
+    pairs: [
+      ["EUR", "SEK"], ["EUR", "NOK"], ["EUR", "DKK"], ["EUR", "PLN"],
+      ["EUR", "CZK"], ["EUR", "HUF"], ["USD", "SEK"], ["USD", "NOK"],
+      ["USD", "TRY"], ["USD", "ISK"], ["EUR", "RON"], ["EUR", "BGN"],
+    ],
+  },
+  {
+    group: "Asia & Pacific",
+    pairs: [
+      ["USD", "CNY"], ["USD", "SGD"], ["USD", "INR"], ["USD", "HKD"],
+      ["USD", "KRW"], ["USD", "THB"], ["USD", "IDR"], ["USD", "MYR"],
+      ["USD", "PHP"], ["EUR", "CNY"], ["EUR", "INR"],
+    ],
+  },
+  {
+    group: "Americas, Middle East & Africa",
+    pairs: [
+      ["USD", "MXN"], ["USD", "BRL"], ["USD", "ZAR"], ["USD", "ILS"],
+      ["EUR", "MXN"], ["EUR", "ZAR"], ["EUR", "BRL"],
+    ],
+  },
 ];
+
+const FX_PAIRS: [string, string][] = FX_GROUPS.flatMap((g) => g.pairs);
+const FX_GROUP_OF = new Map(
+  FX_GROUPS.flatMap((g) => g.pairs.map(([b, q]) => [`${b}/${q}`, g.group] as const)),
+);
 
 /**
  * ECB reference rates via Frankfurter. One request for today and one for the
@@ -176,12 +230,14 @@ async function loadFx(): Promise<{ rates: FxRate[]; date: string; previousDate: 
     const now = rateFor(base, quote, latest.rates);
     if (now === undefined || !Number.isFinite(now)) continue;
     const before = rateFor(base, quote, prev);
+    const pair = `${base}/${quote}`;
     rates.push({
-      pair: `${base}/${quote}`,
+      pair,
       base,
       quote,
       rate: now,
       changePct: before && Number.isFinite(before) ? ((now - before) / before) * 100 : null,
+      group: FX_GROUP_OF.get(pair) ?? "Other",
     });
   }
   return { rates, date: latest.date, previousDate: prevDate };
@@ -200,7 +256,14 @@ async function loadFxYahoo(): Promise<{ rates: FxRate[]; date: string; previousD
   return {
     rates: quotes.map((q) => {
       const [base, quote] = q.name.split("/");
-      return { pair: q.name, base, quote, rate: q.price, changePct: q.changePct };
+      return {
+        pair: q.name,
+        base,
+        quote,
+        rate: q.price,
+        changePct: q.changePct,
+        group: FX_GROUP_OF.get(q.name) ?? "Other",
+      };
     }),
     date: new Date().toISOString().slice(0, 10),
     previousDate: "",
@@ -238,10 +301,26 @@ export interface CryptoRow {
   changeYear: number | null;
 }
 
+/**
+ * CoinGecko ids, not tickers. An id that no longer exists is simply absent from
+ * the response, so a renamed coin costs one missing row rather than an error —
+ * which is why this list can be long without becoming fragile.
+ */
 const CRYPTO_IDS = [
-  "bitcoin", "ethereum", "solana", "ripple", "cardano",
-  "usd-coin", "tether", "binancecoin", "dogecoin", "avalanche-2",
-  "chainlink", "polkadot",
+  // majors
+  "bitcoin", "ethereum", "solana", "ripple", "cardano", "binancecoin",
+  "dogecoin", "avalanche-2", "tron", "the-open-network", "polkadot", "chainlink",
+  // stablecoins and wrapped assets
+  "usd-coin", "tether", "dai", "ethena-usde", "wrapped-bitcoin", "staked-ether",
+  // layer 1 / layer 2
+  "sui", "aptos", "near", "arbitrum", "optimism", "polygon-ecosystem-token",
+  "cosmos", "algorand", "internet-computer", "hedera-hashgraph", "stellar",
+  "litecoin", "bitcoin-cash", "ethereum-classic", "monero", "kaspa", "sei-network",
+  // defi and infrastructure
+  "uniswap", "aave", "maker", "lido-dao", "curve-dao-token", "the-graph",
+  "injective-protocol", "render-token", "filecoin", "quant-network", "thorchain",
+  // consumer and meme
+  "shiba-inu", "pepe", "immutable-x", "the-sandbox", "decentraland", "chiliz",
 ];
 
 async function loadCrypto(): Promise<CryptoRow[]> {
@@ -284,6 +363,8 @@ export interface Quote {
   changeAbs: number | null;
   previousClose: number | null;
   marketState: string;
+  /** Grouping label for the table; empty when the caller didn't supply one. */
+  sector: string;
 }
 
 /**
@@ -294,13 +375,15 @@ export interface Quote {
  * needed. A symbol that fails is dropped from the list rather than shown at
  * zero — a price of 0.00 next to a real one is actively misleading.
  */
-async function loadQuotes(symbols: { symbol: string; name: string }[]): Promise<Quote[]> {
+async function loadQuotes(
+  symbols: { symbol: string; name: string; sector?: string }[],
+): Promise<Quote[]> {
   const out: Quote[] = [];
-  const CONCURRENCY = 4;
+  const CONCURRENCY = 6;
   for (let i = 0; i < symbols.length; i += CONCURRENCY) {
     const batch = symbols.slice(i, i + CONCURRENCY);
     const settled = await Promise.allSettled(
-      batch.map(async ({ symbol, name }) => {
+      batch.map(async ({ symbol, name, sector }) => {
         const j = await getJson<{
           chart: { result?: { meta: Record<string, unknown> }[]; error?: unknown };
         }>(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=5d&interval=1d`, 9000);
@@ -319,6 +402,7 @@ async function loadQuotes(symbols: { symbol: string; name: string }[]): Promise<
           changeAbs: hasPrev ? price - prev : null,
           changePct: hasPrev ? ((price - prev) / prev) * 100 : null,
           marketState: String(meta.marketState ?? ""),
+          sector: sector ?? "",
         } as Quote;
       }),
     );
@@ -328,44 +412,98 @@ async function loadQuotes(symbols: { symbol: string; name: string }[]): Promise<
   return out;
 }
 
+/**
+ * Each symbol costs one upstream request, so these lists are a deliberate
+ * trade: wide enough to be a real market view, short enough that a refresh
+ * finishes inside the cache window without Yahoo throttling us. `sector` is
+ * only a label for grouping the table.
+ */
 const STOCKS = [
-  { symbol: "AAPL", name: "Apple" },
-  { symbol: "MSFT", name: "Microsoft" },
-  { symbol: "NVDA", name: "NVIDIA" },
-  { symbol: "GOOGL", name: "Alphabet" },
-  { symbol: "AMZN", name: "Amazon" },
-  { symbol: "META", name: "Meta" },
-  { symbol: "TSLA", name: "Tesla" },
-  { symbol: "JPM", name: "JPMorgan Chase" },
-  { symbol: "V", name: "Visa" },
-  { symbol: "COIN", name: "Coinbase" },
+  { symbol: "AAPL", name: "Apple", sector: "Technology" },
+  { symbol: "MSFT", name: "Microsoft", sector: "Technology" },
+  { symbol: "NVDA", name: "NVIDIA", sector: "Technology" },
+  { symbol: "AVGO", name: "Broadcom", sector: "Technology" },
+  { symbol: "AMD", name: "AMD", sector: "Technology" },
+  { symbol: "ORCL", name: "Oracle", sector: "Technology" },
+  { symbol: "CRM", name: "Salesforce", sector: "Technology" },
+  { symbol: "ARM", name: "Arm Holdings", sector: "Technology" },
+  { symbol: "TSM", name: "TSMC", sector: "Technology" },
+  { symbol: "ASML", name: "ASML", sector: "Technology" },
+  { symbol: "GOOGL", name: "Alphabet", sector: "Communication" },
+  { symbol: "META", name: "Meta", sector: "Communication" },
+  { symbol: "NFLX", name: "Netflix", sector: "Communication" },
+  { symbol: "DIS", name: "Disney", sector: "Communication" },
+  { symbol: "AMZN", name: "Amazon", sector: "Consumer" },
+  { symbol: "TSLA", name: "Tesla", sector: "Consumer" },
+  { symbol: "WMT", name: "Walmart", sector: "Consumer" },
+  { symbol: "MCD", name: "McDonald's", sector: "Consumer" },
+  { symbol: "KO", name: "Coca-Cola", sector: "Consumer" },
+  { symbol: "NKE", name: "Nike", sector: "Consumer" },
+  { symbol: "JPM", name: "JPMorgan Chase", sector: "Financials" },
+  { symbol: "BAC", name: "Bank of America", sector: "Financials" },
+  { symbol: "GS", name: "Goldman Sachs", sector: "Financials" },
+  { symbol: "V", name: "Visa", sector: "Financials" },
+  { symbol: "MA", name: "Mastercard", sector: "Financials" },
+  { symbol: "BRK-B", name: "Berkshire Hathaway", sector: "Financials" },
+  { symbol: "COIN", name: "Coinbase", sector: "Digital assets" },
+  { symbol: "MSTR", name: "Strategy", sector: "Digital assets" },
+  { symbol: "PYPL", name: "PayPal", sector: "Digital assets" },
+  { symbol: "XOM", name: "ExxonMobil", sector: "Energy & industrials" },
+  { symbol: "CVX", name: "Chevron", sector: "Energy & industrials" },
+  { symbol: "CAT", name: "Caterpillar", sector: "Energy & industrials" },
+  { symbol: "BA", name: "Boeing", sector: "Energy & industrials" },
+  { symbol: "LLY", name: "Eli Lilly", sector: "Healthcare" },
+  { symbol: "UNH", name: "UnitedHealth", sector: "Healthcare" },
+  { symbol: "JNJ", name: "Johnson & Johnson", sector: "Healthcare" },
 ];
 
 const INDICES = [
-  { symbol: "^GSPC", name: "S&P 500" },
-  { symbol: "^IXIC", name: "Nasdaq Composite" },
-  { symbol: "^DJI", name: "Dow Jones" },
-  { symbol: "^FTSE", name: "FTSE 100" },
-  { symbol: "^N225", name: "Nikkei 225" },
-  { symbol: "^VIX", name: "VIX (volatility)" },
+  { symbol: "^GSPC", name: "S&P 500", sector: "United States" },
+  { symbol: "^IXIC", name: "Nasdaq Composite", sector: "United States" },
+  { symbol: "^DJI", name: "Dow Jones Industrial", sector: "United States" },
+  { symbol: "^RUT", name: "Russell 2000", sector: "United States" },
+  { symbol: "^FTSE", name: "FTSE 100", sector: "Europe" },
+  { symbol: "^GDAXI", name: "DAX", sector: "Europe" },
+  { symbol: "^FCHI", name: "CAC 40", sector: "Europe" },
+  { symbol: "^STOXX50E", name: "Euro Stoxx 50", sector: "Europe" },
+  { symbol: "^N225", name: "Nikkei 225", sector: "Asia-Pacific" },
+  { symbol: "^HSI", name: "Hang Seng", sector: "Asia-Pacific" },
+  { symbol: "^AXJO", name: "ASX 200", sector: "Asia-Pacific" },
+  { symbol: "^KS11", name: "KOSPI", sector: "Asia-Pacific" },
+  { symbol: "^BSESN", name: "BSE Sensex", sector: "Asia-Pacific" },
+  { symbol: "^VIX", name: "VIX (volatility)", sector: "Rates & volatility" },
+  { symbol: "^TNX", name: "US 10-year yield", sector: "Rates & volatility" },
+  { symbol: "DX-Y.NYB", name: "US dollar index", sector: "Rates & volatility" },
 ];
 
 const COMMODITIES = [
-  { symbol: "GC=F", name: "Gold" },
-  { symbol: "SI=F", name: "Silver" },
-  { symbol: "HG=F", name: "Copper" },
-  { symbol: "CL=F", name: "Crude oil (WTI)" },
-  { symbol: "BZ=F", name: "Brent crude" },
-  { symbol: "NG=F", name: "Natural gas" },
-  { symbol: "ZC=F", name: "Corn" },
-  { symbol: "ZW=F", name: "Wheat" },
-  { symbol: "KC=F", name: "Coffee" },
+  { symbol: "GC=F", name: "Gold", sector: "Precious metals" },
+  { symbol: "SI=F", name: "Silver", sector: "Precious metals" },
+  { symbol: "PL=F", name: "Platinum", sector: "Precious metals" },
+  { symbol: "PA=F", name: "Palladium", sector: "Precious metals" },
+  { symbol: "HG=F", name: "Copper", sector: "Industrial metals" },
+  { symbol: "ALI=F", name: "Aluminium", sector: "Industrial metals" },
+  { symbol: "CL=F", name: "Crude oil (WTI)", sector: "Energy" },
+  { symbol: "BZ=F", name: "Brent crude", sector: "Energy" },
+  { symbol: "NG=F", name: "Natural gas", sector: "Energy" },
+  { symbol: "RB=F", name: "RBOB gasoline", sector: "Energy" },
+  { symbol: "HO=F", name: "Heating oil", sector: "Energy" },
+  { symbol: "ZC=F", name: "Corn", sector: "Agriculture" },
+  { symbol: "ZW=F", name: "Wheat", sector: "Agriculture" },
+  { symbol: "ZS=F", name: "Soybeans", sector: "Agriculture" },
+  { symbol: "KC=F", name: "Coffee", sector: "Softs" },
+  { symbol: "SB=F", name: "Sugar", sector: "Softs" },
+  { symbol: "CC=F", name: "Cocoa", sector: "Softs" },
+  { symbol: "CT=F", name: "Cotton", sector: "Softs" },
 ];
 
 export async function stocks(): Promise<FeedResult<{ stocks: Quote[]; indices: Quote[] }>> {
   const empty = { stocks: [], indices: [] };
   try {
-    const entry = await cached("stocks", 120_000, async () => ({
+    // Three minutes rather than two: the list is wider now, and these are daily
+    // closes plus an intraday last — a slightly older cache costs nothing and
+    // keeps us well inside what a public endpoint will tolerate.
+    const entry = await cached("stocks", 180_000, async () => ({
       stocks: await loadQuotes(STOCKS),
       indices: await loadQuotes(INDICES),
     }));
@@ -377,9 +515,277 @@ export async function stocks(): Promise<FeedResult<{ stocks: Quote[]; indices: Q
 
 export async function commodities(): Promise<FeedResult<Quote[]>> {
   try {
-    return wrap(await cached("commodities", 120_000, () => loadQuotes(COMMODITIES)), "Yahoo Finance", []);
+    return wrap(await cached("commodities", 180_000, () => loadQuotes(COMMODITIES)), "Yahoo Finance", []);
   } catch (e) {
     return failed("Yahoo Finance", [] as Quote[], e);
+  }
+}
+
+// --- Central banks: policy rates and balance sheets --------------------------
+
+/**
+ * A FRED observation series, oldest first. `.` is FRED's missing-value marker
+ * and those rows are dropped rather than read as zero.
+ */
+export interface Obs {
+  date: string;
+  value: number;
+}
+
+async function loadFredSeries(id: string, sinceISO: string): Promise<Obs[]> {
+  const csv = await getText(
+    `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(id)}&cosd=${sinceISO}`,
+    15_000,
+  );
+  const out: Obs[] = [];
+  for (const line of csv.split("\n").slice(1)) {
+    const [date, raw] = line.trim().split(",");
+    if (!date || !raw) continue;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) continue; // FRED writes "." for no observation
+    out.push({ date, value });
+  }
+  if (!out.length) throw new Error(`no observations for ${id}`);
+  return out;
+}
+
+/** Every series in one shot, with the same limited concurrency as the quotes. */
+async function loadFred(ids: string[], sinceISO: string): Promise<Record<string, Obs[]>> {
+  const out: Record<string, Obs[]> = {};
+  const CONCURRENCY = 5;
+  for (let i = 0; i < ids.length; i += CONCURRENCY) {
+    const batch = ids.slice(i, i + CONCURRENCY);
+    const settled = await Promise.allSettled(batch.map((id) => loadFredSeries(id, sinceISO)));
+    settled.forEach((r, k) => { if (r.status === "fulfilled") out[batch[k]] = r.value; });
+  }
+  if (!Object.keys(out).length) throw new Error("no FRED series was reachable");
+  return out;
+}
+
+export interface PolicyRate {
+  bank: string;
+  /** What the number actually is. Never "the policy rate" when it is a proxy. */
+  instrument: string;
+  /** Formatted for display, e.g. "3.50–3.75%". */
+  display: string;
+  /** The comparable single number (the top of a range). */
+  value: number;
+  /** ISO date of the latest observation. */
+  asOf: string;
+  /** ISO date this level took effect, derived from the series. */
+  since: string | null;
+  /** Size of the move onto this level, in basis points. */
+  moveBps: number | null;
+  /** How long the level has held, in days. */
+  heldDays: number | null;
+  source: string;
+}
+
+export interface BalanceSheet {
+  bank: string;
+  label: string;
+  /** Millions of the currency named in `unit`. */
+  latest: number;
+  unit: string;
+  asOf: string;
+  change4w: number | null;
+  change13w: number | null;
+  change52w: number | null;
+  /** Sign of the 13-week change: what the balance sheet is actually doing. */
+  stance: "expanding" | "contracting" | "broadly flat";
+  source: string;
+}
+
+export interface MarketRate {
+  label: string;
+  value: number;
+  unit: string;
+  asOf: string;
+  /** Change since `changeFrom`, which is *about* a week back but not exactly. */
+  change: number | null;
+  /** The observation date the change was measured against, or null. */
+  changeFrom: string | null;
+  note: string;
+}
+
+const DAY = 86_400_000;
+const daysBetween = (a: string, b: string) => Math.round((Date.parse(b) - Date.parse(a)) / DAY);
+
+/**
+ * When did the current level take effect, and how big was the step onto it?
+ *
+ * Walk backwards from the latest observation to the first one that differs.
+ * The observation *after* that is when the level began — which for a daily
+ * policy-rate series is the effective date of the decision, and the difference
+ * is the size of the cut or hike. This is measurement, not interpretation: we
+ * are reading the rate the central bank set, not what its statement said.
+ */
+export function lastChange(obs: Obs[]): { since: string | null; moveBps: number | null } {
+  if (obs.length < 2) return { since: null, moveBps: null };
+  const current = obs[obs.length - 1].value;
+  for (let i = obs.length - 2; i >= 0; i--) {
+    if (Math.abs(obs[i].value - current) > 1e-9) {
+      return { since: obs[i + 1].date, moveBps: Math.round((current - obs[i].value) * 100) };
+    }
+  }
+  return { since: null, moveBps: null }; // unchanged across the whole window
+}
+
+/**
+ * Change over roughly N weeks, and the observation it was measured against.
+ *
+ * The comparison date is returned rather than assumed because these series do
+ * not share a frequency: asking a monthly series for a one-week change lands on
+ * last month's value, and reporting that as "on the week" would be wrong. The
+ * caller shows the date it actually compared with.
+ */
+export function changeDetail(obs: Obs[], weeks: number): { change: number | null; from: string | null } {
+  const latest = obs[obs.length - 1];
+  const target = Date.parse(latest.date) - weeks * 7 * DAY;
+  let best: Obs | null = null;
+  for (const o of obs) {
+    if (Date.parse(o.date) <= target) best = o;
+    else break;
+  }
+  return best ? { change: latest.value - best.value, from: best.date } : { change: null, from: null };
+}
+
+/** Change over roughly N weeks, for the series where the frequency is known. */
+export function changeOver(obs: Obs[], weeks: number): number | null {
+  return changeDetail(obs, weeks).change;
+}
+
+const POLICY_SERIES = ["DFEDTARU", "DFEDTARL", "ECBDFR", "ECBMRRFR", "IUDSOIA", "IRSTCI01JPM156N"];
+const SHEET_SERIES = ["WALCL", "WSHOSHO", "WSHOMCB", "ECBASSETSW"];
+const MARKET_SERIES = ["DGS10", "DGS2", "T10Y2Y", "T10YIE", "RRPONTSYD"];
+
+async function loadRates(): Promise<{
+  policy: PolicyRate[];
+  sheets: BalanceSheet[];
+  market: MarketRate[];
+}> {
+  // Two years of history: enough to date a policy change that has held for a
+  // long time, and enough for a 52-week balance-sheet comparison.
+  const since = new Date(Date.now() - 760 * DAY).toISOString().slice(0, 10);
+  const s = await loadFred([...POLICY_SERIES, ...SHEET_SERIES, ...MARKET_SERIES], since);
+  const SRC = "FRED (Federal Reserve Bank of St. Louis)";
+  const today = new Date().toISOString().slice(0, 10);
+
+  const policy: PolicyRate[] = [];
+  const push = (
+    bank: string,
+    instrument: string,
+    obs: Obs[] | undefined,
+    display: (v: number) => string,
+  ) => {
+    if (!obs?.length) return;
+    const latest = obs[obs.length - 1];
+    const { since: from, moveBps } = lastChange(obs);
+    policy.push({
+      bank,
+      instrument,
+      display: display(latest.value),
+      value: latest.value,
+      asOf: latest.date,
+      since: from,
+      moveBps,
+      heldDays: from ? daysBetween(from, today) : null,
+      source: SRC,
+    });
+  };
+
+  // The Fed publishes the range as two series; show it as the range it is.
+  const up = s.DFEDTARU;
+  const lo = s.DFEDTARL;
+  if (up?.length && lo?.length) {
+    const { since: from, moveBps } = lastChange(up);
+    policy.push({
+      bank: "Federal Reserve",
+      instrument: "Federal funds target range",
+      display: `${lo[lo.length - 1].value.toFixed(2)}–${up[up.length - 1].value.toFixed(2)}%`,
+      value: up[up.length - 1].value,
+      asOf: up[up.length - 1].date,
+      since: from,
+      moveBps,
+      heldDays: from ? daysBetween(from, today) : null,
+      source: SRC,
+    });
+  }
+  push("European Central Bank", "Deposit facility rate", s.ECBDFR, (v) => `${v.toFixed(2)}%`);
+  push("European Central Bank", "Main refinancing rate", s.ECBMRRFR, (v) => `${v.toFixed(2)}%`);
+  // The UK and Japan appear further down, among the market-set rates. FRED has
+  // no live Bank Rate or BoJ policy-rate series, only realised overnight market
+  // rates. Those drift by fractions of a basis point every day, so running the
+  // "last change" derivation over them produces a meaningless "0 bp move
+  // yesterday" — and putting them in this table at all would imply a decision
+  // nobody made. This table holds administered rates only.
+
+  const sheets: BalanceSheet[] = [];
+  const sheet = (bank: string, label: string, id: string, unit: string) => {
+    const obs = s[id];
+    if (!obs?.length) return;
+    const latest = obs[obs.length - 1];
+    const c4 = changeOver(obs, 4);
+    const c13 = changeOver(obs, 13);
+    const c52 = changeOver(obs, 52);
+    // "Broadly flat" is anything inside ±1% of the total over a quarter.
+    // A central bank's balance sheet moves for reasons that are not policy —
+    // reinvestment timing, currency swap lines, a Treasury cash balance shift —
+    // and calling a 0.5% quarterly drift "quantitative easing" would be reading
+    // a decision into noise. The band is wide on purpose.
+    const threshold = latest.value * 0.01;
+    sheets.push({
+      bank,
+      label,
+      latest: latest.value,
+      unit,
+      asOf: latest.date,
+      change4w: c4,
+      change13w: c13,
+      change52w: c52,
+      stance:
+        c13 === null || Math.abs(c13) < threshold
+          ? "broadly flat"
+          : c13 > 0
+            ? "expanding"
+            : "contracting",
+      source: SRC,
+    });
+  };
+  sheet("Federal Reserve", "Total assets", "WALCL", "USD millions");
+  sheet("Federal Reserve", "Treasury securities held", "WSHOSHO", "USD millions");
+  sheet("Federal Reserve", "Mortgage-backed securities held", "WSHOMCB", "USD millions");
+  sheet("European Central Bank", "Total assets (Eurosystem)", "ECBASSETSW", "EUR millions");
+
+  const market: MarketRate[] = [];
+  const mkt = (label: string, id: string, unit: string, note: string) => {
+    const obs = s[id];
+    if (!obs?.length) return;
+    const latest = obs[obs.length - 1];
+    const { change, from } = changeDetail(obs, 1);
+    market.push({ label, value: latest.value, unit, asOf: latest.date, change, changeFrom: from, note });
+  };
+  mkt("US 2-year Treasury", "DGS2", "%", "The maturity that tracks expected policy most closely.");
+  mkt("US 10-year Treasury", "DGS10", "%", "The long end — growth and term premium, not just policy.");
+  mkt("10-year minus 2-year", "T10Y2Y", "pp", "Negative is an inverted curve.");
+  mkt("10-year breakeven inflation", "T10YIE", "%", "Inflation the bond market is pricing in over ten years.");
+  mkt("Overnight reverse repo", "RRPONTSYD", "USD billions", "Cash parked at the Fed; a drain from bank reserves.");
+  mkt("SONIA (UK overnight)", "IUDSOIA", "%", "Realised sterling overnight rate — the closest live proxy for Bank Rate, not the decision itself.");
+  mkt("Japan call money (overnight)", "IRSTCI01JPM156N", "%", "Realised interbank overnight rate in Japan; monthly, and not the BoJ's policy rate.");
+
+  return { policy, sheets, market };
+}
+
+export async function rates(): Promise<
+  FeedResult<{ policy: PolicyRate[]; sheets: BalanceSheet[]; market: MarketRate[] }>
+> {
+  const empty = { policy: [], sheets: [], market: [] };
+  try {
+    // These series update daily at best and weekly for the balance sheets, so a
+    // six-hour cache is still fresher than the data.
+    return wrap(await cached("rates", 6 * 3600_000, loadRates), "FRED (St. Louis Fed)", empty);
+  } catch (e) {
+    return failed("FRED (St. Louis Fed)", empty, e);
   }
 }
 
@@ -534,7 +940,7 @@ export interface AnalysisLine {
  */
 export async function analysis(): Promise<FeedResult<{ lines: AnalysisLine[]; basis: string[] }>> {
   const empty = { lines: [], basis: [] };
-  const [c, s, cm, f] = await Promise.all([crypto(), stocks(), commodities(), fx()]);
+  const [c, s, cm, f, r] = await Promise.all([crypto(), stocks(), commodities(), fx(), rates()]);
   const lines: AnalysisLine[] = [];
   const basis: string[] = [];
   const pct = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
@@ -552,6 +958,53 @@ export async function analysis(): Promise<FeedResult<{ lines: AnalysisLine[]; ba
     });
   };
 
+  // --- monetary policy: the decision, then the balance sheet ---------------
+  // Ordered first among the derived lines because everything below it is priced
+  // off the policy rate and the size of the central bank's balance sheet.
+  if (r.ok && (r.items.policy.length || r.items.sheets.length)) {
+    basis.push("FRED (St. Louis Fed)");
+    for (const p of r.items.policy) {
+      const move =
+        p.moveBps === null || p.since === null
+          ? "No change inside the two-year window read here."
+          : `Last move ${p.moveBps > 0 ? "+" : ""}${p.moveBps} bp, effective ${p.since}` +
+            (p.heldDays !== null ? ` — held ${p.heldDays} day${p.heldDays === 1 ? "" : "s"}.` : ".");
+      lines.push({
+        label: `${p.bank} — ${p.instrument}`,
+        detail: `${p.display} as of ${p.asOf}. ${move}`,
+        // A cut is stimulus for risk assets, a hike is a headwind; that is the
+        // only directional claim here and it follows from the sign alone.
+        tone: p.moveBps === null ? "flat" : p.moveBps < 0 ? "up" : "down",
+      });
+    }
+    for (const b of r.items.sheets) {
+      const tn = (v: number | null) =>
+        v === null ? "n/a" : `${v >= 0 ? "+" : "−"}${(Math.abs(v) / 1_000_000).toFixed(3)}tn`;
+      lines.push({
+        label: `${b.bank} — ${b.label}`,
+        detail:
+          `${(b.latest / 1_000_000).toFixed(3)}tn ${b.unit.split(" ")[0]} as of ${b.asOf}: ` +
+          `${b.stance}${b.stance === "expanding" ? " (asset purchases outpacing runoff)" : b.stance === "contracting" ? " (quantitative tightening)" : ""}. ` +
+          `Change ${tn(b.change4w)} over 4 weeks, ${tn(b.change13w)} over 13, ${tn(b.change52w)} over 52.`,
+        tone: b.stance === "expanding" ? "up" : b.stance === "contracting" ? "down" : "flat",
+      });
+    }
+    const curve = r.items.market.find((m) => m.label === "10-year minus 2-year");
+    const be = r.items.market.find((m) => m.label === "10-year breakeven inflation");
+    if (curve) {
+      lines.push({
+        label: "Yield curve",
+        detail:
+          `10-year minus 2-year at ${(curve.value * 100).toFixed(0)} bp (${curve.asOf})` +
+          (curve.change !== null
+            ? `, ${curve.change >= 0 ? "+" : ""}${(curve.change * 100).toFixed(0)} bp since ${curve.changeFrom}`
+            : "") +
+          `. ${curve.value < 0 ? "Inverted." : "Positively sloped."}` +
+          (be ? ` Ten-year breakeven inflation ${be.value.toFixed(2)}%.` : ""),
+        tone: curve.value < 0 ? "down" : "up",
+      });
+    }
+  }
   if (s.ok && s.items.stocks.length) {
     breadth(s.items.stocks, "Large-cap equity");
     basis.push("Yahoo Finance equities");
@@ -620,8 +1073,10 @@ export async function analysis(): Promise<FeedResult<{ lines: AnalysisLine[]; ba
   lines.push({
     label: "How this is produced",
     detail:
-      "Every line above is computed from the prices in the other tabs — counts, averages and " +
-      "differences, nothing forecast or inferred. Sources: " + basis.join(", ") + ".",
+      "Every line above is computed from published figures — counts, averages and differences over " +
+      "the prices in the other tabs and the central-bank series in the tables below. Nothing here " +
+      "is forecast, and no policy statement is interpreted: a rate change is dated by finding where " +
+      "the published series changed. Sources: " + basis.join(", ") + ".",
     tone: "info",
   });
   return {

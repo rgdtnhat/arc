@@ -246,13 +246,19 @@ async function main() {
   const cirHeldByDeployer = await bal(deployer.address, CIRBTC_ADDRESS);
   const collateral = cirHeldByDeployer >= 40_000n ? 40_000n : cirHeldByDeployer; // ~0.0004 cirBTC
   if (collateral > 0n) {
-    console.log(`→ funding agent ${collateral} cirBTC + opening its position…`);
-    await dSend(CIRBTC_ADDRESS, erc20Abi, "transfer", [agent.address, collateral]);
-    await aSend(CIRBTC_ADDRESS, erc20Abi, "approve", [pool, maxUint256]);
-    await aSend(pool, tesseraPoolAbi, "supply", [CIRBTC_ADDRESS, collateral]);
-    const usdcLiquidity = await bal(pool, ARC_USDC_ADDRESS);
-    if (usdcLiquidity >= 1_000_000n) {
-      await aSend(pool, tesseraPoolAbi, "borrow", [ARC_USDC_ADDRESS, 1_000_000n]); // 1 USDC
+    // Also best-effort: an already-open position, or a frozen reserve, must not
+    // stop the contracts that come after this from being deployed.
+    try {
+      console.log(`→ funding agent ${collateral} cirBTC + opening its position…`);
+      await dSend(CIRBTC_ADDRESS, erc20Abi, "transfer", [agent.address, collateral]);
+      await aSend(CIRBTC_ADDRESS, erc20Abi, "approve", [pool, maxUint256]);
+      await aSend(pool, tesseraPoolAbi, "supply", [CIRBTC_ADDRESS, collateral]);
+      const usdcLiquidity = await bal(pool, ARC_USDC_ADDRESS);
+      if (usdcLiquidity >= 1_000_000n) {
+        await aSend(pool, tesseraPoolAbi, "borrow", [ARC_USDC_ADDRESS, 1_000_000n]); // 1 USDC
+      }
+    } catch (e) {
+      console.warn(`   (skip agent position: ${String(e.shortMessage ?? e.message).slice(0, 80)})`);
     }
   } else {
     console.log("   (skip agent position — no cirBTC to use as collateral; supply from the dashboard once funded)");
@@ -293,14 +299,26 @@ async function main() {
   }, { custodial: true });
   const swap = swapRes.address;
   // Seed the swap desk with a slice of each asset the deployer still holds.
+  //
+  // Best-effort on purpose. `seed` is owner-only, and on any run after the first
+  // the fee collector owns the swap desk — so this reverts, and when it was
+  // un-caught it aborted the whole script before the AMM was ever deployed.
+  // Inventory is a nice-to-have; the deployment is not.
   for (const r of LIVE_RESERVES) {
     const held = await bal(deployer.address, r.address);
     const want = r.symbol === "cirBTC" ? 10_000n : 2_000_000n; // 0.0001 cirBTC or 2 units
     const seed = want < held ? want : held;
     if (seed > 0n) {
-      await dSend(r.address, erc20Abi, "approve", [swap, maxUint256]);
-      await dSend(swap, tesseraSwapAbi, "seed", [r.address, seed]);
-      console.log(`   seeded swap ${seed} ${r.symbol}`);
+      try {
+        await dSend(r.address, erc20Abi, "approve", [swap, maxUint256]);
+        await dSend(swap, tesseraSwapAbi, "seed", [r.address, seed]);
+        console.log(`   seeded swap ${seed} ${r.symbol}`);
+      } catch (e) {
+        console.warn(
+          `   (skip seeding swap ${r.symbol}: ${String(e.shortMessage ?? e.message).slice(0, 70)}` +
+            ` — the collector owns the desk, so seed from its allocation instead)`,
+        );
+      }
     }
   }
 
@@ -367,7 +385,17 @@ async function main() {
   }, { custodial: true });
   const amm = ammRes.address;
 
-  if (!ammRes.reused) {
+  // Seed the pools from what's actually on chain, not from whether this run
+  // happened to deploy the AMM. A previous run could have deployed the contract
+  // and then died before creating any pool — reusing that address and skipping
+  // this block would leave a permanently empty AMM that no later run repairs.
+  let ammPools = 0n;
+  try {
+    ammPools = await pub.readContract({ address: amm, abi: tesseraAmmAbi, functionName: "poolCount" });
+  } catch (e) {
+    console.warn(`   AMM pool count unreadable: ${String(e.shortMessage ?? e.message).slice(0, 80)}`);
+  }
+  if (ammPools === 0n) {
     // One pool per non-USDC reserve, paired against USDC: 0.30% fee, 50% to LPs.
     for (const r of LIVE_RESERVES.filter((x) => x.address.toLowerCase() !== ARC_USDC_ADDRESS.toLowerCase())) {
       try {
@@ -380,6 +408,8 @@ async function main() {
     // Point the AMM collector's swap leg at pool 0 so app fees cycle back in.
     try { await dSend(ammFeeCollector, tesseraFeeCollectorAbi, "setAmm", [amm, 0n]); }
     catch (e) { console.warn(`   AMM collector not linked: ${String(e.shortMessage ?? e.message).slice(0, 80)}`); }
+  } else {
+    console.log(`   AMM already has ${ammPools} pool(s)`);
   }
 
   // 7) Persist. Merge into whatever record we adopted so escrow/tab and any

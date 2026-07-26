@@ -1429,6 +1429,7 @@ async function main() {
   app.get("/api/feeds/crypto", async (_req, res) => res.json(await feeds.crypto()));
   app.get("/api/feeds/stocks", async (_req, res) => res.json(await feeds.stocks()));
   app.get("/api/feeds/commodities", async (_req, res) => res.json(await feeds.commodities()));
+  app.get("/api/feeds/rates", async (_req, res) => res.json(await feeds.rates()));
   app.get("/api/feeds/analysis", async (_req, res) => res.json(await feeds.analysis()));
   app.get("/api/feeds/news", async (req, res) => {
     const raw = String(req.query.topics ?? "").trim();
