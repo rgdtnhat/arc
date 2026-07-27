@@ -79,6 +79,35 @@ default 6000) and `ARC_RPC_MIN_INTERVAL_MS` (minimum gap between any two RPC
 calls, default 180). Lower both on a private endpoint; raise the first if the
 public node throttles you.
 
+## If `docker compose up --build` fails on apt
+
+```
+At least one invalid signature was encountered.
+E: The repository 'http://deb.debian.org/debian bookworm InRelease' is not signed.
+```
+
+This is the **host's** apt, not the Dockerfile — the container downloaded the
+index files (you can see their sizes in the log) and then could not verify them.
+The build no longer depends on it either way: the runtime stage calls apt not at
+all, and the builder's call is best-effort (`|| echo`), because everything it
+installs is optional. `ca-certificates` is already in the base image, and the two
+native packages in the tree (`keccak`, `secp256k1`) run `node-gyp-build || exit 0`
+and fall back to their prebuilt binaries.
+
+So a rebuild should now get past it. It is still worth knowing why it happened,
+because the usual cause is a real problem with the host:
+
+```bash
+df -h /                     # a full disk truncates the InRelease download
+docker system df            # reclaim with: docker system prune -af --volumes
+date -u                     # a badly skewed clock invalidates signatures
+```
+
+Disk is the common one — a build that has run several times accumulates layers
+fast. If the disk is fine and the clock is right, the remaining suspect is
+something between the host and `deb.debian.org` rewriting plain-HTTP responses (a
+transparent caching proxy at the provider).
+
 ## Option A — Render (one click, uses `render.yaml`)
 
 1. Push this repo to GitHub (already at `github.com/rgdtnhat/arc`).
