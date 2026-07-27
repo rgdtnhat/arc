@@ -79,34 +79,49 @@ default 6000) and `ARC_RPC_MIN_INTERVAL_MS` (minimum gap between any two RPC
 calls, default 180). Lower both on a private endpoint; raise the first if the
 public node throttles you.
 
-## If `docker compose up --build` fails on apt
+## If `docker compose up --build` fails
+
+### `ENOSPC: no space left on device`
 
 ```
-At least one invalid signature was encountered.
+npm warn tar TAR_ENTRY_ERROR ENOSPC: no space left on device, write
+```
+
+The host is out of disk. Nothing in the repo can work around that, so free space
+first:
+
+```bash
+df -h /                              # how bad is it
+docker system prune -af --volumes    # usually reclaims the most, by far
+docker builder prune -af             # the build cache, separately
+journalctl --vacuum-size=100M        # systemd journals grow quietly
+du -sh /var/lib/docker /var/log      # where it actually went
+```
+
+The build now needs far less of it. It used to install the whole workspace
+(~440 MB, 285 packages) including Hardhat, solc and `@nomicfoundation/edr`, and
+run `hardhat compile`. All of that was avoidable: the app imports its ABIs and
+deploy bytecode from `@tessera/shared`, where `shared/src/abi.ts` and
+`shared/src/bytecode.ts` are **generated and committed** — compiling in the image
+regenerated them byte for byte and changed nothing. One stage,
+`npm install --omit=dev`, no compile: **135 MB and 94 packages.**
+
+`npm run compile` still exists for development, and CI runs
+`npm run abi:check -- --compiled`, which fails if the committed ABIs are not
+exactly what the current sources compile to. That check is what lets the image
+trust them.
+
+### `At least one invalid signature was encountered`
+
+```
 E: The repository 'http://deb.debian.org/debian bookworm InRelease' is not signed.
 ```
 
-This is the **host's** apt, not the Dockerfile — the container downloaded the
-index files (you can see their sizes in the log) and then could not verify them.
-The build no longer depends on it either way: the runtime stage calls apt not at
-all, and the builder's call is best-effort (`|| echo`), because everything it
-installs is optional. `ca-certificates` is already in the base image, and the two
-native packages in the tree (`keccak`, `secp256k1`) run `node-gyp-build || exit 0`
-and fall back to their prebuilt binaries.
-
-So a rebuild should now get past it. It is still worth knowing why it happened,
-because the usual cause is a real problem with the host:
-
-```bash
-df -h /                     # a full disk truncates the InRelease download
-docker system df            # reclaim with: docker system prune -af --volumes
-date -u                     # a badly skewed clock invalidates signatures
-```
-
-Disk is the common one — a build that has run several times accumulates layers
-fast. If the disk is fine and the clock is right, the remaining suspect is
-something between the host and `deb.debian.org` rewriting plain-HTTP responses (a
-transparent caching proxy at the provider).
+Also a symptom of the full disk above — a truncated `InRelease` download fails
+verification. The Dockerfile no longer calls `apt` at all, so this cannot fail the
+build any more, but the disk is still worth fixing. If disk and clock (`date -u`)
+are both fine, the remaining suspect is something between the host and
+`deb.debian.org` rewriting plain-HTTP responses.
 
 ## Option A — Render (one click, uses `render.yaml`)
 

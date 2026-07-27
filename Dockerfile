@@ -1,91 +1,64 @@
 # Tessera — live dashboard + agent orchestrator, one self-contained container.
 # Runs the autonomous agent against the Tessera contracts on Arc testnet and
 # serves the dashboard on $PORT. Deploy to any Docker host (Render / Railway /
-# Fly / a VM). For mainnet, point ARC_RPC_URL + the deployment addresses at
-# your production chain and supply production wallet keys.
+# Fly / a VM). For mainnet, point ARC_RPC_URL + the deployment addresses at your
+# production chain and supply production wallet keys.
 #
-# Two stages, because the Solidity toolchain is a build-time need and a runtime
-# liability. Hardhat and its tree carry published advisories (`npm audit`); none
-# of it is reachable from the server — nothing under agent/, shared/ or
-# providers/ imports Hardhat, and nothing reads its build artifacts — but a
-# single-stage image installed and shipped all of it anyway. The builder
-# compiles; the runtime stage installs production dependencies only.
+# ## One stage, production dependencies only
 #
-# Nothing in either stage *requires* `apt`. That is deliberate: a host whose apt
-# cannot verify Debian's signatures (a truncated InRelease from a full disk, an
-# intercepting HTTP proxy, a skewed clock) would otherwise fail the build on a
-# step that installs nothing the app needs.
-
-# ---------------------------------------------------------------- build stage
-FROM node:22-bookworm-slim AS builder
-WORKDIR /app
-
-# Optional, and the build continues without it.
+# This used to install the whole workspace — including Hardhat, solc and
+# @nomicfoundation/edr, about 220 MB of it — and run `hardhat compile`. All of
+# that was wasted:
 #
-#  · ca-certificates is already in the base image; this is belt and braces.
-#  · python3/make/g++ only matter if a prebuilt native binary is missing for this
-#    platform. The only two native packages in the tree (keccak, secp256k1) both
-#    run `node-gyp-build || exit 0`, so they fall back to their prebuilds rather
-#    than failing. Both are dev-only now in any case.
+#  · The app never reads Hardhat's build artifacts. It imports the ABIs and
+#    deploy bytecode from `@tessera/shared`, and `shared/src/abi.ts` +
+#    `shared/src/bytecode.ts` are **generated and committed** (by
+#    `contracts/scripts/export-abi.cjs`, run from `npm run compile` on a
+#    developer machine or in CI). Compiling in the image regenerated those two
+#    files byte for byte and changed nothing.
+#  · So the toolchain was installed, used once to reproduce committed files, and
+#    then either shipped (the original single stage) or thrown away (the
+#    two-stage version) — in both cases paying full price in build disk.
 #
-# So a broken apt must not stop the build — hence `|| echo`, not a hard failure.
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates python3 make g++ \
-  || echo "WARNING: apt is unavailable on this host; continuing with the base image's certificates and prebuilt native binaries"
-RUN rm -rf /var/lib/apt/lists/*
-
-# Install workspace deps first for better layer caching.
-COPY package.json package-lock.json ./
-COPY shared/package.json shared/
-COPY contracts/package.json contracts/
-COPY providers/package.json providers/
-COPY agent/package.json agent/
-RUN npm install --no-audit --no-fund
-
-COPY . .
-
-# Compile contracts (seeds the offline solc, then exports the ABIs and bytecode
-# into shared/src/, which is what the app reads at run time).
-RUN npm run compile --workspace contracts
-
-# -------------------------------------------------------------- runtime stage
+# That price is the reason this is now one stage: on a small VPS the build hit
+# `ENOSPC: no space left on device` during `npm install`. Production-only is
+# ~95 packages instead of ~390, and there is nothing to compile.
+#
+# `npm run compile` still exists and CI still runs it — that is where a change to
+# a `.sol` file gets turned into the committed ABI, and `npm run abi:check`
+# fails the build if the two ever drift.
+#
+# ## No apt
+#
+# Nothing here needs it, deliberately: a host whose apt cannot verify Debian's
+# signatures (a truncated InRelease from a full disk, an intercepting HTTP proxy,
+# a skewed clock) would otherwise fail the build on a step installing nothing the
+# app uses. `ca-certificates` is in the base image, and the only native packages
+# in the tree are dev-only and fall back to prebuilt binaries anyway.
 FROM node:22-bookworm-slim
 WORKDIR /app
 
-# No apt here at all. The only thing the previous version installed was
-# ca-certificates, and the trust store is copied from the builder instead — same
-# base image, so this is at worst a no-op and at best it supplies CAs the base
-# lacks. Offline, deterministic, and one less way for the build to fail.
-#
-# `/etc/ssl/certs` only. It holds the bundle OpenSSL and Node actually read, and
-# it exists in every Debian image. `/usr/share/ca-certificates` is only the source
-# PEMs for update-ca-certificates, is not needed at run time, and — the reason
-# this matters — does not exist unless the ca-certificates package installed,
-# which is exactly the case where apt failed. `COPY` of a missing path is a build
-# failure, so copying it would have put back the failure this stage removes.
-COPY --from=builder /etc/ssl/certs /etc/ssl/certs
-
-# A fresh production-only install rather than a copy of the builder's
-# node_modules: `--omit=dev` is the whole point, and it also keeps the native
-# build toolchain out of the final image.
-#
-# `tsx` is a production dependency of the agent for this reason — the app is
-# served straight from its TypeScript sources via `node --import tsx`, so it is a
-# runtime loader here, not a dev tool.
+# Manifests first, so a source-only change reuses the install layer.
 COPY package.json package-lock.json ./
 COPY shared/package.json shared/
 COPY contracts/package.json contracts/
 COPY providers/package.json providers/
 COPY agent/package.json agent/
+
+# `--omit=dev` is what keeps the Solidity toolchain out. It is also why `tsx` is
+# a production dependency of the agent: the app is served straight from its
+# TypeScript sources via `node --import tsx`, so it is a runtime loader here, not
+# a dev tool. Cleaning the cache in the same layer keeps it out of the image.
 RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 
-# Application sources, taken from the builder so the generated ABIs and bytecode
-# are the ones that compile produced.
-COPY --from=builder /app/shared/src ./shared/src
-COPY --from=builder /app/agent/src ./agent/src
-COPY --from=builder /app/providers/src ./providers/src
-COPY --from=builder /app/dashboard ./dashboard
-COPY --from=builder /app/deployments ./deployments
+# Application sources. Explicit paths rather than `COPY . .` so the image cannot
+# pick up a stray local build directory, and so adding one does not silently
+# grow it.
+COPY shared/src ./shared/src
+COPY agent/src ./agent/src
+COPY providers/src ./providers/src
+COPY dashboard ./dashboard
+COPY deployments ./deployments
 
 ENV NODE_ENV=production
 ENV PORT=8787

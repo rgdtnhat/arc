@@ -23,5 +23,10 @@ jobs:
       - name: Contract tests (Hardhat)
         run: npm test --workspace contracts
 
+      # The Docker image ships the committed ABIs and never compiles, so this is
+      # where a drift between contracts/ and shared/src/ has to be caught.
+      - name: Committed ABIs match the contracts
+        run: npm run compile && npm run abi:check -- --compiled
+
       - name: Agent unit tests (decision engine, guardian, memory, agentkit, wallet, treasury, fleet)
         run: npm test --workspace agent
