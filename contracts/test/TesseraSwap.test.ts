@@ -94,4 +94,81 @@ describe("TesseraSwap (oracle-priced swap desk)", () => {
       hre.viem.deployContract("TesseraSwap", [pool.address, treasury.account.address, 30, 10001])
     ).to.be.rejected; // app share > 100%
   });
+
+  // --- inventory funding ----------------------------------------------------
+  //
+  // `swap` reads inventory as `balanceOf(address(this))`, with no internal
+  // ledger. These pin the consequence: ownership does not gate *adding*
+  // inventory, and it never did — so the permissionless `fund` is a visible
+  // route to something that was always possible, not a new capability.
+
+  it("lets anyone fund inventory, and fills swaps out of it", async () => {
+    const { deployer, alice, treasury, pool, usdc, eurc } = await loadFixture(deployFixture);
+    // A desk owned by someone else entirely, with no inventory.
+    const desk = await hre.viem.deployContract("TesseraSwap", [
+      pool.address, treasury.account.address, SWAP_FEE, APP_FEE_SHARE,
+    ]);
+    await desk.write.transferOwnership([treasury.account.address]);
+    expect((await desk.read.owner()).toLowerCase()).to.equal(treasury.account.address.toLowerCase());
+
+    // Alice is not the owner. She funds it anyway.
+    await eurc.write.mint([alice.account.address, USDC("500")]);
+    const aliceEurc = await hre.viem.getContractAt("MockToken", eurc.address, { client: { wallet: alice } });
+    await aliceEurc.write.approve([desk.address, USDC("500")]);
+    const asAlice = await hre.viem.getContractAt("TesseraSwap", desk.address, { client: { wallet: alice } });
+    await asAlice.write.fund([eurc.address, USDC("500")]);
+    expect(await desk.read.inventoryOf([eurc.address])).to.equal(USDC("500"));
+
+    // And that inventory is fillable: the deployer can now swap against it.
+    await usdc.write.mint([deployer.account.address, USDC("108")]);
+    await usdc.write.approve([desk.address, USDC("108")]);
+    const before = await eurc.read.balanceOf([deployer.account.address]);
+    await desk.write.swap([usdc.address, eurc.address, USDC("108"), 0n]);
+    expect(await eurc.read.balanceOf([deployer.account.address]) > before).to.equal(true);
+  });
+
+  it("counts a plain transfer as inventory, which is why fund() gates nothing", async () => {
+    const { alice, treasury, pool, usdc, eurc } = await loadFixture(deployFixture);
+    const desk = await hre.viem.deployContract("TesseraSwap", [
+      pool.address, treasury.account.address, SWAP_FEE, APP_FEE_SHARE,
+    ]);
+    await desk.write.transferOwnership([treasury.account.address]);
+
+    // No approval, no fund(), no ownership — just an ERC-20 transfer.
+    await eurc.write.mint([alice.account.address, USDC("300")]);
+    const aliceEurc = await hre.viem.getContractAt("MockToken", eurc.address, { client: { wallet: alice } });
+    await aliceEurc.write.transfer([desk.address, USDC("300")]);
+    expect(await desk.read.inventoryOf([eurc.address])).to.equal(USDC("300"));
+
+    // Fillable, exactly as if it had been seeded by the owner.
+    await usdc.write.mint([alice.account.address, USDC("108")]);
+    const aliceUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: alice } });
+    await aliceUsdc.write.approve([desk.address, USDC("108")]);
+    const asAlice = await hre.viem.getContractAt("TesseraSwap", desk.address, { client: { wallet: alice } });
+    const before = await eurc.read.balanceOf([alice.account.address]);
+    await asAlice.write.swap([usdc.address, eurc.address, USDC("108"), 0n]);
+    expect(await eurc.read.balanceOf([alice.account.address]) > before).to.equal(true);
+  });
+
+  it("still lets only the owner take inventory out", async () => {
+    const { alice, usdc, swap, asSwap } = await loadFixture(deployFixture);
+    // Funding is open; withdrawing is not. This is the asymmetry that makes
+    // inventory app-owned — a donation, with no claim on it.
+    await expect(
+      (await asSwap(alice)).write.withdrawInventory([usdc.address, USDC("1"), alice.account.address])
+    ).to.be.rejected;
+    await swap.write.withdrawInventory([usdc.address, USDC("1"), alice.account.address]);
+    expect(await usdc.read.balanceOf([alice.account.address])).to.equal(USDC("1"));
+  });
+
+  it("rejects a zero-amount fund", async () => {
+    const { usdc, swap } = await loadFixture(deployFixture);
+    await expect(swap.write.fund([usdc.address, 0n])).to.be.rejected;
+  });
+
+  it("reports inventory as the desk's own balance", async () => {
+    const { usdc, eurc, swap } = await loadFixture(deployFixture);
+    expect(await swap.read.inventoryOf([usdc.address])).to.equal(await usdc.read.balanceOf([swap.address]));
+    expect(await swap.read.inventoryOf([eurc.address])).to.equal(await eurc.read.balanceOf([swap.address]));
+  });
 });

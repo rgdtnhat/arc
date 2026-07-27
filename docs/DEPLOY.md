@@ -6,7 +6,7 @@ and you get a public URL.
 
 > Prerequisite: the app runs **live on Arc only** (there is no local chain), so
 > the container needs funded wallet keys and the deployed addresses. Deploy the
-> contracts first (`npm run bootstrap:arc` + `npm run pool:arc`, see the README),
+> contracts first (`npm run bootstrap:arc` + `npm run pool:arc:init`, see the README),
 > then pass `AGENT_PRIVATE_KEY`, `PROVIDER_PRIVATE_KEY`, and `ARC_RPC_URL` to the
 > container. Give it **~512 MB–1 GB RAM** (a "starter"/"hobby" instance).
 
@@ -21,20 +21,47 @@ replacing them, and it separates steps that matter from steps that don't:
   position, swap-desk inventory. A revert here prints `⚠ skipped …` and the run
   continues. Each one is listed again in a block at the end.
 
-A line like this is **normal, not an error**:
+### The swap desk needs inventory
 
-```
-(skip swap inventory — the desk is owned by 0x… , not the deployer.
- That is the steady state: the fee collector owns it and funds it from
- its own swap allocation.)
+`TesseraSwap` fills swaps out of its **own token balance** — there is no internal
+ledger, and `swap` checks `balanceOf(address(this))`. An empty desk therefore
+reverts every swap into that asset with `insufficient inventory`, even though
+quotes still work. The dashboard's **Desk inventory** table shows this per asset,
+and flags an empty one.
+
+Three ways to top it up, all landing in the same place:
+
+```bash
+npm run swap:fund              # top every reserve up to a default target
+npm run swap:fund -- --check   # report inventory, send nothing
+npm run swap:fund -- USDC=5 EURC=2 cirBTC=0.0002
 ```
 
-`TesseraSwap.seed` is `onlyOwner`, and the first run hands the desk to the fee
-collector — so from the second run on, the deployer cannot seed it and does not
-try. (An earlier build *did* try, and the uncaught revert aborted the script
-before `TesseraAMM` was deployed, which is why the app then reported "AMM not
-deployed yet". `agent/test/pool-arc.test.ts` runs the script against a fake node
-that reverts `seed`, and asserts the AMM still deploys.)
+…or the **Add inventory** control on the Swap card when signed in as operator,
+or nothing at all — `pool:arc` funds the desk on every run.
+
+Ownership does **not** gate this, and an earlier build wrongly assumed it did.
+`seed` is `onlyOwner`, so that build skipped inventory whenever the fee collector
+owned the desk (which it does from the first run onward) and printed
+`(skip swap inventory …)`. That left the desk empty with no route offered. But
+since inventory is just the desk's balance, a plain ERC-20 transfer from *any*
+sender has always counted — the owner-only gate restricted the route that emits
+an event, not the outcome. `TesseraSwap.fund` is now permissionless for exactly
+that reason, and the tooling picks a route from the deployed bytecode:
+
+| Route | When |
+|---|---|
+| `fund()` | the deployed code has it — emits `InventoryChanged` |
+| `seed()` | no `fund()`, and the caller owns the desk |
+| `transfer` | neither — works on any desk, including ones deployed before `fund()` |
+
+The route is read from the bytecode (the selector is a `PUSH4` constant), not
+probed by simulation: `fund` returns nothing, so an `eth_call` coming back empty
+is a valid success and cannot be told apart from a missing selector.
+
+Inventory is **app-owned**. Funding the desk is a donation to it: there are no
+shares and no claim, and only the owner can `withdrawInventory`. For a position
+you can withdraw with a share of the fees, use `TesseraAMM`.
 
 The run has succeeded when you see:
 
@@ -43,8 +70,9 @@ The run has succeeded when you see:
    pool / vault / swap / fees / amm / amm fees   0x…
 ```
 
-A failure now leads with a single line — `❌ pool:arc failed: <reason>` — before
-the full viem error, which is otherwise a wall of ABI.
+A failure leads with a single line — `❌ pool:arc stopped: <reason>` — before the
+full viem error, which is otherwise a wall of ABI. A stop with a known fix (for
+example the fund-custody opt-in) prints the command to run and no stack at all.
 
 Two knobs for a slow or private RPC: `TESSERA_PACE_MS` (wait between sends,
 default 6000) and `ARC_RPC_MIN_INTERVAL_MS` (minimum gap between any two RPC

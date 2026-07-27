@@ -46,7 +46,11 @@ interface ISwapPool {
  *    to game — it can never pay out more than it holds.
  *  - `swapFeeBps` is capped (`MAX_SWAP_FEE`), and the app-fee share is capped at
  *    100% of the fee (never more than the fee itself).
- *  - `nonReentrant`; owner-only inventory management.
+ *  - `nonReentrant`. Anyone may add inventory (`fund`) — which changes nothing,
+ *    since a plain ERC-20 transfer here has always counted as inventory — but only
+ *    the owner may take it out (`withdrawInventory`). Inventory is app-owned:
+ *    funding it is a donation, with no shares and no claim. TesseraAMM is the
+ *    contract for a position you can withdraw.
  *
  * Unaudited testnet code. The oracle is admin-set (not a live market feed), so on
  * mainnet you must wire a real price oracle and audit before real funds.
@@ -149,8 +153,45 @@ contract TesseraSwap {
         emit Swapped(msg.sender, tokenIn, tokenOut, amountIn, amountOut, fee, appFee);
     }
 
+    // --- inventory -------------------------------------------------------------
+
+    /// @notice What the desk can currently fill in `token`.
+    /// @dev Simply the desk's balance — `swap` checks the same thing. There is no
+    ///      internal ledger to drift from it.
+    function inventoryOf(address token) external view returns (uint256) {
+        return IERC20S(token).balanceOf(address(this));
+    }
+
+    /**
+     * @notice Add inventory to the desk. Anyone may call this.
+     *
+     * @dev Permissionless on purpose, and this is *not* a loosening of the
+     *      access control. `swap` measures inventory as
+     *      `balanceOf(address(this))` — there is no internal ledger — so a plain
+     *      ERC-20 `transfer` to this address already becomes fillable inventory,
+     *      from any sender, and always has. Gating `seed` behind `onlyOwner`
+     *      therefore blocked nothing: it only pushed contributors onto the silent
+     *      path, where no event is emitted and the top-up is invisible to
+     *      indexers and to the dashboard's activity log.
+     *
+     *      This exists so the visible path is the available one. It emits
+     *      `InventoryChanged`, which a raw transfer cannot.
+     *
+     *      Withdrawal stays owner-only, so understand what this is: inventory is
+     *      **app-owned**, and funding the desk is a donation to it, not a deposit
+     *      you can reclaim. There are no shares and no claim on it. If you want a
+     *      position you can withdraw with a share of the fees, use TesseraAMM —
+     *      that is what it is for.
+     */
+    function fund(address token, uint256 amount) external {
+        require(amount > 0, "zero");
+        require(IERC20S(token).transferFrom(msg.sender, address(this), amount), "fund");
+        emit InventoryChanged(token, int256(amount));
+    }
+
     // --- admin: inventory + config -------------------------------------------
 
+    /// @notice Owner-only alias of `fund`, kept so existing callers keep working.
     function seed(address token, uint256 amount) external onlyOwner {
         require(IERC20S(token).transferFrom(msg.sender, address(this), amount), "seed");
         emit InventoryChanged(token, int256(amount));

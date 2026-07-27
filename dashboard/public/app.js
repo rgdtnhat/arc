@@ -598,6 +598,12 @@ const $ = (id) => document.getElementById(id);
         setPanelReady("swap", swReady, ["swAmount", "swIn", "swOut", "swQuote", "swExecute"], sw && sw.deployed);
         if (swReady) {
           window.__swap = sw;
+          // Inventory first, and independently of the quote panel. It must not
+          // depend on the pickers being populated: `renderSwapBalances` bails out
+          // when no valid pair is selected, which on the very first paint (and on
+          // a single-asset desk) is exactly when you most want to see that the
+          // desk is empty.
+          renderSwapInventory();
           renderSwapBalances();
           const syms = sw.assets.map((a) => a.symbol).join(",");
           if ($("swIn").dataset.symbols !== syms) {
@@ -1159,6 +1165,46 @@ const $ = (id) => document.getElementById(id);
           `${mine != null ? ' <span style="opacity:.7">(your wallet)</span>' : ""}` +
           ` · desk has <b>${esc(ao.inventory)}</b> ${esc(ao.symbol)} to give</div>`;
       };
+
+      /**
+       * The desk's inventory, per asset.
+       *
+       * Worth its own table: the desk fills swaps out of its own balance, so an
+       * empty asset means every swap *into* that asset reverts. Showing it up
+       * front beats letting someone discover it as "insufficient inventory"
+       * after filling in an amount.
+       */
+      window.renderSwapInventory = function renderSwapInventory() {
+        const body = $("swInvRows");
+        if (!body) return;
+        const assets = (window.__swap && window.__swap.assets) || [];
+        if (!assets.length) {
+          body.innerHTML = emptyRow(3, "No assets yet.");
+          return;
+        }
+        body.innerHTML = assets
+          .map((a) => {
+            const empty = !parseFloat(a.inventory);
+            return (
+              `<tr><td><b>${esc(a.symbol)}</b></td>` +
+              `<td class="num ${empty ? "down" : ""}">${esc(a.inventory)}</td>` +
+              `<td><span class="tag ${empty ? "warn" : "ok"}">` +
+              `${empty ? "empty — swaps into this asset will fail" : "can fill"}</span></td></tr>`
+            );
+          })
+          .join("");
+        // The fund control spends the app wallet, so it is operator-only.
+        const box = $("swFundBox");
+        if (box) {
+          box.style.display = adminId ? "" : "none";
+          const sel = $("swFundAsset");
+          if (adminId && sel && sel.options.length !== assets.length) {
+            sel.innerHTML = assets
+              .map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`)
+              .join("");
+          }
+        }
+      };
       async function swapQuote() {
         const s = swapSelected(); if (!s) return null;
         const human = $("swAmount").value.trim();
@@ -1254,6 +1300,39 @@ const $ = (id) => document.getElementById(id);
           msg.style.display = "block"; msg.textContent = "request failed"; msg.style.color = "var(--warn)";
         } finally { btn.disabled = false; tick(); }
       });
+
+      // Add inventory to the desk (operator only — it spends the app wallet).
+      if ($("swFund")) {
+        $("swFund").addEventListener("click", async () => {
+          const msg = $("swapMsg");
+          const show = (text, colour) => {
+            msg.style.display = "block"; msg.textContent = text; msg.style.color = colour;
+          };
+          const addr = $("swFundAsset").value;
+          const a = swAsset(addr);
+          const human = $("swFundAmount").value.trim();
+          if (!a) return show("Pick an asset.", "var(--warn)");
+          if (!human || !(parseFloat(human) > 0)) return show("Enter an amount above zero.", "var(--warn)");
+          if (Number(a.wallet) < Number(human)) {
+            return show(`The app wallet only holds ${a.wallet} ${a.symbol}.`, "var(--warn)");
+          }
+          const raw = toRaw(human, a.decimals);
+          const btn = $("swFund");
+          btn.disabled = true;
+          try {
+            const r = await (await postAuthed(`/api/swap/fund?token=${addr}&amount=${raw}`)).json();
+            show(
+              r.ok
+                ? `desk inventory +${human} ${a.symbol} ✓ (via ${r.route}) — tx ${String(r.txHash).slice(0, 12)}…`
+                : `failed: ${r.error}`,
+              r.ok ? "var(--good)" : "var(--warn)",
+            );
+            if (r.ok) $("swFundAmount").value = "";
+          } catch {
+            show("request failed", "var(--warn)");
+          } finally { btn.disabled = false; tick(); }
+        });
+      }
 
       /* ===================================================================
        * Operator notices — the running banner and the bell.

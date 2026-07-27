@@ -84,12 +84,25 @@ function whichFunction(data: `0x${string}`) {
   return null;
 }
 
+/** Selectors the deployed-bytecode probe looks for. */
+const SELECTORS: Record<string, string> = {
+  fund: "7b1837de", // fund(address,uint256)
+  seed: "5684d86a", // seed(address,uint256)
+};
+
 const word = (hex: string) => "0x" + hex.replace(/^0x/, "").padStart(64, "0");
 const addrWord = (a: string) => word(a.toLowerCase().replace(/^0x/, ""));
 
 interface NodeOptions {
   /** Function names that should revert when called. */
   revert?: string[];
+  /**
+   * Function names the deployed bytecode does not have. Modelled where it is
+   * actually detected: the selector is left out of the code `eth_getCode`
+   * returns, exactly as it would be for a contract compiled before the function
+   * was added.
+   */
+  missing?: string[];
   /** Who `owner()` reports for the swap desk. */
   swapOwner?: string;
   /** What `poolCount()` reports. */
@@ -107,6 +120,7 @@ interface FakeNode {
 
 async function startNode(opts: NodeOptions = {}): Promise<FakeNode> {
   const revert = new Set(opts.revert ?? []);
+  const missing = new Set(opts.missing ?? []);
   const swapOwner = opts.swapOwner ?? COLLECTOR;
   const poolCount = opts.poolCount ?? 0n;
   const sent: string[] = [];
@@ -175,7 +189,14 @@ async function startNode(opts: NodeOptions = {}): Promise<FakeNode> {
         case "eth_getTransactionCount": return reply("0x" + (nonce++).toString(16));
         case "eth_getCode": {
           const addr = String(p[0]).toLowerCase();
-          return reply(hasCode.has(addr) ? "0x60806040" : "0x");
+          if (!hasCode.has(addr)) return reply("0x");
+          // Solidity's dispatcher embeds each selector as a PUSH4 constant, and
+          // that is what the fund-route probe reads. Omitting one models a
+          // contract compiled before that function existed.
+          const selectors = Object.entries(SELECTORS)
+            .filter(([name]) => !missing.has(name))
+            .map(([, sel]) => `63${sel}`); // PUSH4 <selector>
+          return reply(`0x60806040${selectors.join("")}`);
         }
         case "eth_getBlockByNumber":
           return reply({ number: "0x64", hash: word("64"), baseFeePerGas: "0x3b9aca00", timestamp: "0x1", transactions: [] });
@@ -301,14 +322,15 @@ const BASE_RECORD = {
   ...EXISTING,
 };
 
-test("a revert while seeding the swap desk does not stop the AMM from deploying", async (t) => {
-  // The exact production failure: the fee collector owns the desk, so the
-  // deployer's `seed` is rejected. Everything after it must still happen.
-  const node = await startNode({ revert: ["seed"], swapOwner: COLLECTOR });
+test("a revert while funding the swap desk does not stop the AMM from deploying", async (t) => {
+  // The exact production failure, generalised: every route into the desk fails.
+  // Everything after it must still happen.
+  const node = await startNode({ revert: ["seed", "fund", "transfer"], swapOwner: COLLECTOR });
   const dir = scratchTree(BASE_RECORD);
   t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
 
-  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
+  const { stdout, stderr } = await runScript(node, dir, ["--deploy-missing"]);
+  const out = stdout + stderr; // `optional()` warns on stderr
 
   // The AMM and its collector are what used to be lost.
   const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
@@ -326,9 +348,8 @@ test("a revert while seeding the swap desk does not stop the AMM from deploying"
   assert.equal(node.sent.filter((n) => n === "createPool").length, 2, "one pool per non-USDC reserve");
   assert.ok(node.sent.includes("setAmm"), "the AMM collector was linked to pool 0");
 
-  // Seeding was never attempted, because the ownership check saw the collector.
-  assert.equal(node.sent.includes("seed"), false, "no doomed seed call was broadcast");
-  assert.match(stdout, /skip swap inventory/);
+  // The failed funding is reported, not silent, and not fatal.
+  assert.match(out, /skipped funding swap inventory/);
   assert.match(stdout, /Pool \+ Vault \+ Swap live on Arc/);
 });
 
@@ -348,19 +369,39 @@ test("a reverting optional step is reported as skipped, not as a failure", async
   assert.ok(record.tesseraAmm);
 });
 
-test("the deployer seeds the swap desk when it still owns it", async (t) => {
-  // First-run shape: ownership has not moved yet, so the inventory transfer is
-  // attempted rather than skipped.
-  const node = await startNode({ swapOwner: DEPLOYER });
+test("the desk is funded even when the fee collector owns it", async (t) => {
+  // The regression this replaces: the script used to *skip* inventory whenever
+  // the deployer was not the owner. Ownership does not gate adding inventory —
+  // `swap` reads the desk's own balance — so skipping left the desk empty and
+  // every swap reverting "insufficient inventory". `fund` is permissionless.
+  const node = await startNode({ swapOwner: COLLECTOR });
   const dir = scratchTree(BASE_RECORD);
   t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
 
   const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
 
-  assert.ok(node.sent.includes("seed"), "inventory was seeded");
+  assert.match(stdout, /swap inventory route: fund\(\)/);
+  assert.ok(node.sent.includes("fund"), "inventory was funded");
+  assert.equal(node.sent.includes("seed"), false, "the owner-only route was not attempted");
   assert.doesNotMatch(stdout, /skip swap inventory/);
   const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
   assert.ok(record.tesseraAmm);
+});
+
+test("a desk deployed before fund() existed is funded by plain transfer", async (t) => {
+  // The live desk on Arc predates `fund`. Inventory is its token balance, so a
+  // transfer reaches exactly the same place — the script must fall back to it
+  // rather than reporting the desk unfundable.
+  const node = await startNode({ swapOwner: COLLECTOR, missing: ["fund"] });
+  const dir = scratchTree(BASE_RECORD);
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
+
+  assert.match(stdout, /swap inventory route: transfer/);
+  assert.match(stdout, /predates fund\(\)/);
+  assert.ok(node.sent.includes("transfer"), "inventory was sent directly");
+  assert.equal(node.sent.includes("fund"), false, "the absent function was not called");
 });
 
 test("an existing AMM with pools is not given duplicates", async (t) => {

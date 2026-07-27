@@ -1055,8 +1055,9 @@
           <div class="card" id="swapCard">
             <h2>🔁 Swap</h2>
             <div class="notready" id="swapNotReady" style="display:none">
-              Swap desk not deployed yet — run <span class="mono">npm run pool:arc</span> to deploy
-              <span class="mono">TesseraSwap</span> and seed its inventory. Quotes work as soon as it's live.
+              Swap desk not deployed yet — run <span class="mono">npm run pool:arc:init</span> to deploy
+              <span class="mono">TesseraSwap</span>, then <span class="mono">npm run swap:fund</span> to give it
+              inventory. Quotes work as soon as it's live; fills need inventory.
             </div>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
               Oracle-priced swaps between pool assets. A 0.30% fee applies; part of it is the app's revenue.
@@ -1072,6 +1073,31 @@
             <div id="swBalances" style="font-size:12.5px;color:var(--muted);margin-top:11px;line-height:1.6"></div>
             <div id="swQuoteOut" style="font-size:13px;margin-top:8px;font-weight:600"></div>
             <div class="kv" id="swapMsg" style="margin-top:9px;display:none"></div>
+
+            <!-- Inventory. The desk fills out of its own balance, so an empty
+                 desk fails every swap — worth showing plainly rather than
+                 letting a swap fail with "insufficient inventory". -->
+            <div class="menuSep" style="margin:14px 0 10px"></div>
+            <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:7px">
+              Desk inventory
+            </div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr><th>Asset</th><th class="num">Available to fill</th><th>Status</th></tr></thead>
+              <tbody id="swInvRows"></tbody>
+            </table></div>
+            <div id="swFundBox" style="display:none;margin-top:11px">
+              <div class="row-actions">
+                <input id="swFundAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
+                <select id="swFundAsset" class="field"></select>
+                <button class="btn" id="swFund">Add inventory</button>
+              </div>
+              <div style="font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.55">
+                Inventory is <b>app-owned</b>: adding to it is a donation to the desk, not a deposit —
+                there are no shares and no claim on it, and only the operator can withdraw it. For a
+                position you can withdraw with a share of the fees, use
+                <a href="#" data-goto="defi#ammCard">Liquidity pools</a> instead.
+              </div>
+            </div>
           </div>
 
           <!-- AMM liquidity pools -->

@@ -48,6 +48,9 @@ const bal = async (who, token = ARC_USDC_ADDRESS) =>
 
 const ONLY_CHECK = process.argv.includes("--check");
 
+/** `fund(address,uint256)` — see the bytecode probe further down. */
+const FUND_SELECTOR = "7b1837de";
+
 // Real Circle assets on Arc (not mocks). Addresses can be overridden via env.
 const CIRBTC_ADDRESS = process.env.CIRBTC_ADDRESS ?? "0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF";
 const EURC_ADDRESS = process.env.EURC_ADDRESS ?? "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a";
@@ -363,37 +366,51 @@ async function main() {
   }, { custodial: true });
   const swap = swapRes.address;
 
-  // Seed the swap desk with a slice of each asset the deployer still holds.
+  // Give the swap desk inventory. It fills user swaps out of its own balance, so
+  // with nothing in it every swap reverts "insufficient inventory".
   //
-  // `seed` is `onlyOwner`, and step 6b hands the desk to the fee collector on the
-  // first run — so from the second run onwards the deployer cannot call it. Ask
-  // who owns the desk before trying, rather than firing a call that is certain to
-  // revert: a revert here used to abort the whole script (leaving the AMM
-  // undeployed), and even caught it dumps a wall of ABI at the operator for a
-  // step that was never going to work.
+  // Ownership does not gate this, and an earlier version of this script wrongly
+  // assumed it did. `TesseraSwap.swap` measures inventory as
+  // `balanceOf(address(this))` — there is no internal ledger — so tokens sent by
+  // *any* sender become fillable inventory. `seed` being `onlyOwner` only ever
+  // restricted the route that emits an event, not the outcome.
+  //
+  // So: use `fund` when the deployed bytecode has it (visible, emits
+  // InventoryChanged), `seed` when we still own the desk, and otherwise a plain
+  // transfer, which works on the desks deployed before `fund` existed.
   const swapOwner = await optional("reading the swap desk owner", () =>
     pub.readContract({ address: swap, abi: tesseraSwapAbi, functionName: "owner" }),
   );
-  const canSeedSwap = swapOwner && String(swapOwner).toLowerCase() === deployer.address.toLowerCase();
-  if (!canSeedSwap) {
-    console.log(
-      `   (skip swap inventory — the desk is owned by ${swapOwner ?? "an unknown address"}, ` +
-        `not the deployer. That is the steady state: the fee collector owns it and funds it ` +
-        `from its own swap allocation.)`,
-    );
-  } else {
-    for (const r of LIVE_RESERVES) {
-      const held = await bal(deployer.address, r.address);
-      const want = r.symbol === "cirBTC" ? 10_000n : 2_000_000n; // 0.0001 cirBTC or 2 units
-      const seed = want < held ? want : held;
-      if (seed > 0n) {
-        await optional(`seeding swap inventory in ${r.symbol}`, async () => {
-          await dSend(r.address, erc20Abi, "approve", [swap, maxUint256]);
-          await dSend(swap, tesseraSwapAbi, "seed", [r.address, seed]);
-          console.log(`   seeded swap ${seed} ${r.symbol}`);
-        });
+  const weOwnSwap = swapOwner && String(swapOwner).toLowerCase() === deployer.address.toLowerCase();
+  // Detected from the deployed bytecode, because the ABI compiled into this
+  // build is newer than the code that may already be on chain.
+  //
+  // Read the selector out of the code rather than simulating the call.
+  // Simulating cannot answer this: `fund` returns nothing, so an `eth_call` that
+  // comes back with empty data is a perfectly valid success — indistinguishable
+  // from the empty data a node returns when the selector isn't there. Solidity's
+  // dispatcher embeds every selector as a PUSH4 constant, so the code either
+  // contains it or does not.
+  const swapHasFund = await optional("checking whether the swap desk has fund()", async () => {
+    const code = await pub.getCode({ address: swap });
+    return typeof code === "string" && code.toLowerCase().includes(FUND_SELECTOR);
+  });
+  const route = swapHasFund ? "fund()" : weOwnSwap ? "seed()" : "transfer";
+  console.log(`   swap inventory route: ${route}${route === "transfer" ? " (this desk predates fund(); its balance is its inventory)" : ""}`);
+  for (const r of LIVE_RESERVES) {
+    const held = await bal(deployer.address, r.address);
+    const want = r.symbol === "cirBTC" ? 10_000n : 2_000_000n; // 0.0001 cirBTC or 2 units
+    const give = want < held ? want : held;
+    if (give === 0n) continue;
+    await optional(`funding swap inventory in ${r.symbol}`, async () => {
+      if (route === "transfer") {
+        await dSend(r.address, erc20Abi, "transfer", [swap, give]);
+      } else {
+        await dSend(r.address, erc20Abi, "approve", [swap, maxUint256]);
+        await dSend(swap, tesseraSwapAbi, route === "fund()" ? "fund" : "seed", [r.address, give]);
       }
-    }
+      console.log(`   swap inventory +${give} ${r.symbol}`);
+    });
   }
 
   // 6b) TesseraFeeCollector: every app fee lands here, then gets allocated

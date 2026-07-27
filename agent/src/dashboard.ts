@@ -2237,6 +2237,36 @@ async function main() {
   });
 
   /**
+   * Top up the swap desk's inventory.
+   *
+   * Operator-only because it spends the app wallet, not because the contract
+   * requires it — `TesseraSwap` reads inventory as its own token balance, so
+   * adding to it was never ownership-gated. See `fundInventory`.
+   */
+  app.post("/api/swap/fund", requireOperator, async (req, res) => {
+    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
+    const token = req.query.token as Hex;
+    const raw = BigInt((req.query.amount as string) ?? "0");
+    try {
+      if (raw <= 0n) throw new Error("Enter an amount above zero.");
+      const { txHash, route } = await swapClient.fundInventory(token, raw);
+      logTx(req, {
+        category: "defi", action: "swap-fund", status: "success",
+        assetAddress: token, raw, txHash,
+        detail: `desk inventory +${assetMeta(token).symbol} via ${route}`,
+      });
+      invalidateAll();
+      res.json({ ok: true, txHash, route });
+    } catch (e) {
+      logTx(req, {
+        category: "defi", action: "swap-fund", status: "failed",
+        assetAddress: token, raw, detail: friendlyError(e),
+      });
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
    * Drop every read cache so the next poll re-reads the chain.
    *
    * Call after ANY state-changing action: individual endpoints used to clear only

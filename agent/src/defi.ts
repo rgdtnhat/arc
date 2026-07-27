@@ -114,6 +114,10 @@ export class VaultClient {
   }
 }
 
+/** `fund(address,uint256)` and `seed(address,uint256)` — see `fundInventory`. */
+const FUND_SELECTOR = "7b1837de";
+const SEED_SELECTOR = "5684d86a";
+
 /** Client for the TesseraSwap (oracle-priced swap desk). */
 export class SwapClient {
   readonly public: PublicClient;
@@ -170,6 +174,72 @@ export class SwapClient {
     const hash = await this.wallet.writeContract(request);
     await this.public.waitForTransactionReceipt({ hash });
     return hash;
+  }
+
+  /**
+   * Add inventory so the desk can fill swaps.
+   *
+   * Three routes, because a desk deployed before `fund()` existed is still live
+   * and still needs topping up. `swap` measures inventory as the desk's own
+   * balance, so all three end in the same place:
+   *
+   *   1. `fund()`  — permissionless, emits InventoryChanged. Preferred.
+   *   2. `seed()`  — owner-only; used when we still own the desk and (1) is absent.
+   *   3. `transfer` — a plain ERC-20 send. Works on any desk, always has.
+   *
+   * The route is *probed*, not assumed: the ABI compiled into this build is
+   * newer than the bytecode that may already be deployed, so only the contract
+   * can say which functions it has.
+   */
+  async fundInventory(token: Hex, amount: bigint): Promise<{ txHash: Hex; route: "fund" | "seed" | "transfer" }> {
+    if (amount <= 0n) throw new Error("amount must be positive");
+
+    // Which entry points does the *deployed* code have? Read the selectors out
+    // of the bytecode rather than simulating a call: `fund` and `seed` return
+    // nothing, so an `eth_call` returning empty data is a valid success and is
+    // indistinguishable from the empty data a node gives for a selector that
+    // isn't there. Solidity embeds each selector as a PUSH4 constant.
+    const code = String((await this.public.getCode({ address: this.swap })) ?? "").toLowerCase();
+    const has = (selector: string) => code.includes(selector);
+    const owner = await this.public
+      .readContract({ address: this.swap, abi: tesseraSwapAbi, functionName: "owner" })
+      .catch(() => null);
+    const weOwnIt =
+      typeof owner === "string" && owner.toLowerCase() === this.cfg.account.address.toLowerCase();
+
+    const route: "fund" | "seed" | "transfer" = has(FUND_SELECTOR)
+      ? "fund"
+      : has(SEED_SELECTOR) && weOwnIt
+        ? "seed"
+        : "transfer";
+
+    if (route !== "transfer") {
+      await this.ensureApproval(token, amount);
+      const { request } = await this.public.simulateContract({
+        address: this.swap,
+        abi: tesseraSwapAbi,
+        functionName: route,
+        args: [token, amount],
+        account: this.cfg.account,
+      });
+      const hash = await this.wallet.writeContract(request);
+      await this.public.waitForTransactionReceipt({ hash });
+      return { txHash: hash, route };
+    }
+
+    // No callable entry point: send the tokens directly. The desk's balance *is*
+    // its inventory, so this lands in the same place — it just emits no
+    // InventoryChanged event.
+    const hash = await this.wallet.writeContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: "transfer",
+      args: [this.swap, amount],
+      chain: this.cfg.chain,
+      account: this.cfg.account,
+    });
+    await this.public.waitForTransactionReceipt({ hash });
+    return { txHash: hash, route: "transfer" };
   }
 }
 
