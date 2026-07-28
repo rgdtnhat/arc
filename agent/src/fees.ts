@@ -15,6 +15,7 @@
  */
 import { createPublicClient, parseAbiItem, type Chain, type Hex, type PublicClient } from "viem";
 import { tesseraFeeCollectorAbi, erc20Abi, pacedHttp } from "@tessera/shared";
+import { findDeploymentBlock } from "./deploy-block.js";
 
 const ALLOCATED = parseAbiItem(
   "event Allocated(uint256 total, uint256 toAgent, uint256 toLending, uint256 toVault, uint256 toSwap, uint256 retained)",
@@ -22,7 +23,7 @@ const ALLOCATED = parseAbiItem(
 
 const LOG_WINDOW = BigInt(process.env.ARC_LOG_WINDOW ?? "9000");
 const LOG_LOOKBACK = BigInt(process.env.ARC_LOG_LOOKBACK ?? "500000");
-const MAX_WINDOWS = Number(process.env.ARC_LOG_MAX_WINDOWS ?? "60");
+const MAX_WINDOWS = Number(process.env.ARC_LOG_MAX_WINDOWS ?? "220");
 
 export interface Allocation {
   blockNumber: string;
@@ -75,7 +76,11 @@ export class FeeReader {
   /** Every `Allocated` log we can reach, newest window first. */
   private async allocations(): Promise<{ list: Allocation[]; partial: boolean; block: string }> {
     const latest = await this.public.getBlockNumber();
-    const floor = latest > LOG_LOOKBACK ? latest - LOG_LOOKBACK : 0n;
+    // From the collector's own creation block, not a fixed lookback: on a fast
+    // chain a lookback is a few days, so an older collector reported an empty
+    // fee history that looked exactly like "no fees have ever been taken".
+    const created = await findDeploymentBlock(this.public, this.collector, latest).catch(() => null);
+    const floor = created ?? (latest > LOG_LOOKBACK ? latest - LOG_LOOKBACK : 0n);
     const out: Allocation[] = [];
     let partial = false;
     let to = latest;

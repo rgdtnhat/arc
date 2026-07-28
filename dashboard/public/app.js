@@ -188,6 +188,26 @@ const $ = (id) => document.getElementById(id);
       const DEFI_TAB_KEY = "tessera_defi_tab";
       let defiTab = "lending";
 
+      /* Per-venue state for the holder leaderboards and fee charts. Declared
+         here, above setDefiTab: that runs while the script is still evaluating
+         (it restores the saved tab), so anything it reaches must already exist. */
+      const HOLD_VENUES = {
+        Lending: { kind: "lending", series: "toLending", label: "lending pool" },
+        Vault: { kind: "vault", series: "toVault", label: "vault" },
+        Swap: { kind: "swap", series: "toSwap", label: "swap desk" },
+        Amm: { kind: "amm", series: "toSwap", label: "AMM pools" },
+      };
+      const HOLD_SIZES = [5, 10, 25, 50];
+      const holdState = {};
+      for (const k of Object.keys(HOLD_VENUES)) {
+        holdState[k] = { rows: [], assets: [], page: 1, size: 10, loading: false, report: null };
+      }
+      /** Shared across all four venue charts; one /api/fees read serves them. */
+      let feeDailyCache = null;
+      /* Same reason: setDefiTab calls loadFees() during initial evaluation when
+         the App fees tab was the one last open. */
+      let feesLoading = false;
+
       function setDefiTab(tab, opts) {
         if (!(tab in DEFI_PANES)) tab = "lending";
         defiTab = tab;
@@ -199,6 +219,11 @@ const $ = (id) => document.getElementById(id);
         document.querySelectorAll("[data-defitab]").forEach((b) =>
           b.classList.toggle("active", b.dataset.defitab === tab));
         if (tab === "fees") loadFees();
+        // Each venue tab carries its own holder leaderboard and fee history.
+        // Loaded on switch rather than up front: a holder scan is a windowed
+        // log sweep, and doing four of them for tabs nobody opened is waste.
+        const venueKey = { lending: "Lending", vault: "Vault", swap: "Swap", amm: "Amm" }[tab];
+        if (venueKey) loadVenuePanels(venueKey);
         // Switching tabs shouldn't leave you halfway down the previous pane.
         if (!opts || opts.scroll !== false) {
           const dock = document.querySelector("#paneDefi .tabDock");
@@ -334,7 +359,19 @@ const $ = (id) => document.getElementById(id);
       function afterTx() {
         tick({ fresh: true });
         refreshMyPositions().catch(() => {});
-        setTimeout(() => { tick({ fresh: true }); refreshMyPositions().catch(() => {}); }, 4000);
+        // A deposit or withdrawal changes the leaderboard and may have moved
+        // fees, so both cached views are stale. Only the visible venue is
+        // re-scanned — re-running all four log sweeps would be gratuitous.
+        feeDailyCache = null;
+        setTimeout(() => {
+          tick({ fresh: true });
+          refreshMyPositions().catch(() => {});
+          const key = { lending: "Lending", vault: "Vault", swap: "Swap", amm: "Amm" }[defiTab];
+          if (key && typeof loadHolders === "function") {
+            loadHolders(key, { refresh: true });
+            loadVenueChart(key);
+          }
+        }, 4000);
       }
 
       // Visible connection state. Without this a failing /api/state just left
@@ -1448,10 +1485,10 @@ const $ = (id) => document.getElementById(id);
        * stop early the report says so and the totals are labelled a lower bound
        * rather than quietly under-reporting.
        * =================================================================== */
-      let feesLoading = false;
       async function loadFees() {
         if (feesLoading) return;
         feesLoading = true;
+        feeDailyCache = null; // this tab is the authority; re-read for everyone
         const note = $("feeChartNote");
         try {
           const r = await (await fetch("/api/fees")).json();
@@ -1553,6 +1590,255 @@ const $ = (id) => document.getElementById(id);
           } catch { feeMsg("request failed", "var(--warn)"); }
           finally { btn.disabled = false; }
         });
+      }
+
+      /* ====================================================================
+       * Holder leaderboards, one per DeFi venue.
+       *
+       * Who is in each pool, largest first, paged. The list arrives sorted from
+       * the server (ranking share counts needs bigint arithmetic, which is the
+       * server's job) and is paged here, so flipping pages costs nothing and
+       * doesn't re-run a log scan.
+       *
+       * The venue's own daily fee history sits under the same card, drawn from
+       * the collector's `Allocated` events — the same source as the App fees
+       * tab, filtered to the one series that belongs to this venue.
+       * ==================================================================== */
+
+      /** Format a raw integer balance for one asset. */
+      function holdAmount(raw, asset) {
+        if (!asset) return raw;
+        const n = Number(raw) / 10 ** asset.decimals;
+        if (!Number.isFinite(n)) return raw;
+        const dp = n >= 1000 ? 2 : n >= 1 ? 4 : 6;
+        return `${n.toLocaleString(undefined, { maximumFractionDigits: dp })} ${asset.symbol}`;
+      }
+
+      async function loadHolders(key, opts) {
+        const st = holdState[key];
+        const v = HOLD_VENUES[key];
+        if (!st || st.loading) return;
+        st.loading = true;
+        const note = $(`hold${key}Note`);
+        // A cold scan walks the contract's whole history in windowed getLogs
+        // calls and can take a minute. Without this the table just sits empty,
+        // which reads as "no holders" rather than "still counting".
+        if (!st.rows.length) {
+          $(`hold${key}Rows`).innerHTML =
+            `<tr><td colspan="5" class="muted">Reading holders from the chain — this walks the contract's full history, so the first load takes a moment.</td></tr>`;
+        }
+        try {
+          const url = `/api/holders?kind=${v.kind}${opts && opts.refresh ? "&refresh=1" : ""}`;
+          const r = await (await fetch(url)).json();
+          if (!r.ok) throw new Error(r.error || "unavailable");
+          st.report = r;
+          st.rows = r.holders || [];
+          st.assets = r.assets || [];
+          st.page = 1;
+          renderHolders(key);
+          if (note) {
+            // A short log scan under-reports *who*, never *how much*. Say so —
+            // a leaderboard quietly missing its biggest holder is worse than
+            // one that admits the scan was incomplete.
+            const parts = [];
+            if (r.note) parts.push(r.note);
+            if (r.partial) parts.push("The log scan hit its window budget, so some holders may be missing. Balances shown are exact.");
+            else if (st.rows.length) parts.push(`Read at block ${r.block}.`);
+            note.className = r.partial ? "feedNote bad" : "feedNote";
+            note.textContent = parts.join(" ");
+          }
+        } catch (e) {
+          if (note) { note.className = "feedNote bad"; note.textContent = String(e.message || e); }
+          $(`hold${key}Rows`).innerHTML = `<tr><td colspan="5" class="muted">Could not read holders.</td></tr>`;
+          $(`hold${key}Pager`).innerHTML = "";
+        } finally {
+          st.loading = false;
+        }
+      }
+
+      function renderHolders(key) {
+        const st = holdState[key];
+        const body = $(`hold${key}Rows`);
+        if (!body) return;
+
+        const head = $(`hold${key}RankHead`);
+        if (head && st.report) head.textContent = st.report.rankLabel || "Share";
+
+        if (!st.rows.length) {
+          body.innerHTML = `<tr><td colspan="5" class="muted">${
+            st.report && st.report.note ? "" : "No positions yet — the first deposit shows up here."
+          }</td></tr>`;
+          $(`hold${key}Pager`).innerHTML = "";
+          return;
+        }
+
+        const pages = Math.max(1, Math.ceil(st.rows.length / st.size));
+        st.page = Math.min(Math.max(1, st.page), pages);
+        const start = (st.page - 1) * st.size;
+        const slice = st.rows.slice(start, start + st.size);
+        const isUsd = st.report && /USD/i.test(st.report.rankLabel || "");
+
+        body.innerHTML = slice
+          .map((h, i) => {
+            const rank = isUsd
+              ? `$${(Number(h.rank) / 1e6).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+              : Number(h.rank) / 1e18 >= 0.0001
+                ? (Number(h.rank) / 1e18).toLocaleString(undefined, { maximumFractionDigits: 6 })
+                : h.rank;
+            const position = st.assets
+              .map((a) => {
+                const raw = (h.balances || {})[a.address.toLowerCase()];
+                return raw && raw !== "0" ? holdAmount(raw, a) : null;
+              })
+              .filter(Boolean)
+              .join(" · ") || "—";
+            return `<tr class="${h.isApp ? "selfRow" : ""}">
+              <td class="num muted">${start + i + 1}</td>
+              <td class="mono" style="font-size:11.5px">${esc(h.address)}${h.isApp ? '<span class="appTag">app</span>' : ""}</td>
+              <td class="num mono">${esc(rank)}</td>
+              <td class="num">${h.pct.toFixed(2)}%</td>
+              <td style="font-size:12px">${esc(position)}</td>
+            </tr>`;
+          })
+          .join("");
+
+        renderPager(key, st.page, pages, st.rows.length);
+      }
+
+      /**
+       * First / prev / numbered / next / last, plus a page-size picker.
+       *
+       * The numbers are buttons, not a label: "page 7 of 12" you can't click is
+       * a status line. Long runs collapse around the current page so the strip
+       * doesn't wrap into a wall on a pool with hundreds of providers.
+       */
+      function renderPager(key, page, pages, total) {
+        const host = $(`hold${key}Pager`);
+        if (!host) return;
+        const btn = (label, target, opts = {}) =>
+          `<button class="pgBtn${opts.active ? " active" : ""}" data-pg="${target}"${
+            opts.disabled ? " disabled" : ""
+          }${opts.title ? ` title="${esc(opts.title)}"` : ""}>${label}</button>`;
+
+        const nums = [];
+        const push = (n) => nums.push(btn(String(n), n, { active: n === page }));
+        if (pages <= 7) {
+          for (let n = 1; n <= pages; n++) push(n);
+        } else {
+          push(1);
+          const from = Math.max(2, page - 1);
+          const to = Math.min(pages - 1, page + 1);
+          if (from > 2) nums.push(`<span class="pgGap">…</span>`);
+          for (let n = from; n <= to; n++) push(n);
+          if (to < pages - 1) nums.push(`<span class="pgGap">…</span>`);
+          push(pages);
+        }
+
+        const sizes = HOLD_SIZES.map(
+          (n) => `<option value="${n}"${n === holdState[key].size ? " selected" : ""}>${n} / page</option>`,
+        ).join("");
+
+        host.innerHTML =
+          btn("« First", 1, { disabled: page === 1, title: "First page" }) +
+          btn("‹ Prev", page - 1, { disabled: page === 1 }) +
+          nums.join("") +
+          btn("Next ›", page + 1, { disabled: page === pages }) +
+          btn("Last »", pages, { disabled: page === pages, title: "Last page" }) +
+          `<select class="field" data-pgsize style="margin-left:8px">${sizes}</select>` +
+          `<span class="pgInfo">${total} holder${total === 1 ? "" : "s"}</span>`;
+
+        host.querySelectorAll("[data-pg]").forEach((b) =>
+          b.addEventListener("click", () => {
+            holdState[key].page = Number(b.dataset.pg);
+            renderHolders(key);
+          }),
+        );
+        host.querySelector("[data-pgsize]").addEventListener("change", (e) => {
+          // Keep the first row of the current view visible rather than jumping
+          // back to page 1, which loses your place in a long list.
+          const st = holdState[key];
+          const firstRow = (st.page - 1) * st.size;
+          st.size = Number(e.target.value);
+          st.page = Math.floor(firstRow / st.size) + 1;
+          renderHolders(key);
+        });
+      }
+
+      /* --- the per-venue daily fee chart -------------------------------- */
+
+      /** Cached once per load; all four venue charts read the same report. */
+      async function feeDaily() {
+        if (feeDailyCache) return feeDailyCache;
+        try {
+          const r = await (await fetch("/api/fees")).json();
+          feeDailyCache = r.ok ? r : { ok: false, error: r.error };
+        } catch (e) {
+          feeDailyCache = { ok: false, error: String(e.message || e) };
+        }
+        return feeDailyCache;
+      }
+
+      async function loadVenueChart(key) {
+        const v = HOLD_VENUES[key];
+        const host = $(`hold${key}Chart`);
+        const note = $(`hold${key}ChartNote`);
+        const stats = $(`hold${key}Stats`);
+        if (!host) return;
+        const r = await feeDaily();
+        if (!r.ok) {
+          host.innerHTML = `<div class="feeChartEmpty">${esc(r.error || "No fee data.")}</div>`;
+          if (note) note.textContent = "";
+          if (stats) stats.innerHTML = "";
+          return;
+        }
+        const days = Number($(`hold${key}Range`) ? $(`hold${key}Range`).value : 0);
+        let rows = r.daily || [];
+        if (days > 0) {
+          const cut = Date.now() - days * 86400_000;
+          rows = rows.filter((d) => Date.parse(d.day + "T00:00:00Z") >= cut);
+        }
+        const series = rows.map((d) => ({ day: d.day, v: d[v.series] || 0 }));
+        if (!series.length || series.every((d) => d.v === 0)) {
+          host.innerHTML = `<div class="feeChartEmpty">No fees routed to the ${esc(v.label)} in this range yet.</div>`;
+          if (stats) stats.innerHTML = "";
+        } else {
+          const max = Math.max(...series.map((d) => d.v)) || 1;
+          host.innerHTML = series
+            .map((d) => {
+              const pct = d.v > 0 ? Math.max(2, Math.round((d.v / max) * 100)) : 1;
+              return `<span class="feeBar" title="${esc(`${d.day}: ${d.v.toFixed(6)} USDC to the ${v.label}`)}"><i style="height:${pct}%"></i></span>`;
+            })
+            .join("");
+          host.scrollLeft = host.scrollWidth;
+
+          const sum = series.reduce((s, d) => s + d.v, 0);
+          const active = series.filter((d) => d.v > 0);
+          const best = active.reduce((a, d) => (d.v > a.v ? d : a), active[0]);
+          if (stats) {
+            stats.innerHTML =
+              `<span>Total in range</span><b>${sum.toFixed(6)} USDC</b>` +
+              `<span>Days with a distribution</span><b>${active.length} of ${series.length}</b>` +
+              `<span>Average per active day</span><b>${(sum / active.length).toFixed(6)} USDC</b>` +
+              `<span>Best day</span><b>${esc(best.day)} — ${best.v.toFixed(6)} USDC</b>`;
+          }
+        }
+        if (note) {
+          note.className = r.partial ? "feedNote bad" : "feedNote";
+          note.textContent = r.partial
+            ? "The log scan stopped early, so these are a lower bound rather than the full history."
+            : `From the collector's own Allocated events${rows.length ? ` — ${rows[0].day} to ${rows[rows.length - 1].day}` : ""}.`;
+        }
+      }
+
+      for (const key of Object.keys(HOLD_VENUES)) {
+        const sel = $(`hold${key}Range`);
+        if (sel) sel.addEventListener("change", () => loadVenueChart(key));
+      }
+
+      /** Everything one DeFi tab needs beyond its own card. */
+      function loadVenuePanels(key) {
+        loadHolders(key);
+        loadVenueChart(key);
       }
 
       /** Reverse a swap pair. Two selects, one click — the common second trade. */

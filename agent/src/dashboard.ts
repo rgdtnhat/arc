@@ -55,6 +55,7 @@ import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
 import { VaultClient, SwapClient, AmmClient } from "./defi.js";
 import { FeeReader } from "./fees.js";
+import { HolderReader, type HolderKind } from "./holders.js";
 import { DefiOracle } from "@tessera/shared";
 import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
@@ -2022,6 +2023,65 @@ async function main() {
   const archive = new ArchiveStore(statePath(".tessera-history.json"));
   const scanner = new ArchiveScanner(chain, rpcUrl);
 
+  /* --------------------------------------------------------------------------
+   * Who holds what, per venue.
+   *
+   * The same log-scan-then-read-balances machinery the archive uses, pointed at
+   * the contracts that are still running. Cached, because a windowed
+   * `eth_getLogs` sweep across 500k blocks is not something to do on every poll.
+   * ----------------------------------------------------------------------- */
+  const holderReader = new HolderReader(chain, rpcUrl, {
+    agent: agentAccount.address as Hex,
+    collector: (liveDeployment.tesseraFeeCollector as Hex) ?? undefined,
+    treasury: (owner?.account.address as Hex) ?? undefined,
+  });
+
+  /** The arguments a holder scan needs, in one place — boot warm-up uses them too. */
+  const holderOpts = (poolId = 0) => ({
+    pool: poolDeployment?.poolAddress,
+    vault: vaultClient?.vault,
+    vaultAsset: (() => {
+      const a = (liveDeployment.vaultAsset as Hex) ?? usdcAddress;
+      return { address: a, ...assetMeta(a) };
+    })(),
+    amm: ammClient?.amm,
+    poolId,
+    swap: swapClient?.swap,
+    assets: (poolDeployment?.assets ?? []).map((a) => ({ address: a.address, ...assetMeta(a.address) })),
+  });
+
+  /**
+   * Warm the holder scans in the background, once, shortly after boot.
+   *
+   * A cold scan walks the contract's entire history and takes about a minute on
+   * the public RPC. Paying that on a visitor's first click is the difference
+   * between a table that fills in and a table that looks broken. Failures are
+   * swallowed on purpose: this is a cache warm-up, and the endpoint will simply
+   * do the work itself if it didn't land.
+   */
+  setTimeout(() => {
+    for (const kind of ["lending", "vault", "amm", "swap"] as HolderKind[]) {
+      holderReader.read(kind, holderOpts()).catch(() => {});
+    }
+  }, 5_000).unref?.();
+
+  app.get("/api/holders", async (req, res) => {
+    const kind = String(req.query.kind ?? "lending") as HolderKind;
+    if (!["lending", "vault", "amm", "swap"].includes(kind)) {
+      res.status(400).json({ ok: false, error: "unknown venue" });
+      return;
+    }
+    try {
+      const report = await holderReader.read(kind, {
+        ...holderOpts(Number(req.query.poolId ?? 0)),
+        force: req.query.refresh === "1",
+      });
+      res.json({ ok: true, ...report });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
   /** The asset list an archive scan should use for a given kind. */
   const archiveAssets = (body: Record<string, unknown>) => {
     const given = Array.isArray(body.assets) ? (body.assets as { address: Hex }[]) : null;
@@ -2877,6 +2937,9 @@ async function main() {
     vaultAt = 0;
     swapAt = 0;
     ammAt = 0;
+    // A deposit or withdrawal moves someone up or down the leaderboard, so the
+    // cached holder scan is stale the moment any of these actions lands.
+    holderReader.invalidate();
   }
   async function refreshAll() {
     invalidateAll();

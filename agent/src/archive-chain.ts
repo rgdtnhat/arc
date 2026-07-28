@@ -23,6 +23,8 @@ import type { ArchiveKind, HolderBalance } from "./history.js";
  * totals don't account for, whereas a wrong amount would be paid out silently.
  */
 
+import { findDeploymentBlock } from "./deploy-block.js";
+
 const EVENTS = {
   poolSupply: parseAbiItem("event Supply(address indexed asset, address indexed user, uint256 amount, uint256 shares)"),
   vaultDeposit: parseAbiItem("event Deposit(address indexed user, uint256 assets, uint256 shares)"),
@@ -30,7 +32,7 @@ const EVENTS = {
 } as const;
 
 /** Arc's public RPC caps `eth_getLogs` spans, so scan in windows. */
-const LOG_WINDOW = BigInt(process.env.ARC_LOG_WINDOW ?? "9000");
+const LOG_WINDOW = BigInt(process.env.ARC_LOG_WINDOW ?? "9000"); // Arc caps eth_getLogs at 10k
 /** How far back to look. Blocks, not time — the deploy is the real lower bound. */
 const LOG_LOOKBACK = BigInt(process.env.ARC_LOG_LOOKBACK ?? "500000");
 
@@ -52,14 +54,22 @@ export class ArchiveScanner {
   /** Collect the distinct `user`/`provider` addresses from an event, in windows. */
   private async holderAddresses(address: Hex, event: (typeof EVENTS)[keyof typeof EVENTS], field: string) {
     const latest = await this.public.getBlockNumber();
-    const floor = latest > LOG_LOOKBACK ? latest - LOG_LOOKBACK : 0n;
+    // Start at the contract's own creation block. A fixed lookback is a few
+    // days on a fast chain, so anything older reads as "no holders" — which is
+    // indistinguishable from an empty pool and the reason this used to return
+    // nothing for a week-old deployment.
+    const created = await findDeploymentBlock(this.public, address, latest).catch(() => null);
+    const floor = created ?? (latest > LOG_LOOKBACK ? latest - LOG_LOOKBACK : 0n);
     const found = new Set<string>();
     let partial = false;
     let to = latest;
     // Walk backwards so the most recent activity is captured first: if the scan
     // has to stop early, what it has is the part most likely to still matter.
     let windows = 0;
-    const MAX_WINDOWS = Number(process.env.ARC_LOG_MAX_WINDOWS ?? "60");
+    // Enough windows to cover a real deployment's lifetime. The budget still
+    // exists so a pathological range can't hang a request; hitting it sets
+    // `partial` rather than passing off a short scan as a full one.
+    const MAX_WINDOWS = Number(process.env.ARC_LOG_MAX_WINDOWS ?? "220");
     while (to > floor) {
       if (windows++ >= MAX_WINDOWS) { partial = true; break; }
       const from = to > LOG_WINDOW ? to - LOG_WINDOW : 0n;

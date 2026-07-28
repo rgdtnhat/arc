@@ -758,6 +758,31 @@
         min-height: 2px;
       }
       .feeBar:hover i { background: var(--accent-2); }
+      /* Pager for the holder leaderboards. Numbered pages are the point —
+         "page 7 of 12" that you can't click is a status line, not navigation. */
+      .pager { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; font-size: 12px; }
+      .pager .pgBtn {
+        min-width: 30px; padding: 4px 9px; border-radius: 8px; cursor: pointer;
+        border: 1px solid var(--line-strong); background: var(--panel-2); color: var(--text);
+        font: inherit; font-size: 12px; line-height: 1.5;
+      }
+      .pager .pgBtn:hover:not(:disabled) { border-color: var(--accent); background: var(--panel); }
+      .pager .pgBtn:disabled { opacity: .38; cursor: default; }
+      .pager .pgBtn.active {
+        border-color: var(--accent); font-weight: 700;
+        background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+      }
+      :root[data-theme="dark"] .pager .pgBtn.active { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+      .pager .pgGap { padding: 0 2px; color: var(--muted); }
+      .pager .pgInfo { margin-left: auto; color: var(--muted); }
+      .pager select.field { font-size: 12px; padding: 3px 8px; }
+      /* The app's own row, so nobody mistakes protocol-owned liquidity for a user. */
+      .data tr.selfRow { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+      .data .appTag {
+        font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+        padding: 1px 6px; border-radius: 999px; margin-left: 7px;
+        background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent);
+      }
       .feeChartEmpty { color: var(--muted); font-size: 13px; padding: 34px 0; text-align: center; width: 100%; }
       .feedNote.bad { color: var(--warn); }
 
@@ -1208,6 +1233,37 @@
             </div>
             <div class="kv" id="lendingMsg" style="margin-top:11px;display:none"></div>
           </div>
+
+          <!-- Who holds this venue, largest first, plus the venue's own daily
+               fee history. Both are read from the chain; a short log scan is
+               reported rather than silently dropping holders. -->
+          <div class="card" id="holdLendingCard">
+            <h2>👥 Suppliers — who is lending into this pool</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">Every address the pool has ever credited, ranked by the pool's own USD valuation of their supply — the same figure it lends and liquidates against.</div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr>
+                <th style="width:34px">#</th><th>Address</th>
+                <th class="num" id="holdLendingRankHead">Share</th>
+                <th class="num">% of venue</th><th>Position</th>
+              </tr></thead>
+              <tbody id="holdLendingRows"></tbody>
+            </table></div>
+            <div class="pager" id="holdLendingPager"></div>
+            <p class="feedNote" id="holdLendingNote" style="margin-top:8px"></p>
+
+            <div style="font-size:11px;color:var(--muted);margin:20px 0 9px">
+              Fees routed to this venue, per day
+              <select class="field" id="holdLendingRange" style="margin-left:8px;font-size:11px;padding:3px 8px">
+                <option value="0">Since inception</option>
+                <option value="90">Last 90 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="7">Last 7 days</option>
+              </select>
+            </div>
+            <div id="holdLendingChart" class="feeChart"></div>
+            <div class="kv" id="holdLendingStats" style="margin-top:10px"></div>
+            <p class="feedNote" id="holdLendingChartNote" style="margin-top:8px"></p>
+          </div>
           </div>
 
           <div class="defiPane" id="defiVault" hidden>
@@ -1245,6 +1301,37 @@
         </div>
 
         <!-- ---------- AGENT TRANSACTIONS ---------- -->
+
+          <!-- Who holds this venue, largest first, plus the venue's own daily
+               fee history. Both are read from the chain; a short log scan is
+               reported rather than silently dropping holders. -->
+          <div class="card" id="holdVaultCard">
+            <h2>🏛 Depositors — who holds vault shares</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">Every depositor and the share count they hold. Shares are the vault's single unit of ownership, so this ranking is exact rather than a valuation.</div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr>
+                <th style="width:34px">#</th><th>Address</th>
+                <th class="num" id="holdVaultRankHead">Share</th>
+                <th class="num">% of venue</th><th>Position</th>
+              </tr></thead>
+              <tbody id="holdVaultRows"></tbody>
+            </table></div>
+            <div class="pager" id="holdVaultPager"></div>
+            <p class="feedNote" id="holdVaultNote" style="margin-top:8px"></p>
+
+            <div style="font-size:11px;color:var(--muted);margin:20px 0 9px">
+              Fees routed to this venue, per day
+              <select class="field" id="holdVaultRange" style="margin-left:8px;font-size:11px;padding:3px 8px">
+                <option value="0">Since inception</option>
+                <option value="90">Last 90 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="7">Last 7 days</option>
+              </select>
+            </div>
+            <div id="holdVaultChart" class="feeChart"></div>
+            <div class="kv" id="holdVaultStats" style="margin-top:10px"></div>
+            <p class="feedNote" id="holdVaultChartNote" style="margin-top:8px"></p>
+          </div>
           </div>
 
           <div class="defiPane" id="defiSwap" hidden>
@@ -1296,6 +1383,37 @@
                 <a href="#" data-goto="defi#ammCard">Liquidity pools</a> instead.
               </div>
             </div>
+          </div>
+
+          <!-- Who holds this venue, largest first, plus the venue's own daily
+               fee history. Both are read from the chain; a short log scan is
+               reported rather than silently dropping holders. -->
+          <div class="card" id="holdSwapCard">
+            <h2>📦 Desk inventory — what the desk can fill from</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">The swap desk fills out of its own balance. There are no depositors and no shares, so what follows is inventory, not a leaderboard.</div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr>
+                <th style="width:34px">#</th><th>Address</th>
+                <th class="num" id="holdSwapRankHead">Share</th>
+                <th class="num">% of venue</th><th>Position</th>
+              </tr></thead>
+              <tbody id="holdSwapRows"></tbody>
+            </table></div>
+            <div class="pager" id="holdSwapPager"></div>
+            <p class="feedNote" id="holdSwapNote" style="margin-top:8px"></p>
+
+            <div style="font-size:11px;color:var(--muted);margin:20px 0 9px">
+              Fees routed to this venue, per day
+              <select class="field" id="holdSwapRange" style="margin-left:8px;font-size:11px;padding:3px 8px">
+                <option value="0">Since inception</option>
+                <option value="90">Last 90 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="7">Last 7 days</option>
+              </select>
+            </div>
+            <div id="holdSwapChart" class="feeChart"></div>
+            <div class="kv" id="holdSwapStats" style="margin-top:10px"></div>
+            <p class="feedNote" id="holdSwapChartNote" style="margin-top:8px"></p>
           </div>
           </div>
 
@@ -1350,6 +1468,37 @@
             </div>
             <div id="amLpHint" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
             <div class="kv" id="ammMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <!-- Who holds this venue, largest first, plus the venue's own daily
+               fee history. Both are read from the chain; a short log scan is
+               reported rather than silently dropping holders. -->
+          <div class="card" id="holdAmmCard">
+            <h2>💧 Liquidity providers — who owns this pool</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">Every provider and their LP share count, largest first. Their slice of each asset follows from that share of the pool's balances.</div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr>
+                <th style="width:34px">#</th><th>Address</th>
+                <th class="num" id="holdAmmRankHead">Share</th>
+                <th class="num">% of venue</th><th>Position</th>
+              </tr></thead>
+              <tbody id="holdAmmRows"></tbody>
+            </table></div>
+            <div class="pager" id="holdAmmPager"></div>
+            <p class="feedNote" id="holdAmmNote" style="margin-top:8px"></p>
+
+            <div style="font-size:11px;color:var(--muted);margin:20px 0 9px">
+              Fees routed to this venue, per day
+              <select class="field" id="holdAmmRange" style="margin-left:8px;font-size:11px;padding:3px 8px">
+                <option value="0">Since inception</option>
+                <option value="90">Last 90 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="7">Last 7 days</option>
+              </select>
+            </div>
+            <div id="holdAmmChart" class="feeChart"></div>
+            <div class="kv" id="holdAmmStats" style="margin-top:10px"></div>
+            <p class="feedNote" id="holdAmmChartNote" style="margin-top:8px"></p>
           </div>
           </div>
 
