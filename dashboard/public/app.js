@@ -178,10 +178,12 @@ const $ = (id) => document.getElementById(id);
        * One tab per function instead of four long cards stacked in a column.
        * Purely a view switch: no fetching hangs off it, because the DeFi panels
        * are all fed by the same `/api/state` poll. */
-      const DEFI_PANES = { lending: "defiLending", vault: "defiVault", swap: "defiSwap", amm: "defiAmm" };
+      const DEFI_PANES = {
+        lending: "defiLending", vault: "defiVault", swap: "defiSwap", amm: "defiAmm", fees: "defiFees",
+      };
       /** Which tab owns each card, so a deep link can open the right one. */
       const DEFI_CARD_TAB = {
-        lendingCard: "lending", vaultCard: "vault", swapCard: "swap", ammCard: "amm",
+        lendingCard: "lending", vaultCard: "vault", swapCard: "swap", ammCard: "amm", feesCard: "fees",
       };
       const DEFI_TAB_KEY = "tessera_defi_tab";
       let defiTab = "lending";
@@ -196,6 +198,7 @@ const $ = (id) => document.getElementById(id);
         }
         document.querySelectorAll("[data-defitab]").forEach((b) =>
           b.classList.toggle("active", b.dataset.defitab === tab));
+        if (tab === "fees") loadFees();
         // Switching tabs shouldn't leave you halfway down the previous pane.
         if (!opts || opts.scroll !== false) {
           const dock = document.querySelector("#paneDefi .tabDock");
@@ -1436,6 +1439,150 @@ const $ = (id) => document.getElementById(id);
           } finally { btn.disabled = false; tick(); }
         });
       }
+
+      /* ===================================================================
+       * App fees — intake, split, and the daily chart.
+       *
+       * Everything here comes from the collector's own `Allocated` events, so
+       * every figure is checkable against the chain. When the log scan had to
+       * stop early the report says so and the totals are labelled a lower bound
+       * rather than quietly under-reporting.
+       * =================================================================== */
+      let feesLoading = false;
+      async function loadFees() {
+        if (feesLoading) return;
+        feesLoading = true;
+        const note = $("feeChartNote");
+        try {
+          const r = await (await fetch("/api/fees")).json();
+          const notReady = $("feesNotReady");
+          if (!r.ok) {
+            if (notReady) { notReady.style.display = ""; notReady.textContent = r.error || "Fee collector unavailable."; }
+            if (note) note.textContent = "";
+            $("feeChart").innerHTML = `<div class="feeChartEmpty">${esc(r.error || "No fee data.")}</div>`;
+            return;
+          }
+          if (notReady) notReady.style.display = "none";
+
+          $("feePending").textContent = r.pending + " USDC";
+          $("feeTotal").textContent = r.totals.total + " USDC";
+          const secs = Number(r.secondsUntilAllocatable);
+          $("feeNext").textContent =
+            secs <= 0 ? "ready now" : secs < 3600 ? `${Math.round(secs / 60)}m` : `${Math.round(secs / 3600)}h`;
+
+          // Each sink's configured share alongside what it has actually received.
+          const rows = [
+            ["Agent wallet", r.split.agentBps, r.totals.toAgent],
+            ["Lending pool", r.split.lendingBps, r.totals.toLending],
+            ["Yield vault", r.split.vaultBps, r.totals.toVault],
+            ["Swap desk / AMM", r.split.swapBps, r.totals.toSwap],
+            ["Retained", r.split.retainedBps, r.totals.retained],
+          ];
+          $("feeSplitRows").innerHTML = rows
+            .map(([label, bps, got]) =>
+              `<tr><td><b>${esc(label)}</b></td>` +
+              `<td class="num">${esc((Number(bps) / 100).toFixed(0))}%</td>` +
+              `<td class="num">${esc(got)}</td></tr>`)
+            .join("");
+
+          renderFeeChart(r.daily);
+          if (note) {
+            note.className = r.partial ? "feedNote bad" : "feedNote";
+            note.textContent = r.partial
+              ? `Read as far back as block ${r.block} allowed — these are a lower bound, not a total.`
+              : `${r.daily.length} day(s) of history, from the collector's Allocated events.`;
+          }
+          // The operator controls spend the deployer key, so they are gated.
+          const admin = $("feeAdmin");
+          if (admin) admin.style.display = adminId ? "" : "none";
+        } catch {
+          if (note) { note.className = "feedNote bad"; note.textContent = "Couldn't reach the server."; }
+        } finally {
+          feesLoading = false;
+        }
+      }
+
+      /** Bars, one per day, scaled to the largest. */
+      function renderFeeChart(daily) {
+        const host = $("feeChart");
+        if (!host) return;
+        if (!daily || !daily.length) {
+          host.innerHTML = `<div class="feeChartEmpty">No fees distributed yet — the chart fills in once the first split runs.</div>`;
+          return;
+        }
+        const max = Math.max(...daily.map((d) => d.total)) || 1;
+        host.innerHTML = daily
+          .map((d) => {
+            const pct = Math.max(2, Math.round((d.total / max) * 100));
+            const tip = `${d.day}: ${d.total.toFixed(6)} USDC total · agent ${d.toAgent.toFixed(4)} · lending ` +
+              `${d.toLending.toFixed(4)} · vault ${d.toVault.toFixed(4)} · swap ${d.toSwap.toFixed(4)}`;
+            return `<span class="feeBar" title="${esc(tip)}"><i style="height:${pct}%"></i></span>`;
+          })
+          .join("");
+        // Newest day in view, which is the one anyone looks for first.
+        host.scrollLeft = host.scrollWidth;
+      }
+
+      if ($("feeAllocate")) {
+        const feeMsg = (text, colour) => {
+          const m = $("feeMsg");
+          m.style.display = "block"; m.textContent = text; m.style.color = colour;
+        };
+        $("feeAllocate").addEventListener("click", async () => {
+          const btn = $("feeAllocate");
+          btn.disabled = true;
+          try {
+            const r = await (await postAuthed("/api/fees/allocate")).json();
+            feeMsg(r.ok ? `distributed ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`,
+              r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) loadFees();
+          } catch { feeMsg("request failed", "var(--warn)"); }
+          finally { btn.disabled = false; }
+        });
+        $("feeWithdraw").addEventListener("click", async () => {
+          const human = $("feeWithdrawAmount").value.trim();
+          if (!human || !(parseFloat(human) > 0)) return feeMsg("Enter an amount above zero.", "var(--warn)");
+          const btn = $("feeWithdraw");
+          btn.disabled = true;
+          try {
+            const raw = toRaw(human, 6); // the collector's asset is USDC
+            const r = await (await postAuthed(`/api/fees/withdraw?amount=${raw}`)).json();
+            feeMsg(r.ok ? `withdrew ${human} USDC ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`,
+              r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) { $("feeWithdrawAmount").value = ""; loadFees(); }
+          } catch { feeMsg("request failed", "var(--warn)"); }
+          finally { btn.disabled = false; }
+        });
+      }
+
+      /** Reverse a swap pair. Two selects, one click — the common second trade. */
+      function wireFlip(btnId, inId, outId, after) {
+        const btn = $(btnId);
+        if (!btn) return;
+        btn.addEventListener("click", () => {
+          const a = $(inId), b = $(outId);
+          if (!a || !b) return;
+          const v = a.value;
+          a.value = b.value;
+          b.value = v;
+          // A select whose option list doesn't contain the value silently keeps
+          // its old one, which would leave the pair unchanged and look broken.
+          if (a.value !== b.value || a.selectedIndex !== b.selectedIndex) {
+            a.dispatchEvent(new Event("change"));
+            b.dispatchEvent(new Event("change"));
+          }
+          if (after) after();
+        });
+      }
+      wireFlip("swFlip", "swIn", "swOut", () => {
+        if (window.renderSwapBalances) window.renderSwapBalances();
+        const q = $("swQuoteOut");
+        if (q) q.textContent = ""; // the old quote is for the old direction
+      });
+      wireFlip("amFlip", "amSwapIn", "amSwapOut", () => {
+        const q = $("amSwapQuote");
+        if (q) q.textContent = "";
+      });
 
       /* ===================================================================
        * Operator notices — the running banner and the bell.
@@ -3192,6 +3339,43 @@ const $ = (id) => document.getElementById(id);
         return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
       };
 
+      /**
+       * Headlines, revealed in pages.
+       *
+       * The server returns up to 120 de-duplicated items; rendering all of them
+       * buries the rest of the tab under a wall of links. Show a page at a time
+       * and let the reader ask for more.
+       */
+      const NEWS_PAGE = 25;
+      let newsItems = [];
+      let newsShown = NEWS_PAGE;
+
+      function renderNews() {
+        const host = $("newsList");
+        const more = $("newsMore");
+        if (!newsItems.length) {
+          host.innerHTML = `<div style="color:var(--warn);padding:8px 0">No headlines available.</div>`;
+          if (more) more.hidden = true;
+          return;
+        }
+        host.innerHTML = newsItems
+          .slice(0, newsShown)
+          .map(
+            (n) =>
+              `<div style="padding:9px 0;border-bottom:1px solid var(--line)">` +
+              // rel=noopener so a publisher's page can't touch this one.
+              `<a href="${esc(n.link)}" target="_blank" rel="noopener noreferrer" style="font-size:13.5px;font-weight:600">${esc(n.title)}</a>` +
+              `<span style="display:block;color:var(--muted);font-size:11.5px;margin-top:3px">` +
+              `<span class="tag">${esc(n.topic)}</span> ${esc(n.source)} · ${esc(ago(n.publishedAt))}</span></div>`,
+          )
+          .join("");
+        if (more) {
+          const left = newsItems.length - newsShown;
+          more.hidden = left <= 0;
+          more.textContent = `Show ${Math.min(left, NEWS_PAGE)} more (${left} left)`;
+        }
+      }
+
       async function loadNews() {
         const host = $("newsList");
         host.innerHTML = `<div style="color:var(--muted);padding:8px 0">Loading headlines…</div>`;
@@ -3199,22 +3383,26 @@ const $ = (id) => document.getElementById(id);
         try {
           const r = await feed("/api/feeds/news?topics=" + encodeURIComponent(topics));
           feedNote("newsNote", r);
-          const items = r.items || [];
-          host.innerHTML = items.length
-            ? items
-                .map(
-                  (n) =>
-                    `<div style="padding:9px 0;border-bottom:1px solid var(--line)">` +
-                    // rel=noopener so a publisher's page can't touch this one.
-                    `<a href="${esc(n.link)}" target="_blank" rel="noopener noreferrer" style="font-size:13.5px;font-weight:600">${esc(n.title)}</a>` +
-                    `<span style="display:block;color:var(--muted);font-size:11.5px;margin-top:3px">` +
-                    `<span class="tag">${esc(n.topic)}</span> ${esc(n.source)} · ${esc(ago(n.publishedAt))}</span></div>`,
-                )
-                .join("")
-            : `<div style="color:var(--warn);padding:8px 0">${esc(r.error || "No headlines available.")}</div>`;
+          newsItems = r.items || [];
+          // A fresh query starts at the first page again.
+          newsShown = NEWS_PAGE;
+          if (!newsItems.length && r.error) {
+            host.innerHTML = `<div style="color:var(--warn);padding:8px 0">${esc(r.error)}</div>`;
+            if ($("newsMore")) $("newsMore").hidden = true;
+            return;
+          }
+          renderNews();
         } catch {
           host.innerHTML = `<div style="color:var(--warn);padding:8px 0">Couldn't reach the server.</div>`;
+          if ($("newsMore")) $("newsMore").hidden = true;
         }
+      }
+
+      if ($("newsMore")) {
+        $("newsMore").addEventListener("click", () => {
+          newsShown += NEWS_PAGE;
+          renderNews();
+        });
       }
 
       const AG_LOADERS = {

@@ -305,4 +305,43 @@ describe("TesseraSwap (oracle-priced swap desk)", () => {
     const got = (await eurc.read.balanceOf([alice.account.address])) - before;
     expect(got > USDC("99.6") && got < USDC("100")).to.equal(true);
   });
+
+  // --- direction on the desk ---------------------------------------------------
+
+  it("gives the caller tokenOut and takes tokenIn, in both directions", async () => {
+    const { alice, usdc, eurc, swap, asSwap } = await loadFixture(deployFixture);
+    await usdc.write.mint([alice.account.address, USDC("108")]);
+    await eurc.write.mint([alice.account.address, USDC("100")]);
+    const aUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: alice } });
+    const aEurc = await hre.viem.getContractAt("MockToken", eurc.address, { client: { wallet: alice } });
+    await aUsdc.write.approve([swap.address, USDC("108")]);
+    await aEurc.write.approve([swap.address, USDC("100")]);
+
+    // USDC -> EURC at $1.00 / $1.08.
+    let usdcBefore = await usdc.read.balanceOf([alice.account.address]);
+    let eurcBefore = await eurc.read.balanceOf([alice.account.address]);
+    const [outEurc] = await swap.read.quote([usdc.address, eurc.address, USDC("108")]);
+    await (await asSwap(alice)).write.swap([usdc.address, eurc.address, USDC("108"), 0n]);
+    expect(usdcBefore - (await usdc.read.balanceOf([alice.account.address]))).to.equal(USDC("108"));
+    expect((await eurc.read.balanceOf([alice.account.address])) - eurcBefore).to.equal(outEurc);
+
+    // EURC -> USDC: 100 EURC should come back as roughly 108 USDC, not 100.
+    usdcBefore = await usdc.read.balanceOf([alice.account.address]);
+    eurcBefore = await eurc.read.balanceOf([alice.account.address]);
+    const [outUsdc] = await swap.read.quote([eurc.address, usdc.address, USDC("100")]);
+    expect(outUsdc > USDC("107") && outUsdc < USDC("108")).to.equal(true);
+    await (await asSwap(alice)).write.swap([eurc.address, usdc.address, USDC("100"), 0n]);
+    expect(eurcBefore - (await eurc.read.balanceOf([alice.account.address]))).to.equal(USDC("100"));
+    expect((await usdc.read.balanceOf([alice.account.address])) - usdcBefore).to.equal(outUsdc);
+  });
+
+  it("refuses to swap an asset for itself", async () => {
+    const { alice, usdc, swap, asSwap } = await loadFixture(deployFixture);
+    await usdc.write.mint([alice.account.address, USDC("100")]);
+    const aUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: alice } });
+    await aUsdc.write.approve([swap.address, USDC("100")]);
+    await expect(
+      (await asSwap(alice)).write.swap([usdc.address, usdc.address, USDC("100"), 0n])
+    ).to.be.rejected;
+  });
 });

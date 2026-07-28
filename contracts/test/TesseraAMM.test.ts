@@ -331,4 +331,71 @@ describe("TesseraAMM (multi-asset liquidity pools)", () => {
     expect(info[4]).to.equal(await amm.read.MINIMUM_LIQUIDITY()); // only the burn remains
     expect(info[1][0] > 0n).to.equal(true); // dust stays behind, pool is never zeroed
   });
+
+  // --- direction: does the caller get the asset they asked for? ---------------
+  //
+  // The existing swap tests assert amounts. These assert *identity*: the right
+  // token arrives, the right token leaves, nothing else in the pool moves, and
+  // the two directions are independent. A transposed tokenIn/tokenOut would keep
+  // every amount plausible while handing back the wrong asset.
+
+  it("gives the caller tokenOut and takes tokenIn, in both directions", async () => {
+    const { bob, usdc, eurc, amm, asAmm, mint } = await loadFixture(deployFixture);
+    await mint(usdc, bob, U("2000"));
+    await mint(eurc, bob, U("2000"));
+
+    // USDC -> EURC
+    let usdcBefore = await usdc.read.balanceOf([bob.account.address]);
+    let eurcBefore = await eurc.read.balanceOf([bob.account.address]);
+    const [expectOut] = await amm.read.quote([0n, usdc.address, eurc.address, U("1000")]);
+    await (await asAmm(bob)).write.swap([0n, usdc.address, eurc.address, U("1000"), 0n]);
+    expect(usdcBefore - (await usdc.read.balanceOf([bob.account.address]))).to.equal(U("1000"));
+    expect((await eurc.read.balanceOf([bob.account.address])) - eurcBefore).to.equal(expectOut);
+
+    // EURC -> USDC: the opposite token must move the opposite way.
+    usdcBefore = await usdc.read.balanceOf([bob.account.address]);
+    eurcBefore = await eurc.read.balanceOf([bob.account.address]);
+    const [expectBack] = await amm.read.quote([0n, eurc.address, usdc.address, U("500")]);
+    await (await asAmm(bob)).write.swap([0n, eurc.address, usdc.address, U("500"), 0n]);
+    expect(eurcBefore - (await eurc.read.balanceOf([bob.account.address]))).to.equal(U("500"));
+    expect((await usdc.read.balanceOf([bob.account.address])) - usdcBefore).to.equal(expectBack);
+  });
+
+  it("leaves the pool's other assets untouched in a three-asset pool", async () => {
+    const { alice, bob, usdc, eurc, btc, amm, asAmm, mint } = await loadFixture(deployFixture);
+    await amm.write.createPool([[usdc.address, eurc.address, btc.address], SWAP_FEE, LP_SHARE, "tri"]);
+    await mint(btc, alice, U("100000"));
+    await (await asAmm(alice)).write.addLiquidity([1n, [U("5000"), U("5000"), U("5000")], 0n]);
+
+    const before: any = await amm.read.poolInfo([1n]);
+    const eurcReserveBefore = before[1][1] as bigint;
+
+    await mint(usdc, bob, U("1000"));
+    const btcBefore = await btc.read.balanceOf([bob.account.address]);
+    const eurcBefore = await eurc.read.balanceOf([bob.account.address]);
+    // Swap USDC -> cirBTC. EURC is in the pool but not in this trade.
+    await (await asAmm(bob)).write.swap([1n, usdc.address, btc.address, U("1000"), 0n]);
+
+    expect((await btc.read.balanceOf([bob.account.address])) > btcBefore).to.equal(true);
+    expect(await eurc.read.balanceOf([bob.account.address])).to.equal(eurcBefore);
+    const after: any = await amm.read.poolInfo([1n]);
+    expect(after[1][1]).to.equal(eurcReserveBefore); // EURC reserve unmoved
+  });
+
+  it("refuses to swap an asset for itself", async () => {
+    const { bob, usdc, asAmm, mint } = await loadFixture(deployFixture);
+    await mint(usdc, bob, U("100"));
+    await expect(
+      (await asAmm(bob)).write.swap([0n, usdc.address, usdc.address, U("100"), 0n])
+    ).to.be.rejected;
+  });
+
+  it("refuses a token that is not in the pool", async () => {
+    const { bob, usdc, btc, asAmm, mint } = await loadFixture(deployFixture);
+    await mint(usdc, bob, U("100"));
+    // btc is not an asset of pool 0.
+    await expect(
+      (await asAmm(bob)).write.swap([0n, usdc.address, btc.address, U("100"), 0n])
+    ).to.be.rejected;
+  });
 });

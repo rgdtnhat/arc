@@ -51,6 +51,7 @@ interface PoolDeploymentRef {
 import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
 import { VaultClient, SwapClient, AmmClient } from "./defi.js";
+import { FeeReader } from "./fees.js";
 import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
 import { OwnerClient } from "./owner.js";
@@ -253,6 +254,10 @@ async function main() {
     : undefined;
   const ammClient = liveDeployment.tesseraAmm
     ? new AmmClient({ chain, rpcUrl, account: agentAccount }, liveDeployment.tesseraAmm as Hex)
+    : undefined;
+  // Reads app-fee intake and distribution from the collector's `Allocated` logs.
+  const feeReader = liveDeployment.tesseraFeeCollector
+    ? new FeeReader(chain, rpcUrl, liveDeployment.tesseraFeeCollector as Hex, usdcAddress, 6)
     : undefined;
 
   // Signs owner-gated calls (vault setParams, fee collector setShares/interval/
@@ -1465,6 +1470,121 @@ async function main() {
   app.get("/api/feeds/crypto", async (_req, res) => res.json(await feeds.crypto()));
   app.get("/api/feeds/stocks", async (_req, res) => res.json(await feeds.stocks()));
   app.get("/api/feeds/commodities", async (_req, res) => res.json(await feeds.commodities()));
+  /* --- App fees: what came in, and where it went ----------------------------
+   * A public read, because it is a claim about the app's own revenue and
+   * hiding it would make the split unverifiable. Everything is derived from the
+   * collector's `Allocated` logs, so a reader can check it against the chain.
+   * Cached briefly — it costs a windowed log scan. */
+  let feeCache: { at: number; body: unknown } | null = null;
+  app.get("/api/fees", async (_req, res) => {
+    if (!feeReader) { res.status(404).json({ ok: false, error: "fee collector not deployed" }); return; }
+    if (feeCache && Date.now() - feeCache.at < 30_000) { res.json(feeCache.body); return; }
+    try {
+      const r = await feeReader.read();
+      const dec = r.decimals;
+      const body = {
+        ok: true,
+        collector: r.collector,
+        pending: fmtUnits(r.pending, dec),
+        split: r.split,
+        intervalSeconds: r.intervalSeconds,
+        secondsUntilAllocatable: r.secondsUntilAllocatable,
+        totals: {
+          total: fmtUnits(r.totals.total, dec),
+          toAgent: fmtUnits(r.totals.toAgent, dec),
+          toLending: fmtUnits(r.totals.toLending, dec),
+          toVault: fmtUnits(r.totals.toVault, dec),
+          toSwap: fmtUnits(r.totals.toSwap, dec),
+          retained: fmtUnits(r.totals.retained, dec),
+        },
+        allocations: r.allocations.map((a) => ({
+          txHash: a.txHash,
+          blockNumber: a.blockNumber,
+          at: a.at,
+          total: fmtUnits(a.total, dec),
+          toAgent: fmtUnits(a.toAgent, dec),
+          toLending: fmtUnits(a.toLending, dec),
+          toVault: fmtUnits(a.toVault, dec),
+          toSwap: fmtUnits(a.toSwap, dec),
+          retained: fmtUnits(a.retained, dec),
+        })),
+        daily: r.daily,
+        // Says so when the scan was truncated, rather than presenting a lower
+        // bound as a total. Someone will reconcile against this.
+        partial: r.partial,
+        block: r.block,
+      };
+      feeCache = { at: Date.now(), body };
+      res.json(body);
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Run the split now, without waiting for the cadence. Owner-gated on-chain. */
+  app.post("/api/fees/allocate", requireOperator, async (req, res) => {
+    if (!owner || !liveDeployment.tesseraFeeCollector) {
+      res.status(404).json({ ok: false, error: "no fee collector, or no deployer key to sign with" });
+      return;
+    }
+    try {
+      const txHash = await owner.write(
+        liveDeployment.tesseraFeeCollector as Hex,
+        tesseraFeeCollectorAbi,
+        "allocateNow",
+        [],
+      );
+      feeCache = null;
+      logTx(req, { category: "defi", action: "fee-allocate", status: "success", txHash, detail: "distributed app fees" });
+      invalidateAll();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      logTx(req, { category: "defi", action: "fee-allocate", status: "failed", detail: friendlyError(e) });
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Withdraw undistributed fees from the collector.
+   *
+   * `sweep` on the contract. Note what this can and cannot reach: fees still
+   * sitting in the collector, yes — but not the shares already sent on to the
+   * pool, the vault or the swap desk, which belong to those contracts now. The
+   * response says so rather than letting a partial withdrawal look like a full
+   * one.
+   */
+  app.post("/api/fees/withdraw", requireOperator, async (req, res) => {
+    if (!owner || !liveDeployment.tesseraFeeCollector) {
+      res.status(404).json({ ok: false, error: "no fee collector, or no deployer key to sign with" });
+      return;
+    }
+    const token = (req.query.token as Hex) || usdcAddress;
+    const raw = BigInt((req.query.amount as string) ?? "0");
+    const to = (req.query.to as Hex) || (owner.account.address as Hex);
+    try {
+      if (raw <= 0n) throw new Error("Enter an amount above zero.");
+      const txHash = await owner.write(
+        liveDeployment.tesseraFeeCollector as Hex,
+        tesseraFeeCollectorAbi,
+        "sweep",
+        [token, raw, to],
+      );
+      feeCache = null;
+      logTx(req, {
+        category: "defi", action: "fee-withdraw", status: "success", txHash,
+        assetAddress: token, raw, detail: `swept app fees to ${to.slice(0, 10)}…`,
+      });
+      invalidateAll();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      logTx(req, {
+        category: "defi", action: "fee-withdraw", status: "failed",
+        assetAddress: token, raw, detail: friendlyError(e),
+      });
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
   app.get("/api/feeds/rates", async (_req, res) => res.json(await feeds.rates()));
   app.get("/api/feeds/analysis", async (_req, res) => res.json(await feeds.analysis()));
   app.get("/api/feeds/news", async (req, res) => {

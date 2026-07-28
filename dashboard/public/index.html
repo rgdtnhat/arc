@@ -623,14 +623,38 @@
         padding: 10px 18px; border-bottom: 1px solid var(--line);
       }
       .sheetTabs::-webkit-scrollbar { display: none; }
+      /* Tabs have to read as "there is more here", not as disabled text. The
+         resting state used to be muted-on-transparent, which on a dark
+         background is close to invisible — a whole row of features nobody
+         clicked because it did not look clickable. Now each tab sits on its own
+         surface with a border, and the active one is marked three ways at once
+         (fill, accent border, and an underline) so it survives both themes and
+         colour-blindness. */
       .sheetTab {
+        position: relative;
         display: inline-flex; align-items: center; gap: 7px;
-        border: 1px solid transparent; background: transparent; color: var(--muted);
-        padding: 7px 13px; border-radius: 999px; font: inherit; font-size: 13px;
+        border: 1px solid var(--line-strong); background: var(--panel-2);
+        color: var(--text); opacity: .82;
+        padding: 8px 14px; border-radius: 999px; font: inherit; font-size: 13px; font-weight: 550;
         cursor: pointer; white-space: nowrap;
+        transition: opacity .15s ease, border-color .15s ease, background .15s ease;
       }
-      .sheetTab:hover { color: var(--text); background: var(--panel-2); }
-      .sheetTab.active { color: var(--text); background: var(--panel); border-color: var(--line-strong); font-weight: 650; }
+      .sheetTab:hover { opacity: 1; border-color: var(--accent); background: var(--panel); }
+      .sheetTab.active {
+        opacity: 1; color: var(--text); font-weight: 700;
+        background: color-mix(in srgb, var(--accent) 16%, var(--panel));
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+      }
+      /* The third signal: a bar under the active tab. */
+      .sheetTab.active::after {
+        content: ""; position: absolute; left: 22%; right: 22%; bottom: -1px; height: 2px;
+        border-radius: 2px; background: var(--accent);
+      }
+      :root[data-theme="dark"] .sheetTab { background: color-mix(in srgb, var(--text) 6%, transparent); }
+      :root[data-theme="dark"] .sheetTab.active {
+        background: color-mix(in srgb, var(--accent) 26%, transparent);
+      }
       /* Same reasoning as the drawer: one stroke weight, inherits currentColor,
          identical on every platform. */
       .tabIco { display: inline-flex; flex: 0 0 auto; width: 15px; height: 15px; opacity: .8; }
@@ -718,6 +742,23 @@
       .tag.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
       .tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
       .feedNote { font-size: 11.5px; color: var(--muted); margin: 0 0 12px; }
+
+      /* Daily fee chart. Bars in a flex row rather than a charting library: the
+         data is one number per day, and a dependency for that would be more
+         code than the chart. Scrolls sideways once history outgrows the width. */
+      .feeChart {
+        display: flex; align-items: flex-end; gap: 3px; height: 120px;
+        overflow-x: auto; overscroll-behavior-x: contain;
+        padding: 6px 2px 0; border-bottom: 1px solid var(--line);
+      }
+      .feeBar { flex: 0 0 auto; width: 14px; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
+      .feeBar i {
+        display: block; width: 100%; border-radius: 3px 3px 0 0;
+        background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 55%, transparent));
+        min-height: 2px;
+      }
+      .feeBar:hover i { background: var(--accent-2); }
+      .feeChartEmpty { color: var(--muted); font-size: 13px; padding: 34px 0; text-align: center; width: 100%; }
       .feedNote.bad { color: var(--warn); }
 
       /* ---- compact dashboard ------------------------------------------------
@@ -1095,6 +1136,11 @@
                   <path d="M4 8.5h13.5l-3-3M20 15.5H6.5l3 3"/>
                 </svg></span>Swap desk
               </button>
+              <button class="sheetTab" data-defitab="fees" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 19.4V4.6M4 19.4h15.4"/><rect x="7" y="12" width="3" height="5"/><rect x="12" y="8.6" width="3" height="8.4"/><rect x="17" y="5.6" width="3" height="11.4"/>
+                </svg></span>App fees
+              </button>
               <button class="sheetTab" data-defitab="amm" role="tab">
                 <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M3 15.4c2-2.2 3.4-2.2 4.5 0s2.5 2.2 4.5 0 3.4-2.2 4.5 0 2.5 2.2 4.5 0"/><path d="M3 10c2-2.2 3.4-2.2 4.5 0s2.5 2.2 4.5 0 3.4-2.2 4.5 0 2.5 2.2 4.5 0"/>
@@ -1216,7 +1262,7 @@
             <div class="row-actions">
               <input id="swAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
               <select id="swIn" class="field"></select>
-              <span style="color:var(--muted)">→</span>
+              <button class="iconBtn" id="swFlip" title="Reverse the pair" aria-label="Reverse the pair" style="width:34px;height:34px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8.5h13.5l-3-3M20 15.5H6.5l3 3"/></svg></button>
               <select id="swOut" class="field"></select>
               <button class="btn" id="swQuote">Quote</button>
               <button class="btn primary" id="swExecute">Swap</button>
@@ -1286,7 +1332,7 @@
             <div class="row-actions">
               <input id="amSwapAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
               <select id="amSwapIn" class="field"></select>
-              <span style="color:var(--muted)">→</span>
+              <button class="iconBtn" id="amFlip" title="Reverse the pair" aria-label="Reverse the pair" style="width:34px;height:34px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8.5h13.5l-3-3M20 15.5H6.5l3 3"/></svg></button>
               <select id="amSwapOut" class="field"></select>
               <button class="btn primary" id="amSwapExec">Swap</button>
             </div>
@@ -1305,6 +1351,54 @@
             <div id="amLpHint" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
             <div class="kv" id="ammMsg" style="margin-top:11px;display:none"></div>
           </div>
+          </div>
+
+
+          <div class="defiPane" id="defiFees" hidden>
+            <div class="card" id="feesCard">
+              <h2>◪ App fees — what the app earned, and where it went</h2>
+              <div class="notready" id="feesNotReady" style="display:none">
+                Fee collector not deployed — run <span class="mono">npm run pool:arc:init</span>.
+              </div>
+              <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+                Every app fee lands in <span class="mono">TesseraFeeCollector</span> and is split across the
+                agent, the lending pool, the vault and the swap desk, with a retained remainder. Figures below
+                are read from the contract's own <span class="mono">Allocated</span> events, so they can be
+                checked against the chain.
+              </div>
+
+              <div class="metrics tight">
+                <div class="metric"><div class="k">Undistributed</div><div class="v" id="feePending">—</div></div>
+                <div class="metric"><div class="k">Distributed to date</div><div class="v" id="feeTotal">—</div></div>
+                <div class="metric"><div class="k">Next split</div><div class="v" id="feeNext">—</div></div>
+              </div>
+
+              <div class="tblWrap auto" style="margin-top:14px"><table class="data" style="min-width:0">
+                <thead><tr><th>Destination</th><th class="num">Share</th><th class="num">Received to date</th></tr></thead>
+                <tbody id="feeSplitRows"></tbody>
+              </table></div>
+
+              <div class="menuSep" style="margin:16px 0 10px"></div>
+              <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:8px">
+                Fees per day
+              </div>
+              <div id="feeChart" class="feeChart"></div>
+              <p class="feedNote" id="feeChartNote" style="margin-top:8px"></p>
+
+              <div id="feeAdmin" style="display:none;margin-top:14px">
+                <div class="menuSep" style="margin:0 0 11px"></div>
+                <div class="row-actions">
+                  <button class="btn" id="feeAllocate">Distribute now</button>
+                  <input id="feeWithdrawAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
+                  <button class="btn" id="feeWithdraw">Withdraw undistributed</button>
+                </div>
+                <div style="font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.55">
+                  Withdrawing reaches only what is still sitting in the collector. Shares already sent on to the
+                  pool, the vault or the swap desk belong to those contracts — pull those from their own tabs.
+                </div>
+                <div class="kv" id="feeMsg" style="margin-top:9px;display:none"></div>
+              </div>
+            </div>
           </div>
 
 <div class="tabPane" id="paneAgents" hidden>
@@ -1385,6 +1479,9 @@
             <div class="card compact">
               <p class="feedNote" id="newsNote"></p>
               <div id="newsList" style="display:flex;flex-direction:column;gap:1px"></div>
+              <div style="display:flex;justify-content:center;margin-top:12px">
+                <button class="btn" id="newsMore" hidden>Show more headlines</button>
+              </div>
             </div>
           </div>
 
