@@ -8,7 +8,14 @@ import {
   type PublicClient,
   type WalletClient,
 } from "viem";
-import { tesseraVaultAbi, tesseraSwapAbi, tesseraAmmAbi, erc20Abi, pacedHttp } from "@tessera/shared";
+import {
+  tesseraVaultAbi,
+  tesseraSwapAbi,
+  tesseraAmmAbi,
+  tesseraFeeCollectorAbi,
+  erc20Abi,
+  pacedHttp,
+} from "@tessera/shared";
 
 interface Cfg {
   chain: Chain;
@@ -240,6 +247,72 @@ export class SwapClient {
     });
     await this.public.waitForTransactionReceipt({ hash });
     return { txHash: hash, route: "transfer" };
+  }
+
+  /**
+   * Take inventory back out of the desk.
+   *
+   * Two routes, because withdrawal is gated and which gate the caller can pass
+   * depends on how the desk was deployed:
+   *
+   *   1. **Direct** — the desk's `withdrawInventory`, if this wallet is its
+   *      `owner` or its `admin`.
+   *   2. **Via the fee collector** — deployment hands the desk's ownership to
+   *      `TesseraFeeCollector` so its `seed` leg works, which on a desk with no
+   *      `admin` key leaves the collector as the only account that can withdraw.
+   *      The collector's `withdrawSwapInventory` forwards the call for its own
+   *      owner.
+   *
+   * A desk predating both (`withdrawInventory` owner-only, collector with no
+   * forwarder) genuinely cannot be drained — reported as such rather than
+   * failing obscurely.
+   */
+  async withdrawInventory(
+    token: Hex,
+    amount: bigint,
+    to: Hex,
+    feeCollector?: Hex,
+  ): Promise<{ txHash: Hex; route: "direct" | "collector" }> {
+    if (amount <= 0n) throw new Error("amount must be positive");
+
+    const attempt = async (address: Hex, abi: typeof tesseraSwapAbi | typeof tesseraFeeCollectorAbi,
+                           functionName: string, args: unknown[]) => {
+      const { request } = await this.public.simulateContract({
+        address, abi: abi as never, functionName: functionName as never,
+        args: args as never, account: this.cfg.account,
+      });
+      const hash = await this.wallet.writeContract(request);
+      await this.public.waitForTransactionReceipt({ hash });
+      return hash;
+    };
+
+    let directError = "";
+    try {
+      return { txHash: await attempt(this.swap, tesseraSwapAbi, "withdrawInventory", [token, amount, to]), route: "direct" };
+    } catch (e) {
+      directError = String((e as { shortMessage?: string })?.shortMessage ?? (e as Error)?.message ?? e)
+        .split("\n")[0]
+        .slice(0, 120);
+    }
+
+    if (feeCollector) {
+      try {
+        return {
+          txHash: await attempt(feeCollector, tesseraFeeCollectorAbi, "withdrawSwapInventory", [token, amount, to]),
+          route: "collector",
+        };
+      } catch (e) {
+        const via = String((e as { shortMessage?: string })?.shortMessage ?? (e as Error)?.message ?? e)
+          .split("\n")[0]
+          .slice(0, 120);
+        throw new Error(
+          `Neither route could withdraw. Directly: ${directError}. Via the fee collector: ${via}. ` +
+            `A swap desk deployed before the admin key and the collector's forwarder existed cannot be ` +
+            `drained — redeploy with \`npm run pool:arc -- --fresh\` to move to one that can.`,
+        );
+      }
+    }
+    throw new Error(directError || "withdrawInventory failed");
   }
 }
 

@@ -705,11 +705,47 @@ async function main() {
     // `ready` is sticky: once the chain has answered we keep rendering values
     // (possibly a few seconds stale) instead of flipping back to a "loading"
     // notice on every throttled poll, which made the banner appear constantly.
+    // How much could actually be drawn right now, as opposed to how much the
+    // collateral would allow.
+    //
+    // These are very different numbers and conflating them is misleading in a
+    // way that costs a user a reverted transaction: a wallet holding 1 cirBTC at
+    // the configured $95,000 has a $66,500 borrow limit against a pool that may
+    // hold $100 of USDC. The contract is right to cap the draw at the liquidity
+    // that exists (`borrow` reverts with InsufficientLiquidity above it) — but
+    // the dashboard was showing only the collateral figure, which reads as
+    // "you may borrow $66,500".
+    //
+    // `borrowableNowUsd` is the honest headline: collateral headroom, capped by
+    // the borrowable liquidity actually sitting in the pool. `limitedBy` names
+    // whichever constraint binds, so the number is explicable rather than just
+    // smaller.
+    const borrowableLiquidityUsd = assets.reduce((sum, a) => {
+      if (!a.borrowable || !a.enabled) return sum;
+      const price = Number(a.priceUsd);
+      const cash = Number(a.reserve.cash);
+      return Number.isFinite(price) && Number.isFinite(cash) ? sum + price * cash : sum;
+    }, 0);
+    const headroomNum = Number(headroomUsd) / 1e8;
+    const borrowableNow = Math.min(headroomNum, borrowableLiquidityUsd);
+
     const account = acct
       ? {
           suppliedUsd: fmtUsd(acct.supplyValue),
           borrowedUsd: fmtUsd(acct.borrowValue),
           borrowLimitUsd: fmtUsd(acct.borrowLimit),
+          /** Collateral headroom left, before the liquidity cap. */
+          headroomUsd: headroomNum.toFixed(2),
+          /** What can actually be drawn: the smaller of the two. */
+          borrowableNowUsd: borrowableNow.toFixed(2),
+          /** Total borrowable cash across every reserve, in USD. */
+          poolLiquidityUsd: borrowableLiquidityUsd.toFixed(2),
+          limitedBy:
+            borrowableNow <= 0
+              ? "none"
+              : borrowableLiquidityUsd < headroomNum
+                ? "liquidity"
+                : "collateral",
           healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
         }
       : lastLending?.account ?? null;
@@ -2260,6 +2296,41 @@ async function main() {
     } catch (e) {
       logTx(req, {
         category: "defi", action: "swap-fund", status: "failed",
+        assetAddress: token, raw, detail: friendlyError(e),
+      });
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Withdraw inventory from the swap desk.
+   *
+   * The counterpart to `/api/swap/fund`. Operator-only, and it needs to be —
+   * unlike funding, this takes app-owned assets out.
+   */
+  app.post("/api/swap/withdraw", requireOperator, async (req, res) => {
+    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
+    const token = req.query.token as Hex;
+    const raw = BigInt((req.query.amount as string) ?? "0");
+    const to = (req.query.to as Hex) || (agentAccount.address as Hex);
+    try {
+      if (raw <= 0n) throw new Error("Enter an amount above zero.");
+      const { txHash, route } = await swapClient.withdrawInventory(
+        token,
+        raw,
+        to,
+        (liveDeployment.tesseraFeeCollector as Hex) ?? undefined,
+      );
+      logTx(req, {
+        category: "defi", action: "swap-withdraw", status: "success",
+        assetAddress: token, raw, txHash,
+        detail: `desk inventory −${assetMeta(token).symbol} via ${route}`,
+      });
+      invalidateAll();
+      res.json({ ok: true, txHash, route });
+    } catch (e) {
+      logTx(req, {
+        category: "defi", action: "swap-withdraw", status: "failed",
         assetAddress: token, raw, detail: friendlyError(e),
       });
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });

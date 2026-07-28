@@ -503,6 +503,15 @@ async function main() {
     console.log(`   AMM already has ${ammPools} pool(s)`);
   }
 
+  // 6d) Let the swap desk fall back to AMM liquidity when its own inventory runs
+  //     short, so an empty desk quotes and fills instead of reverting. Routed
+  //     through the fee collector because it owns the desk; the desk's own
+  //     `setAmm` is owner-or-admin and the collector is the owner here.
+  await optional("pointing the swap desk at AMM pool 0", async () => {
+    await dSend(feeCollector, tesseraFeeCollectorAbi, "setSwapAmm", [amm, 0n]);
+    console.log("   swap desk falls back to AMM pool 0 when inventory is short");
+  });
+
   // 7) Persist. Merge into whatever record we adopted so escrow/tab and any
   //     other recorded addresses survive.
   const dep = { ...existing };

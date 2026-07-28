@@ -49,7 +49,14 @@
 
       * { box-sizing: border-box; }
       html { scroll-behavior: smooth; }
-      html, body { max-width: 100%; overflow-x: hidden; }
+      /* `overflow-x: hidden` on BOTH html and body is what kills `position:
+         sticky`: it makes body a scroll container while html is the element
+         that actually scrolls, so a sticky descendant resolves against a
+         scrollport that never moves and simply scrolls away. Keeping the clamp
+         on html alone stops sideways overflow and leaves sticky working — the
+         browser checks assert both properties, on every view. */
+      html { max-width: 100%; overflow-x: hidden; }
+      body { max-width: 100%; }
       body {
         margin: 0;
         background:
@@ -357,7 +364,12 @@
       .view { padding: 24px 0 90px; }
       .view[hidden] { display: none; }
       /* Fade tab content in on switch */
-      .tabPane { animation: fade .26s ease both; }
+      /* `both` kept the animation's fill applied forever, and an element with an
+         active transform/filter becomes the containing block for sticky
+         descendants — which would anchor the tab dock to the pane instead of
+         the viewport. `forwards` on opacity alone leaves no such ancestor. */
+      .tabPane { animation: fadeIn .26s ease; }
+      @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
       .tabPane[hidden] { display: none; }
       @keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
@@ -624,6 +636,16 @@
       .tabIco { display: inline-flex; flex: 0 0 auto; width: 15px; height: 15px; opacity: .8; }
       .tabIco svg { width: 100%; height: 100%; }
       .sheetTab.active .tabIco { opacity: 1; color: var(--accent); }
+
+      /* A tab strip that stays put while its pane scrolls. Sits directly under
+         the fixed header — `--headerH` is measured, drawer included, so this
+         lands flush whether or not the menu is open. Below the header's z-index
+         so it slides under rather than over it. */
+      .tabDock {
+        position: sticky; top: var(--headerH, 56px); z-index: 55;
+        backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
+        background: color-mix(in srgb, var(--bg) 88%, transparent);
+      }
       .sheetBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px 18px 24px; }
       .sheetFilters {
         display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -1051,7 +1073,136 @@
             </div>
           </div>
 
-          <!-- Swap -->
+          
+
+          <!-- One tab per DeFi function. Four long cards in a column meant
+               scrolling past three to reach the fourth; the strip stays pinned
+               under the header so switching never needs a scroll back up. -->
+          <div class="card compact tabDock" style="padding:10px 14px">
+            <div class="sheetTabs" id="defiTabs" role="tablist" style="border-bottom:0;padding:0;margin:0">
+              <button class="sheetTab active" data-defitab="lending" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3.4 9.4 12 4.2l8.6 5.2"/><path d="M5.4 10.6v7M9.8 10.6v7M14.2 10.6v7M18.6 10.6v7"/><path d="M3.4 20.2h17.2"/>
+                </svg></span>Lending &amp; borrowing
+              </button>
+              <button class="sheetTab" data-defitab="vault" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="3.4" y="5" width="17.2" height="14" rx="2.6"/><circle cx="12" cy="12" r="3.4"/><path d="M12 8.6v-2M12 17.4v-2"/>
+                </svg></span>Yield vault
+              </button>
+              <button class="sheetTab" data-defitab="swap" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 8.5h13.5l-3-3M20 15.5H6.5l3 3"/>
+                </svg></span>Swap desk
+              </button>
+              <button class="sheetTab" data-defitab="amm" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 15.4c2-2.2 3.4-2.2 4.5 0s2.5 2.2 4.5 0 3.4-2.2 4.5 0 2.5 2.2 4.5 0"/><path d="M3 10c2-2.2 3.4-2.2 4.5 0s2.5 2.2 4.5 0 3.4-2.2 4.5 0 2.5 2.2 4.5 0"/>
+                </svg></span>Liquidity pools
+              </button>
+            </div>
+          </div>
+
+          <div class="defiPane" id="defiLending">
+<!-- Lending -->
+          <div class="card" id="lendingCard">
+            <h2>🏦 Lending &amp; borrowing — TesseraPool</h2>
+            <div class="notready" id="lendingNotReady" style="display:none">
+              Pool not deployed yet — run <span class="mono">npm run pool:arc</span> to create the
+              USDC / EURC / cirBTC reserves. Live values appear here automatically once it's on-chain.
+            </div>
+            <div class="metrics tight" style="margin-bottom:14px">
+              <div class="metric"><div class="k">Supplied</div><div class="v" id="lnSupplied">—</div></div>
+              <div class="metric"><div class="k">Borrowed</div><div class="v" id="lnBorrowed">—</div></div>
+              <!-- Two numbers, because they differ and only one is actionable:
+                   the collateral limit, and what the pool can actually lend. -->
+              <div class="metric"><div class="k">Borrow limit (collateral)</div><div class="v" id="lnLimit">—</div></div>
+              <div class="metric">
+                <div class="k">Available to borrow now</div>
+                <div class="v" id="lnBorrowable">—</div>
+                <div class="k" id="lnLimitedBy" style="text-transform:none;letter-spacing:0;margin-top:2px"></div>
+              </div>
+              <div class="metric"><div class="k">Health</div><div class="v" id="lnHealth" style="color:var(--good)">—</div></div>
+            </div>
+            <div class="row-actions" style="margin-bottom:14px">
+              <label style="font-size:12px;color:var(--muted)">Asset</label>
+              <select id="lnAsset" class="field"></select>
+              <span id="lnPrice" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+            <div class="grid2">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Reserve</div>
+                <div class="metrics">
+                  <div class="metric"><div class="k">Liquidity</div><div class="v" id="lnCash">—</div></div>
+                  <div class="metric"><div class="k">Utilization</div><div class="v" id="lnUtil">—</div></div>
+                  <div class="metric"><div class="k">Borrow APR</div><div class="v" id="lnBorrowApr" style="color:var(--warn)">—</div></div>
+                  <div class="metric"><div class="k">Supply APR</div><div class="v" id="lnSupplyApr" style="color:var(--good)">—</div></div>
+                </div>
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Your position in this asset</div>
+                <div class="metrics">
+                  <div class="metric"><div class="k">Supplied</div><div class="v" id="lnAssetSupplied">—</div></div>
+                  <div class="metric"><div class="k">Borrowed</div><div class="v" id="lnAssetBorrowed">—</div></div>
+                  <div class="metric"><div class="k">Wallet</div><div class="v" id="lnWallet">—</div></div>
+                </div>
+              </div>
+            </div>
+            <div class="row-actions" style="margin-top:16px">
+              <select id="lnAction" class="field">
+                <option value="supply">Supply</option>
+                <option value="withdraw">Withdraw</option>
+                <option value="borrow">Borrow</option>
+                <option value="repay">Repay</option>
+              </select>
+              <input id="lnAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:150px" />
+              <button class="btn" id="lnMax">Max</button>
+              <button class="btn primary" id="lnExecute">Execute</button>
+              <span id="lnMaxHint" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+            <div class="kv" id="lendingMsg" style="margin-top:11px;display:none"></div>
+          </div>
+          </div>
+
+          <div class="defiPane" id="defiVault" hidden>
+<!-- Vault -->
+          <div class="card" id="vaultCard">
+            <h2>🏛 Vault — auto-yield on USDC</h2>
+            <div class="notready" id="vaultNotReady" style="display:none">
+              Vault not deployed yet — run <span class="mono">npm run pool:arc</span> to deploy
+              <span class="mono">TesseraVault</span>. Deposits, APR and your balance appear here once it's live.
+            </div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Deposit USDC; a <b id="vReserve">—</b>% liquid reserve is always kept for instant withdrawals
+              (an 80% floor is fixed in the contract) and the rest earns the pool's supply APR.
+              You keep the yield; the app takes a <b id="vFee">—</b>% performance fee on yield only — never principal.
+            </div>
+            <div class="metrics tight" style="margin-bottom:14px">
+              <div class="metric"><div class="k">Vault TVL</div><div class="v" id="vTvl">—</div></div>
+              <div class="metric"><div class="k">Your balance</div><div class="v" id="vYours">—</div></div>
+              <div class="metric"><div class="k">Wallet available</div><div class="v" id="vWallet">—</div></div>
+              <div class="metric"><div class="k">APR</div><div class="v" id="vApr" style="color:var(--good)">—</div></div>
+              <div class="metric"><div class="k">Liquid buffer</div><div class="v" id="vBuffer">—</div></div>
+            </div>
+            <div class="row-actions">
+              <select id="vAction" class="field">
+                <option value="deposit">Deposit</option>
+                <option value="withdraw">Withdraw</option>
+              </select>
+              <input id="vAmount" class="field" inputmode="decimal" placeholder="USDC amount" style="width:150px" />
+              <button class="btn" id="vMax">Max</button>
+              <button class="btn primary" id="vExecute">Execute</button>
+              <span id="vHint" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+            <div class="kv" id="vaultMsg" style="margin-top:11px;display:none"></div>
+          </div>
+        </div>
+
+        <!-- ---------- AGENT TRANSACTIONS ---------- -->
+          </div>
+
+          <div class="defiPane" id="defiSwap" hidden>
+<!-- Swap -->
           <div class="card" id="swapCard">
             <h2>🔁 Swap</h2>
             <div class="notready" id="swapNotReady" style="display:none">
@@ -1090,6 +1241,7 @@
                 <input id="swFundAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
                 <select id="swFundAsset" class="field"></select>
                 <button class="btn" id="swFund">Add inventory</button>
+                <button class="btn" id="swWithdraw">Withdraw</button>
               </div>
               <div style="font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.55">
                 Inventory is <b>app-owned</b>: adding to it is a donation to the desk, not a deposit —
@@ -1099,8 +1251,10 @@
               </div>
             </div>
           </div>
+          </div>
 
-          <!-- AMM liquidity pools -->
+          <div class="defiPane" id="defiAmm" hidden>
+<!-- AMM liquidity pools -->
           <div class="card" id="ammCard">
             <h2>🌊 Liquidity pools — earn a share of every swap</h2>
             <div class="notready" id="ammNotReady" style="display:none">
@@ -1151,94 +1305,9 @@
             <div id="amLpHint" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
             <div class="kv" id="ammMsg" style="margin-top:11px;display:none"></div>
           </div>
-
-          <!-- Lending -->
-          <div class="card" id="lendingCard">
-            <h2>🏦 Lending &amp; borrowing — TesseraPool</h2>
-            <div class="notready" id="lendingNotReady" style="display:none">
-              Pool not deployed yet — run <span class="mono">npm run pool:arc</span> to create the
-              USDC / EURC / cirBTC reserves. Live values appear here automatically once it's on-chain.
-            </div>
-            <div class="metrics tight" style="margin-bottom:14px">
-              <div class="metric"><div class="k">Supplied</div><div class="v" id="lnSupplied">—</div></div>
-              <div class="metric"><div class="k">Borrowed</div><div class="v" id="lnBorrowed">—</div></div>
-              <div class="metric"><div class="k">Borrow limit</div><div class="v" id="lnLimit">—</div></div>
-              <div class="metric"><div class="k">Health</div><div class="v" id="lnHealth" style="color:var(--good)">—</div></div>
-            </div>
-            <div class="row-actions" style="margin-bottom:14px">
-              <label style="font-size:12px;color:var(--muted)">Asset</label>
-              <select id="lnAsset" class="field"></select>
-              <span id="lnPrice" style="font-size:12px;color:var(--muted)"></span>
-            </div>
-            <div class="grid2">
-              <div>
-                <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Reserve</div>
-                <div class="metrics">
-                  <div class="metric"><div class="k">Liquidity</div><div class="v" id="lnCash">—</div></div>
-                  <div class="metric"><div class="k">Utilization</div><div class="v" id="lnUtil">—</div></div>
-                  <div class="metric"><div class="k">Borrow APR</div><div class="v" id="lnBorrowApr" style="color:var(--warn)">—</div></div>
-                  <div class="metric"><div class="k">Supply APR</div><div class="v" id="lnSupplyApr" style="color:var(--good)">—</div></div>
-                </div>
-              </div>
-              <div>
-                <div style="font-size:11px;color:var(--muted);margin-bottom:9px">Your position in this asset</div>
-                <div class="metrics">
-                  <div class="metric"><div class="k">Supplied</div><div class="v" id="lnAssetSupplied">—</div></div>
-                  <div class="metric"><div class="k">Borrowed</div><div class="v" id="lnAssetBorrowed">—</div></div>
-                  <div class="metric"><div class="k">Wallet</div><div class="v" id="lnWallet">—</div></div>
-                </div>
-              </div>
-            </div>
-            <div class="row-actions" style="margin-top:16px">
-              <select id="lnAction" class="field">
-                <option value="supply">Supply</option>
-                <option value="withdraw">Withdraw</option>
-                <option value="borrow">Borrow</option>
-                <option value="repay">Repay</option>
-              </select>
-              <input id="lnAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:150px" />
-              <button class="btn" id="lnMax">Max</button>
-              <button class="btn primary" id="lnExecute">Execute</button>
-              <span id="lnMaxHint" style="font-size:12px;color:var(--muted)"></span>
-            </div>
-            <div class="kv" id="lendingMsg" style="margin-top:11px;display:none"></div>
           </div>
 
-          <!-- Vault -->
-          <div class="card" id="vaultCard">
-            <h2>🏛 Vault — auto-yield on USDC</h2>
-            <div class="notready" id="vaultNotReady" style="display:none">
-              Vault not deployed yet — run <span class="mono">npm run pool:arc</span> to deploy
-              <span class="mono">TesseraVault</span>. Deposits, APR and your balance appear here once it's live.
-            </div>
-            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
-              Deposit USDC; a <b id="vReserve">—</b>% liquid reserve is always kept for instant withdrawals
-              (an 80% floor is fixed in the contract) and the rest earns the pool's supply APR.
-              You keep the yield; the app takes a <b id="vFee">—</b>% performance fee on yield only — never principal.
-            </div>
-            <div class="metrics tight" style="margin-bottom:14px">
-              <div class="metric"><div class="k">Vault TVL</div><div class="v" id="vTvl">—</div></div>
-              <div class="metric"><div class="k">Your balance</div><div class="v" id="vYours">—</div></div>
-              <div class="metric"><div class="k">Wallet available</div><div class="v" id="vWallet">—</div></div>
-              <div class="metric"><div class="k">APR</div><div class="v" id="vApr" style="color:var(--good)">—</div></div>
-              <div class="metric"><div class="k">Liquid buffer</div><div class="v" id="vBuffer">—</div></div>
-            </div>
-            <div class="row-actions">
-              <select id="vAction" class="field">
-                <option value="deposit">Deposit</option>
-                <option value="withdraw">Withdraw</option>
-              </select>
-              <input id="vAmount" class="field" inputmode="decimal" placeholder="USDC amount" style="width:150px" />
-              <button class="btn" id="vMax">Max</button>
-              <button class="btn primary" id="vExecute">Execute</button>
-              <span id="vHint" style="font-size:12px;color:var(--muted)"></span>
-            </div>
-            <div class="kv" id="vaultMsg" style="margin-top:11px;display:none"></div>
-          </div>
-        </div>
-
-        <!-- ---------- AGENT TRANSACTIONS ---------- -->
-        <div class="tabPane" id="paneAgents" hidden>
+<div class="tabPane" id="paneAgents" hidden>
           <!-- ================= AGENT WORKSPACE =================
                Redesigned from a single task readout into a working surface: the
                agent's own operations sit alongside the live information a person
@@ -1251,7 +1320,7 @@
                 Live market and news feeds, alongside the agent's own pay-per-call operations.
               </span>
             </div>
-            <div class="sheetTabs" id="agTabs" role="tablist" style="border-bottom:0;padding:12px 0 0;margin:0 -2px">
+            <div class="sheetTabs tabDock" id="agTabs" role="tablist" style="border-bottom:0;padding:12px 0 0;margin:0 -2px">
               <button class="sheetTab active" data-agtab="operations" role="tab">
                 <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M4 16.5 9 11l3.6 3.6L20 7"/><path d="M15.4 7H20v4.6"/>

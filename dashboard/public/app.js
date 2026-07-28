@@ -174,6 +174,48 @@ const $ = (id) => document.getElementById(id);
       }
       window.addEventListener("hashchange", () => showView(routeFromHash()));
 
+      /* ---- DeFi sub-tabs -------------------------------------------------
+       * One tab per function instead of four long cards stacked in a column.
+       * Purely a view switch: no fetching hangs off it, because the DeFi panels
+       * are all fed by the same `/api/state` poll. */
+      const DEFI_PANES = { lending: "defiLending", vault: "defiVault", swap: "defiSwap", amm: "defiAmm" };
+      /** Which tab owns each card, so a deep link can open the right one. */
+      const DEFI_CARD_TAB = {
+        lendingCard: "lending", vaultCard: "vault", swapCard: "swap", ammCard: "amm",
+      };
+      const DEFI_TAB_KEY = "tessera_defi_tab";
+      let defiTab = "lending";
+
+      function setDefiTab(tab, opts) {
+        if (!(tab in DEFI_PANES)) tab = "lending";
+        defiTab = tab;
+        try { localStorage.setItem(DEFI_TAB_KEY, tab); } catch {}
+        for (const [name, id] of Object.entries(DEFI_PANES)) {
+          const el = $(id);
+          if (el) el.hidden = name !== tab;
+        }
+        document.querySelectorAll("[data-defitab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.defitab === tab));
+        // Switching tabs shouldn't leave you halfway down the previous pane.
+        if (!opts || opts.scroll !== false) {
+          const dock = document.querySelector("#paneDefi .tabDock");
+          if (dock) {
+            const top = dock.getBoundingClientRect().top + window.scrollY - (headerHeight() + 8);
+            if (window.scrollY > top) window.scrollTo({ top, behavior: "instant" in window ? "instant" : "auto" });
+          }
+        }
+      }
+      const headerHeight = () =>
+        parseInt(getComputedStyle(document.documentElement).getPropertyValue("--headerH"), 10) || 56;
+
+      if ($("defiTabs")) {
+        document.querySelectorAll("[data-defitab]").forEach((b) =>
+          b.addEventListener("click", () => setDefiTab(b.dataset.defitab)));
+        let saved = "lending";
+        try { saved = localStorage.getItem(DEFI_TAB_KEY) || "lending"; } catch {}
+        setDefiTab(saved, { scroll: false });
+      }
+
       // Brand → home; Start / CTA → dashboard.
       $("brandBtn").addEventListener("click", () => navigate("home"));
       ["startBtn", "heroStart", "ctaStart"].forEach((id) => {
@@ -186,6 +228,10 @@ const $ = (id) => document.getElementById(id);
       function gotoTarget(spec) {
         const [tab, anchor] = String(spec).split("#");
         navigate(tab, { keepScroll: true });
+        // A DeFi card now lives inside a tab, so opening its pane has to happen
+        // before the scroll — `scrollIntoView` on a `hidden` element does
+        // nothing, which would land the user on whichever tab was already open.
+        if (anchor && DEFI_CARD_TAB[anchor]) setDefiTab(DEFI_CARD_TAB[anchor], { scroll: false });
         requestAnimationFrame(() => {
           const el = anchor && $(anchor);
           if (el) {
@@ -199,7 +245,13 @@ const $ = (id) => document.getElementById(id);
         });
       }
       document.querySelectorAll("[data-goto]").forEach((el) => {
-        el.addEventListener("click", () => gotoTarget(el.dataset.goto));
+        el.addEventListener("click", (e) => {
+          // `preventDefault` matters: some of these are anchors, and letting the
+          // browser follow `href="#"` rewrites the hash to "" *after* we set the
+          // route — which sent a deep link to the landing page instead.
+          e.preventDefault();
+          gotoTarget(el.dataset.goto);
+        });
         el.addEventListener("keydown", (e) => {
           if (e.key === "Enter" || e.key === " ") { e.preventDefault(); gotoTarget(el.dataset.goto); }
         });
@@ -551,6 +603,23 @@ const $ = (id) => document.getElementById(id);
           $("lnSupplied").textContent = "$" + ln.account.suppliedUsd;
           $("lnBorrowed").textContent = "$" + ln.account.borrowedUsd;
           $("lnLimit").textContent = "$" + ln.account.borrowLimitUsd;
+          // The collateral limit alone reads as a promise the pool may not be
+          // able to keep — a $66,500 limit against $100 of lendable USDC. Show
+          // what can actually be drawn, and say which constraint binds.
+          if ($("lnBorrowable")) {
+            $("lnBorrowable").textContent = "$" + (ln.account.borrowableNowUsd ?? "0.00");
+            const by = ln.account.limitedBy;
+            const note = $("lnLimitedBy");
+            if (note) {
+              note.textContent =
+                by === "liquidity"
+                  ? `capped by pool liquidity ($${ln.account.poolLiquidityUsd})`
+                  : by === "collateral"
+                    ? "capped by your collateral"
+                    : "";
+              note.style.color = by === "liquidity" ? "var(--warn)" : "var(--muted)";
+            }
+          }
           $("lnHealth").textContent = ln.account.healthFactor;
           window.__lending = ln;
           const sel = $("lnAsset");
@@ -1324,6 +1393,40 @@ const $ = (id) => document.getElementById(id);
             show(
               r.ok
                 ? `desk inventory +${human} ${a.symbol} ✓ (via ${r.route}) — tx ${String(r.txHash).slice(0, 12)}…`
+                : `failed: ${r.error}`,
+              r.ok ? "var(--good)" : "var(--warn)",
+            );
+            if (r.ok) $("swFundAmount").value = "";
+          } catch {
+            show("request failed", "var(--warn)");
+          } finally { btn.disabled = false; tick(); }
+        });
+      }
+
+      // Take inventory back out (operator only). The counterpart to funding —
+      // and the reason the desk keeps an admin key separate from its owner.
+      if ($("swWithdraw")) {
+        $("swWithdraw").addEventListener("click", async () => {
+          const msg = $("swapMsg");
+          const show = (text, colour) => {
+            msg.style.display = "block"; msg.textContent = text; msg.style.color = colour;
+          };
+          const addr = $("swFundAsset").value;
+          const a = swAsset(addr);
+          const human = $("swFundAmount").value.trim();
+          if (!a) return show("Pick an asset.", "var(--warn)");
+          if (!human || !(parseFloat(human) > 0)) return show("Enter an amount above zero.", "var(--warn)");
+          if (Number(a.inventory) < Number(human)) {
+            return show(`The desk only holds ${a.inventory} ${a.symbol}.`, "var(--warn)");
+          }
+          const raw = toRaw(human, a.decimals);
+          const btn = $("swWithdraw");
+          btn.disabled = true;
+          try {
+            const r = await (await postAuthed(`/api/swap/withdraw?token=${addr}&amount=${raw}`)).json();
+            show(
+              r.ok
+                ? `withdrew ${human} ${a.symbol} ✓ (via ${r.route}) — tx ${String(r.txHash).slice(0, 12)}…`
                 : `failed: ${r.error}`,
               r.ok ? "var(--good)" : "var(--warn)",
             );

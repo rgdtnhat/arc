@@ -162,4 +162,40 @@ describe("TesseraFeeCollector (fee allocation)", () => {
     expect(await usdc.read.balanceOf([amm.address])).to.equal(0n);
     expect(await usdc.read.balanceOf([collector.address])).to.equal(USDC("40")); // 20 retained + 20 undelivered
   });
+
+  // --- reaching into the desk it owns -----------------------------------------
+
+  it("can withdraw inventory from the swap desk it owns", async () => {
+    const { deployer, usdc, swap, collector } = await loadFixture(deployFixture);
+    // This is the trap the function exists for: deployment gives the collector
+    // ownership so `seed` works, and `withdrawInventory` is owner-gated — so
+    // without a forwarding path the desk's inventory is unreachable by anyone.
+    await collector.write.allocateNow();
+    const inDesk = await usdc.read.balanceOf([swap.address]);
+    expect(inDesk > 0n).to.equal(true);
+    expect((await swap.read.owner()).toLowerCase()).to.equal(collector.address.toLowerCase());
+
+    const before = await usdc.read.balanceOf([deployer.account.address]);
+    await collector.write.withdrawSwapInventory([usdc.address, inDesk, deployer.account.address]);
+    expect(await usdc.read.balanceOf([swap.address])).to.equal(0n);
+    expect(await usdc.read.balanceOf([deployer.account.address])).to.equal(before + inDesk);
+  });
+
+  it("only the collector's owner can pull from the desk", async () => {
+    const { agentWallet, usdc, collector } = await loadFixture(deployFixture);
+    const asOther = await hre.viem.getContractAt("TesseraFeeCollector", collector.address, {
+      client: { wallet: agentWallet },
+    });
+    await expect(
+      asOther.write.withdrawSwapInventory([usdc.address, 1n, agentWallet.account.address])
+    ).to.be.rejected;
+  });
+
+  it("can point the desk it owns at an AMM pool", async () => {
+    const { deployer, swap, collector } = await loadFixture(deployFixture);
+    const amm = await hre.viem.deployContract("TesseraAMM", [deployer.account.address]);
+    await collector.write.setSwapAmm([amm.address, 3n]);
+    expect((await swap.read.amm()).toLowerCase()).to.equal(amm.address.toLowerCase());
+    expect(await swap.read.ammPoolId()).to.equal(3n);
+  });
 });

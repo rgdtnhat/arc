@@ -18,6 +18,8 @@ interface IFeeVault {
 
 interface IFeeSwap {
     function seed(address token, uint256 amount) external;
+    function withdrawInventory(address token, uint256 amount, address to) external;
+    function setAmm(address amm, uint256 poolId) external;
 }
 
 interface IFeeAmm {
@@ -241,6 +243,35 @@ contract TesseraFeeCollector {
         amm = amm_;
         ammPoolId = poolId_;
         emit AmmSet(amm_, poolId_);
+    }
+
+    /**
+     * @notice Withdraw inventory from the swap desk this collector owns.
+     *
+     * @dev Deployment hands the desk's ownership to this contract so its `seed`
+     *      leg can run. Without this function that made the desk's inventory
+     *      unreachable: the operator is not the owner, and the owner is a
+     *      contract that could not be asked. Newer desks also keep a separate
+     *      `admin` key for the same reason — this is the path for one whose
+     *      admin was never set or was handed away.
+     *
+     *      Deliberately narrow. Not a generic "call anything as the owner"
+     *      escape hatch: that would make this contract able to reassign the
+     *      desk's fees, treasury or ownership, which is far more authority than
+     *      recovering stuck tokens needs.
+     */
+    function withdrawSwapInventory(address token, uint256 amount, address to) external onlyOwner {
+        require(swap != address(0), "no swap desk");
+        require(to != address(0), "zero");
+        IFeeSwap(swap).withdrawInventory(token, amount, to);
+    }
+
+    /// @notice Point the owned swap desk at an AMM pool to fall back on when its
+    ///         inventory is short. Same reasoning as `withdrawSwapInventory`:
+    ///         only this contract can reach the desk's owner-gated setters.
+    function setSwapAmm(address amm_, uint256 poolId_) external onlyOwner {
+        require(swap != address(0), "no swap desk");
+        IFeeSwap(swap).setAmm(amm_, poolId_);
     }
 
     /// @notice Recover any token sent here (e.g. a non-fee asset).

@@ -150,10 +150,10 @@ describe("TesseraSwap (oracle-priced swap desk)", () => {
     expect(await eurc.read.balanceOf([alice.account.address]) > before).to.equal(true);
   });
 
-  it("still lets only the owner take inventory out", async () => {
+  it("keeps withdrawal restricted even though funding is open", async () => {
     const { alice, usdc, swap, asSwap } = await loadFixture(deployFixture);
-    // Funding is open; withdrawing is not. This is the asymmetry that makes
-    // inventory app-owned — a donation, with no claim on it.
+    // Funding is open; withdrawing is owner-or-admin. This asymmetry is what
+    // makes inventory app-owned — a donation, with no claim on it.
     await expect(
       (await asSwap(alice)).write.withdrawInventory([usdc.address, USDC("1"), alice.account.address])
     ).to.be.rejected;
@@ -170,5 +170,139 @@ describe("TesseraSwap (oracle-priced swap desk)", () => {
     const { usdc, eurc, swap } = await loadFixture(deployFixture);
     expect(await swap.read.inventoryOf([usdc.address])).to.equal(await usdc.read.balanceOf([swap.address]));
     expect(await swap.read.inventoryOf([eurc.address])).to.equal(await eurc.read.balanceOf([swap.address]));
+  });
+
+  // --- withdrawal + AMM fallback ---------------------------------------------
+
+  it("lets the admin withdraw inventory after ownership moves to the fee collector", async () => {
+    const { deployer, alice, usdc, swap } = await loadFixture(deployFixture);
+    // Deployment hands the desk to the fee collector so its `seed` leg works.
+    // Before this fix that made inventory unreachable: the operator was no
+    // longer the owner, and the owner was a contract with no way to be asked.
+    await swap.write.transferOwnership([alice.account.address]);
+    expect((await swap.read.owner()).toLowerCase()).to.equal(alice.account.address.toLowerCase());
+    expect((await swap.read.admin()).toLowerCase()).to.equal(deployer.account.address.toLowerCase());
+
+    const before = await usdc.read.balanceOf([deployer.account.address]);
+    await swap.write.withdrawInventory([usdc.address, USDC("1000"), deployer.account.address]);
+    expect(await usdc.read.balanceOf([deployer.account.address])).to.equal(before + USDC("1000"));
+  });
+
+  it("lets the new owner withdraw too, but nobody else", async () => {
+    const { alice, treasury, usdc, swap, asSwap } = await loadFixture(deployFixture);
+    await swap.write.transferOwnership([alice.account.address]);
+    // The owner can.
+    await (await asSwap(alice)).write.withdrawInventory([usdc.address, USDC("10"), alice.account.address]);
+    expect(await usdc.read.balanceOf([alice.account.address])).to.equal(USDC("10"));
+    // A third party cannot.
+    await expect(
+      (await asSwap(treasury)).write.withdrawInventory([usdc.address, USDC("10"), treasury.account.address])
+    ).to.be.rejected;
+  });
+
+  it("only the admin can hand over the admin key, so ownership changes can't strand inventory", async () => {
+    const { alice, treasury, swap, asSwap } = await loadFixture(deployFixture);
+    // Owner is not admin, and taking ownership does not take the admin key.
+    await swap.write.transferOwnership([alice.account.address]);
+    await expect((await asSwap(alice)).write.setAdmin([alice.account.address])).to.be.rejected;
+    await swap.write.setAdmin([treasury.account.address]);
+    expect((await swap.read.admin()).toLowerCase()).to.equal(treasury.account.address.toLowerCase());
+  });
+
+  it("routes to the AMM when inventory can't cover the fill", async () => {
+    const { deployer, alice, treasury, pool, usdc, eurc } = await loadFixture(deployFixture);
+
+    // An AMM with real liquidity in both assets.
+    const amm = await hre.viem.deployContract("TesseraAMM", [treasury.account.address]);
+    await amm.write.createPool([[usdc.address, eurc.address], 30, 5000, "USDC / EURC"]);
+    await usdc.write.mint([deployer.account.address, USDC("50000")]);
+    await eurc.write.mint([deployer.account.address, USDC("50000")]);
+    await usdc.write.approve([amm.address, USDC("50000")]);
+    await eurc.write.approve([amm.address, USDC("50000")]);
+    await amm.write.addLiquidity([0n, [USDC("20000"), USDC("20000")], 0n]);
+
+    // A desk with NO EURC at all — every EURC-out swap used to revert here.
+    const desk = await hre.viem.deployContract("TesseraSwap", [
+      pool.address, treasury.account.address, SWAP_FEE, APP_FEE_SHARE,
+    ]);
+    expect(await desk.read.inventoryOf([eurc.address])).to.equal(0n);
+    await desk.write.setAmm([amm.address, 0n]);
+
+    // The quote says up front that this will fill from the AMM.
+    const [routedOut, viaAmm] = await desk.read.quoteRouted([usdc.address, eurc.address, USDC("108")]);
+    expect(viaAmm).to.equal(true);
+    expect(routedOut > 0n).to.equal(true);
+
+    await usdc.write.mint([alice.account.address, USDC("108")]);
+    const aliceUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: alice } });
+    await aliceUsdc.write.approve([desk.address, USDC("108")]);
+    const asAlice = await hre.viem.getContractAt("TesseraSwap", desk.address, { client: { wallet: alice } });
+
+    const before = await eurc.read.balanceOf([alice.account.address]);
+    await asAlice.write.swap([usdc.address, eurc.address, USDC("108"), 0n]);
+    const got = (await eurc.read.balanceOf([alice.account.address])) - before;
+    expect(got > 0n).to.equal(true);
+    // The desk kept nothing: the whole input went to the AMM and the whole
+    // output came back out to the user.
+    expect(await usdc.read.balanceOf([desk.address])).to.equal(0n);
+    expect(await eurc.read.balanceOf([desk.address])).to.equal(0n);
+  });
+
+  it("honours minOut on the AMM route, so a worse price than accepted reverts", async () => {
+    const { deployer, alice, treasury, pool, usdc, eurc } = await loadFixture(deployFixture);
+    const amm = await hre.viem.deployContract("TesseraAMM", [treasury.account.address]);
+    await amm.write.createPool([[usdc.address, eurc.address], 30, 5000, "USDC / EURC"]);
+    await usdc.write.mint([deployer.account.address, USDC("50000")]);
+    await eurc.write.mint([deployer.account.address, USDC("50000")]);
+    await usdc.write.approve([amm.address, USDC("50000")]);
+    await eurc.write.approve([amm.address, USDC("50000")]);
+    await amm.write.addLiquidity([0n, [USDC("20000"), USDC("20000")], 0n]);
+
+    const desk = await hre.viem.deployContract("TesseraSwap", [
+      pool.address, treasury.account.address, SWAP_FEE, APP_FEE_SHARE,
+    ]);
+    await desk.write.setAmm([amm.address, 0n]);
+    await usdc.write.mint([alice.account.address, USDC("108")]);
+    const aliceUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: alice } });
+    await aliceUsdc.write.approve([desk.address, USDC("108")]);
+    const asAlice = await hre.viem.getContractAt("TesseraSwap", desk.address, { client: { wallet: alice } });
+
+    // The oracle price would give ~100 EURC; the AMM (1:1 reserves) gives ~108.
+    // Demand more than either can and it must revert, not fill.
+    await expect(
+      asAlice.write.swap([usdc.address, eurc.address, USDC("108"), USDC("500")])
+    ).to.be.rejected;
+  });
+
+  it("still reverts when inventory is short and no AMM is configured", async () => {
+    const { alice, treasury, pool, usdc, eurc } = await loadFixture(deployFixture);
+    const desk = await hre.viem.deployContract("TesseraSwap", [
+      pool.address, treasury.account.address, SWAP_FEE, APP_FEE_SHARE,
+    ]);
+    await usdc.write.mint([alice.account.address, USDC("108")]);
+    const aliceUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: alice } });
+    await aliceUsdc.write.approve([desk.address, USDC("108")]);
+    const asAlice = await hre.viem.getContractAt("TesseraSwap", desk.address, { client: { wallet: alice } });
+    await expect(asAlice.write.swap([usdc.address, eurc.address, USDC("108"), 0n])).to.be.rejected;
+  });
+
+  it("prefers inventory over the AMM when it can cover the fill", async () => {
+    const { alice, treasury, usdc, eurc, swap, asSwap } = await loadFixture(deployFixture);
+    // The fixture desk holds 5,000 of each, so this fills from inventory even
+    // with an AMM available — the AMM is a fallback, not a preference.
+    const amm = await hre.viem.deployContract("TesseraAMM", [treasury.account.address]);
+    await swap.write.setAmm([amm.address, 0n]);
+
+    const [, viaAmm] = await swap.read.quoteRouted([usdc.address, eurc.address, USDC("108")]);
+    expect(viaAmm).to.equal(false);
+
+    await usdc.write.mint([alice.account.address, USDC("108")]);
+    const aliceUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: alice } });
+    await aliceUsdc.write.approve([swap.address, USDC("108")]);
+    const before = await eurc.read.balanceOf([alice.account.address]);
+    await (await asSwap(alice)).write.swap([usdc.address, eurc.address, USDC("108"), 0n]);
+    // Oracle-priced fill: ~100 EURC for 108 USDC at $1.08.
+    const got = (await eurc.read.balanceOf([alice.account.address])) - before;
+    expect(got > USDC("99.6") && got < USDC("100")).to.equal(true);
   });
 });
