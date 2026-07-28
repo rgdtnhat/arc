@@ -18,8 +18,9 @@ import {
   PaymentStatus,
   quoteTypedData,
   pacedHttp,
+  type DefiOracle,
 } from "@tessera/shared";
-import { CATALOG, type ServiceDef } from "./catalog.js";
+import { CATALOG, produceBody, type ServiceDef, type ServiceContext } from "./catalog.js";
 import { quoteHash, responseHash, randomNonce } from "./quote.js";
 
 export interface ProviderConfig {
@@ -32,6 +33,11 @@ export interface ProviderConfig {
   providerKeys: Record<string, Hex>;
   /** Optional sink for telemetry / dashboard events. */
   onEvent?: (e: ProviderEvent) => void;
+  /**
+   * Live DeFi reads, for the services that sell them. Optional: without it those
+   * services report themselves unavailable rather than inventing an answer.
+   */
+  oracle?: DefiOracle;
 }
 
 export interface ProviderEvent {
@@ -52,6 +58,14 @@ export function createProviderApp(config: ProviderConfig): Express {
   const app = express();
   app.use(express.json());
 
+  // Handed to every `respondAsync`, so a service can read live chain state
+  // without standing up its own client or importing the agent.
+  const serviceCtx: ServiceContext = {
+    oracle: config.oracle,
+    chain: config.chain,
+    rpcUrl: config.rpcUrl,
+    escrowAddress: config.escrowAddress,
+  };
   const publicClient = createPublicClient({
     chain: config.chain,
     transport: pacedHttp(config.rpcUrl),
@@ -274,8 +288,20 @@ export function createProviderApp(config: ProviderConfig): Express {
       return;
     }
 
+    // Same live-read path as the escrow-billed services. A tab buyer is paying
+    // for a feed of current positions; serving the sync placeholder here would
+    // charge them for the string "unavailable".
+    const produced = await produceBody(svc, req.query as Record<string, string>, serviceCtx);
+    if (!produced.ok) {
+      // Bank the voucher only once the tick has actually been served. A failed
+      // read leaves the previous voucher as the best one, so the keeper is not
+      // billed for it and can simply retry.
+      emit({ kind: "tab", resource: svc.resource, detail: `tick failed — not billed (${produced.error.slice(0, 80)})` });
+      res.status(503).json({ error: "live read unavailable", detail: produced.error.slice(0, 200) });
+      return;
+    }
+    const body = produced.body;
     bestVoucher.set(tabId, { cum, sig, resource: svc.resource });
-    const body = svc.respond(req.query as Record<string, string>);
     emit({
       kind: "tab",
       resource: svc.resource,
@@ -396,19 +422,21 @@ export function createProviderApp(config: ProviderConfig): Express {
     }
     emit({ kind: "verify", resource: svc.resource, detail: `escrow ${paymentId} verified (${formatUsdc(amount)} USDC)` });
 
-    const query = req.query as Record<string, string>;
-    let body: unknown;
-    if (svc.respondAsync) {
-      try {
-        body = await svc.respondAsync(query);
-        emit({ kind: "serve", resource: svc.resource, detail: "served live upstream data" });
-      } catch {
-        body = svc.respond(query); // network unavailable → graceful fallback
-        emit({ kind: "serve", resource: svc.resource, detail: "upstream unreachable — served fallback" });
-      }
-    } else {
-      body = svc.respond(query);
+    const produced = await produceBody(svc, req.query as Record<string, string>, serviceCtx);
+    if (!produced.ok) {
+      // A `liveOnly` service could not read the chain. Return 503 and do NOT
+      // record delivery: the escrow stays open, so the buyer refunds after the
+      // deadline rather than paying for an error object.
+      emit({ kind: "serve", resource: svc.resource, detail: `live read failed — not delivered (${produced.error.slice(0, 80)})` });
+      res.status(503).json({ error: "live read unavailable", detail: produced.error.slice(0, 200) });
+      return;
     }
+    const body = produced.body;
+    emit({
+      kind: "serve",
+      resource: svc.resource,
+      detail: produced.live ? "served live upstream data" : "upstream unreachable — served fallback",
+    });
     const rHash = responseHash(body);
 
     // "no-fulfill": deliver data but never settle on-chain -> agent times out.

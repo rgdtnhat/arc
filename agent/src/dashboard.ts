@@ -4,14 +4,17 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
-import { verifyMessage, formatUnits, toFunctionSelector } from "viem";
+import { verifyMessage, formatUnits, toFunctionSelector, keccak256, toHex } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID } from "node:crypto";
 import {
   formatUsdc,
+  HEADERS,
+  PaymentStatus,
   arcTestnet,
   ARC_USDC_ADDRESS,
   tesseraFeeCollectorAbi,
+  tesseraEscrowAbi,
   tesseraAmmAbi,
   tesseraPoolAbi,
   tesseraVaultAbi,
@@ -52,6 +55,7 @@ import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
 import { VaultClient, SwapClient, AmmClient } from "./defi.js";
 import { FeeReader } from "./fees.js";
+import { DefiOracle } from "@tessera/shared";
 import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
 import { OwnerClient } from "./owner.js";
@@ -216,12 +220,35 @@ async function main() {
     onEventPushed();
   };
 
+  // The reader behind Tessera's own paid DeFi services. Shared with the agent so
+  // the answers it sells are the ones it acts on itself.
+  const defiOracle = new DefiOracle({
+    chain,
+    rpcUrl,
+    pool: (liveDeployment.tesseraPool as Hex) ?? undefined,
+    vault: (liveDeployment.tesseraVault as Hex) ?? undefined,
+    swap: (liveDeployment.tesseraSwap as Hex) ?? undefined,
+    amm: (liveDeployment.tesseraAmm as Hex) ?? undefined,
+    escrow: escrowAddress,
+    // Same fallback the pool reference uses: a bare deployment still lists USDC,
+    // so `route` and the treasury quote have something to name.
+    assets:
+      Array.isArray(liveDeployment.poolAssets) && liveDeployment.poolAssets.length
+        ? (liveDeployment.poolAssets as { symbol: string; address: string; decimals: number }[]).map((a) => ({
+            symbol: a.symbol,
+            address: a.address as Hex,
+            decimals: a.decimals ?? 6,
+          }))
+        : [{ symbol: "USDC", address: usdcAddress, decimals: 6 }],
+  });
+
   const providerApp = createProviderApp({
     chain,
     rpcUrl,
     escrowAddress,
     tabAddress,
     providerKeys,
+    oracle: defiOracle,
     onEvent: (e) => pushEvent({ ...e, source: "provider", ts: Date.now(), level: e.kind }),
   });
   await new Promise<void>((r) => providerApp.listen(PROVIDERS_PORT, r));
@@ -377,6 +404,64 @@ async function main() {
 
   app.use(express.static(dashboardDir));
   app.use(express.json({ limit: "64kb" }));
+
+  /* --------------------------------------------------------------------------
+   * Public x402 gateway.
+   *
+   * The providers app listens on loopback only, and Caddy publishes just the
+   * dashboard port — so without this the DeFi services would be for sale to
+   * nobody. This forwards the two things an outside agent needs (the catalogue,
+   * and the /defi/* endpoints) verbatim: same status, same `x-tessera-*` quote
+   * headers, same body. Everything else the providers app serves — `/invoices`
+   * above all, which is Tessera's own accounting — stays private.
+   *
+   * CORS is wide open on purpose. A quote is public information; the thing that
+   * actually gates delivery is an on-chain escrow, not an Origin header.
+   * ----------------------------------------------------------------------- */
+  const X402_PREFIX = "/x402";
+  const x402Allowed = (p: string) => p === "/catalog" || p.startsWith("/defi/");
+
+  app.use(X402_PREFIX, (req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", Object.values(HEADERS).join(", "));
+    // Without this a browser agent can read the body but not the quote headers,
+    // which is the half it actually needs to pay.
+    res.setHeader("Access-Control-Expose-Headers", Object.values(HEADERS).join(", "));
+    if (req.method === "OPTIONS") { res.status(204).end(); return; }
+    next();
+  });
+
+  app.get(`${X402_PREFIX}/*`, async (req, res) => {
+    const upstreamPath = req.path.slice(X402_PREFIX.length) || "/";
+    if (!x402Allowed(upstreamPath)) {
+      res.status(404).json({ error: "not a public endpoint" });
+      return;
+    }
+    const qs = new URLSearchParams(req.query as Record<string, string>).toString();
+    // Pass through only the protocol headers; nothing else upstream reads, and
+    // forwarding a caller's Authorization into our own process would be sloppy.
+    const forward: Record<string, string> = {};
+    for (const name of Object.values(HEADERS)) {
+      const v = req.headers[name];
+      if (typeof v === "string") forward[name] = v;
+    }
+    try {
+      const upstream = await fetch(
+        `http://127.0.0.1:${PROVIDERS_PORT}${upstreamPath}${qs ? `?${qs}` : ""}`,
+        { headers: forward, signal: AbortSignal.timeout(30_000) },
+      );
+      for (const name of Object.values(HEADERS)) {
+        const v = upstream.headers.get(name);
+        if (v !== null) res.setHeader(name, v);
+      }
+      res.status(upstream.status);
+      res.type(upstream.headers.get("content-type") ?? "application/json");
+      res.send(Buffer.from(await upstream.arrayBuffer()));
+    } catch (e) {
+      res.status(502).json({ error: `provider unreachable: ${friendlyError(e)}` });
+    }
+  });
 
   // Brute-force protection on the login endpoints: lock an IP out for 15 min
   // after 5 failed attempts.
@@ -1583,6 +1668,327 @@ async function main() {
       });
       res.status(500).json({ ok: false, error: friendlyError(e) });
     }
+  });
+
+  /* --------------------------------------------------------------------------
+   * Escrow-as-a-service.
+   *
+   * `TesseraEscrow.open()` is permissionless — any two agents can use it for a
+   * trade Tessera has nothing to do with. These endpoints expose the fee that
+   * makes hosting it worth something, and the reason they're separate from the
+   * fee collector is that this is revenue from *other people's* trades.
+   *
+   * The fee starts at zero and stays there until an owner sets it. Charging by
+   * default would be taking a cut from counterparties who never agreed to one.
+   * ----------------------------------------------------------------------- */
+  /**
+   * Does the *deployed* escrow have the fee surface at all?
+   *
+   * The ABI compiled into this build is newer than the bytecode already on Arc,
+   * so only the contract can say. Read the selector out of the bytecode — a
+   * missing function and a reverting one produce the same generic error, and
+   * "your escrow predates this feature" is a very different thing to report
+   * than "the call reverted".
+   */
+  const SET_PROTOCOL_FEE_SELECTOR = toFunctionSelector("function setProtocolFee(uint16,address)").slice(2);
+  let escrowFeeSupported: boolean | null = null;
+  const escrowSupportsFee = async () => {
+    if (escrowFeeSupported !== null) return escrowFeeSupported;
+    const code = String((await client.public.getCode({ address: escrowAddress })) ?? "").toLowerCase();
+    escrowFeeSupported = code.includes(SET_PROTOCOL_FEE_SELECTOR);
+    return escrowFeeSupported;
+  };
+
+  const readEscrowFee = async () => {
+    const [bps, treasury, escrowOwner, max] = await Promise.all([
+      client.public.readContract({ address: escrowAddress, abi: tesseraEscrowAbi, functionName: "protocolFeeBps" }) as Promise<number>,
+      client.public.readContract({ address: escrowAddress, abi: tesseraEscrowAbi, functionName: "treasury" }) as Promise<Hex>,
+      client.public.readContract({ address: escrowAddress, abi: tesseraEscrowAbi, functionName: "owner" }) as Promise<Hex>,
+      client.public.readContract({ address: escrowAddress, abi: tesseraEscrowAbi, functionName: "MAX_PROTOCOL_FEE" }) as Promise<number>,
+    ]);
+    return { bps: Number(bps), treasury, owner: escrowOwner, maxBps: Number(max) };
+  };
+
+  app.get("/api/escrow/fee", async (_req, res) => {
+    try {
+      if (!(await escrowSupportsFee())) {
+        res.json({
+          ok: true,
+          escrow: escrowAddress,
+          supported: false,
+          bps: 0,
+          maxBps: 0,
+          treasury: null,
+          canSet: false,
+          note:
+            "This escrow was deployed before the protocol fee existed, so it charges nothing and cannot be " +
+            "configured. Third parties can still use it for their own trades — redeploy the escrow to charge for that.",
+        });
+        return;
+      }
+      const fee = await readEscrowFee();
+      res.json({
+        ok: true,
+        escrow: escrowAddress,
+        supported: true,
+        ...fee,
+        // Whether *this* deployment can change it, rather than just what the
+        // contract says — the deployer key may not be loaded.
+        canSet: Boolean(owner) && owner!.account.address.toLowerCase() === fee.owner.toLowerCase(),
+        suggestedTreasury: (liveDeployment.tesseraFeeCollector as Hex) ?? null,
+        note:
+          fee.bps === 0
+            ? "No fee is charged. Third parties can already use the escrow for their own trades; setting a fee is what turns that into revenue."
+            : `${(fee.bps / 100).toFixed(2)}% of each settled payment goes to the treasury. Refunds are never charged.`,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  app.post("/api/escrow/fee", requireOperator, async (req, res) => {
+    if (!owner) {
+      res.status(404).json({ ok: false, error: "no deployer key loaded to sign the owner call" });
+      return;
+    }
+    const bps = Number(req.query.bps ?? NaN);
+    const treasury = ((req.query.treasury as Hex) ||
+      (liveDeployment.tesseraFeeCollector as Hex) ||
+      (owner.account.address as Hex));
+    // Not a failed transaction — there is nothing to call. Say that plainly
+    // instead of dressing it up as a revert.
+    if (!(await escrowSupportsFee().catch(() => false))) {
+      res.status(409).json({
+        ok: false,
+        error: "This escrow was deployed before the protocol fee existed — redeploy the escrow to charge one.",
+      });
+      return;
+    }
+    try {
+      if (!Number.isInteger(bps) || bps < 0) throw new Error("Fee must be a whole number of basis points, zero or more.");
+      const txHash = await owner.write(escrowAddress, tesseraEscrowAbi, "setProtocolFee", [bps, treasury]);
+      logTx(req, {
+        category: "defi", action: "escrow-fee", status: "success", txHash,
+        detail: `escrow fee set to ${(bps / 100).toFixed(2)}% → ${treasury.slice(0, 10)}…`,
+      });
+      invalidateAll();
+      res.json({ ok: true, txHash, ...(await readEscrowFee()) });
+    } catch (e) {
+      logTx(req, { category: "defi", action: "escrow-fee", status: "failed", detail: friendlyError(e) });
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Buy one of Tessera's own DeFi services, through the real 402 + escrow path.
+   *
+   * Deliberately the same route an outside agent takes — the app pays itself.
+   * A "try it" button that bypassed payment would be demonstrating something
+   * other than the product.
+   */
+  app.post("/api/services/try", requireOperator, async (req, res) => {
+    const resource = String(req.query.resource ?? "");
+    const svc = CATALOG.find((c) => c.resource === resource);
+    if (!svc) { res.status(404).json({ ok: false, error: "unknown service" }); return; }
+
+    // Only the DeFi services are buyable from here. The sample services exist to
+    // demonstrate refunds and flaky providers; letting the operator spend real
+    // USDC on a deliberately-broken one is a footgun, not a feature.
+    if (!svc.resource.startsWith("defi:")) {
+      res.status(400).json({ ok: false, error: "only Tessera's DeFi services can be bought here" });
+      return;
+    }
+
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(req.query)) {
+      if (k !== "resource" && typeof v === "string" && v !== "") params.set(k, v);
+    }
+    const qs = params.toString();
+    const path = `${svc.path}${qs ? `?${qs}` : ""}`;
+    const url = `http://127.0.0.1:${PROVIDERS_PORT}${path}`;
+
+    let paymentId: bigint | undefined;
+    try {
+      // 1) Ask unpaid and expect a 402 carrying a signed quote.
+      const challenge = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+      if (challenge.status !== 402) {
+        throw new Error(`expected a 402 quote, got HTTP ${challenge.status}`);
+      }
+      const provider = challenge.headers.get(HEADERS.provider) as Hex | null;
+      const price = challenge.headers.get(HEADERS.price);
+      if (!provider || !price) {
+        throw new Error("the 402 challenge was missing quote headers");
+      }
+
+      // A tab-billed service (the liquidation feed) advertises different terms:
+      // no per-call quote, because the whole point is that calls don't touch the
+      // chain. Fund a tab, sign one off-chain voucher, collect, close.
+      if (challenge.headers.get(HEADERS.billing) === "tab") {
+        const perCall = BigInt(price);
+        // Two calls of headroom: the provider rejects a voucher that exceeds the
+        // deposit, and an unspent remainder comes straight back on close.
+        const deposit = perCall * 2n;
+        const { tabId, txHash: openTx } = await client.openTab(provider, deposit, 3600);
+        try {
+          const sig = await client.signVoucher(tabId, perCall);
+          const paid = await fetch(url, {
+            headers: {
+              [HEADERS.tab]: tabId.toString(),
+              [HEADERS.voucher]: perCall.toString(),
+              [HEADERS.voucherSig]: sig,
+            },
+            signal: AbortSignal.timeout(30_000),
+          });
+          const body = await paid.json();
+          if (!paid.ok) {
+            throw new Error((body as { error?: string })?.error ?? `provider returned HTTP ${paid.status}`);
+          }
+          // One claim() for the stream, remainder returned. If the provider
+          // doesn't settle, the deposit is still reclaimable after expiry.
+          let closeTx: string | undefined;
+          let settled = "0";
+          const closed = await fetch(`http://127.0.0.1:${PROVIDERS_PORT}/tab/${tabId}/close`, { method: "POST" });
+          if (closed.ok) {
+            const c = (await closed.json()) as { settled: string; txHash: string };
+            closeTx = c.txHash;
+            settled = fmtUnits(BigInt(c.settled), 6);
+          }
+          logTx(req, {
+            category: "agentic", action: "service-call", status: "success",
+            assetAddress: usdcAddress, raw: perCall, txHash: closeTx ?? openTx,
+            detail: `bought ${svc.resource} on tab #${tabId} for ${settled} USDC`,
+          });
+          invalidateAll();
+          res.json({
+            ok: true,
+            resource: svc.resource,
+            name: svc.name,
+            price: fmtUnits(perCall, 6),
+            billing: "tab",
+            tabId: tabId.toString(),
+            settled,
+            txs: closeTx ? { openTab: openTx, closeTab: closeTx } : { openTab: openTx },
+            body,
+          });
+        } catch (e) {
+          // The deposit is time-locked to the tab; reclaim only works after it
+          // expires, so say plainly where the money is rather than pretending.
+          logTx(req, {
+            category: "agentic", action: "service-call", status: "failed",
+            assetAddress: usdcAddress, raw: deposit, txHash: openTx,
+            detail: `${svc.resource}: ${friendlyError(e)}`,
+          });
+          res.status(500).json({
+            ok: false,
+            error: `${friendlyError(e)} — tab #${tabId} still holds ${fmtUnits(deposit, 6)} USDC; it is reclaimable after the tab expires.`,
+          });
+        }
+        return;
+      }
+
+      const quoteHash = challenge.headers.get(HEADERS.quote) as Hex | null;
+      const sla = challenge.headers.get(HEADERS.deadline);
+      if (!quoteHash || !sla) {
+        throw new Error("the 402 challenge was missing quote headers");
+      }
+
+      // 2) Escrow the price on Arc. Chain and wall clocks skew either way, so
+      //    anchor to whichever is further ahead, and floor the SLA so public-RPC
+      //    latency can't make open() revert with DeadlinePassed.
+      const amount = BigInt(price);
+      await client.ensureApproval(amount);
+      const chainNow = await client.chainTime();
+      const wallNow = BigInt(Math.floor(Date.now() / 1000));
+      const minDeadline = Number(process.env.TESSERA_MIN_DEADLINE_SECONDS ?? 60);
+      const deadline = (chainNow > wallNow ? chainNow : wallNow)
+        + BigInt(Math.max(Number(sla), minDeadline));
+      const opened = await client.open(provider, amount, deadline, quoteHash);
+      paymentId = opened.paymentId;
+
+      // 3) Re-request with proof of payment; the provider fulfils on-chain.
+      const paid = await fetch(url, {
+        headers: { [HEADERS.payment]: paymentId.toString() },
+        signal: AbortSignal.timeout(30_000),
+      });
+      const body = await paid.json();
+
+      // 4) Release only against what the chain says was delivered.
+      const payment = await client.getPayment(paymentId);
+      if (payment.status !== PaymentStatus.Fulfilled) {
+        throw new Error("provider did not record delivery on-chain");
+      }
+      const delivered = keccak256(toHex(JSON.stringify(body)));
+      if (delivered !== payment.responseHash) {
+        const refundTx = await client.refund(paymentId);
+        logTx(req, {
+          category: "agentic", action: "service-call", status: "failed",
+          raw: amount, txHash: refundTx,
+          detail: `${svc.resource}: response hash mismatch — refunded`,
+        });
+        res.status(502).json({
+          ok: false,
+          error: "response did not match what the provider committed on-chain — payment refunded",
+          txs: { open: opened.txHash, refund: refundTx },
+        });
+        return;
+      }
+      const settleTx = await client.settle(paymentId);
+
+      logTx(req, {
+        category: "agentic", action: "service-call", status: "success",
+        assetAddress: usdcAddress, raw: amount, txHash: settleTx,
+        detail: `bought ${svc.resource} for ${fmtUnits(amount, 6)} USDC`,
+      });
+      invalidateAll();
+      res.json({
+        ok: true,
+        resource: svc.resource,
+        name: svc.name,
+        price: fmtUnits(amount, 6),
+        paymentId: paymentId.toString(),
+        txs: { open: opened.txHash, settle: settleTx },
+        body,
+      });
+    } catch (e) {
+      // An escrow that was opened but never released is the operator's money
+      // sitting in the contract. Reclaim it if we can; if the deadline has not
+      // passed yet the refund reverts, and the agent's own sweep picks it up.
+      let refundTx: Hex | undefined;
+      if (paymentId !== undefined) {
+        try { refundTx = await client.refund(paymentId); } catch { /* deadline not reached */ }
+      }
+      logTx(req, {
+        category: "agentic", action: "service-call", status: "failed",
+        assetAddress: usdcAddress, raw: svc.price, txHash: refundTx, detail: `${svc.resource}: ${friendlyError(e)}`,
+      });
+      res.status(500).json({ ok: false, error: friendlyError(e), refunded: Boolean(refundTx) });
+    }
+  });
+
+  /**
+   * The catalogue itself, so the UI can list what is for sale — and the asset
+   * list alongside it, so the argument inputs can offer the tokens this
+   * deployment actually lists instead of asking anyone to paste an address.
+   */
+  app.get("/api/services", (req, res) => {
+    res.json({
+      ok: true,
+      // The public prefix an outside agent hits, derived from how this request
+      // arrived so it's right behind Caddy and right on localhost.
+      base: `${req.protocol}://${req.get("host")}${X402_PREFIX}`,
+      assets: (defiOracle?.assets ?? []).map((a) => ({
+        symbol: a.symbol, address: a.address, decimals: a.decimals,
+      })),
+      services: CATALOG.filter((c) => c.resource.startsWith("defi:")).map((c) => ({
+        resource: c.resource,
+        name: c.name,
+        path: c.path,
+        price: fmtUnits(c.price, 6),
+        billing: c.billing ?? "escrow",
+        slaSeconds: c.slaSeconds,
+        tags: c.tags,
+      })),
+    });
   });
 
   app.get("/api/feeds/rates", async (_req, res) => res.json(await feeds.rates()));

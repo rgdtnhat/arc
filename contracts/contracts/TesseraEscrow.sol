@@ -94,9 +94,79 @@ contract TesseraEscrow is ReentrancyGuard {
     error DisputeWindowOpen();
     error TransferFailed();
 
+    /**
+     * @notice Escrow-as-a-service: a protocol fee on settled payments.
+     *
+     * @dev `open` has always been permissionless — any address can be the agent,
+     *      any address the provider — so this contract was already usable by
+     *      third-party agent pairs for their own trades. What was missing was a
+     *      way for it to earn from that, which is what turns it from an app's
+     *      internal rail into infrastructure other people can build on.
+     *
+     *      Three deliberate constraints:
+     *
+     *      · **Capped in the bytecode.** `MAX_PROTOCOL_FEE` is a constant, so no
+     *        operator key can raise the fee toward confiscating an escrow. 1% is
+     *        the ceiling, whatever a future admin wants.
+     *      · **Defaults to zero.** Turning it on is an explicit act.
+     *      · **Charged on payout only.** A refund returns the full amount — the
+     *        protocol does not take a cut of a failed delivery, because the agent
+     *        got nothing and the fee would be a penalty for being let down.
+     */
+    uint16 public constant MAX_PROTOCOL_FEE = 100; // 1%, hard ceiling
+    uint16 public protocolFeeBps; // starts at 0
+    address public owner;
+    address public treasury;
+
+    event ProtocolFeeSet(uint16 bps, address treasury);
+    event ProtocolFeeTaken(uint256 indexed paymentId, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
     constructor(address usdc_) {
         require(usdc_ != address(0), "usdc=0");
         usdc = IERC20(usdc_);
+        owner = msg.sender;
+        treasury = msg.sender;
+    }
+
+    /// @notice Set the protocol fee and where it goes. Capped by the constant above.
+    function setProtocolFee(uint16 bps, address treasury_) external onlyOwner {
+        require(bps <= MAX_PROTOCOL_FEE, "fee too high");
+        require(treasury_ != address(0), "treasury=0");
+        protocolFeeBps = bps;
+        treasury = treasury_;
+        emit ProtocolFeeSet(bps, treasury_);
+    }
+
+    function transferOwnership(address o) external onlyOwner {
+        require(o != address(0), "owner=0");
+        owner = o;
+    }
+
+    /**
+     * @notice What a provider would actually receive for `amount`.
+     * @dev Public so a third party can price a job before committing to it,
+     *      rather than discovering the fee when the money lands.
+     */
+    function quotePayout(uint256 amount) public view returns (uint256 net, uint256 fee) {
+        fee = (amount * protocolFeeBps) / 10_000;
+        net = amount - fee;
+    }
+
+    /// @dev Pays the provider net of the protocol fee. Shared by both payout
+    ///      paths so they can never disagree about what a provider is owed.
+    function _payProvider(uint256 paymentId, Payment storage p) internal returns (uint256 net) {
+        uint256 fee;
+        (net, fee) = quotePayout(p.amount);
+        if (fee > 0) {
+            if (!usdc.transfer(treasury, fee)) revert TransferFailed();
+            emit ProtocolFeeTaken(paymentId, fee);
+        }
+        if (!usdc.transfer(p.provider, net)) revert TransferFailed();
     }
 
     /**
@@ -157,12 +227,15 @@ contract TesseraEscrow is ReentrancyGuard {
 
         p.status = Status.Settled;
 
+        uint256 net = _payProvider(paymentId, p);
+
         Reputation storage r = reputationOf[p.provider];
         r.fulfilled += 1;
-        r.earned += p.amount;
+        // What the provider actually received, not the gross — `earned` is read
+        // as a track record of income, and gross would overstate it.
+        r.earned += net;
 
-        if (!usdc.transfer(p.provider, p.amount)) revert TransferFailed();
-        emit PaymentSettled(paymentId, p.provider, p.amount);
+        emit PaymentSettled(paymentId, p.provider, net);
     }
 
     /**
@@ -181,12 +254,13 @@ contract TesseraEscrow is ReentrancyGuard {
 
         p.status = Status.Settled;
 
+        uint256 net = _payProvider(paymentId, p);
+
         Reputation storage r = reputationOf[p.provider];
         r.fulfilled += 1;
-        r.earned += p.amount;
+        r.earned += net;
 
-        if (!usdc.transfer(p.provider, p.amount)) revert TransferFailed();
-        emit PaymentClaimed(paymentId, p.provider, p.amount);
+        emit PaymentClaimed(paymentId, p.provider, net);
     }
 
     /**

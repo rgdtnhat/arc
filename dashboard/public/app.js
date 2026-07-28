@@ -3405,6 +3405,225 @@ const $ = (id) => document.getElementById(id);
         });
       }
 
+      /* ====================================================================
+       * Services Tessera sells.
+       *
+       * These are the app's own DeFi reads, published over HTTP 402. The "Call
+       * it" button walks the real handshake — 402 quote, on-chain escrow,
+       * delivery, settle — because a shortcut that returned the answer without
+       * paying would be demonstrating a REST API, not agentic commerce.
+       *
+       * Which arguments each service needs is declared here rather than
+       * inferred, so a service that gains a parameter fails loudly (a missing
+       * input) instead of silently answering about the wrong thing.
+       * ==================================================================== */
+      const SELL_ARGS = {
+        "defi:yield-best": [],
+        "defi:treasury": [],
+        "defi:route": [
+          { key: "tokenIn", label: "Token in", kind: "asset" },
+          { key: "tokenOut", label: "Token out", kind: "asset" },
+          { key: "amountIn", label: "Amount in", kind: "amount", of: "tokenIn", ph: "100" },
+        ],
+        "defi:health": [{ key: "account", label: "Account", kind: "address", ph: "0x…" }],
+        "defi:reputation": [{ key: "provider", label: "Provider", kind: "address", ph: "0x…" }],
+        "defi:at-risk": [
+          { key: "accounts", label: "Accounts", kind: "text", ph: "0x…,0x… (comma-separated, max 25)" },
+        ],
+      };
+      let sellState = { services: [], assets: [], base: "", picked: null, busy: false };
+
+      async function loadSellServices() {
+        const rows = $("sellRows");
+        if (!rows) return;
+        try {
+          const r = await (await fetch("/api/services")).json();
+          if (!r.ok) throw new Error(r.error || "catalogue unavailable");
+          sellState.services = r.services || [];
+          sellState.assets = r.assets || [];
+          sellState.base = r.base || "";
+        } catch (e) {
+          rows.innerHTML = `<tr><td colspan="4" class="muted">${esc(String(e.message || e))}</td></tr>`;
+          return;
+        }
+        if (!sellState.services.length) {
+          rows.innerHTML = `<tr><td colspan="4" class="muted">No services published.</td></tr>`;
+          return;
+        }
+        rows.innerHTML = sellState.services
+          .map(
+            (s) => `<tr>
+              <td>
+                <div style="font-weight:600">${esc(s.name)}</div>
+                <div class="mono" style="font-size:11px;color:var(--muted)">${esc(s.resource)} · ${esc(s.path)}</div>
+              </td>
+              <td class="num mono">${esc(s.price)}</td>
+              <td>${s.billing === "tab" ? "tab (nanopayments)" : "escrow, per call"}</td>
+              <td class="num"><button class="btn" data-sell="${esc(s.resource)}">Try it</button></td>
+            </tr>`,
+          )
+          .join("");
+        rows.querySelectorAll("[data-sell]").forEach((b) =>
+          b.addEventListener("click", () => pickSellService(b.dataset.sell)));
+
+        const baseEl = $("sellBase");
+        if (baseEl && sellState.base) baseEl.textContent = sellState.base;
+        const curl = $("sellCurl");
+        if (curl && sellState.base) {
+          curl.textContent =
+            `# 1. quote (unpaid — returns 402 + signed headers)\n` +
+            `curl -i ${sellState.base}/defi/yield/best\n\n` +
+            `# 2. escrow x-tessera-price USDC to x-tessera-provider in TesseraEscrow.open()\n\n` +
+            `# 3. collect (paid)\n` +
+            `curl -H "x-tessera-payment: <paymentId>" ${sellState.base}/defi/yield/best\n\n` +
+            `# the whole catalogue\n` +
+            `curl ${sellState.base}/catalog`;
+        }
+      }
+
+      /** Show the argument form for one service. */
+      function pickSellService(resource) {
+        const svc = sellState.services.find((s) => s.resource === resource);
+        if (!svc) return;
+        sellState.picked = svc;
+        const spec = SELL_ARGS[resource] || [];
+        $("sellPicked").textContent = `${svc.name} — ${svc.price} USDC per call`;
+        const assetOpts = sellState.assets
+          .map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`)
+          .join("");
+        $("sellArgFields").innerHTML = spec.length
+          ? spec
+              .map((f) =>
+                f.kind === "asset" && sellState.assets.length
+                  ? `<label style="flex:1;min-width:150px;font-size:11.5px;color:var(--muted)">${esc(f.label)}
+                       <select class="field" data-arg="${esc(f.key)}" style="width:100%">${assetOpts}</select></label>`
+                  : `<label style="flex:1;min-width:180px;font-size:11.5px;color:var(--muted)">${esc(f.label)}
+                       <input class="field" data-arg="${esc(f.key)}" data-kind="${esc(f.kind)}"
+                              placeholder="${esc(f.ph || "")}" style="width:100%" /></label>`,
+              )
+              .join("")
+          : `<div style="font-size:12px;color:var(--muted)">No arguments — this one reads the whole deployment.</div>`;
+        $("sellHint").textContent = svc.billing === "tab"
+          ? "Tab-billed for keepers streaming it. Calling it here opens a single escrow instead, which is the same answer at a higher unit cost."
+          : "Pays the quote into TesseraEscrow, collects the answer, then settles — operator only.";
+        $("sellArgs").style.display = "";
+        $("sellOut").style.display = "none";
+      }
+
+      /** Amounts go over the wire in base units; the form takes human numbers. */
+      function sellDecimalsFor(argKey) {
+        const spec = (SELL_ARGS[sellState.picked?.resource] || []).find((f) => f.key === argKey);
+        if (!spec || spec.kind !== "amount") return null;
+        const src = $("sellArgFields").querySelector(`[data-arg="${spec.of}"]`);
+        const asset = sellState.assets.find((a) => a.address === src?.value);
+        return asset ? asset.decimals : 6;
+      }
+
+      async function runSellService() {
+        if (!sellState.picked || sellState.busy) return;
+        const out = $("sellOut");
+        const spec = SELL_ARGS[sellState.picked.resource] || [];
+        const qs = new URLSearchParams({ resource: sellState.picked.resource });
+        for (const f of spec) {
+          const el = $("sellArgFields").querySelector(`[data-arg="${f.key}"]`);
+          const v = (el?.value || "").trim();
+          if (!v) {
+            out.style.display = "";
+            out.textContent = `${f.label} is required — the service will not answer about nothing.`;
+            return;
+          }
+          if (f.kind === "amount") {
+            const dp = sellDecimalsFor(f.key) ?? 6;
+            const n = Number(v);
+            if (!Number.isFinite(n) || n <= 0) {
+              out.style.display = "";
+              out.textContent = `${f.label} must be a positive number.`;
+              return;
+            }
+            // Human number -> base units, without floating point in the middle.
+            const [whole, frac = ""] = v.split(".");
+            qs.set(f.key, (BigInt(whole || "0") * 10n ** BigInt(dp)
+              + BigInt((frac + "0".repeat(dp)).slice(0, dp) || "0")).toString());
+          } else {
+            qs.set(f.key, v);
+          }
+        }
+
+        sellState.busy = true;
+        $("sellRun").disabled = true;
+        out.style.display = "";
+        out.textContent = "Requesting a quote, escrowing on Arc, collecting… this is three transactions, give it a moment.";
+        try {
+          const res = await postAuthed("/api/services/try?" + qs.toString());
+          const r = await res.json();
+          if (!r.ok) {
+            out.textContent = "✗ " + (r.error || `HTTP ${res.status}`) +
+              (r.refunded ? "\n\nThe escrow was reclaimed — no USDC was lost." : "");
+            return;
+          }
+          const links = Object.entries(r.txs || {})
+            .map(([k, h]) => `${k}: ${h}`)
+            .join("\n");
+          out.textContent =
+            `✓ paid ${r.price} USDC · payment #${r.paymentId}\n${links}\n\n` +
+            JSON.stringify(r.body, null, 2);
+          afterTx();
+        } catch (e) {
+          out.textContent = "✗ " + String(e.message || e);
+        } finally {
+          sellState.busy = false;
+          $("sellRun").disabled = false;
+        }
+      }
+
+      /** Escrow-as-a-service: read the on-chain fee, and let an owner change it. */
+      async function loadEscrowFee() {
+        if (!$("escFeeBps")) return;
+        try {
+          const r = await (await fetch("/api/escrow/fee")).json();
+          if (!r.ok) throw new Error(r.error || "unavailable");
+          // An escrow deployed before the fee existed. Say that, rather than
+          // showing a 0% that looks like a setting someone chose.
+          $("escFeeBps").textContent = r.supported ? `${r.bps} bps (${(r.bps / 100).toFixed(2)}%)` : "not available on this escrow";
+          $("escFeeTreasury").textContent = r.treasury || "—";
+          $("escFeeMax").textContent = r.supported ? `${r.maxBps} bps (${(r.maxBps / 100).toFixed(2)}%)` : "—";
+          $("escFeeNote").textContent = r.canSet
+            ? r.note
+            : r.note + " Changing it needs the deploying key, which this dashboard doesn't hold.";
+          $("escFeeControls").style.display = r.canSet ? "" : "none";
+          if (r.canSet && !$("escFeeInput").value) $("escFeeInput").value = String(r.bps);
+        } catch (e) {
+          $("escFeeNote").textContent = String(e.message || e);
+        }
+      }
+
+      if ($("escFeeSet")) {
+        $("escFeeSet").addEventListener("click", async () => {
+          const bps = $("escFeeInput").value.trim();
+          if (bps === "") { $("escFeeNote").textContent = "Enter a fee in basis points."; return; }
+          $("escFeeSet").disabled = true;
+          $("escFeeNote").textContent = "Sending the owner call…";
+          try {
+            const r = await (await postAuthed(`/api/escrow/fee?bps=${encodeURIComponent(bps)}`)).json();
+            $("escFeeNote").textContent = r.ok ? `Fee updated — ${r.txHash}` : "✗ " + (r.error || "failed");
+            if (r.ok) { loadEscrowFee(); afterTx(); }
+          } catch (e) {
+            $("escFeeNote").textContent = "✗ " + String(e.message || e);
+          } finally {
+            $("escFeeSet").disabled = false;
+          }
+        });
+      }
+
+      if ($("sellRun")) {
+        $("sellRun").addEventListener("click", runSellService);
+        $("sellCancel").addEventListener("click", () => {
+          sellState.picked = null;
+          $("sellArgs").style.display = "none";
+          $("sellOut").style.display = "none";
+        });
+      }
+
       const AG_LOADERS = {
         news: loadNews,
         fx: loadFx,
@@ -3412,6 +3631,7 @@ const $ = (id) => document.getElementById(id);
         analysis: loadAnalysis,
         stocks: loadStocks,
         commodities: loadCommodities,
+        marketplace: () => { loadSellServices(); loadEscrowFee(); },
       };
       /** Refresh cadence per tab. Prices move; news does not, minute to minute. */
       const AG_REFRESH = { fx: 120_000, crypto: 60_000, stocks: 90_000, commodities: 90_000, analysis: 120_000, news: 600_000 };

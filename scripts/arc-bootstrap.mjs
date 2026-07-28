@@ -140,6 +140,27 @@ async function main() {
     const h2 = await wallet.deployContract({ abi: tesseraTabAbi, bytecode: tesseraTabBytecode, args: [USDC] });
     tabAddress = (await waitReceipt(h2)).contractAddress;
     console.log(`   TesseraTab:    ${tabAddress}`);
+
+    // Escrow-as-a-service: the escrow is permissionless, so third parties can
+    // settle their own trades through it. The fee that makes that revenue is
+    // opt-in — charging counterparties by default, on a deployment nobody asked
+    // to be taxed, would be the wrong default. Set TESSERA_ESCROW_FEE_BPS to
+    // turn it on at deploy time; the dashboard can change it later either way.
+    const feeBps = Number(env.TESSERA_ESCROW_FEE_BPS ?? 0);
+    if (Number.isInteger(feeBps) && feeBps > 0) {
+      const treasury = env.TESSERA_ESCROW_TREASURY ?? deployer.address;
+      console.log(`⚖  Setting escrow protocol fee to ${feeBps} bps → ${treasury}…`);
+      await waitReceipt(
+        await wallet.writeContract({
+          address: escrowAddress,
+          abi: tesseraEscrowAbi,
+          functionName: "setProtocolFee",
+          args: [feeBps, treasury],
+        })
+      );
+    } else {
+      console.log("⚖  Escrow protocol fee left at 0 — set TESSERA_ESCROW_FEE_BPS to charge for third-party escrows.");
+    }
   } else {
     console.log(`\n📦 Reusing deployed contracts from .env (escrow ${escrowAddress})`);
   }

@@ -33,7 +33,60 @@ export interface ServiceDef {
    * (e.g. the network is unavailable), the provider falls back to `respond`,
    * so the service degrades gracefully offline while being genuinely live when it can.
    */
-  respondAsync?: (query: Record<string, string>) => Promise<unknown>;
+  respondAsync?: (query: Record<string, string>, ctx: ServiceContext) => Promise<unknown>;
+  /**
+   * Refuse rather than degrade. A weather sample can serve a cached reading when
+   * its upstream is down; an APR or a health factor cannot — the buyer acts on
+   * it with money. When this is set the provider returns 503 and never records
+   * delivery, so the escrow stays refundable instead of settling for an error.
+   */
+  liveOnly?: boolean;
+}
+
+/**
+ * Produce a response body, honouring `liveOnly`.
+ *
+ * Shared by both billing paths so the escrow and tab flows can never drift into
+ * answering differently — which is exactly how the tab feed ended up billing
+ * for the "unavailable" placeholder.
+ */
+export async function produceBody(
+  svc: ServiceDef,
+  query: Record<string, string>,
+  ctx: ServiceContext,
+): Promise<{ ok: true; body: unknown; live: boolean } | { ok: false; error: string }> {
+  if (!svc.respondAsync) return { ok: true, body: svc.respond(query), live: false };
+  try {
+    return { ok: true, body: await svc.respondAsync(query, ctx), live: true };
+  } catch (err) {
+    if (svc.liveOnly) return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    return { ok: true, body: svc.respond(query), live: false };
+  }
+}
+
+/**
+ * What a live service is handed at call time.
+ *
+ * `oracle` is optional on purpose: without it the DeFi services report
+ * themselves unavailable instead of falling back to a plausible-looking number.
+ * These answers are sold, and an agent moves money on them — a made-up APR is
+ * worse than an error.
+ */
+export interface ServiceContext {
+  oracle?: import("@tessera/shared").DefiOracle;
+  chain: unknown;
+  rpcUrl: string;
+  escrowAddress: `0x${string}`;
+}
+
+/** Every DeFi service refuses rather than guesses when it cannot read the chain. */
+function needOracle(ctx: ServiceContext) {
+  if (!ctx.oracle) {
+    throw new Error(
+      "This service reads live on-chain state and the reader is not configured on this deployment.",
+    );
+  }
+  return ctx.oracle;
 }
 
 /**
@@ -195,6 +248,209 @@ export const CATALOG: ServiceDef[] = [
         price: Number((base + wobble).toFixed(6)),
         ts: Date.now(),
         source: "PulseWire",
+      };
+    },
+  },
+
+  // ==========================================================================
+  // Tessera's own DeFi services, sold to outside agents over HTTP 402.
+  //
+  // These are not samples. Every one reads live chain state through the shared
+  // `DefiOracle`, and every one refuses rather than guesses when it cannot —
+  // an agent is going to move money on the answer. `respond` still exists as
+  // the interface requires it, but for these it returns the reason the live
+  // read is the only acceptable path, never a plausible-looking number.
+  // ==========================================================================
+  {
+    resource: "defi:yield-best",
+    path: "/defi/yield/best",
+    name: "Tessera — best yield right now",
+    tags: ["defi", "yield", "apr", "treasury", "lending", "vault"],
+    price: usdc("0.001"),
+    slaSeconds: 30,
+    behavior: "reliable",
+    liveOnly: true,
+    respond: () => ({ error: "live read unavailable — this service does not serve cached rates" }),
+    respondAsync: async (q, ctx) => {
+      const answer = await needOracle(ctx).bestYield(q.asset);
+      return {
+        service: "yield/best",
+        ...answer,
+        // Say what the buyer is meant to do with it.
+        actionable: answer.best
+          ? `Supply ${answer.best.asset} to the ${answer.best.venue} venue for ${answer.best.aprPct}% APR.`
+          : "No venue currently offers a positive rate with liquidity to withdraw against.",
+      };
+    },
+  },
+  {
+    resource: "defi:route",
+    path: "/defi/route",
+    name: "Tessera — best swap route",
+    tags: ["defi", "swap", "route", "amm", "execution"],
+    price: usdc("0.001"),
+    slaSeconds: 30,
+    behavior: "reliable",
+    liveOnly: true,
+    respond: () => ({ error: "live read unavailable — this service does not serve cached quotes" }),
+    respondAsync: async (q, ctx) => {
+      const oracle = needOracle(ctx);
+      if (!q.tokenIn || !q.tokenOut || !q.amountIn) {
+        throw new Error("tokenIn, tokenOut and amountIn (base units) are required");
+      }
+      const answer = await oracle.route(
+        q.tokenIn as `0x${string}`,
+        q.tokenOut as `0x${string}`,
+        BigInt(q.amountIn),
+      );
+      return {
+        service: "route",
+        ...answer,
+        actionable: answer.best
+          ? `Route through the ${answer.best.venue} for ${answer.best.amountOut} ${answer.tokenOut}.`
+          : "Neither venue can fill this size right now.",
+      };
+    },
+  },
+  {
+    resource: "defi:health",
+    path: "/defi/health",
+    name: "Tessera — liquidation risk for a position",
+    tags: ["defi", "risk", "health", "liquidation", "lending"],
+    price: usdc("0.001"),
+    slaSeconds: 30,
+    behavior: "reliable",
+    liveOnly: true,
+    respond: () => ({ error: "live read unavailable — this service does not serve cached positions" }),
+    respondAsync: async (q, ctx) => {
+      const oracle = needOracle(ctx);
+      if (!q.account) throw new Error("account is required");
+      const h = await oracle.health(q.account as `0x${string}`);
+      return {
+        service: "health",
+        ...h,
+        actionable:
+          h.band === "liquidatable"
+            ? "This position can be liquidated now."
+            : h.bufferPct === null
+              ? "No debt, so nothing to liquidate."
+              : `Collateral can fall ${h.bufferPct}% before liquidation.`,
+      };
+    },
+  },
+  {
+    resource: "defi:at-risk",
+    path: "/defi/at-risk",
+    name: "Tessera — liquidation feed (at-risk positions)",
+    tags: ["defi", "liquidation", "keeper", "feed", "risk"],
+    // Tab-billed: a keeper polls this continuously, and one escrow per poll
+    // would cost more in gas than the data is worth.
+    price: usdc("0.0004"),
+    slaSeconds: 30,
+    billing: "tab",
+    behavior: "reliable",
+    liveOnly: true,
+    respond: () => ({ error: "live read unavailable — this feed does not serve cached positions" }),
+    respondAsync: async (q, ctx) => {
+      const oracle = needOracle(ctx);
+      // The caller supplies the addresses to check. Enumerating every borrower
+      // on chain is a log scan we will not do inside a per-tick call — a keeper
+      // watches a watchlist, and this prices each tick honestly.
+      const accounts = String(q.accounts ?? "")
+        .split(",")
+        .map((a) => a.trim())
+        .filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a))
+        .slice(0, 25);
+      if (!accounts.length) {
+        throw new Error("accounts is required: a comma-separated list of addresses to watch (max 25)");
+      }
+      const rows = await Promise.all(
+        accounts.map(async (a) => {
+          try {
+            return await oracle.health(a as `0x${string}`);
+          } catch {
+            return null;
+          }
+        }),
+      );
+      const seen = rows.filter((r): r is NonNullable<typeof r> => r !== null);
+      const atRisk = seen
+        .filter((r) => r.band === "at-risk" || r.band === "liquidatable")
+        .sort((x, y) => (x.healthFactor ?? 99) - (y.healthFactor ?? 99));
+      return {
+        service: "at-risk",
+        checked: seen.length,
+        unreadable: accounts.length - seen.length,
+        atRisk,
+        // The keeper's edge is the liquidation bonus on the pool, not this feed.
+        actionable: atRisk.length
+          ? `${atRisk.length} position(s) at or past the liquidation threshold — call liquidate() on TesseraPool to claim the bonus.`
+          : "Nothing at risk among the accounts checked.",
+        asOf: new Date().toISOString(),
+      };
+    },
+  },
+  {
+    resource: "defi:reputation",
+    path: "/defi/reputation",
+    name: "Tessera — counterparty reputation oracle",
+    tags: ["reputation", "trust", "counterparty", "escrow", "risk"],
+    price: usdc("0.0008"),
+    slaSeconds: 30,
+    behavior: "reliable",
+    liveOnly: true,
+    respond: () => ({ error: "live read unavailable — this service does not serve cached reputation" }),
+    respondAsync: async (q, ctx) => {
+      const oracle = needOracle(ctx);
+      if (!q.provider) throw new Error("provider address is required");
+      const r = await oracle.reputation(q.provider as `0x${string}`);
+      return {
+        service: "reputation",
+        ...r,
+        // The thresholds are published so a buyer can apply their own.
+        rule:
+          "unknown: no history · unproven: <5 settlements · poor: <70% · mixed: <95% · good: >=95%. " +
+          "Counts and stake are included so you can apply your own threshold.",
+        actionable:
+          r.verdict === "good"
+            ? "Settled record with a real sample. Reasonable to deal with."
+            : r.verdict === "unknown" || r.verdict === "unproven"
+              ? "Not enough history to judge — treat as a stranger and size accordingly."
+              : "Failed deliveries on record. Require stake or avoid.",
+      };
+    },
+  },
+  {
+    resource: "defi:treasury",
+    path: "/defi/treasury",
+    name: "Tessera — managed treasury for agents",
+    tags: ["defi", "treasury", "vault", "yield", "managed"],
+    price: usdc("0.001"),
+    slaSeconds: 30,
+    behavior: "reliable",
+    liveOnly: true,
+    respond: () => ({ error: "live read unavailable — this service does not serve cached vault state" }),
+    respondAsync: async (q, ctx) => {
+      const oracle = needOracle(ctx);
+      const y = await oracle.bestYield("USDC");
+      const vault = y.venues.find((v) => v.venue === "vault");
+      return {
+        service: "treasury",
+        // What an outside agent needs in order to actually do it. `deposit` on
+        // the vault is permissionless, so this is a real instruction, not a
+        // sales pitch — the agent keeps custody of its shares throughout.
+        vault: oracle.addresses.vault ?? null,
+        netAprPct: vault?.aprPct ?? null,
+        note: vault?.note ?? "Vault rate unavailable — do not deposit on an unknown rate.",
+        howTo: [
+          "approve(vault, amount) on USDC",
+          "deposit(amount) on the vault — you receive shares, and they are yours",
+          "withdraw(shares) any time up to the liquid reserve",
+        ],
+        custody:
+          "Non-custodial: shares are held by your address, not by Tessera. The performance fee is " +
+          "charged on yield only, never on principal.",
+        asOf: new Date().toISOString(),
       };
     },
   },

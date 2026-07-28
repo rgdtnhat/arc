@@ -27,7 +27,16 @@ async function deployFixture() {
     client: { wallet: provider },
   });
 
-  return { deployer, agent, provider, publicClient, usdc, escrow, agentEscrow, providerEscrow };
+  // A treasury and an unrelated pair, for the escrow-as-a-service tests: the
+  // point there is that neither side is this app's agent or provider.
+  const [, , , treasury, other] = await hre.viem.getWalletClients();
+  const asEscrow = (who: any) =>
+    hre.viem.getContractAt("TesseraEscrow", escrow.address, { client: { wallet: who } });
+
+  return {
+    deployer, agent, provider, treasury, other, publicClient, usdc, escrow,
+    agentEscrow, providerEscrow, asEscrow,
+  };
 }
 
 async function futureDeadline(seconds = 60): Promise<bigint> {
@@ -246,5 +255,116 @@ describe("TesseraEscrow", () => {
     expect(getAddress(p[1])).to.equal(getAddress(provider.account.address));
     expect(p[2]).to.equal(PRICE);
     expect(p[6]).to.equal(1); // Status.Escrowed
+  });
+
+  // --- escrow as a service for third parties ---------------------------------
+  //
+  // `open` was always permissionless, so any agent/provider pair could already
+  // use this contract for their own trade. These pin the fee that turns that
+  // into revenue, and the limits on it.
+
+  /** open -> fulfill, returning the payment id. */
+  async function opened(fx: any, amount: bigint, buyer: any, seller: any) {
+    const deadline = await futureDeadline(3600);
+    await (await fx.asEscrow(buyer)).write.open([seller.account.address, amount, deadline, quoteHash]);
+    const id = (await fx.escrow.read.nextPaymentId()) - 1n;
+    await (await fx.asEscrow(seller)).write.fulfill([id, responseHash]);
+    return id;
+  }
+
+  it("defaults to charging nothing, so existing flows are untouched", async () => {
+    const { escrow } = await loadFixture(deployFixture);
+    expect(await escrow.read.protocolFeeBps()).to.equal(0);
+    const [net, fee] = await escrow.read.quotePayout([MINT]);
+    expect(net).to.equal(MINT);
+    expect(fee).to.equal(0n);
+  });
+
+  it("takes the fee from the provider's payout on settle", async () => {
+    const fx = await loadFixture(deployFixture);
+    const { agent, provider, treasury, usdc, escrow } = fx;
+    await escrow.write.setProtocolFee([100, treasury.account.address]); // 1%
+
+    const before = await usdc.read.balanceOf([provider.account.address]);
+    const tBefore = await usdc.read.balanceOf([treasury.account.address]);
+    const id = await opened(fx, 1_000_000n, agent, provider);
+    await (await fx.asEscrow(agent)).write.settle([id]);
+
+    // 1 USDC less 1%: 0.99 to the provider, 0.01 to the treasury, 0 stranded.
+    expect((await usdc.read.balanceOf([provider.account.address])) - before).to.equal(990_000n);
+    expect((await usdc.read.balanceOf([treasury.account.address])) - tBefore).to.equal(10_000n);
+    expect(await usdc.read.balanceOf([escrow.address])).to.equal(0n);
+  });
+
+  it("charges nothing on a refund — the agent got nothing to be taxed on", async () => {
+    const fx = await loadFixture(deployFixture);
+    const { agent, provider, treasury, usdc, escrow } = fx;
+    await escrow.write.setProtocolFee([100, treasury.account.address]);
+
+    const before = await usdc.read.balanceOf([agent.account.address]);
+    const tBefore = await usdc.read.balanceOf([treasury.account.address]);
+    const id = await opened(fx, 1_000_000n, agent, provider);
+    await (await fx.asEscrow(agent)).write.refund([id]);
+
+    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(before);
+    expect(await usdc.read.balanceOf([treasury.account.address])).to.equal(tBefore);
+  });
+
+  it("takes the fee on a provider claim too, so the liveness path isn't a bypass", async () => {
+    const fx = await loadFixture(deployFixture);
+    const { agent, provider, treasury, usdc, escrow } = fx;
+    await escrow.write.setProtocolFee([100, treasury.account.address]);
+    const tBefore = await usdc.read.balanceOf([treasury.account.address]);
+
+    const id = await opened(fx, 1_000_000n, agent, provider);
+    await time.increase(3601 + 3600); // past the dispute window
+    await (await fx.asEscrow(provider)).write.providerClaim([id]);
+
+    expect((await usdc.read.balanceOf([treasury.account.address])) - tBefore).to.equal(10_000n);
+  });
+
+  it("records what the provider actually received, not the gross", async () => {
+    const fx = await loadFixture(deployFixture);
+    const { agent, provider, treasury, escrow } = fx;
+    await escrow.write.setProtocolFee([100, treasury.account.address]);
+    const id = await opened(fx, 1_000_000n, agent, provider);
+    await (await fx.asEscrow(agent)).write.settle([id]);
+    const [, , earned] = await escrow.read.reputation([provider.account.address]);
+    // `earned` reads as a track record of income; gross would overstate it.
+    expect(earned).to.equal(990_000n);
+  });
+
+  it("caps the fee in the bytecode, so no key can raise it toward confiscation", async () => {
+    const { treasury, escrow } = await loadFixture(deployFixture);
+    expect(await escrow.read.MAX_PROTOCOL_FEE()).to.equal(100);
+    await expect(escrow.write.setProtocolFee([101, treasury.account.address])).to.be.rejected;
+    await escrow.write.setProtocolFee([100, treasury.account.address]); // the ceiling itself is fine
+  });
+
+  it("keeps the fee switch owner-only", async () => {
+    const fx = await loadFixture(deployFixture);
+    await expect(
+      (await fx.asEscrow(fx.agent)).write.setProtocolFee([50, fx.treasury.account.address])
+    ).to.be.rejected;
+  });
+
+  it("lets an unrelated pair use the escrow for their own trade", async () => {
+    // The point of escrow-as-a-service: neither side is the app's agent or one
+    // of its providers, and it works anyway.
+    const fx = await loadFixture(deployFixture);
+    const { treasury, other, usdc, escrow } = fx;
+    await escrow.write.setProtocolFee([50, treasury.account.address]); // 0.5%
+    const buyer = other, seller = fx.deployer;
+
+    await usdc.write.mint([buyer.account.address, 10_000_000n]);
+    const buyerUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, { client: { wallet: buyer } });
+    await buyerUsdc.write.approve([escrow.address, 10_000_000n]);
+
+    const sellerBefore = await usdc.read.balanceOf([seller.account.address]);
+    const id = await opened(fx, 10_000_000n, buyer, seller);
+    await (await fx.asEscrow(buyer)).write.settle([id]);
+
+    // 10 USDC less 0.5% = 9.95 to the seller.
+    expect((await usdc.read.balanceOf([seller.account.address])) - sellerBefore).to.equal(9_950_000n);
   });
 });
