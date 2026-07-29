@@ -207,6 +207,8 @@ const $ = (id) => document.getElementById(id);
       /* Same reason: setDefiTab calls loadFees() during initial evaluation when
          the App fees tab was the one last open. */
       let feesLoading = false;
+      /** Retry handle while the collector's history is still being read. */
+      let feesRetry = null;
 
       function setDefiTab(tab, opts) {
         if (!(tab in DEFI_PANES)) tab = "lending";
@@ -1493,6 +1495,16 @@ const $ = (id) => document.getElementById(id);
         try {
           const r = await (await fetch("/api/fees")).json();
           const notReady = $("feesNotReady");
+          if (!r.ok && r.indexing) {
+            // Not an error: the first pass over the collector's history hasn't
+            // landed yet. Say that, and come back for it.
+            if (notReady) { notReady.style.display = ""; notReady.textContent = r.error; }
+            if (note) note.textContent = "";
+            $("feeChart").innerHTML = `<div class="feeChartEmpty">${esc(r.error)}</div>`;
+            clearTimeout(feesRetry);
+            feesRetry = setTimeout(loadFees, 8000);
+            return;
+          }
           if (!r.ok) {
             if (notReady) { notReady.style.display = ""; notReady.textContent = r.error || "Fee collector unavailable."; }
             if (note) note.textContent = "";
@@ -1623,10 +1635,6 @@ const $ = (id) => document.getElementById(id);
         // A cold scan walks the contract's whole history in windowed getLogs
         // calls and can take a minute. Without this the table just sits empty,
         // which reads as "no holders" rather than "still counting".
-        if (!st.rows.length) {
-          $(`hold${key}Rows`).innerHTML =
-            `<tr><td colspan="5" class="muted">Reading holders from the chain — this walks the contract's full history, so the first load takes a moment.</td></tr>`;
-        }
         try {
           const url = `/api/holders?kind=${v.kind}${opts && opts.refresh ? "&refresh=1" : ""}`;
           const r = await (await fetch(url)).json();
@@ -1639,23 +1647,27 @@ const $ = (id) => document.getElementById(id);
 
           // The server answers straight away and scans in the background, so a
           // slow sweep can never time out the request. Poll until it lands.
-          if (r.scanning) {
-            clearTimeout(st.pollTimer);
-            st.pollTimer = setTimeout(() => loadHolders(key, { keepPage: true }), 4000);
-          }
           if (note) {
             // A short log scan under-reports *who*, never *how much*. Say so —
             // a leaderboard quietly missing its biggest holder is worse than
             // one that admits the scan was incomplete.
             const parts = [];
             if (r.note) parts.push(r.note);
-            if (r.scanning) {
-              parts.push(r.stale
-                ? "Refreshing from the chain — showing the previous scan until it finishes."
-                : "Reading the contract's full history — this takes about a minute the first time.");
+            // Balances are always live reads, so a half-built index shows fewer
+            // holders but never a wrong number. Say which of those it is.
+            const p = r.progress;
+            if (p && !p.complete) {
+              parts.push(
+                `Indexing past holders — ${Math.round(p.ratio * 100)}% of the contract's history read so far. ` +
+                "Balances shown are exact; more addresses will appear as it catches up.",
+              );
+              clearTimeout(st.pollTimer);
+              st.pollTimer = setTimeout(() => loadHolders(key, { keepPage: true }), 6000);
+            } else if (p && p.gaps > 0) {
+              parts.push(`${p.gaps} block range${p.gaps === 1 ? "" : "s"} could not be read, so a holder may be missing.`);
+            } else if (st.rows.length) {
+              parts.push(`Read at block ${r.block}.`);
             }
-            if (r.partial) parts.push("The log scan hit its window budget, so some holders may be missing. Balances shown are exact.");
-            else if (st.rows.length && !r.scanning) parts.push(`Read at block ${r.block}.`);
             note.className = r.partial ? "feedNote bad" : "feedNote";
             note.textContent = parts.join(" ");
           }
@@ -1677,8 +1689,8 @@ const $ = (id) => document.getElementById(id);
         if (head && st.report) head.textContent = st.report.rankLabel || "Share";
 
         if (!st.rows.length) {
-          const why = st.report && st.report.scanning
-            ? "Reading holders from the chain — this walks the contract's full history, so the first load takes a moment."
+          const why = st.report && st.report.progress && !st.report.progress.complete
+            ? "Indexing the contract's history — holders appear here as they are found."
             : st.report && st.report.note
               ? ""
               : "No positions yet — the first deposit shows up here.";
@@ -1802,6 +1814,8 @@ const $ = (id) => document.getElementById(id);
         const r = await feeDaily();
         if (!r.ok) {
           host.innerHTML = `<div class="feeChartEmpty">${esc(r.error || "No fee data.")}</div>`;
+          // Still building the fee history — check back rather than sit blank.
+          if (r.indexing) { feeDailyCache = null; setTimeout(() => loadVenueChart(key), 8000); }
           if (note) note.textContent = "";
           if (stats) stats.innerHTML = "";
           return;
@@ -2257,16 +2271,42 @@ const $ = (id) => document.getElementById(id);
           const lpFee = fmtUnitsJs(r.lpFee, ai.decimals);
           const appFee = fmtUnitsJs(r.appFee, ai.decimals);
           const eff = Number(out) > 0 && Number(human) > 0 ? Number(out) / Number(human) : 0;
-          // Price impact: how far this trade moves you off the pool's spot rate.
-          const spot = Number(ao.balance) > 0 && Number(ai.balance) > 0 ? Number(ao.balance) / Number(ai.balance) : 0;
-          const impact = spot > 0 && eff > 0 ? Math.max(0, (1 - eff / spot) * 100) : 0;
+          // Impact comes from the server, measured against the same reserves the
+          // contract quotes from. Computing it here off display strings was how
+          // a trade that returns almost nothing could still look reasonable.
+          const imp = r.impact || { impactPct: 0, severity: "fine", reason: "", reserveUsedPct: 0 };
+          const colour = imp.severity === "severe" ? "var(--bad, #dc2626)"
+            : imp.severity === "warn" ? "var(--warn)" : "var(--muted)";
+          const suggestion = r.suggestedAmountIn && BigInt(r.suggestedAmountIn) > 0n
+            ? ` <button class="btn" id="amUseSafe" data-raw="${esc(r.suggestedAmountIn)}" style="padding:2px 8px;font-size:11px">Use ${esc(fmtUnitsJs(r.suggestedAmountIn, ai.decimals))} instead</button>`
+            : "";
           $("amSwapQuote").innerHTML =
             `You pay <b>${esc(human)} ${esc(ai.symbol)}</b> → you receive <b>${esc(out)} ${esc(ao.symbol)}</b><br>` +
             `<span style="font-weight:400;color:var(--muted)">effective rate 1 ${esc(ai.symbol)} = ` +
-            `${eff ? eff.toPrecision(6) : "—"} ${esc(ao.symbol)} · price impact ${esc(impact.toFixed(2))}% · ` +
-            `fee ${esc(lpFee)} to providers + ${esc(appFee)} to the app · 1% max slippage</span>`;
-          return { poolId: p.id, tokenIn, tokenOut, amountIn, out: r.out, ai, ao };
+            `${eff ? eff.toPrecision(6) : "—"} ${esc(ao.symbol)} · ` +
+            `<span style="color:${colour};font-weight:${imp.severity === "fine" ? 400 : 600}">price impact ${esc(imp.impactPct.toFixed(2))}%</span> · ` +
+            `fee ${esc(lpFee)} to providers + ${esc(appFee)} to the app · 1% max slippage</span>` +
+            (imp.reason
+              ? `<div style="margin-top:8px;font-weight:400;font-size:12px;color:${colour}">${esc(imp.reason)}${suggestion}</div>`
+              : "");
+
+          const useSafe = $("amUseSafe");
+          if (useSafe) {
+            useSafe.addEventListener("click", () => {
+              $("amSwapAmount").value = fmtUnitsJs(useSafe.dataset.raw, ai.decimals);
+              ammQuote();
+            });
+          }
+          return { poolId: p.id, tokenIn, tokenOut, amountIn, out: r.out, ai, ao, impact: imp };
         }
+
+        /**
+         * One-time override per exact trade. Keyed on the pool, pair and size so
+         * editing any of them re-arms the guard — an acknowledgement of a 40%
+         * impact must not silently carry over to a different order.
+         */
+        const amImpactAck = new Set();
+        const amAckKey = (q) => `${q.poolId}:${q.tokenIn}:${q.tokenOut}:${q.amountIn}`;
 
         $("amSwapExec").addEventListener("click", async () => {
           const msg = $("ammMsg");
@@ -2274,6 +2314,17 @@ const $ = (id) => document.getElementById(id);
           if (!q) {
             msg.style.display = "block"; msg.style.color = "var(--warn)";
             msg.textContent = "Enter an amount and pick two different assets first.";
+            return;
+          }
+          // Refuse a trade the pool is too shallow to fill sensibly. This is the
+          // "I swapped and received nothing" case: constant-product working
+          // exactly as designed against reserves far smaller than the order.
+          if (q.impact && q.impact.severity === "severe" && !amImpactAck.has(amAckKey(q))) {
+            amImpactAck.add(amAckKey(q));
+            msg.style.display = "block";
+            msg.style.color = "var(--warn)";
+            msg.textContent =
+              `Blocked: ${q.impact.reason} Press Swap again to go ahead anyway at this price.`;
             return;
           }
           const minOut = ((BigInt(q.out) * 99n) / 100n).toString();

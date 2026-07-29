@@ -23,6 +23,7 @@ import { createTesseraActions, type TesseraActionKit } from "./agentkit.js";
 import type { Faucet } from "./circle/faucet.js";
 import type { TesseraTreasury } from "./treasury.js";
 import type { TesseraPoolClient } from "./pool.js";
+import { adviseFrom } from "./scenario.js";
 
 export type Brain = "rules" | "llm";
 
@@ -201,7 +202,7 @@ export class TesseraAgent {
 
         let entry: LedgerEntry;
         try {
-          entry = await this.purchase(svc, decision);
+          entry = await this.purchase(svc, decision, this.resolveQuery(need.query));
         } catch (err) {
           const ve = err as { metaMessages?: string[]; shortMessage?: string; message?: string };
           const reason =
@@ -293,7 +294,22 @@ export class TesseraAgent {
   }
 
   /** The 402 handshake: quote -> escrow -> deliver -> verify -> settle/refund. */
-  private async purchase(svc: OfferedService, decision: Decision): Promise<LedgerEntry> {
+  /**
+   * Fill in runtime values the scenario could not know when it was written.
+   * `$self` is the agent's own address — used by the health and reputation
+   * reads, which refuse to answer without a subject.
+   */
+  private resolveQuery(q?: Record<string, string>): string {
+    if (!q) return "";
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(q)) {
+      params.set(k, v === "$self" ? this.cfg.client.account.address : v);
+    }
+    const s = params.toString();
+    return s ? `?${s}` : "";
+  }
+
+  private async purchase(svc: OfferedService, decision: Decision, query = ""): Promise<LedgerEntry> {
     const entry: LedgerEntry = {
       resource: svc.resource,
       name: svc.name,
@@ -305,7 +321,7 @@ export class TesseraAgent {
     };
 
     // 1) Get a fresh 402 quote.
-    const quote = await this.fetchQuote(svc);
+    const quote = await this.fetchQuote(svc, query);
     if (!quote) {
       entry.reason = "provider did not return a 402 quote";
       return entry;
@@ -386,9 +402,28 @@ export class TesseraAgent {
     }
 
     // 5) Never fulfilled: wait out the deadline, then reclaim on timeout.
-    const waitMs = Number(payment.deadline) * 1000 - Date.now() + 1500;
-    if (waitMs > 0) await sleep(Math.min(waitMs, 20_000));
-    const refundTx = await this.cfg.client.refund(paymentId);
+    //
+    // The wait has to cover the *whole* remaining deadline. Capping it at 20s
+    // while the escrow's minimum deadline is 60s meant refund() was called
+    // before the contract would allow it and reverted with DeadlineNotReached,
+    // leaving the payment open and the money stuck until someone noticed. The
+    // deadline is chain time, so also re-check against the chain rather than
+    // trusting the local clock, and retry once if we were still early.
+    const deadlineMs = Number(payment.deadline) * 1000;
+    const waitFor = async () => {
+      const chainNow = Number(await this.cfg.client.chainTime()) * 1000;
+      const remaining = deadlineMs - Math.max(chainNow, Date.now()) + 2000;
+      if (remaining > 0) await sleep(Math.min(remaining, 180_000));
+    };
+    await waitFor();
+    let refundTx: Hex;
+    try {
+      refundTx = await this.cfg.client.refund(paymentId);
+    } catch (err) {
+      if (!/DeadlineNotReached/i.test(String(err))) throw err;
+      await waitFor();
+      refundTx = await this.cfg.client.refund(paymentId);
+    }
     entry.status = "refunded";
     entry.reason = "provider missed SLA deadline";
     entry.txs.refund = refundTx;
@@ -565,6 +600,15 @@ export class TesseraAgent {
   /** Compose everything the agent bought into the final deliverable. */
   briefing(streamData?: unknown[]): string[] {
     const lines: string[] = [];
+
+    // The treasury advice comes first: it is the conclusion the run was for.
+    // Everything below it is the evidence and the incidental purchases.
+    const advice = adviseFrom(this.ledger);
+    if (advice.lines.length) {
+      lines.push(`${advice.headline}:`);
+      for (const l of advice.lines) lines.push(`• ${l}`);
+    }
+
     for (const e of this.ledger) {
       if (e.status !== "settled" || !e.data) continue;
       const d = e.data as Record<string, unknown>;
@@ -600,8 +644,8 @@ export class TesseraAgent {
     return lines;
   }
 
-  private async fetchQuote(svc: OfferedService): Promise<Quote | null> {
-    const res = await fetch(`${this.cfg.providersBaseUrl}${svc.path}`);
+  private async fetchQuote(svc: OfferedService, query = ""): Promise<Quote | null> {
+    const res = await fetch(`${this.cfg.providersBaseUrl}${svc.path}${query}`);
     if (res.status !== 402) return null;
     const provider = res.headers.get(HEADERS.provider) as Hex | null;
     const price = res.headers.get(HEADERS.price);
@@ -639,7 +683,7 @@ export class TesseraAgent {
       quoteHash,
       deadlineSeconds: Number(deadline),
       resource,
-      url: svc.path,
+      url: `${svc.path}${query}`,
     };
   }
 }

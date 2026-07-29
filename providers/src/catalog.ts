@@ -298,11 +298,21 @@ export const CATALOG: ServiceDef[] = [
       if (!q.tokenIn || !q.tokenOut || !q.amountIn) {
         throw new Error("tokenIn, tokenOut and amountIn (base units) are required");
       }
-      const answer = await oracle.route(
-        q.tokenIn as `0x${string}`,
-        q.tokenOut as `0x${string}`,
-        BigInt(q.amountIn),
-      );
+      // Accept a symbol as well as an address. A caller who knows the pair by
+      // name shouldn't have to look up a deployment-specific address first, and
+      // an unknown symbol is named in the error rather than being sent on as a
+      // malformed address that reverts somewhere less obvious.
+      const resolve = (v: string): `0x${string}` => {
+        if (/^0x[0-9a-fA-F]{40}$/.test(v)) return v as `0x${string}`;
+        const hit = oracle.assets.find((a) => a.symbol.toLowerCase() === v.toLowerCase());
+        if (!hit) {
+          throw new Error(
+            `unknown asset "${v}" — this deployment lists ${oracle.assets.map((a) => a.symbol).join(", ") || "nothing"}`,
+          );
+        }
+        return hit.address;
+      };
+      const answer = await oracle.route(resolve(q.tokenIn), resolve(q.tokenOut), BigInt(q.amountIn));
       return {
         service: "route",
         ...answer,

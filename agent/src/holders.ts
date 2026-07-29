@@ -20,9 +20,16 @@
  *    through, and the caller is expected to say so — a leaderboard that is
  *    quietly missing the largest holder is worse than one that admits it.
  */
-import { createPublicClient, type Chain, type Hex, type PublicClient } from "viem";
-import { tesseraPoolAbi, erc20Abi, pacedHttp } from "@tessera/shared";
-import { ArchiveScanner } from "./archive-chain.js";
+import { createPublicClient, parseAbiItem, type Chain, type Hex, type PublicClient } from "viem";
+import { tesseraPoolAbi, tesseraVaultAbi, tesseraAmmAbi, erc20Abi, pacedHttp } from "@tessera/shared";
+import { HolderIndex, mergeAddresses, type IndexProgress } from "./holder-index.js";
+
+/** The events that reveal a holder. Balances always come from live reads. */
+const EVENTS = {
+  supply: parseAbiItem("event Supply(address indexed asset, address indexed user, uint256 amount, uint256 shares)"),
+  deposit: parseAbiItem("event Deposit(address indexed user, uint256 assets, uint256 shares)"),
+  liquidity: parseAbiItem("event LiquidityAdded(uint256 indexed poolId, address indexed provider, uint256[] amounts, uint256 shares)"),
+} as const;
 
 export type HolderKind = "lending" | "vault" | "amm" | "swap";
 
@@ -58,6 +65,8 @@ export interface HolderReport {
   scanning?: boolean;
   /** Served from an older scan while a fresh one runs. */
   stale?: boolean;
+  /** How far the address index has got. Absent for venues that need no index. */
+  progress?: IndexProgress;
 }
 
 /** The shape returned before a venue has ever been scanned. */
@@ -77,7 +86,7 @@ export interface AppAddresses {
 
 export class HolderReader {
   readonly public: PublicClient;
-  private readonly scanner: ArchiveScanner;
+  private readonly index: HolderIndex;
   /** Log scans are expensive on a throttled RPC; serve a recent one instead. */
   private cache = new Map<string, { at: number; report: HolderReport }>();
   /** Scans in flight, so N pollers cause one sweep rather than N. */
@@ -87,12 +96,32 @@ export class HolderReader {
     private readonly chain: Chain,
     private readonly rpcUrl: string,
     private readonly app: AppAddresses = {},
-    // A full-history log sweep is ~90 windowed requests on a throttled RPC.
-    // Worth doing well and reusing, not worth redoing every minute.
-    private readonly ttlMs = 5 * 60_000,
+    /** Where the address index is persisted, so a restart doesn't re-scan. */
+    indexFile = ".tessera-holders.json",
+    /** Balances move with every trade; the reads behind them are cheap. */
+    private readonly ttlMs = 30_000,
   ) {
     this.public = createPublicClient({ chain, transport: pacedHttp(rpcUrl), batch: { multicall: true } });
-    this.scanner = new ArchiveScanner(chain, rpcUrl);
+    this.index = new HolderIndex(indexFile);
+  }
+
+  /** Addresses we can show without any log scan at all. */
+  private seeds(): (string | undefined)[] {
+    return [this.app.agent, this.app.collector, this.app.treasury];
+  }
+
+  /**
+   * Read the index, kick it forward in the background, and return what is known.
+   *
+   * The background advance is deliberately not awaited: it is bounded-burst work
+   * sharing one global RPC pacing gate with everything a user is waiting on.
+   * Seeding with the app's own wallets means the table has correct rows on the
+   * very first render, before the index has found anybody.
+   */
+  private addressesFor(contract: Hex, tag: keyof typeof EVENTS, field: string) {
+    const { addresses, progress } = this.index.known(contract, tag);
+    void this.index.advance(this.public, contract, tag, EVENTS[tag], field).catch(() => {});
+    return { addresses: mergeAddresses(addresses, this.seeds()), progress };
   }
 
   private isApp(address: string) {
@@ -105,6 +134,13 @@ export class HolderReader {
     this.cache.clear();
   }
 
+  /**
+   * A venue's current holders.
+   *
+   * Fast by construction now: the address set comes from the persisted index
+   * (no scanning on the request path) and the balances are one bounded
+   * multicall. What used to be a minute-long sweep is a handful of reads.
+   */
   async read(
     kind: HolderKind,
     opts: {
@@ -120,50 +156,36 @@ export class HolderReader {
   ): Promise<HolderReport> {
     const key = `${kind}:${opts.poolId ?? 0}`;
     const hit = this.cache.get(key);
-    const fresh = hit && Date.now() - hit.at < this.ttlMs && !opts.force;
-    if (fresh) return { ...hit!.report, scanning: this.scans.has(key) || undefined };
+    if (!opts.force && hit && Date.now() - hit.at < this.ttlMs) return hit.report;
 
-    // Never make a caller wait on the scan. It walks the contract's whole
-    // history in windowed getLogs calls and takes about a minute — long enough
-    // that a phone browser or a reverse proxy gives up first, which is exactly
-    // what "Failed to fetch" was. Kick it off, answer immediately with whatever
-    // is known, and let the client poll until `scanning` clears.
-    this.startScan(key, kind, opts);
-    if (hit) return { ...hit.report, stale: true, scanning: true };
-    return { ...emptyReport(kind), scanning: true };
-  }
+    const inflight = this.scans.get(key);
+    if (inflight) return inflight;
 
-  /** One scan per venue at a time; extra callers join the one in flight. */
-  private startScan(
-    key: string,
-    kind: HolderKind,
-    opts: Parameters<HolderReader["read"]>[1],
-  ): Promise<HolderReport> {
-    const running = this.scans.get(key);
-    if (running) return running;
     const job = this.build(kind, opts)
       .then((report) => {
         this.cache.set(key, { at: Date.now(), report });
         return report;
       })
-      .catch((err) => {
-        // Remember the failure too, so the UI can show a reason instead of
-        // spinning forever, and so a broken RPC isn't retried on every poll.
-        const report = {
-          ...emptyReport(kind),
-          note: `Could not read holders: ${err instanceof Error ? err.message : String(err)}`,
-        };
-        this.cache.set(key, { at: Date.now(), report });
-        return report;
-      })
+      .catch((err) => ({
+        ...emptyReport(kind),
+        note: `Could not read holders: ${err instanceof Error ? err.message : String(err)}`,
+      }))
       .finally(() => this.scans.delete(key));
     this.scans.set(key, job);
     return job;
   }
 
-  /** Block until the venue's scan has completed at least once. Used at boot. */
+  /** Block until the venue's index has fully caught up. Used at boot. */
   async warm(kind: HolderKind, opts: Parameters<HolderReader["read"]>[1]): Promise<void> {
-    await this.startScan(`${kind}:${opts.poolId ?? 0}`, kind, opts).catch(() => {});
+    const target =
+      kind === "lending" ? ([opts.pool, "supply", "user"] as const)
+      : kind === "vault" ? ([opts.vault, "deposit", "user"] as const)
+      : kind === "amm" ? ([opts.amm, "liquidity", "provider"] as const)
+      : null;
+    if (!target || !target[0]) return;
+    await this.index
+      .advance(this.public, target[0], target[1], EVENTS[target[1]], target[2])
+      .catch(() => {});
   }
 
   private async build(
@@ -182,32 +204,43 @@ export class HolderReader {
     pool: Hex | undefined,
     assets: { address: Hex; symbol: string; decimals: number }[],
   ): Promise<HolderReport> {
-    const empty = {
-      kind: "lending" as const, contract: pool ?? null, rankLabel: "Supplied (USD)",
-      assets: [], holders: [], total: "0", partial: false, block: "0",
-    };
-    if (!pool || !assets.length) return { ...empty, note: "The lending pool is not deployed on this network yet." };
-
-    const scan = await this.scanner.scanPool(pool, assets);
-    if (!scan.holders.length) {
-      return { ...empty, assets: scan.assets, block: scan.block, partial: scan.partial };
+    if (!pool || !assets.length) {
+      return { ...emptyReport("lending"), note: "The lending pool is not deployed on this network yet." };
+    }
+    const { addresses, progress } = this.addressesFor(pool, "supply", "user");
+    const meta = assets.map((a) => ({ ...a, address: a.address.toLowerCase() }));
+    if (!addresses.length) {
+      return { ...emptyReport("lending"), contract: pool, assets: meta, progress };
     }
 
-    // Rank on the pool's own valuation rather than on summed token amounts —
-    // this is the figure the protocol itself lends and liquidates against.
+    // Per-asset balances plus the pool's own USD valuation, in one round trip.
+    const perHolder = assets.length + 1;
     const res = await this.public.multicall({
-      contracts: scan.holders.map(
-        (h) => ({ address: pool, abi: tesseraPoolAbi, functionName: "accountData", args: [h.address as Hex] }) as const,
-      ) as never,
+      contracts: addresses.flatMap((who) => [
+        ...assets.map(
+          (a) => ({ address: pool, abi: tesseraPoolAbi, functionName: "supplyBalance", args: [a.address, who as Hex] }) as const,
+        ),
+        { address: pool, abi: tesseraPoolAbi, functionName: "accountData", args: [who as Hex] } as const,
+      ]) as never,
       allowFailure: true,
     });
 
-    const ranked = scan.holders.map((h, i) => {
-      const row = res[i];
-      const supplied = row?.status === "success" ? ((row.result as bigint[])[0] ?? 0n) : 0n;
-      return { h, value: supplied };
+    const rows = addresses.map((who, i) => {
+      const base = i * perHolder;
+      const balances: Record<string, string> = {};
+      assets.forEach((a, j) => {
+        const r = res[base + j];
+        balances[a.address.toLowerCase()] = (r?.status === "success" ? (r.result as bigint) : 0n).toString();
+      });
+      const acct = res[base + assets.length];
+      // Rank on the pool's own valuation, not on summed token amounts: 1 cirBTC
+      // and 1 USDC are not comparable and adding them ranks dust above real size.
+      const supplied = acct?.status === "success" ? ((acct.result as bigint[])[0] ?? 0n) : 0n;
+      return { h: { address: who, balances }, value: supplied };
     });
-    return this.finish("lending", pool, "Supplied (USD)", scan, ranked);
+
+    const block = (await this.public.getBlockNumber()).toString();
+    return { ...this.finish("lending", pool, "Supplied (USD)", meta, block, progress, rows) };
   }
 
   // --- vault -----------------------------------------------------------------
@@ -216,46 +249,90 @@ export class HolderReader {
     vault: Hex | undefined,
     asset?: { address: Hex; symbol: string; decimals: number },
   ): Promise<HolderReport> {
-    const empty = {
-      kind: "vault" as const, contract: vault ?? null, rankLabel: "Shares",
-      assets: [], holders: [], total: "0", partial: false, block: "0",
-    };
-    if (!vault || !asset) return { ...empty, note: "The yield vault is not deployed on this network yet." };
+    if (!vault || !asset) {
+      return { ...emptyReport("vault"), note: "The yield vault is not deployed on this network yet." };
+    }
+    const { addresses, progress } = this.addressesFor(vault, "deposit", "user");
+    const meta = [{ ...asset, address: asset.address.toLowerCase() }];
+    if (!addresses.length) return { ...emptyReport("vault"), contract: vault, assets: meta, progress };
 
-    const scan = await this.scanner.scanVault(vault, asset);
-    const ranked = scan.holders.map((h) => ({ h, value: BigInt(h.shares ?? "0") }));
-    return this.finish("vault", vault, "Shares", scan, ranked);
+    const res = await this.public.multicall({
+      contracts: addresses.flatMap((who) => [
+        { address: vault, abi: tesseraVaultAbi, functionName: "sharesOf", args: [who as Hex] } as const,
+        { address: vault, abi: tesseraVaultAbi, functionName: "balanceOfAssets", args: [who as Hex] } as const,
+      ]) as never,
+      allowFailure: true,
+    });
+    const rows = addresses.map((who, i) => {
+      const sh = res[i * 2]?.status === "success" ? (res[i * 2].result as bigint) : 0n;
+      const val = res[i * 2 + 1]?.status === "success" ? (res[i * 2 + 1].result as bigint) : 0n;
+      return { h: { address: who, balances: { [meta[0].address]: val.toString() }, shares: sh.toString() }, value: sh };
+    });
+    const block = (await this.public.getBlockNumber()).toString();
+    return this.finish("vault", vault, "Shares", meta, block, progress, rows);
   }
 
   // --- AMM -------------------------------------------------------------------
 
   private async amm(amm: Hex | undefined, poolId: number): Promise<HolderReport> {
-    const empty = {
-      kind: "amm" as const, contract: amm ?? null, rankLabel: "LP shares",
-      assets: [], holders: [], total: "0", partial: false, block: "0",
-    };
-    if (!amm) return { ...empty, note: "No AMM is deployed on this network yet." };
+    if (!amm) return { ...emptyReport("amm"), note: "No AMM is deployed on this network yet." };
 
-    const scan = await this.scanner.scanAmm(amm, poolId);
-    const ranked = scan.holders.map((h) => ({ h, value: BigInt(h.shares ?? "0") }));
-    return this.finish("amm", amm, "LP shares", scan, ranked);
+    const { addresses, progress } = this.addressesFor(amm, "liquidity", "provider");
+    const info = (await this.public.readContract({
+      address: amm, abi: tesseraAmmAbi, functionName: "poolInfo", args: [BigInt(poolId)],
+    })) as readonly [Hex[], bigint[], number, number, bigint, boolean, string];
+    const [assetAddrs, balances, , , totalShares] = info;
+
+    const metaRes = await this.public.multicall({
+      contracts: assetAddrs.flatMap((a) => [
+        { address: a, abi: erc20Abi, functionName: "symbol" } as const,
+        { address: a, abi: erc20Abi, functionName: "decimals" } as const,
+      ]) as never,
+      allowFailure: true,
+    });
+    const meta = assetAddrs.map((a, i) => ({
+      address: a.toLowerCase(),
+      symbol: metaRes[i * 2]?.status === "success" ? String(metaRes[i * 2].result) : a.slice(0, 8),
+      decimals: metaRes[i * 2 + 1]?.status === "success" ? Number(metaRes[i * 2 + 1].result) : 18,
+    }));
+    if (!addresses.length || totalShares === 0n) {
+      return { ...emptyReport("amm"), contract: amm, assets: meta, progress };
+    }
+
+    const res = await this.public.multicall({
+      contracts: addresses.map(
+        (who) => ({ address: amm, abi: tesseraAmmAbi, functionName: "sharesOf", args: [BigInt(poolId), who as Hex] }) as const,
+      ) as never,
+      allowFailure: true,
+    });
+    const rows = addresses.map((who, i) => {
+      const sh = res[i]?.status === "success" ? (res[i].result as bigint) : 0n;
+      const bal: Record<string, string> = {};
+      assetAddrs.forEach((a, j) => {
+        bal[a.toLowerCase()] = (((balances[j] ?? 0n) * sh) / totalShares).toString();
+      });
+      return { h: { address: who, balances: bal, shares: sh.toString() }, value: sh };
+    });
+    const block = (await this.public.getBlockNumber()).toString();
+    return this.finish("amm", amm, "LP shares", meta, block, progress, rows);
   }
 
   // --- swap desk -------------------------------------------------------------
 
   /**
    * The desk has no depositors. Its inventory *is* its token balance, so there
-   * is no per-wallet position to rank — showing an empty leaderboard here would
-   * read as a bug. Report the inventory instead, and say why.
+   * is no per-wallet position to rank — an empty leaderboard here would read as
+   * a bug. Report the inventory instead, and say why. No index needed.
    */
   private async swap(
     swap: Hex | undefined,
     assets: { address: Hex; symbol: string; decimals: number }[],
   ): Promise<HolderReport> {
-    const base = {
-      kind: "swap" as const, contract: swap ?? null, rankLabel: "Inventory",
-      assets: assets.map((a) => ({ ...a, address: a.address.toLowerCase() })),
-      holders: [] as HolderRow[], total: "0", partial: false, block: "0",
+    const meta = assets.map((a) => ({ ...a, address: a.address.toLowerCase() }));
+    const base: HolderReport = {
+      ...emptyReport("swap"),
+      contract: swap ?? null,
+      assets: meta,
       note:
         "The swap desk has no depositors — its inventory is its own token balance, so there are no " +
         "per-wallet shares to rank. What it holds is shown below; the app owns all of it.",
@@ -278,9 +355,7 @@ export class HolderReader {
     return {
       ...base,
       block,
-      holders: anything
-        ? [{ address: swap.toLowerCase(), balances, rank: "0", pct: 100, isApp: true }]
-        : [],
+      holders: anything ? [{ address: swap.toLowerCase(), balances, rank: "0", pct: 100, isApp: true }] : [],
     };
   }
 
@@ -291,17 +366,22 @@ export class HolderReader {
     kind: HolderKind,
     contract: Hex,
     rankLabel: string,
-    scan: { holders: { address: string; balances: Record<string, string>; shares?: string }[]; assets: HolderReport["assets"]; block: string; partial: boolean },
-    ranked: { h: { address: string; balances: Record<string, string>; shares?: string }; value: bigint }[],
+    assets: HolderReport["assets"],
+    block: string,
+    progress: IndexProgress,
+    rows: { h: { address: string; balances: Record<string, string>; shares?: string }; value: bigint }[],
   ): HolderReport {
-    const withValue = ranked.filter((r) => r.value > 0n);
+    // Someone who has fully withdrawn isn't a holder. Dropping them here is
+    // also what keeps the seeded app addresses from showing as zero rows on a
+    // venue the app has never used.
+    const withValue = rows.filter((r) => r.value > 0n);
     withValue.sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : 0));
     const total = withValue.reduce((s, r) => s + r.value, 0n);
     return {
       kind,
       contract,
       rankLabel,
-      assets: scan.assets,
+      assets,
       holders: withValue.map((r) => ({
         address: r.h.address,
         balances: r.h.balances,
@@ -311,8 +391,10 @@ export class HolderReader {
         isApp: this.isApp(r.h.address) || undefined,
       })),
       total: total.toString(),
-      partial: scan.partial,
-      block: scan.block,
+      // The index can be short, which under-reports *who*, never *how much*.
+      partial: !progress.complete || progress.gaps > 0,
+      progress,
+      block,
     };
   }
 }

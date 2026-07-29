@@ -56,6 +56,7 @@ import { TesseraPoolClient } from "./pool.js";
 import { VaultClient, SwapClient, AmmClient } from "./defi.js";
 import { FeeReader } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
+import { priceImpact, maxInputWithin, IMPACT_MAX_PCT } from "./impact.js";
 import { DefiOracle } from "@tessera/shared";
 import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
@@ -1104,7 +1105,12 @@ async function main() {
           const { symbol, decimals } = assetMeta(addr);
           const bal = p.balances[i] ?? 0n;
           const mine = p.totalShares > 0n ? (bal * p.myShares) / p.totalShares : 0n;
-          return { symbol, address: addr, decimals, balance: fmtUnits(bal, decimals), myBalance: fmtUnits(mine, decimals) };
+          // `raw` alongside the formatted value: price-impact maths needs the
+          // integer, and re-parsing a display string loses precision.
+          return {
+            symbol, address: addr, decimals, raw: bal.toString(),
+            balance: fmtUnits(bal, decimals), myBalance: fmtUnits(mine, decimals),
+          };
         }),
       };
     });
@@ -1139,13 +1145,40 @@ async function main() {
     if (!ammClient) { res.status(404).json({ ok: false, error: "AMM not deployed" }); return; }
     try {
       const poolId = Number(req.query.poolId ?? 0);
-      const [out, lpFee, appFee] = await ammClient.quote(
-        poolId,
-        req.query.tokenIn as Hex,
-        req.query.tokenOut as Hex,
-        BigInt((req.query.amountIn as string) ?? "0"),
-      );
-      res.json({ ok: true, out: out.toString(), lpFee: lpFee.toString(), appFee: appFee.toString() });
+      const tokenIn = req.query.tokenIn as Hex;
+      const tokenOut = req.query.tokenOut as Hex;
+      const amountIn = BigInt((req.query.amountIn as string) ?? "0");
+      const [out, lpFee, appFee] = await ammClient.quote(poolId, tokenIn, tokenOut, amountIn);
+
+      // What the trade costs beyond the fee. A shallow pool can quote a number
+      // that looks like an answer while returning almost nothing per unit, and
+      // a quote that doesn't say so is the front-end's failure, not the AMM's.
+      const pool = (lastAmm?.pools ?? []).find((p) => p.id === poolId) ?? null;
+      const reserveOf = (token: Hex) => {
+        const a = pool?.assets?.find((x: { address: string }) => x.address.toLowerCase() === token.toLowerCase());
+        return a ? { raw: BigInt(a.raw ?? "0"), decimals: Number(a.decimals ?? 18) } : null;
+      };
+      const rIn = reserveOf(tokenIn);
+      const rOut = reserveOf(tokenOut);
+      const impact = rIn && rOut
+        ? priceImpact(rIn.raw, rOut.raw, amountIn, out, rIn.decimals, rOut.decimals)
+        : null;
+      const suggested = impact && impact.severity === "severe" && rIn && rOut
+        ? maxInputWithin(
+            // Bisecting on the real curve, so the suggestion matches the contract.
+            (x) => (x * (rOut.raw) ) / (rIn.raw + x),
+            rIn.raw, rOut.raw, amountIn, rIn.decimals, rOut.decimals,
+          ).toString()
+        : null;
+
+      res.json({
+        ok: true,
+        out: out.toString(),
+        lpFee: lpFee.toString(),
+        appFee: appFee.toString(),
+        impact,
+        suggestedAmountIn: suggested,
+      });
     } catch (e) {
       res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -1561,10 +1594,25 @@ async function main() {
    * hiding it would make the split unverifiable. Everything is derived from the
    * collector's `Allocated` logs, so a reader can check it against the chain.
    * Cached briefly — it costs a windowed log scan. */
+  /* --------------------------------------------------------------------------
+   * App fees.
+   *
+   * Reading these means scanning the collector's `Allocated` logs across its
+   * whole life — the same windowed sweep the holder index does, and the same
+   * reason it must never sit on the request path: every RPC call in this
+   * process shares one ~5.5/s pacing gate with the live app, so an inline sweep
+   * is starved and the tab renders blank em-dashes forever.
+   *
+   * So the sweep runs on a timer and the endpoint only ever serves the last
+   * completed read, saying plainly when it has not finished one yet.
+   * ----------------------------------------------------------------------- */
   let feeCache: { at: number; body: unknown } | null = null;
-  app.get("/api/fees", async (_req, res) => {
-    if (!feeReader) { res.status(404).json({ ok: false, error: "fee collector not deployed" }); return; }
-    if (feeCache && Date.now() - feeCache.at < 30_000) { res.json(feeCache.body); return; }
+  let feeReading = false;
+  let feeError: string | null = null;
+
+  async function refreshFees(): Promise<void> {
+    if (!feeReader || feeReading) return;
+    feeReading = true;
     try {
       const r = await feeReader.read();
       const dec = r.decimals;
@@ -1601,11 +1649,34 @@ async function main() {
         block: r.block,
       };
       feeCache = { at: Date.now(), body };
-      res.json(body);
+      feeError = null;
     } catch (e) {
-      res.status(500).json({ ok: false, error: friendlyError(e) });
+      feeError = friendlyError(e);
+    } finally {
+      feeReading = false;
     }
+  }
+
+  app.get("/api/fees", (_req, res) => {
+    if (!feeReader) { res.status(404).json({ ok: false, error: "fee collector not deployed" }); return; }
+    if (feeCache) {
+      // Kick a refresh once the cached read is stale, but never wait on it.
+      if (Date.now() - feeCache.at > 60_000) void refreshFees();
+      res.json({ ...(feeCache.body as object), readAt: feeCache.at, refreshing: feeReading || undefined });
+      return;
+    }
+    void refreshFees();
+    res.json({
+      ok: false,
+      indexing: true,
+      error: feeError
+        ?? "Reading the collector's fee history from the chain. This is a one-off pass over its whole life; the figures appear here as soon as it lands.",
+    });
   });
+
+  // First pass shortly after boot, then keep it warm on the split cadence.
+  setTimeout(() => void refreshFees(), 12_000).unref?.();
+  setInterval(() => void refreshFees(), 5 * 60_000).unref?.();
 
   /** Run the split now, without waiting for the cadence. Owner-gated on-chain. */
   app.post("/api/fees/allocate", requireOperator, async (req, res) => {
@@ -1621,6 +1692,7 @@ async function main() {
         [],
       );
       feeCache = null;
+      void refreshFees();
       logTx(req, { category: "defi", action: "fee-allocate", status: "success", txHash, detail: "distributed app fees" });
       invalidateAll();
       res.json({ ok: true, txHash });
@@ -2030,11 +2102,16 @@ async function main() {
    * the contracts that are still running. Cached, because a windowed
    * `eth_getLogs` sweep across 500k blocks is not something to do on every poll.
    * ----------------------------------------------------------------------- */
-  const holderReader = new HolderReader(chain, rpcUrl, {
-    agent: agentAccount.address as Hex,
-    collector: (liveDeployment.tesseraFeeCollector as Hex) ?? undefined,
-    treasury: (owner?.account.address as Hex) ?? undefined,
-  });
+  const holderReader = new HolderReader(
+    chain,
+    rpcUrl,
+    {
+      agent: agentAccount.address as Hex,
+      collector: (liveDeployment.tesseraFeeCollector as Hex) ?? undefined,
+      treasury: (owner?.account.address as Hex) ?? undefined,
+    },
+    statePath(".tessera-holders.json"),
+  );
 
   /** The arguments a holder scan needs, in one place — boot warm-up uses them too. */
   const holderOpts = (poolId = 0) => ({

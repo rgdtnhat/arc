@@ -6,6 +6,16 @@ export interface Need {
   maxPrice: bigint; // USDC base units
   /** Relative importance, used when the budget is tight. */
   weight?: number;
+  /**
+   * Query arguments to send with the request.
+   *
+   * The DeFi services refuse to answer about nothing — asking for a health
+   * factor without naming an account is a question with no answer, and they
+   * return 503 rather than inventing one. `$self` is substituted with the
+   * agent's own address at call time, since the scenario is written before the
+   * wallet exists.
+   */
+  query?: Record<string, string>;
 }
 
 export interface AgentTask {

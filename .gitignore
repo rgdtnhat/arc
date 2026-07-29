@@ -22,6 +22,8 @@ deployments/arc.local.json
 # Per-host transaction ledger written at runtime — it records this deployment's
 # own wallet activity, so it belongs to the machine, not the repo.
 .tessera-txlog.json
+# Persisted holder-address index. A cache rebuilt from the chain, never truth.
+.tessera-holders.json
 deployments/arc.history.json
 # Scratch directory for local QA scripts; never part of the app.
 .tmpqa/
