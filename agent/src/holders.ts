@@ -54,6 +54,18 @@ export interface HolderReport {
   block: string;
   /** Set when the venue has no per-wallet positions at all (the swap desk). */
   note?: string;
+  /** A scan is running; these figures will be replaced. Poll again. */
+  scanning?: boolean;
+  /** Served from an older scan while a fresh one runs. */
+  stale?: boolean;
+}
+
+/** The shape returned before a venue has ever been scanned. */
+function emptyReport(kind: HolderKind): HolderReport {
+  const rankLabel = kind === "lending" ? "Supplied (USD)"
+    : kind === "amm" ? "LP shares"
+    : kind === "swap" ? "Inventory" : "Shares";
+  return { kind, contract: null, rankLabel, assets: [], holders: [], total: "0", partial: false, block: "0" };
 }
 
 /** Addresses that belong to the app rather than to a user. */
@@ -68,6 +80,8 @@ export class HolderReader {
   private readonly scanner: ArchiveScanner;
   /** Log scans are expensive on a throttled RPC; serve a recent one instead. */
   private cache = new Map<string, { at: number; report: HolderReport }>();
+  /** Scans in flight, so N pollers cause one sweep rather than N. */
+  private scans = new Map<string, Promise<HolderReport>>();
 
   constructor(
     private readonly chain: Chain,
@@ -106,11 +120,50 @@ export class HolderReader {
   ): Promise<HolderReport> {
     const key = `${kind}:${opts.poolId ?? 0}`;
     const hit = this.cache.get(key);
-    if (!opts.force && hit && Date.now() - hit.at < this.ttlMs) return hit.report;
+    const fresh = hit && Date.now() - hit.at < this.ttlMs && !opts.force;
+    if (fresh) return { ...hit!.report, scanning: this.scans.has(key) || undefined };
 
-    const report = await this.build(kind, opts);
-    this.cache.set(key, { at: Date.now(), report });
-    return report;
+    // Never make a caller wait on the scan. It walks the contract's whole
+    // history in windowed getLogs calls and takes about a minute — long enough
+    // that a phone browser or a reverse proxy gives up first, which is exactly
+    // what "Failed to fetch" was. Kick it off, answer immediately with whatever
+    // is known, and let the client poll until `scanning` clears.
+    this.startScan(key, kind, opts);
+    if (hit) return { ...hit.report, stale: true, scanning: true };
+    return { ...emptyReport(kind), scanning: true };
+  }
+
+  /** One scan per venue at a time; extra callers join the one in flight. */
+  private startScan(
+    key: string,
+    kind: HolderKind,
+    opts: Parameters<HolderReader["read"]>[1],
+  ): Promise<HolderReport> {
+    const running = this.scans.get(key);
+    if (running) return running;
+    const job = this.build(kind, opts)
+      .then((report) => {
+        this.cache.set(key, { at: Date.now(), report });
+        return report;
+      })
+      .catch((err) => {
+        // Remember the failure too, so the UI can show a reason instead of
+        // spinning forever, and so a broken RPC isn't retried on every poll.
+        const report = {
+          ...emptyReport(kind),
+          note: `Could not read holders: ${err instanceof Error ? err.message : String(err)}`,
+        };
+        this.cache.set(key, { at: Date.now(), report });
+        return report;
+      })
+      .finally(() => this.scans.delete(key));
+    this.scans.set(key, job);
+    return job;
+  }
+
+  /** Block until the venue's scan has completed at least once. Used at boot. */
+  async warm(kind: HolderKind, opts: Parameters<HolderReader["read"]>[1]): Promise<void> {
+    await this.startScan(`${kind}:${opts.poolId ?? 0}`, kind, opts).catch(() => {});
   }
 
   private async build(

@@ -1634,16 +1634,28 @@ const $ = (id) => document.getElementById(id);
           st.report = r;
           st.rows = r.holders || [];
           st.assets = r.assets || [];
-          st.page = 1;
+          if (!opts || !opts.keepPage) st.page = 1;
           renderHolders(key);
+
+          // The server answers straight away and scans in the background, so a
+          // slow sweep can never time out the request. Poll until it lands.
+          if (r.scanning) {
+            clearTimeout(st.pollTimer);
+            st.pollTimer = setTimeout(() => loadHolders(key, { keepPage: true }), 4000);
+          }
           if (note) {
             // A short log scan under-reports *who*, never *how much*. Say so —
             // a leaderboard quietly missing its biggest holder is worse than
             // one that admits the scan was incomplete.
             const parts = [];
             if (r.note) parts.push(r.note);
+            if (r.scanning) {
+              parts.push(r.stale
+                ? "Refreshing from the chain — showing the previous scan until it finishes."
+                : "Reading the contract's full history — this takes about a minute the first time.");
+            }
             if (r.partial) parts.push("The log scan hit its window budget, so some holders may be missing. Balances shown are exact.");
-            else if (st.rows.length) parts.push(`Read at block ${r.block}.`);
+            else if (st.rows.length && !r.scanning) parts.push(`Read at block ${r.block}.`);
             note.className = r.partial ? "feedNote bad" : "feedNote";
             note.textContent = parts.join(" ");
           }
@@ -1665,9 +1677,12 @@ const $ = (id) => document.getElementById(id);
         if (head && st.report) head.textContent = st.report.rankLabel || "Share";
 
         if (!st.rows.length) {
-          body.innerHTML = `<tr><td colspan="5" class="muted">${
-            st.report && st.report.note ? "" : "No positions yet — the first deposit shows up here."
-          }</td></tr>`;
+          const why = st.report && st.report.scanning
+            ? "Reading holders from the chain — this walks the contract's full history, so the first load takes a moment."
+            : st.report && st.report.note
+              ? ""
+              : "No positions yet — the first deposit shows up here.";
+          body.innerHTML = `<tr><td colspan="5" class="muted">${esc(why)}</td></tr>`;
           $(`hold${key}Pager`).innerHTML = "";
           return;
         }
@@ -1835,10 +1850,88 @@ const $ = (id) => document.getElementById(id);
         if (sel) sel.addEventListener("change", () => loadVenueChart(key));
       }
 
+      /* --- reserve prices, and the drift from the live market ------------ */
+
+      async function loadPoolPrices() {
+        const body = $("poolPriceRows");
+        if (!body) return;
+        const note = $("poolPriceNote");
+        try {
+          const r = await (await fetch("/api/lending/prices")).json();
+          if (!r.ok) throw new Error(r.error || "unavailable");
+          if (r.supported === false) {
+            // Not a failure — this pool simply predates the price surface.
+            body.innerHTML = `<tr><td colspan="5" class="muted">Reserve prices are not exposed by this pool.</td></tr>`;
+            if (note) { note.className = "feedNote"; note.textContent = r.note || ""; }
+            return;
+          }
+          body.innerHTML = r.assets
+            .map((a) => {
+              const pool = a.onChainUsd === null ? "—" : `$${a.onChainUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+              const mkt = a.marketUsd === null ? "—" : `$${a.marketUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+              const drift = a.driftPct === null
+                ? `<td class="num flat">—</td>`
+                : `<td class="num ${a.stale ? "down" : "flat"}">${a.driftPct >= 0 ? "+" : ""}${a.driftPct.toFixed(2)}%</td>`;
+              // Only offer the button where there is a market price to sync to.
+              const action = r.canSet && a.marketUsd !== null
+                ? `<button class="btn" data-syncprice="${esc(a.address)}" data-usd="${a.marketUsd}">Sync to market</button>`
+                : "";
+              return `<tr class="${a.stale ? "selfRow" : ""}">
+                <td><b>${esc(a.symbol)}</b></td>
+                <td class="num mono">${pool}</td>
+                <td class="num mono">${mkt}</td>
+                ${drift}
+                <td class="num">${action}</td>
+              </tr>`;
+            })
+            .join("");
+
+          body.querySelectorAll("[data-syncprice]").forEach((b) =>
+            b.addEventListener("click", async () => {
+              b.disabled = true;
+              const prev = b.textContent;
+              b.textContent = "Setting…";
+              try {
+                const q = `asset=${encodeURIComponent(b.dataset.syncprice)}&usd=${encodeURIComponent(b.dataset.usd)}`;
+                const res = await (await postAuthed(`/api/lending/admin/price?${q}`)).json();
+                if (note) {
+                  note.className = res.ok ? "feedNote" : "feedNote bad";
+                  note.textContent = res.ok ? `Repriced — tx ${res.txHash}` : res.error || "failed";
+                }
+                if (res.ok) { loadPoolPrices(); afterTx(); }
+              } catch (e) {
+                if (note) { note.className = "feedNote bad"; note.textContent = String(e.message || e); }
+              } finally {
+                b.disabled = false;
+                b.textContent = prev;
+              }
+            }),
+          );
+
+          const stale = r.assets.filter((a) => a.stale);
+          if (note && !note.textContent.startsWith("Repriced")) {
+            note.className = stale.length ? "feedNote bad" : "feedNote";
+            note.textContent = stale.length
+              ? `${stale.map((a) => a.symbol).join(", ")} ${stale.length === 1 ? "is" : "are"} more than 5% away from the market. ` +
+                "Borrow limits and liquidation thresholds are computed from the pool price, so this gap is real money."
+              : "Pool prices are in line with the market feed.";
+          }
+        } catch (e) {
+          body.innerHTML = `<tr><td colspan="5" class="muted">Could not read reserve prices.</td></tr>`;
+          if (note) { note.className = "feedNote bad"; note.textContent = String(e.message || e); }
+        }
+      }
+
       /** Everything one DeFi tab needs beyond its own card. */
       function loadVenuePanels(key) {
+        // Only the visible venue polls; leaving a tab mid-scan shouldn't keep
+        // a timer alive for a card nobody is looking at.
+        for (const other of Object.keys(HOLD_VENUES)) {
+          if (other !== key) clearTimeout(holdState[other].pollTimer);
+        }
         loadHolders(key);
         loadVenueChart(key);
+        if (key === "Lending") loadPoolPrices();
       }
 
       /** Reverse a swap pair. Two selects, one click — the common second trade. */

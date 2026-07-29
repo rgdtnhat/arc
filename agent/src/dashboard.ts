@@ -2061,7 +2061,7 @@ async function main() {
    */
   setTimeout(() => {
     for (const kind of ["lending", "vault", "amm", "swap"] as HolderKind[]) {
-      holderReader.read(kind, holderOpts()).catch(() => {});
+      holderReader.warm(kind, holderOpts()).catch(() => {});
     }
   }, 5_000).unref?.();
 
@@ -2535,6 +2535,137 @@ async function main() {
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* --------------------------------------------------------------------------
+   * Reserve prices: what the pool thinks an asset is worth, versus the market.
+   *
+   * Arc testnet has no BTC oracle, so cirBTC is priced by an operator-set
+   * constant written at deploy time — 95,000 USD. Bitcoin does not stay at
+   * 95,000, and a stale collateral price is not cosmetic: it is what decides
+   * how much someone can borrow and when they get liquidated. This surfaces the
+   * drift and gives the operator a one-click way to close it, using the app's
+   * own live market feed as the source.
+   * ----------------------------------------------------------------------- */
+  /**
+   * Does the deployed pool expose its prices at all?
+   *
+   * The ABI in this build is newer than the bytecode on Arc. `price()` and
+   * `setPrice()` reverting for every asset is indistinguishable from a pool
+   * with no reserves, so read the selectors out of the code and say which it
+   * is. Cached — a contract's code doesn't change.
+   */
+  const POOL_PRICE_SEL = toFunctionSelector("function price(address)").slice(2);
+  const POOL_SET_PRICE_SEL = toFunctionSelector("function setPrice(address,uint256)").slice(2);
+  let poolPriceSupport: { read: boolean; write: boolean } | null = null;
+  const poolSupportsPrices = async () => {
+    if (poolPriceSupport) return poolPriceSupport;
+    if (!poolDeployment) return { read: false, write: false };
+    const code = String((await client.public.getCode({ address: poolDeployment.poolAddress })) ?? "").toLowerCase();
+    poolPriceSupport = { read: code.includes(POOL_PRICE_SEL), write: code.includes(POOL_SET_PRICE_SEL) };
+    return poolPriceSupport;
+  };
+
+  app.get("/api/lending/prices", async (_req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    try {
+      const support = await poolSupportsPrices();
+      if (!support.read) {
+        res.json({
+          ok: true,
+          supported: false,
+          canSet: false,
+          assets: [],
+          note:
+            "This pool was deployed before it exposed its reserve prices, so they can't be read or " +
+            "changed from here. It still values collateral internally — borrow limits and health " +
+            "factors are correct — but a stale manual price can only be fixed by redeploying the pool.",
+        });
+        return;
+      }
+      const assets = poolDeployment.assets;
+      const [onChain, market] = await Promise.all([
+        client.public.multicall({
+          contracts: assets.map(
+            (a) => ({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [a.address] }) as const,
+          ) as never,
+          allowFailure: true,
+        }),
+        feeds.crypto().catch(() => ({ ok: false, data: [] as { symbol: string; price: number }[] })),
+      ]);
+
+      // Map a reserve symbol to the feed's. Stablecoins are pegged, so their
+      // market price is 1 by definition rather than by lookup.
+      const marketFor = (symbol: string): number | null => {
+        const s = symbol.toUpperCase();
+        if (s === "USDC" || s === "USDT" || s === "DAI") return 1;
+        if (s === "EURC") return null; // an FX rate, not a crypto quote
+        const wanted = s.replace(/^CIR/, "").replace(/^W/, ""); // cirBTC -> BTC
+        const rows = (market as { data?: { symbol: string; price: number }[] }).data ?? [];
+        const hit = rows.find((r) => String(r.symbol).toUpperCase() === wanted);
+        return hit && Number.isFinite(hit.price) ? hit.price : null;
+      };
+
+      res.json({
+        ok: true,
+        supported: true,
+        // Only offer the button when the deployed code actually has the setter.
+        canSet: Boolean(owner) && support.write,
+        assets: assets.map((a, i) => {
+          const row = onChain[i];
+          const raw = row?.status === "success" ? (row.result as bigint) : null;
+          const onChainUsd = raw === null ? null : Number(raw) / 1e8;
+          const marketUsd = marketFor(a.symbol);
+          const driftPct =
+            onChainUsd && marketUsd ? ((marketUsd - onChainUsd) / onChainUsd) * 100 : null;
+          return {
+            symbol: a.symbol,
+            address: a.address,
+            onChainUsd,
+            marketUsd,
+            driftPct,
+            // Flagged rather than judged silently: a double-digit gap on a
+            // collateral asset is the difference between a safe position and a
+            // liquidatable one.
+            stale: driftPct !== null && Math.abs(driftPct) >= 5,
+          };
+        }),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Set a reserve's manual USD price. Ignored by the pool once a feed exists. */
+  app.post("/api/lending/admin/price", requireOperator, async (req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    const asset = String(req.query.asset ?? req.body?.asset ?? "") as Hex;
+    const usd = Number(req.query.usd ?? req.body?.usd ?? NaN);
+    if (!(await poolSupportsPrices()).write) {
+      res.status(409).json({
+        ok: false,
+        error: "This pool was deployed before setPrice existed — redeploy the pool to reprice a reserve.",
+      });
+      return;
+    }
+    try {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(asset)) throw new Error("Pick a reserve to reprice.");
+      if (!Number.isFinite(usd) || usd <= 0) throw new Error("Enter a price above zero.");
+      // PRICE_SCALE is 1e8. Round rather than truncate: dropping the fraction on
+      // a 95,000 asset is a silent 1-cent haircut on every valuation.
+      const scaled = BigInt(Math.round(usd * 1e8));
+      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setPrice", [asset, scaled]);
+      logTx(req, {
+        category: "defi", action: "set-price", status: "success", txHash,
+        detail: `repriced ${assetMeta(asset).symbol} to $${usd}`,
+      });
+      await refreshAll();
+      res.json({ ok: true, txHash, usd });
+    } catch (e) {
+      logTx(req, { category: "defi", action: "set-price", status: "failed", detail: friendlyError(e) });
+      res.status(500).json({ ok: false, error: friendlyError(e) });
     }
   });
 

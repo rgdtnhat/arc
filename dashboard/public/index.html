@@ -1237,6 +1237,23 @@
           <!-- Who holds this venue, largest first, plus the venue's own daily
                fee history. Both are read from the chain; a short log scan is
                reported rather than silently dropping holders. -->
+          <!-- Arc testnet has no BTC oracle, so cirBTC is priced by a constant
+               set at deploy time. A stale collateral price decides borrow
+               limits and liquidations, so the drift is shown, not buried. -->
+          <div class="card" id="poolPriceCard">
+            <h2>🎯 Reserve prices — what the pool values collateral at</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
+              These prices set every borrow limit and every liquidation threshold. Where no on-chain
+              feed exists the pool uses a manually-set price, which does not move with the market —
+              so it is compared against the app's own live feed here.
+            </div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr><th>Asset</th><th class="num">Pool price</th><th class="num">Market</th><th class="num">Drift</th><th></th></tr></thead>
+              <tbody id="poolPriceRows"></tbody>
+            </table></div>
+            <p class="feedNote" id="poolPriceNote" style="margin-top:8px"></p>
+          </div>
+
           <div class="card" id="holdLendingCard">
             <h2>👥 Suppliers — who is lending into this pool</h2>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">Every address the pool has ever credited, ranked by the pool's own USD valuation of their supply — the same figure it lends and liquidates against.</div>
@@ -1298,9 +1315,6 @@
             </div>
             <div class="kv" id="vaultMsg" style="margin-top:11px;display:none"></div>
           </div>
-        </div>
-
-        <!-- ---------- AGENT TRANSACTIONS ---------- -->
 
           <!-- Who holds this venue, largest first, plus the venue's own daily
                fee history. Both are read from the chain; a short log scan is
@@ -1549,6 +1563,7 @@
               </div>
             </div>
           </div>
+          </div><!-- /#paneDefi -->
 
 <div class="tabPane" id="paneAgents" hidden>
           <!-- ================= AGENT WORKSPACE =================
