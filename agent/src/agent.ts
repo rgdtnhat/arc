@@ -12,6 +12,7 @@ import {
   decideByLlm,
   decideByRules,
   passesQuality,
+  quoteMatchesOffer,
   trustScore,
   type AgentTask,
   type Decision,
@@ -327,6 +328,23 @@ export class TesseraAgent {
       return entry;
     }
 
+    // 1b) The quote — not the catalog entry — is what gets escrowed, so it has
+    //     to be checked against what the policy gate actually approved. This is
+    //     the last point before funds move; every spending path passes here.
+    const match = quoteMatchesOffer(quote, svc);
+    if (!match.ok) {
+      entry.status = "skipped";
+      entry.reason = match.reason;
+      this.emit({
+        level: "skip",
+        resource: svc.resource,
+        message: `Refusing ${svc.name} — ${match.reason}`,
+      });
+      return entry;
+    }
+    // Record what will actually move, which may be below the vetted price.
+    entry.price = quote.price;
+
     // 2) Escrow the payment on Arc. Chain time and wall time can skew either
     //    way (fast-mined blocks run ahead; idle local chains fall behind), so
     //    anchor the deadline to whichever clock is further ahead.
@@ -383,7 +401,7 @@ export class TesseraAgent {
         this.emit({
           level: "settle",
           resource: svc.resource,
-          message: `Verified (${quality.reason}) — released ${formatUsdc(svc.price)} USDC to provider`,
+          message: `Verified (${quality.reason}) — released ${formatUsdc(quote.price)} USDC to provider`,
           txHash: settleTx,
         });
       } else {
@@ -655,10 +673,17 @@ export class TesseraAgent {
     if (!provider || !price || !quoteHash || !deadline || !resource) return null;
 
     // Verify the provider's EIP-712 signature over the quote before trusting it.
+    // Required, not optional: when the signature headers merely gated the check,
+    // a provider could skip verification entirely by omitting them. Honest
+    // providers always sign (see providers/src/app.ts).
     const nonce = res.headers.get(HEADERS.quoteNonce) as Hex | null;
     const expiry = res.headers.get(HEADERS.quoteExpiry);
     const sig = res.headers.get(HEADERS.quoteSig) as Hex | null;
-    if (nonce && expiry && sig) {
+    if (!nonce || !expiry || !sig) {
+      this.emit({ level: "skip", resource, message: `Quote from ${svc.name} is unsigned — refusing to pay` });
+      return null;
+    }
+    {
       if (BigInt(expiry) < BigInt(Math.floor(Date.now() / 1000))) {
         this.emit({ level: "skip", resource, message: `Quote from ${svc.name} expired — skipping` });
         return null;
