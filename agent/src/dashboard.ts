@@ -658,8 +658,27 @@ async function main() {
    * return one plain sentence that says what to do next.
    */
   function friendlyError(err: unknown): string {
-    const raw = String((err as { shortMessage?: string; message?: string })?.shortMessage ?? (err as Error)?.message ?? err);
-    const s = raw.toLowerCase();
+    // Look everywhere viem might have put the revert reason. Reading only
+    // `shortMessage` was why every failed swap said "the contract rejected
+    // this transaction": viem puts a generic sentence there and the actual
+    // `require` string ("in", "slippage", "insufficient inventory") in
+    // `details`, `cause.reason` or the `metaMessages` block. Matching against
+    // the generic sentence meant the one useful fact was thrown away.
+    const e = err as {
+      shortMessage?: string;
+      message?: string;
+      details?: string;
+      metaMessages?: string[];
+      cause?: { reason?: string; shortMessage?: string; details?: string; message?: string };
+    };
+    const parts = [
+      e?.shortMessage, e?.details, e?.cause?.reason, e?.cause?.shortMessage,
+      e?.cause?.details, ...(e?.metaMessages ?? []), e?.message,
+    ].filter((x): x is string => typeof x === "string" && x.length > 0);
+    const raw = parts[0] ?? String(err);
+    // The whole haystack is searched, so a specific reason wins over the
+    // generic "reverted" that always accompanies it.
+    const s = (parts.join(" | ") || String(err)).toLowerCase();
     const table: [RegExp, string][] = [
       [/request limit|rate limit|too many requests|429|-32005/, "The Arc network is rate-limiting us right now. Wait a few seconds and try again."],
       [/timeout|timed out|fetch failed|socket|econnreset|network/, "Couldn't reach the Arc network. Check your connection and try again."],
@@ -674,7 +693,11 @@ async function main() {
       [/zero ?amount|zero in|zero out|no shares|\bzero\b/, "Enter an amount greater than zero."],
       [/not borrowable/, "That asset can't be borrowed from this pool."],
       [/unknownreserve/, "That asset isn't a reserve in this pool."],
-      [/allowance|transferfrom/, "Token approval failed — the wallet may not hold enough of that token."],
+      [/\breverted with the following reason:\s*in\b|"in"/, "The desk couldn't take your input token — approve it for the swap desk first, and check the balance."],
+      [/\breverted with the following reason:\s*out\b|"out"/, "The desk couldn't send the output token. Its inventory may have moved since the quote — get a fresh quote."],
+      [/app fee/, "The desk couldn't pay the app's fee out of the output token. Its inventory is short by the fee amount — try a smaller trade."],
+      [/amm returned nothing/, "The AMM had nothing to fill this with. The pool is empty for that pair."],
+      [/allowance|transferfrom/, "Token approval failed — approve the spender first, or check the wallet holds enough of that token."],
       [/exceeds balance|insufficient balance|\bbalance\b/, "Not enough balance for that amount."],
       [/insufficient funds|gas required|out of gas/, "Not enough USDC to cover network fees. Top up the wallet at faucet.circle.com."],
       [/nonce/, "A previous transaction is still settling. Wait a moment and try again."],
@@ -1352,7 +1375,57 @@ async function main() {
       const tokenOut = req.query.tokenOut as Hex;
       const amountIn = BigInt((req.query.amountIn as string) ?? "0");
       const [out, fee, appFee] = await swapClient.quote(tokenIn, tokenOut, amountIn);
-      res.json({ ok: true, out: out.toString(), fee: fee.toString(), appFee: appFee.toString() });
+
+      /* Preflight. A quote proves the desk can *price* the trade; it says
+       * nothing about whether the trade would go through. The two things that
+       * actually stop it are invisible from the quote: the desk needs
+       * `amountOut + appFee` of the output token (not just `amountOut`, which
+       * is what the inventory table shows), and the caller has to have approved
+       * the desk for the input. Both were showing up as "the contract rejected
+       * this transaction" after the fact. */
+      const need = out + appFee;
+      const [deskHas, allowance, callerHas] = (await client.public.multicall({
+        contracts: [
+          { address: tokenOut, abi: erc20Abi, functionName: "balanceOf", args: [swapClient.swap] },
+          { address: tokenIn, abi: erc20Abi, functionName: "allowance", args: [agentAccount.address, swapClient.swap] },
+          { address: tokenIn, abi: erc20Abi, functionName: "balanceOf", args: [agentAccount.address] },
+        ] as never,
+        allowFailure: true,
+      })).map((r) => (r?.status === "success" ? (r.result as bigint) : 0n));
+
+      // Where it would fill. `ammPoolId` alone isn't enough — a desk deployed
+      // before the fallback existed has no `amm` at all, so probe the code.
+      const routed = deskHas < need;
+      const ammWired = await swapClient.hasAmmFallback().catch(() => false);
+      const outMeta = assetMeta(tokenOut);
+      const inMeta = assetMeta(tokenIn);
+
+      const blockers: string[] = [];
+      if (routed && !ammWired) {
+        blockers.push(
+          `The desk holds ${fmtUnits(deskHas, outMeta.decimals)} ${outMeta.symbol} but needs ` +
+          `${fmtUnits(need, outMeta.decimals)} (output plus the app's fee), and it has no AMM fallback ` +
+          `configured — so this reverts with "insufficient inventory". Trade a smaller amount, add ` +
+          `inventory, or wire the AMM.`,
+        );
+      }
+      if (callerHas < amountIn) {
+        blockers.push(`The wallet holds ${fmtUnits(callerHas, inMeta.decimals)} ${inMeta.symbol}, less than the ${fmtUnits(amountIn, inMeta.decimals)} being sold.`);
+      }
+
+      res.json({
+        ok: true,
+        out: out.toString(),
+        fee: fee.toString(),
+        appFee: appFee.toString(),
+        // What the desk must part with, which is more than `out`.
+        needed: need.toString(),
+        deskBalance: deskHas.toString(),
+        route: routed ? (ammWired ? "amm" : "blocked") : "inventory",
+        ammWired,
+        approvalNeeded: allowance < amountIn,
+        blockers,
+      });
     } catch (e) {
       res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }

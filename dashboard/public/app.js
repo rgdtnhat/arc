@@ -1329,12 +1329,27 @@ const $ = (id) => document.getElementById(id);
         const fee = fmtUnitsJs(r.fee, s.decOut);
         const appFee = fmtUnitsJs(r.appFee, s.decOut);
         const eff = Number(out) > 0 && Number(human) > 0 ? (Number(out) / Number(human)) : 0;
+        // What the desk must actually part with — output *plus* the app's fee.
+        // The inventory table shows its balance, which is why a trade that looked
+        // affordable reverted: the fee pushes the requirement above it.
+        const needed = r.needed ? fmtUnitsJs(r.needed, s.decOut) : out;
+        const routeNote =
+          r.route === "amm" ? " · filling from the AMM (price moves with size)"
+          : r.route === "inventory" ? " · filling from desk inventory at the oracle price"
+          : "";
         $("swQuoteOut").innerHTML =
           `You pay <b>${esc(human)} ${esc(s.symIn)}</b> → you receive <b>${esc(out)} ${esc(s.symOut)}</b><br>` +
           `<span style="font-weight:400;color:var(--muted)">effective rate 1 ${esc(s.symIn)} = ` +
           `${eff ? eff.toPrecision(6) : "—"} ${esc(s.symOut)} · total fee ${esc(fee)} ${esc(s.symOut)} ` +
-          `(app keeps ${esc(appFee)}) · 1% max slippage</span>`;
-        return { ...s, amountIn, out: r.out };
+          `(app keeps ${esc(appFee)}) · desk parts with ${esc(needed)} ${esc(s.symOut)}` +
+          `${routeNote} · 1% max slippage</span>` +
+          // Say up front what would revert, instead of after the fact.
+          ((r.blockers || []).length
+            ? `<div style="margin-top:8px;font-weight:400;font-size:12px;color:var(--warn)">${
+                r.blockers.map((b) => esc(b)).join("<br>")
+              }</div>`
+            : "");
+        return { ...s, amountIn, out: r.out, blockers: r.blockers || [] };
       }
       function fmtUnitsJs(raw, dec) {
         const s = String(raw).padStart(dec + 1, "0");
@@ -1344,6 +1359,29 @@ const $ = (id) => document.getElementById(id);
       // Refresh the rate/balance line whenever either side changes.
       $("swIn").addEventListener("change", () => { renderSwapBalances(); $("swQuoteOut").textContent = ""; });
       $("swOut").addEventListener("change", () => { renderSwapBalances(); $("swQuoteOut").textContent = ""; });
+      /**
+       * Max on the swap desk: your whole balance of the input asset.
+       *
+       * Prefers the connected wallet's own figure when self-custody is on —
+       * filling the agent's balance into a form that will spend the user's is a
+       * quote for a trade they cannot make.
+       */
+      if ($("swMax")) {
+        $("swMax").addEventListener("click", () => {
+          const s = swapSelected();
+          if (!s) return;
+          const ai = swAsset(s.tokenIn);
+          const mine = window.__myTokenIn;
+          const bal = mine != null ? mine : ai && ai.wallet;
+          if (bal == null || !(parseFloat(bal) > 0)) {
+            $("swQuoteOut").textContent = `No ${ai ? ai.symbol : "input"} balance to sell.`;
+            return;
+          }
+          $("swAmount").value = String(bal);
+          swapQuote();
+        });
+      }
+
       $("swQuote").addEventListener("click", swapQuote);
       /* Auto-quote while typing. A stale quote is a real risk — the rate could
        * have moved since it was fetched — so the figure refreshes as the amount
@@ -1493,7 +1531,7 @@ const $ = (id) => document.getElementById(id);
         feeDailyCache = null; // this tab is the authority; re-read for everyone
         const note = $("feeChartNote");
         try {
-          const r = await (await fetch("/api/fees")).json();
+          const r = await feeDaily({ fresh: true });
           const notReady = $("feesNotReady");
           if (!r.ok && r.indexing) {
             // Not an error: the first pass over the collector's history hasn't
@@ -1513,8 +1551,17 @@ const $ = (id) => document.getElementById(id);
           }
           if (notReady) notReady.style.display = "none";
 
-          $("feePending").textContent = r.pending + " USDC";
-          $("feeTotal").textContent = r.totals.total + " USDC";
+          /** Full 6dp, because app fees are fractions of a cent per call. */
+          const usd6 = (v) => {
+            const n = Number(v);
+            if (!Number.isFinite(n)) return String(v);
+            if (n === 0) return "0.000000";
+            // Below a millionth of a dollar there is nothing left to show in
+            // USDC's 6 decimals; say it is non-zero rather than printing 0.
+            return n > 0 && n < 0.000001 ? "<0.000001" : n.toFixed(6);
+          };
+          $("feePending").textContent = usd6(r.pending) + " USDC";
+          $("feeTotal").textContent = usd6(r.totals.total) + " USDC";
           const secs = Number(r.secondsUntilAllocatable);
           $("feeNext").textContent =
             secs <= 0 ? "ready now" : secs < 3600 ? `${Math.round(secs / 60)}m` : `${Math.round(secs / 3600)}h`;
@@ -1531,7 +1578,7 @@ const $ = (id) => document.getElementById(id);
             .map(([label, bps, got]) =>
               `<tr><td><b>${esc(label)}</b></td>` +
               `<td class="num">${esc((Number(bps) / 100).toFixed(0))}%</td>` +
-              `<td class="num">${esc(got)}</td></tr>`)
+              `<td class="num mono">${esc(usd6(got))}</td></tr>`)
             .join("");
 
           renderFeeChart(r.daily);
@@ -1544,8 +1591,14 @@ const $ = (id) => document.getElementById(id);
           // The operator controls spend the deployer key, so they are gated.
           const admin = $("feeAdmin");
           if (admin) admin.style.display = adminId ? "" : "none";
-        } catch {
-          if (note) { note.className = "feedNote bad"; note.textContent = "Couldn't reach the server."; }
+        } catch (e) {
+          // Say what actually went wrong. "Couldn't reach the server" was a
+          // guess, and it was wrong for every render failure — which is exactly
+          // the case that leaves every figure showing an em-dash.
+          const why = String((e && e.message) || e);
+          if (note) { note.className = "feedNote bad"; note.textContent = `Could not render the fee report: ${why}`; }
+          const nr = $("feesNotReady");
+          if (nr) { nr.style.display = ""; nr.textContent = `Fee report failed to render: ${why}`; }
         } finally {
           feesLoading = false;
         }
@@ -1794,11 +1847,15 @@ const $ = (id) => document.getElementById(id);
       /* --- the per-venue daily fee chart -------------------------------- */
 
       /** Cached once per load; all four venue charts read the same report. */
-      async function feeDaily() {
-        if (feeDailyCache) return feeDailyCache;
+      async function feeDaily(opts) {
+        if (feeDailyCache && !(opts && opts.fresh)) return feeDailyCache;
         try {
-          const r = await (await fetch("/api/fees")).json();
-          feeDailyCache = r.ok ? r : { ok: false, error: r.error };
+          const res = await fetch("/api/fees");
+          const r = await res.json();
+          // Keep the whole body either way. Reducing a failure to {ok,error}
+          // threw away `indexing`, which is the difference between "no fees" and
+          // "still reading the history".
+          feeDailyCache = r.ok ? r : { ...r, ok: false, error: r.error || `HTTP ${res.status}` };
         } catch (e) {
           feeDailyCache = { ok: false, error: String(e.message || e) };
         }
@@ -2307,6 +2364,37 @@ const $ = (id) => document.getElementById(id);
          */
         const amImpactAck = new Set();
         const amAckKey = (q) => `${q.poolId}:${q.tokenIn}:${q.tokenOut}:${q.amountIn}`;
+
+        /**
+         * Max on the AMM: your whole balance of the input asset.
+         *
+         * Deliberately does *not* cap at the impact threshold — you asked for
+         * your maximum, and the quote will tell you what it costs and refuse to
+         * execute if it is severe. Silently shrinking the number would be the
+         * form lying about what it filled in.
+         */
+        if ($("amMax")) {
+          $("amMax").addEventListener("click", async () => {
+            const p = amSelected();
+            if (!p) return;
+            const tokenIn = $("amSwapIn").value;
+            const ai = amAsset(p, tokenIn);
+            // In self-custody the user's own wallet pays, so its balance is the
+            // ceiling. Otherwise fall back to the pool-share figure the operator
+            // path spends from. `myBalance` is a share of the pool, not a wallet
+            // balance — using it in self-custody mode would offer to trade money
+            // the signer doesn't have.
+            const wallet = await amWalletBalances(p).catch(() => null);
+            const idx = p.assets.findIndex((a) => a.address === tokenIn);
+            const bal = wallet && idx >= 0 ? wallet[idx] : ai && ai.myBalance;
+            if (bal == null || !(parseFloat(bal) > 0)) {
+              $("amSwapQuote").textContent = `No ${ai ? ai.symbol : "input"} balance to trade.`;
+              return;
+            }
+            $("amSwapAmount").value = String(bal);
+            ammQuote();
+          });
+        }
 
         $("amSwapExec").addEventListener("click", async () => {
           const msg = $("ammMsg");
@@ -3794,7 +3882,9 @@ const $ = (id) => document.getElementById(id);
             (n) =>
               `<div style="padding:9px 0;border-bottom:1px solid var(--line)">` +
               // rel=noopener so a publisher's page can't touch this one.
-              `<a href="${esc(n.link)}" target="_blank" rel="noopener noreferrer" style="font-size:13.5px;font-weight:600">${esc(n.title)}</a>` +
+              // nofollow as well: we are not vouching for the destination, and a
+              // compromised publisher page shouldn't inherit our ranking signal.
+              `<a href="${esc(n.link)}" target="_blank" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer" style="font-size:13.5px;font-weight:600">${esc(n.title)}</a>` +
               `<span style="display:block;color:var(--muted);font-size:11.5px;margin-top:3px">` +
               `<span class="tag">${esc(n.topic)}</span> ${esc(n.source)} · ${esc(ago(n.publishedAt))}</span></div>`,
           )

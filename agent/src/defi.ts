@@ -124,11 +124,39 @@ export class VaultClient {
 /** `fund(address,uint256)` and `seed(address,uint256)` — see `fundInventory`. */
 const FUND_SELECTOR = "7b1837de";
 const SEED_SELECTOR = "5684d86a";
+/** `amm()` — present only on desks built with the AMM fallback. */
+const AMM_GETTER_SELECTOR = "2a943945";
 
 /** Client for the TesseraSwap (oracle-priced swap desk). */
 export class SwapClient {
   readonly public: PublicClient;
   readonly wallet: WalletClient;
+  /** Probed once from the deployed bytecode; a contract's code never changes. */
+  private ammFallback: boolean | null = null;
+
+  /**
+   * Does the *deployed* desk have the AMM fallback, and is it wired to one?
+   *
+   * The ABI in this build has it; a desk deployed earlier does not, and on that
+   * desk a trade the inventory can't cover reverts with "insufficient
+   * inventory" no matter how much liquidity the AMM holds. Reading the selector
+   * out of the code is the only way to tell — an `amm()` call on a contract
+   * without the getter and one that returns the zero address are equally empty.
+   */
+  async hasAmmFallback(): Promise<boolean> {
+    if (this.ammFallback !== null) return this.ammFallback;
+    const code = String((await this.public.getCode({ address: this.swap })) ?? "").toLowerCase();
+    if (!code.includes(AMM_GETTER_SELECTOR)) {
+      this.ammFallback = false;
+      return false;
+    }
+    const amm = await this.public
+      .readContract({ address: this.swap, abi: tesseraSwapAbi, functionName: "amm" })
+      .catch(() => null);
+    this.ammFallback = typeof amm === "string" && /^0x[0-9a-f]{40}$/i.test(amm) && BigInt(amm) !== 0n;
+    return this.ammFallback;
+  }
+
   constructor(
     private readonly cfg: Cfg,
     readonly swap: Hex,

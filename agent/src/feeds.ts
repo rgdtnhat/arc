@@ -828,6 +828,84 @@ export const NEWS_TOPICS: Record<string, string[]> = {
   biology: ["https://phys.org/rss-feed/biology-news/"],
 };
 
+/**
+ * Hosts a headline is allowed to come from, and to link to.
+ *
+ * Derived from NEWS_TOPICS rather than written out again, so the two can't drift.
+ *
+ * On "can you scan for viruses": scanning this text would be the wrong control.
+ * A headline is a string; it cannot execute. The three things that can actually
+ * hurt someone here are (1) markup injected through a feed and rendered as HTML,
+ * (2) a link that leads somewhere hostile, and (3) a feed URL that redirects off
+ * the sources we chose. Each has a real defence, and none of them is a virus
+ * scanner:
+ *
+ *   (1) nothing from a feed is ever inserted as markup — every field is escaped
+ *       by the client, and `parseFeed` strips tags before it gets that far;
+ *   (2) a link is rendered only when its host is on this list, so a headline
+ *       cannot send anyone to an arbitrary domain;
+ *   (3) fetches use redirect: "follow" but the final URL's host is re-checked
+ *       against this list, so a hijacked feed that 302s elsewhere is dropped.
+ */
+export const NEWS_HOSTS: ReadonlySet<string> = new Set([
+  // Registrable domains, because a feed and the articles it links to are often
+  // on different hosts of the same publisher. BBC is the clearest case: the feed
+  // is `feeds.bbci.co.uk`, every article is `www.bbc.co.uk`. Deriving the list
+  // from feed URLs alone dropped almost every BBC link.
+  "bbc.co.uk",
+  "bbci.co.uk",
+  "arstechnica.com",
+  "ycombinator.com",
+  "hnrss.org",
+  "phys.org",
+  "cointelegraph.com",
+  "coindesk.com",
+  "marketwatch.com",
+  "dowjones.io",
+  "wsj.com",
+  "lifehacker.com",
+  "theguardian.com",
+  "krebsonsecurity.com",
+  "bleepingcomputer.com",
+  "nasa.gov",
+]);
+
+/**
+ * Is this URL safe to fetch, or to offer as a link?
+ *
+ * Requires https and a host that is one of the allowlisted domains or a
+ * subdomain of one. The subdomain check is anchored on a leading dot on purpose:
+ * a substring or bare `endsWith` test accepts `feeds.bbci.co.uk.attacker.com`,
+ * which is the attacker's domain, not the BBC's.
+ */
+export function isTrustedNewsUrl(url: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  // Plain http can be rewritten in transit, which is how a trusted-looking
+  // headline ends up pointing somewhere else.
+  if (u.protocol !== "https:") return false;
+  const host = u.host.toLowerCase();
+  for (const domain of NEWS_HOSTS) {
+    if (host === domain || host.endsWith("." + domain)) return true;
+  }
+  return false;
+}
+
+/**
+ * Every feed URL must itself pass the allowlist.
+ *
+ * Checked at startup rather than trusted: the list above and NEWS_TOPICS are
+ * edited separately, and a source that silently fails the check would just stop
+ * producing headlines with no indication why.
+ */
+export function untrustedFeedUrls(): string[] {
+  return Object.values(NEWS_TOPICS).flat().filter((u) => !isTrustedNewsUrl(u));
+}
+
 const decodeEntities = (s: string) =>
   s
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
@@ -852,7 +930,11 @@ function parseFeed(xml: string, source: string, topic: string): NewsItem[] {
   const items: NewsItem[] = [];
   const blocks = xml.match(/<(item|entry)\b[\s\S]*?<\/\1>/gi) ?? [];
   for (const b of blocks.slice(0, 30)) {
-    const title = decodeEntities((b.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "").slice(0, 300));
+    // Decode, then strip tags. A feed that puts markup in a title cannot get it
+    // to the client as markup even if some future renderer forgets to escape.
+    const title = decodeEntities((b.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "").slice(0, 300))
+      .replace(/<[^>]*>/g, "")
+      .trim();
     // RSS puts the URL in <link>text</link>; Atom puts it in href.
     const link =
       decodeEntities(b.match(/<link[^>]*>([\s\S]*?)<\/link>/i)?.[1] ?? "") ||
@@ -863,7 +945,9 @@ function parseFeed(xml: string, source: string, topic: string): NewsItem[] {
       b.match(/<published[^>]*>([\s\S]*?)<\/published>/i)?.[1] ??
       "";
     const ts = Date.parse(decodeEntities(dateRaw));
-    if (!title || !/^https?:\/\//i.test(link)) continue;
+    // An item is dropped unless its link is https and points at a source we
+    // chose. A compromised feed cannot use us to send anyone anywhere else.
+    if (!title || !isTrustedNewsUrl(link)) continue;
     items.push({
       title,
       link,
@@ -886,7 +970,17 @@ const hostOf = (url: string) => {
 async function loadTopic(topic: string): Promise<NewsItem[]> {
   const urls = NEWS_TOPICS[topic] ?? [];
   const settled = await Promise.allSettled(
-    urls.map(async (u) => parseFeed(await getText(u, 9000), hostOf(u), topic)),
+    urls.map(async (u) => {
+      // Re-check the host we actually landed on. `fetch` follows redirects, so a
+      // hijacked feed could 302 us to an attacker's document; refusing to parse
+      // anything served from an off-list host closes that without giving up
+      // redirects, which legitimate outlets do use.
+      const res = await get(u, 9000);
+      if (!isTrustedNewsUrl(res.url || u)) {
+        throw new Error(`feed redirected off the allowlist: ${res.url || u}`);
+      }
+      return parseFeed(await res.text(), hostOf(u), topic);
+    }),
   );
   const items = settled.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
   if (!items.length) throw new Error("no feed reachable for this topic");

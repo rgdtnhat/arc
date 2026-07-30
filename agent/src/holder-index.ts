@@ -152,17 +152,37 @@ export class HolderIndex {
 
       while (cursor <= head) {
         const to = cursor + WINDOW - 1n > head ? head : cursor + WINDOW - 1n;
-        try {
-          const logs = await pub.getLogs({ address: contract, event, fromBlock: cursor, toBlock: to });
-          for (const l of logs) {
-            const v = (l.args as Record<string, unknown>)[field];
-            if (typeof v === "string") seen.add(v.toLowerCase());
+        // A refused window used to be recorded straight away as a permanent hole
+        // in the address set — which is what "14 block ranges could not be read"
+        // was reporting. Nearly all of those are transient: the shared pacing
+        // gate gets throttled, or the node declines that particular span. So
+        // retry with backoff, halving the span each attempt — a smaller range is
+        // cheaper for the node to serve and narrows what is lost if it still
+        // fails. Only a range that fails at the smallest span is a real gap.
+        let recovered = false;
+        let span = to - cursor + 1n;
+        for (let attempt = 0; attempt < 4 && !recovered; attempt++) {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * 2 ** attempt));
+          let sub = cursor;
+          let ok = true;
+          while (sub <= to) {
+            const subTo = sub + span - 1n > to ? to : sub + span - 1n;
+            try {
+              const logs = await pub.getLogs({ address: contract, event, fromBlock: sub, toBlock: subTo });
+              for (const l of logs) {
+                const v = (l.args as Record<string, unknown>)[field];
+                if (typeof v === "string") seen.add(v.toLowerCase());
+              }
+            } catch {
+              ok = false;
+              break;
+            }
+            sub = subTo + 1n;
           }
-        } catch {
-          // A refused window is a hole in the address set, not a wrong balance.
-          // Count it, move on, and let the caller say the list may be short.
-          st.gaps += 1;
+          if (ok) recovered = true;
+          else span = span > 1n ? span / 2n : 1n;
         }
+        if (!recovered) st.gaps += 1;
         // Record progress per window so a restart resumes here, not at the start.
         st.scannedTo = to.toString();
         st.addresses = [...seen];
