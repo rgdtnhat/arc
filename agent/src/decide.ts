@@ -255,3 +255,32 @@ export function passesQuality(resource: string, body: unknown): { ok: boolean; r
       return { ok: true, reason: "no specific quality rule" };
   }
 }
+
+/**
+ * Does this quote match the offer that was actually vetted?
+ *
+ * The guardian cap, the blocked-provider list, and the trust score are all
+ * evaluated against the catalog entry. The quote arrives afterwards, over
+ * headers the provider controls, and is what gets escrowed — so a quote that
+ * raises the price or names a different payee has slipped past every one of
+ * those checks. Refuse it instead of paying it; escrow protects against a
+ * provider that fails to deliver, not one that overcharges and then delivers.
+ */
+export function quoteMatchesOffer(
+  quote: { provider: `0x${string}`; price: bigint },
+  svc: { provider: `0x${string}`; price: bigint }
+): { ok: boolean; reason: string } {
+  if (quote.provider.toLowerCase() !== svc.provider.toLowerCase()) {
+    return {
+      ok: false,
+      reason: `quote names payee ${quote.provider}, not the vetted provider ${svc.provider}`,
+    };
+  }
+  if (quote.price > svc.price) {
+    return {
+      ok: false,
+      reason: `quote price ${formatUsdc(quote.price)} USDC exceeds the vetted ${formatUsdc(svc.price)} USDC`,
+    };
+  }
+  return { ok: true, reason: "quote matches the vetted offer" };
+}
