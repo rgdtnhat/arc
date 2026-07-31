@@ -1323,7 +1323,22 @@ const $ = (id) => document.getElementById(id);
         // The same-asset hint already appears under the pickers; don't repeat it.
         if (s.tokenIn === s.tokenOut) { $("swQuoteOut").textContent = ""; return null; }
         const amountIn = toRaw(human, s.decIn);
-        const r = await (await fetch(`/api/swap/quote?tokenIn=${s.tokenIn}&tokenOut=${s.tokenOut}&amountIn=${amountIn}`)).json();
+        // Tell the server whose wallet will actually pay. In self-custody mode
+        // that is the connected wallet, not the agent's — otherwise the
+        // preflight reports a balance the signer has nothing to do with.
+        // `eth_accounts` rather than `eth_requestAccounts`: a quote must not
+        // pop a connection prompt.
+        let from = "";
+        if (selfMode() && window.ethereum) {
+          try {
+            const [a] = await window.ethereum.request({ method: "eth_accounts" });
+            if (a) from = a;
+          } catch { /* not connected — the server falls back to the agent wallet */ }
+        }
+        const r = await (await fetch(
+          `/api/swap/quote?tokenIn=${s.tokenIn}&tokenOut=${s.tokenOut}&amountIn=${amountIn}` +
+          (from ? `&from=${encodeURIComponent(from)}` : ""),
+        )).json();
         if (!r.ok) { $("swQuoteOut").textContent = "Quote failed: " + r.error; return null; }
         const out = fmtUnitsJs(r.out, s.decOut);
         const fee = fmtUnitsJs(r.fee, s.decOut);

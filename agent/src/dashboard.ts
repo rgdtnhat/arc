@@ -1414,11 +1414,23 @@ async function main() {
        * the desk for the input. Both were showing up as "the contract rejected
        * this transaction" after the fact. */
       const need = out + appFee;
+
+      // Whose balance and allowance actually matter. This endpoint serves two
+      // callers: the operator path, where the agent wallet spends, and the
+      // self-custody path, where the user's own connected wallet does. Checking
+      // the agent's wallet for both told a self-custody user with plenty of USDC
+      // that they were short — a false blocker about somebody else's money.
+      const fromParam = String(req.query.from ?? "");
+      const spender = /^0x[0-9a-fA-F]{40}$/.test(fromParam)
+        ? (fromParam as Hex)
+        : (agentAccount.address as Hex);
+      const spenderIsAgent = spender.toLowerCase() === (agentAccount.address as string).toLowerCase();
+
       const [deskHas, allowance, callerHas] = (await client.public.multicall({
         contracts: [
           { address: tokenOut, abi: erc20Abi, functionName: "balanceOf", args: [swapClient.swap] },
-          { address: tokenIn, abi: erc20Abi, functionName: "allowance", args: [agentAccount.address, swapClient.swap] },
-          { address: tokenIn, abi: erc20Abi, functionName: "balanceOf", args: [agentAccount.address] },
+          { address: tokenIn, abi: erc20Abi, functionName: "allowance", args: [spender, swapClient.swap] },
+          { address: tokenIn, abi: erc20Abi, functionName: "balanceOf", args: [spender] },
         ] as never,
         allowFailure: true,
       })).map((r) => (r?.status === "success" ? (r.result as bigint) : 0n));
@@ -1440,7 +1452,13 @@ async function main() {
         );
       }
       if (callerHas < amountIn) {
-        blockers.push(`The wallet holds ${fmtUnits(callerHas, inMeta.decimals)} ${inMeta.symbol}, less than the ${fmtUnits(amountIn, inMeta.decimals)} being sold.`);
+        // Name the wallet. "The wallet holds…" is ambiguous the moment there are
+        // two of them, and the wrong one is worse than none.
+        const whose = spenderIsAgent ? "The agent wallet" : `${spender.slice(0, 10)}…`;
+        blockers.push(
+          `${whose} holds ${fmtUnits(callerHas, inMeta.decimals)} ${inMeta.symbol}, less than the ` +
+          `${fmtUnits(amountIn, inMeta.decimals)} being sold.`,
+        );
       }
 
       res.json({
@@ -1453,6 +1471,9 @@ async function main() {
         deskBalance: deskHas.toString(),
         route: routed ? (ammWired ? "amm" : "blocked") : "inventory",
         ammWired,
+        // Which wallet these two are about, so a caller can tell whether the
+        // answer applies to them.
+        spender,
         approvalNeeded: allowance < amountIn,
         blockers,
       });
