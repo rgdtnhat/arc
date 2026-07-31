@@ -54,6 +54,36 @@ interface IssuedQuote {
   expiresAt: number;
 }
 
+/**
+ * Canonical ledger key for a tab, or null if it isn't a usable id.
+ *
+ * The voucher ledger must be keyed by the tab's numeric identity, never by the
+ * string a caller sent. Both the signature hash and the contract read go through
+ * `BigInt(tabId)`, so "1", "01", "0x1" and " 1" are one tab on-chain under one
+ * signature — but they are four distinct Map keys. Keying on the raw string let
+ * a buyer replay a single voucher indefinitely: each spelling found no previous
+ * voucher, `prev` fell back to the on-chain `claimed` value, and
+ * `cum - prev >= price` passed again every time. The provider served N ticks and
+ * could only ever claim one of them.
+ *
+ * Negatives are rejected as well as junk: `BigInt("-1")` parses happily and
+ * would otherwise open a second namespace for a tab that cannot exist.
+ */
+export function tabKey(raw: string | undefined): string | null {
+  // An empty or whitespace-only value is not an id. `BigInt("")` is 0n, so
+  // without this an absent header would silently settle against tab 0. The
+  // caller happens to reject falsy values first today; this function should not
+  // depend on that.
+  if (raw === undefined || raw.trim() === "") return null;
+  let id: bigint;
+  try {
+    id = BigInt(raw.trim());
+  } catch {
+    return null;
+  }
+  return id >= 0n ? id.toString(10) : null;
+}
+
 export function createProviderApp(config: ProviderConfig): Express {
   const app = express();
   app.use(express.json());
@@ -208,7 +238,17 @@ export function createProviderApp(config: ProviderConfig): Express {
   };
 
   // The best voucher seen per tab, so the provider can settle in one claim.
+  //
+  // Keyed by the tab's *numeric* identity, never by the string the caller sent.
+  // Both the signature hash and the contract read use `BigInt(tabId)`, so "1",
+  // "01", "0x1" and " 1" are one and the same tab on-chain and under one and the
+  // same signature — but they are four different Map keys. Keying on the raw
+  // string let a buyer replay a single voucher indefinitely: each spelling found
+  // no previous voucher, so `prev` fell back to the on-chain `claimed` value and
+  // `cum - prev >= price` passed again every time. The provider served N ticks
+  // and could only ever claim one of them.
   const bestVoucher = new Map<string, { cum: bigint; sig: Hex; resource: string }>();
+
 
   /** Nanopayments: verify an off-chain voucher, then serve — zero gas per call. */
   async function handleTab(svc: ServiceDef, req: Request, res: Response) {
@@ -218,12 +258,12 @@ export function createProviderApp(config: ProviderConfig): Express {
       return;
     }
 
-    const tabId = req.header(HEADERS.tab);
+    const rawTabId = req.header(HEADERS.tab);
     const voucher = req.header(HEADERS.voucher);
     const sig = req.header(HEADERS.voucherSig) as Hex | undefined;
 
     // Unpaid: advertise tab billing terms.
-    if (!tabId || !voucher || !sig) {
+    if (!rawTabId || !voucher || !sig) {
       res
         .status(402)
         .set({
@@ -239,6 +279,14 @@ export function createProviderApp(config: ProviderConfig): Express {
           pricePerCall: formatUsdc(svc.price),
           how: "openTab() on TesseraTab, then send x-tessera-tab / x-tessera-voucher / x-tessera-voucher-sig per call",
         });
+      return;
+    }
+
+    // One canonical id from here down — the value the ledger, the signature and
+    // the contract all agree on.
+    const tabId = tabKey(rawTabId);
+    if (tabId === null) {
+      res.status(400).json({ error: "invalid tab id" });
       return;
     }
 
@@ -312,9 +360,9 @@ export function createProviderApp(config: ProviderConfig): Express {
 
   /** Agent asks the provider to settle its tab: one on-chain claim for N calls. */
   app.post("/tab/:tabId/close", async (req: Request, res: Response) => {
-    const tabId = req.params.tabId;
-    const best = bestVoucher.get(tabId);
-    if (!config.tabAddress || !best) {
+    const tabId = tabKey(req.params.tabId);
+    const best = tabId === null ? undefined : bestVoucher.get(tabId);
+    if (!config.tabAddress || tabId === null || !best) {
       res.status(404).json({ error: "no vouchers for this tab" });
       return;
     }
