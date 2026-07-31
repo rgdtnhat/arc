@@ -126,6 +126,10 @@ const FUND_SELECTOR = "7b1837de";
 const SEED_SELECTOR = "5684d86a";
 /** `amm()` — present only on desks built with the AMM fallback. */
 const AMM_GETTER_SELECTOR = "2a943945";
+/** `admin()` — absent on desks built before the admin key existed. */
+const ADMIN_GETTER_SELECTOR = "f851a440";
+/** `withdrawSwapInventory(address,uint256,address)` on the fee collector. */
+const FORWARD_WITHDRAW_SELECTOR = "b668a956";
 
 /** Client for the TesseraSwap (oracle-priced swap desk). */
 export class SwapClient {
@@ -295,6 +299,74 @@ export class SwapClient {
    * forwarder) genuinely cannot be drained — reported as such rather than
    * failing obscurely.
    */
+  /**
+   * Who, if anyone, can pull inventory out of this desk.
+   *
+   * Worth answering before the attempt rather than after. `withdrawInventory`
+   * is `onlyOwnerOrAdmin` in current source, but a desk deployed before the
+   * `admin` key existed is `onlyOwner` — and deployment hands ownership to the
+   * fee collector so its `seed` leg works. If that collector also predates the
+   * `withdrawSwapInventory` forwarder, there is no code path from anyone's key
+   * to the desk's balance. That is a real state a live deployment can be in, and
+   * "the contract rejected this transaction" is a useless way to learn it.
+   */
+  async withdrawAuthority(feeCollector?: Hex): Promise<{
+    canWithdraw: boolean;
+    owner: Hex | null;
+    admin: Hex | null;
+    /** Whether the desk exposes the admin key at all (older ones do not). */
+    hasAdmin: boolean;
+    /** Whether the owning collector can forward a withdrawal. */
+    collectorCanForward: boolean;
+    reason: string;
+  }> {
+    const me = this.cfg.account.address.toLowerCase();
+    const code = String((await this.public.getCode({ address: this.swap })) ?? "").toLowerCase();
+    const hasAdmin = code.includes(ADMIN_GETTER_SELECTOR);
+
+    const read = async (address: Hex, abi: unknown, functionName: string) =>
+      this.public
+        .readContract({ address, abi: abi as never, functionName: functionName as never })
+        .catch(() => null) as Promise<Hex | null>;
+
+    const owner = await read(this.swap, tesseraSwapAbi, "owner");
+    const admin = hasAdmin ? await read(this.swap, tesseraSwapAbi, "admin") : null;
+
+    const isMine = (a: Hex | null) => typeof a === "string" && a.toLowerCase() === me;
+    if (isMine(owner) || isMine(admin)) {
+      return { canWithdraw: true, owner, admin, hasAdmin, collectorCanForward: false,
+        reason: isMine(admin) ? "This key is the desk's admin." : "This key owns the desk." };
+    }
+
+    // Not us directly. The owner may be the fee collector, which can forward —
+    // but only if it was deployed with the forwarder, and only for its own owner.
+    let collectorCanForward = false;
+    if (feeCollector && typeof owner === "string" && owner.toLowerCase() === feeCollector.toLowerCase()) {
+      const cCode = String((await this.public.getCode({ address: feeCollector })) ?? "").toLowerCase();
+      const cOwner = await read(feeCollector, tesseraFeeCollectorAbi, "owner");
+      collectorCanForward = cCode.includes(FORWARD_WITHDRAW_SELECTOR) && isMine(cOwner);
+      if (collectorCanForward) {
+        return { canWithdraw: true, owner, admin, hasAdmin, collectorCanForward,
+          reason: "The fee collector owns the desk and can forward the withdrawal for its owner." };
+      }
+    }
+
+    const why = !hasAdmin
+      ? "This desk predates the admin key, so only its owner can withdraw"
+      : "This key is neither the desk's owner nor its admin";
+    const andThe = feeCollector && typeof owner === "string" && owner.toLowerCase() === feeCollector.toLowerCase()
+      ? ", and the fee collector that owns it has no forwarder to pass the call through"
+      : "";
+    return {
+      canWithdraw: false, owner, admin, hasAdmin, collectorCanForward,
+      reason:
+        `${why}${andThe}. The inventory is not lost — it is the desk's trading stock, so it can still be ` +
+        `bought out by swapping into it at the oracle price (minus the 0.30% fee). To get an admin ` +
+        `withdrawal back, redeploy the desk; current contracts keep the admin key with the deployer ` +
+        `precisely so handing ownership to the collector cannot strand it again.`,
+    };
+  }
+
   async withdrawInventory(
     token: Hex,
     amount: bigint,

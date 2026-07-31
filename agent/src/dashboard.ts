@@ -3226,6 +3226,26 @@ async function main() {
    * The counterpart to `/api/swap/fund`. Operator-only, and it needs to be —
    * unlike funding, this takes app-owned assets out.
    */
+  /**
+   * Who can pull inventory out of this desk, and if nobody, why.
+   *
+   * Read before offering the button. `withdrawInventory` is `onlyOwnerOrAdmin`
+   * in current source, but deployment hands ownership to the fee collector so
+   * its `seed` leg works — and on a desk built before the `admin` key existed,
+   * paired with a collector built before the forwarder, there is no code path
+   * from any key we hold to that balance. Discovering that as "the contract
+   * rejected this transaction" tells an operator nothing.
+   */
+  app.get("/api/swap/authority", async (_req, res) => {
+    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
+    try {
+      const a = await swapClient.withdrawAuthority((liveDeployment.tesseraFeeCollector as Hex) ?? undefined);
+      res.json({ ok: true, desk: swapClient.swap, ...a });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
   app.post("/api/swap/withdraw", requireOperator, async (req, res) => {
     if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
     const token = req.query.token as Hex;
@@ -3233,6 +3253,10 @@ async function main() {
     const to = (req.query.to as Hex) || (agentAccount.address as Hex);
     try {
       if (raw <= 0n) throw new Error("Enter an amount above zero.");
+      const authority = await swapClient
+        .withdrawAuthority((liveDeployment.tesseraFeeCollector as Hex) ?? undefined)
+        .catch(() => null);
+      if (authority && !authority.canWithdraw) throw new Error(authority.reason);
       const { txHash, route } = await swapClient.withdrawInventory(
         token,
         raw,

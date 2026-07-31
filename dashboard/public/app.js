@@ -716,6 +716,7 @@ const $ = (id) => document.getElementById(id);
           // desk is empty.
           renderSwapInventory();
           renderSwapBalances();
+          loadSwapAuthority();
           const syms = sw.assets.map((a) => a.symbol).join(",");
           if ($("swIn").dataset.symbols !== syms) {
             const opts = sw.assets.map((a) => `<option value="${esc(a.address)}" data-sym="${esc(a.symbol)}" data-dec="${Number(a.decimals) || 6}">${esc(a.symbol)}</option>`).join("");
@@ -1276,6 +1277,31 @@ const $ = (id) => document.getElementById(id);
           `${mine != null ? ' <span style="opacity:.7">(your wallet)</span>' : ""}` +
           ` · desk has <b>${esc(ao.inventory)}</b> ${esc(ao.symbol)} to give</div>`;
       };
+
+      /**
+       * Can this deployment withdraw desk inventory at all?
+       *
+       * Checked up front so the answer is visible before the button is pressed,
+       * and so a desk that genuinely cannot be drained says so with its reason
+       * rather than reverting.
+       */
+      async function loadSwapAuthority() {
+        const el = $("swAuthority");
+        if (!el) return;
+        try {
+          const r = await (await fetch("/api/swap/authority")).json();
+          if (!r.ok) { el.textContent = ""; return; }
+          el.className = r.canWithdraw ? "feedNote" : "feedNote bad";
+          el.textContent = r.reason || "";
+          const btn = $("swWithdraw");
+          if (btn) {
+            btn.disabled = !r.canWithdraw;
+            btn.title = r.canWithdraw ? "" : r.reason || "";
+          }
+        } catch {
+          el.textContent = "";
+        }
+      }
 
       /**
        * The desk's inventory, per asset.
