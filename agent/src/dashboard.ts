@@ -421,7 +421,36 @@ async function main() {
    * actually gates delivery is an on-chain escrow, not an Origin header.
    * ----------------------------------------------------------------------- */
   const X402_PREFIX = "/x402";
+  const PROVIDERS_ORIGIN = `http://127.0.0.1:${PROVIDERS_PORT}`;
   const x402Allowed = (p: string) => p === "/catalog" || p.startsWith("/defi/");
+
+  /**
+   * Resolve the requested path to exactly what will be fetched, or null.
+   *
+   * The subtlety that matters: `req.path` keeps `..` and percent-encoded
+   * segments verbatim, but the URL parser inside `fetch` normalises them. Check
+   * the raw string and forward it unchanged, and the string you validated is not
+   * the string you request — `/defi/../invoices` passes a `startsWith("/defi/")`
+   * test and then resolves to `/invoices`, which is precisely the endpoint this
+   * gateway exists to keep private.
+   *
+   * So normalise first and validate the result, and hand that same resolved
+   * value to `fetch`. Validation and use then operate on one string by
+   * construction, which closes the whole class rather than the `..` instance —
+   * encoded traversal, redundant slashes and dot segments all collapse before
+   * the allowlist ever sees them. The origin is re-checked too, so a path that
+   * somehow escapes the base cannot redirect the request off loopback.
+   */
+  function x402Target(rawPath: string): URL | null {
+    let resolved: URL;
+    try {
+      resolved = new URL(decodeURIComponent(rawPath), PROVIDERS_ORIGIN);
+    } catch {
+      return null;
+    }
+    if (resolved.origin !== PROVIDERS_ORIGIN) return null;
+    return x402Allowed(resolved.pathname) ? resolved : null;
+  }
 
   app.use(X402_PREFIX, (req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -435,8 +464,8 @@ async function main() {
   });
 
   app.get(`${X402_PREFIX}/*`, async (req, res) => {
-    const upstreamPath = req.path.slice(X402_PREFIX.length) || "/";
-    if (!x402Allowed(upstreamPath)) {
+    const target = x402Target(req.path.slice(X402_PREFIX.length) || "/");
+    if (!target) {
       res.status(404).json({ error: "not a public endpoint" });
       return;
     }
@@ -449,9 +478,10 @@ async function main() {
       if (typeof v === "string") forward[name] = v;
     }
     try {
+      // The resolved pathname, not the raw one — the value the allowlist passed.
       const upstream = await fetch(
-        `http://127.0.0.1:${PROVIDERS_PORT}${upstreamPath}${qs ? `?${qs}` : ""}`,
-        { headers: forward, signal: AbortSignal.timeout(30_000) },
+        `${PROVIDERS_ORIGIN}${target.pathname}${qs ? `?${qs}` : ""}`,
+        { headers: forward, redirect: "error", signal: AbortSignal.timeout(30_000) },
       );
       for (const name of Object.values(HEADERS)) {
         const v = upstream.headers.get(name);
