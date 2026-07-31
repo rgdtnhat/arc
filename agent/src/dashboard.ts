@@ -2636,6 +2636,28 @@ async function main() {
         ]);
       }
 
+      // 2b) Wire a fresh swap desk to the AMM, while we still own it.
+      //
+      //     A desk deployed here is owned *and* admin'd by the deployer, so
+      //     `setAmm` is a direct call. The bootstrap script routes this through
+      //     the fee collector's `setSwapAmm` instead, which only works if that
+      //     collector has the forwarder — the reason the live desk has no
+      //     fallback today. Doing it here, before ownership goes anywhere, means
+      //     a redeployed desk can reach AMM liquidity when its inventory is
+      //     short instead of reverting "insufficient inventory".
+      //
+      //     Best-effort: a desk with no AMM to point at is fine, and a failure
+      //     here must not lose the address we just deployed.
+      const wired: string[] = [];
+      if (kind === "swap" && ammClient?.amm) {
+        try {
+          await owner.write(address, tesseraSwapAbi, "setAmm", [ammClient.amm, BigInt(req.body?.ammPoolId ?? 0)]);
+          wired.push(`AMM fallback pointed at pool ${Number(req.body?.ammPoolId ?? 0)}`);
+        } catch (e) {
+          wired.push(`could not wire the AMM fallback: ${friendlyError(e)}`);
+        }
+      }
+
       // 3) Record it where the app reads addresses from. arc.local.json is
       //    gitignored and wins over arc.json, so a later `git reset --hard`
       //    can't revert a running server to the contract it just replaced.
@@ -2664,10 +2686,15 @@ async function main() {
         address,
         archived,
         wrote,
+        wired,
         note: wrote
           ? `Deployed and recorded. Restart the app to start using it — the running process keeps ` +
             `the previous ${kind} until then, on purpose.` +
-            (archived ? ` The previous ${kind} was archived first; its holders can still be paid out or migrated.` : "")
+            (archived ? ` The previous ${kind} was archived first; its holders can still be paid out or migrated.` : "") +
+            (kind === "swap"
+              ? ` The new desk starts empty — fund it with "Add inventory", or every swap into an asset it ` +
+                `does not hold will revert. This deployment owns it directly, so withdrawals work.`
+              : "")
           : `Deployed at ${address}, but the deployment file could not be written — set it by hand before restarting.`,
       });
     } catch (e) {
