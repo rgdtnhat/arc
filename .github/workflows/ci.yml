@@ -30,3 +30,24 @@ jobs:
 
       - name: Agent unit tests (decision engine, guardian, memory, agentkit, wallet, treasury, fleet)
         run: npm test --workspace agent
+
+      # The dashboard and the providers app are plain JS/TS run through tsx, so
+      # nothing else would catch a syntax error in them before a container
+      # rebuild does. Parsing them here is cheap and turns "the site is blank"
+      # into a red build.
+      - name: Dashboard script parses
+        run: node --check dashboard/public/app.js
+
+      - name: Server entry points load
+        run: |
+          node --import tsx --input-type=module -e '
+            await import("./providers/src/app.ts");
+            await import("./providers/src/catalog.ts");
+            await import("./shared/src/index.ts");
+            console.log("modules loaded");
+          '
+
+      # Production dependencies only: dev-tool advisories are tracked separately
+      # and must not be able to fail a build that ships none of them.
+      - name: No vulnerable production dependencies
+        run: npm audit --omit=dev

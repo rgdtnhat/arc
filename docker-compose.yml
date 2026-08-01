@@ -19,6 +19,11 @@ services:
       # without this the server can only save config locally.
       - DEPLOYER_PRIVATE_KEY=${DEPLOYER_PRIVATE_KEY:-}
       - ARC_RPC_URL=${ARC_RPC_URL:-https://rpc.testnet.arc.network}
+      # Where runtime state lives. This MUST match the volume mounted below:
+      # without it STATE_DIR falls back to the app root, which is inside the
+      # image — so every `up --build` reset the admin password to the env seed
+      # and lost the config, profiles, transaction history and holder index.
+      - STATE_DIR=/app/state
       - ARC_CHAIN_ID=${ARC_CHAIN_ID:-}
       - ARC_EXPLORER_URL=${ARC_EXPLORER_URL:-}
       # Dashboard admin login (secret — set in a .env next to this file). Blank = disabled.
@@ -33,7 +38,7 @@ services:
       # Live deployment record + persisted admin/config/profile state, so a
       # redeploy or a container rebuild doesn't lose them.
       - ./deployments:/app/deployments
-      - tessera_state:/app/state   # STATE_DIR below points here
+      - tessera_state:/app/state   # STATE_DIR above points here
     expose:
       - "8787"
     restart: unless-stopped

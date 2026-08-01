@@ -399,3 +399,81 @@ describe("TesseraAMM (multi-asset liquidity pools)", () => {
     ).to.be.rejected;
   });
 });
+
+describe("TesseraAMM (amplified curve for near-parity pairs)", () => {
+  /**
+   * Constant product has no notion that USDC and EURC are worth roughly the
+   * same, so it prices a large order against a modest pool as if the pair were
+   * unrelated. That is the curve, not a disclosure problem — which is why the
+   * fix is a different curve rather than a louder warning.
+   *
+   * These pin the property that matters: at the same reserves, amplification
+   * gives a materially better rate near parity, and still degrades safely as the
+   * pool goes lopsided.
+   */
+  it("is off by default, so existing pools price exactly as before", async () => {
+    const { amm } = await loadFixture(deployFixture);
+    expect(await amm.read.amp([0n])).to.equal(0);
+  });
+
+  it("quotes a large trade far better than constant product", async () => {
+    const { amm, usdc, eurc } = await loadFixture(deployFixture);
+    // 1,000 into a 10k/10k pool — 10% of the reserve, where x*y=k hurts most.
+    const size = U("1000");
+    const [cpOut] = await amm.read.quote([0n, usdc.address, eurc.address, size]);
+
+    await amm.write.setAmp([0n, 200]);
+    const [ampOut] = await amm.read.quote([0n, usdc.address, eurc.address, size]);
+
+    expect(ampOut > cpOut).to.equal(true, "amplification must improve the rate");
+    // Constant product loses ~9% here; the amplified curve should stay within 1%.
+    const netIn = size - (size * BigInt(SWAP_FEE)) / 10_000n;
+    expect(ampOut > (netIn * 99n) / 100n).to.equal(
+      true,
+      `expected near-parity output, got ${ampOut} for ${netIn} in`,
+    );
+  });
+
+  it("never returns more than the pool holds, however extreme the order", async () => {
+    // The safety property. Newton's last-digit slack must not be able to
+    // over-pay, and a swap larger than the pool must fail rather than drain it.
+    const { amm, usdc, eurc } = await loadFixture(deployFixture);
+    await amm.write.setAmp([0n, 200]);
+    const [, balances] = await amm.read.poolInfo([0n]);
+    const balOut = balances[1];
+
+    const [out] = await amm.read.quote([0n, usdc.address, eurc.address, U("5000")]);
+    expect(out < balOut).to.equal(true, "output must stay under the reserve");
+  });
+
+  it("executes an amplified swap and grows the invariant", async () => {
+    const { amm, asAmm, bob, mint, usdc, eurc } = await loadFixture(deployFixture);
+    await amm.write.setAmp([0n, 200]);
+    await mint(usdc, bob, U("1000"));
+
+    const [, before] = await amm.read.poolInfo([0n]);
+    const [expected] = await amm.read.quote([0n, usdc.address, eurc.address, U("1000")]);
+    await (await asAmm(bob)).write.swap([0n, usdc.address, eurc.address, U("1000"), expected]);
+
+    expect(await eurc.read.balanceOf([bob.account.address])).to.equal(expected);
+    const [, after] = await amm.read.poolInfo([0n]);
+    // The LP fee stays behind, so the pool is strictly better off in USDC terms.
+    expect(after[0] > before[0]).to.equal(true);
+  });
+
+  it("refuses amplification where it would price wrongly", async () => {
+    const { amm, usdc, eurc, btc } = await loadFixture(deployFixture);
+    // Three assets: the two-sided invariant does not describe this pool.
+    await amm.write.createPool([[usdc.address, eurc.address, btc.address], SWAP_FEE, LP_SHARE, "tri"]);
+    await expect(amm.write.setAmp([1n, 200])).to.be.rejectedWith("amp needs a 2-asset pool");
+
+    // And beyond the bound.
+    await expect(amm.write.setAmp([0n, 6000])).to.be.rejectedWith("amp");
+  });
+
+  it("only the owner can change the curve", async () => {
+    const { amm, bob } = await loadFixture(deployFixture);
+    const asBob = await hre.viem.getContractAt("TesseraAMM", amm.address, { client: { wallet: bob } });
+    await expect(asBob.write.setAmp([0n, 200])).to.be.rejectedWith("not owner");
+  });
+});

@@ -43,6 +43,15 @@ contract TesseraEscrow is ReentrancyGuard {
         bytes32 quoteHash; // binds the off-chain price quote
         bytes32 responseHash; // set on fulfill; commitment to the delivered payload
         Status status;
+        // The protocol fee in force when this escrow was funded.
+        //
+        // Snapshotted rather than read at payout, because the two are not the
+        // same promise. `protocolFeeBps` is owner-settable, so reading it on
+        // settle let an owner raise the cut *after* a provider had already
+        // delivered — changing the terms of a trade that was agreed, and
+        // already worked, before the change. Both parties commit to the fee
+        // they could see at `open()`; a later change applies to later escrows.
+        uint16 feeBps;
     }
 
     struct Reputation {
@@ -152,16 +161,31 @@ contract TesseraEscrow is ReentrancyGuard {
      * @dev Public so a third party can price a job before committing to it,
      *      rather than discovering the fee when the money lands.
      */
+    /// @notice What a payout of `amount` would look like at the *current* fee.
+    /// @dev For quoting a trade that has not been opened yet. A payment already
+    ///      in flight settles on the fee it recorded — see `quotePayoutAt`.
     function quotePayout(uint256 amount) public view returns (uint256 net, uint256 fee) {
-        fee = (amount * protocolFeeBps) / 10_000;
+        return quotePayoutAt(amount, protocolFeeBps);
+    }
+
+    /// @notice The split for an amount at a specific fee, in basis points.
+    function quotePayoutAt(uint256 amount, uint16 bps) public pure returns (uint256 net, uint256 fee) {
+        fee = (amount * bps) / 10_000;
         net = amount - fee;
+    }
+
+    /// @notice What this specific payment will pay out, at the fee it recorded.
+    function quotePayoutFor(uint256 paymentId) external view returns (uint256 net, uint256 fee) {
+        Payment storage p = payments[paymentId];
+        return quotePayoutAt(p.amount, p.feeBps);
     }
 
     /// @dev Pays the provider net of the protocol fee. Shared by both payout
     ///      paths so they can never disagree about what a provider is owed.
     function _payProvider(uint256 paymentId, Payment storage p) internal returns (uint256 net) {
         uint256 fee;
-        (net, fee) = quotePayout(p.amount);
+        // The fee this payment was opened under, never the one in force now.
+        (net, fee) = quotePayoutAt(p.amount, p.feeBps);
         if (fee > 0) {
             if (!usdc.transfer(treasury, fee)) revert TransferFailed();
             emit ProtocolFeeTaken(paymentId, fee);
@@ -195,7 +219,8 @@ contract TesseraEscrow is ReentrancyGuard {
             fulfilledAt: 0,
             quoteHash: quoteHash,
             responseHash: bytes32(0),
-            status: Status.Escrowed
+            status: Status.Escrowed,
+            feeBps: protocolFeeBps
         });
 
         emit PaymentOpened(paymentId, msg.sender, provider, amount, deadline, quoteHash);

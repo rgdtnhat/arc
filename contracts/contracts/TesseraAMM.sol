@@ -5,6 +5,7 @@ interface IERC20A {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
+    function decimals() external view returns (uint8);
 }
 
 /**
@@ -57,6 +58,27 @@ contract TesseraAMM {
         string name;
     }
 
+    /**
+     * Per-pool amplification, 0 = plain constant product.
+     *
+     * Constant product is the wrong shape for assets that are meant to trade
+     * near parity. A USDC/EURC pool holding 11 and 9 units quotes a 400-unit
+     * order at a ~99% loss of rate, because `x*y=k` has no notion that the two
+     * sides are worth roughly the same. That is not a shallow-pool problem you
+     * can fix by disclosure — it is the curve.
+     *
+     * With `amp > 0` the pool prices on the Curve StableSwap invariant, which is
+     * near-flat around the balance point and only degenerates toward constant
+     * product as the pool gets lopsided. Same reserves, dramatically less
+     * slippage on the trades this pair actually sees.
+     *
+     * Kept opt-in and per pool: it is only correct for assets that *should* be
+     * near parity. Applying it to USDC/cirBTC would quote a wildly wrong price.
+     */
+    mapping(uint256 => uint16) public amp;
+    /// @notice Bounds on `amp`. 1 is nearly constant product; 5000 is very flat.
+    uint16 public constant MAX_AMP = 5_000;
+
     address public owner;
     address public appFeeCollector;
     /// @notice Upper bound on assets in a single pool, set by the operator.
@@ -70,6 +92,7 @@ contract TesseraAMM {
 
     bool private _locked;
 
+    event AmpSet(uint256 indexed poolId, uint16 amp);
     event PoolCreated(uint256 indexed poolId, address[] assets, uint16 swapFeeBps, uint16 lpShareBps, string name);
     event LiquidityAdded(uint256 indexed poolId, address indexed provider, uint256[] amounts, uint256 shares);
     event LiquidityRemoved(uint256 indexed poolId, address indexed provider, uint256[] amounts, uint256 shares);
@@ -130,6 +153,46 @@ contract TesseraAMM {
         return (p.assets, balances, p.swapFeeBps, p.lpShareBps, p.totalShares, p.frozen, p.name);
     }
 
+    /**
+     * The StableSwap invariant D for a two-sided balance, by Newton iteration.
+     *
+     * Curve's formula for n=2. Converges in a handful of rounds for any sane
+     * balance; the loop bound is a safety net, not an expectation. Returns 0 for
+     * an empty pool, which the caller treats as "no liquidity".
+     */
+    function _invariant(uint256 x, uint256 y, uint256 a) internal pure returns (uint256) {
+        uint256 s = x + y;
+        if (s == 0) return 0;
+        uint256 d = s;
+        uint256 ann = a * 4; // A * n^n, n = 2
+        for (uint256 i = 0; i < 255; i++) {
+            uint256 dP = (((d * d) / (x * 2)) * d) / (y * 2);
+            uint256 prev = d;
+            d = (((ann * s) + (dP * 2)) * d) / (((ann - 1) * d) + (dP * 3));
+            if (d > prev ? d - prev <= 1 : prev - d <= 1) return d;
+        }
+        return d;
+    }
+
+    /**
+     * The output-side balance that satisfies the invariant once `newX` is in.
+     *
+     * Again Newton, and again the loop bound is a guard rather than a plan.
+     */
+    function _getY(uint256 newX, uint256 a, uint256 d) internal pure returns (uint256) {
+        uint256 ann = a * 4;
+        // c = D^(n+1) / (n^n * newX * Ann), built stepwise to keep the terms small.
+        uint256 c = (((d * d) / (newX * 2)) * d) / (ann * 2);
+        uint256 b = newX + (d / ann);
+        uint256 y = d;
+        for (uint256 i = 0; i < 255; i++) {
+            uint256 prev = y;
+            y = ((y * y) + c) / ((y * 2) + b - d);
+            if (y > prev ? y - prev <= 1 : prev - y <= 1) return y;
+        }
+        return y;
+    }
+
     /// @notice Output, LP fee and app fee for a swap, without executing it.
     function quote(uint256 poolId, address tokenIn, address tokenOut, uint256 amountIn)
         public
@@ -155,8 +218,18 @@ contract TesseraAMM {
         // behind as extra reserve, which is precisely what makes each share
         // redeemable for more over time (Uniswap-v2 semantics).
         uint256 amountInNet = amountIn - fee;
-        amountOut = (balOut * amountInNet) / (balIn + amountInNet);
-        require(amountOut < balOut, "insufficient liquidity");
+        uint256 a = amp[poolId];
+        if (a == 0) {
+            amountOut = (balOut * amountInNet) / (balIn + amountInNet);
+        } else {
+            // Amplified: solve the invariant for the new output balance. The
+            // subtraction of 1 rounds the trader down by a wei, so Newton's
+            // last-digit slack can never hand out more than the curve allows.
+            uint256 d = _invariant(balIn, balOut, a);
+            uint256 y = _getY(balIn + amountInNet, a, d);
+            amountOut = balOut > y + 1 ? balOut - y - 1 : 0;
+        }
+        require(amountOut > 0 && amountOut < balOut, "insufficient liquidity");
     }
 
     // --- liquidity ------------------------------------------------------------
@@ -341,6 +414,27 @@ contract TesseraAMM {
         p.lpShareBps = lpShareBps;
         p.name = name;
         emit PoolCreated(poolId, assets, swapFeeBps, lpShareBps, name);
+    }
+
+    /**
+     * @notice Turn amplification on (or off, with 0) for one pool.
+     * @dev Only sound for assets that should trade near parity, and only when
+     *      they share a decimal precision — the invariant adds the two balances,
+     *      so mixing a 6-decimal and an 8-decimal token would compare quantities
+     *      that are not the same size. Both are enforced rather than documented,
+     *      because a mispriced curve is silent: it quotes confidently and wrongly.
+     */
+    function setAmp(uint256 poolId, uint16 amp_) external onlyOwner {
+        Pool storage p = pools[poolId];
+        require(p.exists, "no pool");
+        require(amp_ <= MAX_AMP, "amp");
+        if (amp_ > 0) {
+            require(p.assets.length == 2, "amp needs a 2-asset pool");
+            uint8 d0 = IERC20A(p.assets[0]).decimals();
+            require(d0 == IERC20A(p.assets[1]).decimals(), "amp needs matching decimals");
+        }
+        amp[poolId] = amp_;
+        emit AmpSet(poolId, amp_);
     }
 
     /// @notice Retune one pool's fee and LP split (LP share stays >= 50%).

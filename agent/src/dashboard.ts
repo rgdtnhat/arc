@@ -2784,14 +2784,23 @@ async function main() {
    * with no reserves, so read the selectors out of the code and say which it
    * is. Cached — a contract's code doesn't change.
    */
-  const POOL_PRICE_SEL = toFunctionSelector("function price(address)").slice(2);
-  const POOL_SET_PRICE_SEL = toFunctionSelector("function setPrice(address,uint256)").slice(2);
-  let poolPriceSupport: { read: boolean; write: boolean } | null = null;
+  const POOL_SELECTORS = {
+    read: toFunctionSelector("function price(address)").slice(2),
+    write: toFunctionSelector("function setPrice(address,uint256)").slice(2),
+    freeze: toFunctionSelector("function setFrozen(address,uint8)").slice(2),
+    feed: toFunctionSelector("function setPriceFeed(address,address,uint32)").slice(2),
+  };
+  let poolPriceSupport: { read: boolean; write: boolean; freeze: boolean; feed: boolean } | null = null;
   const poolSupportsPrices = async () => {
     if (poolPriceSupport) return poolPriceSupport;
-    if (!poolDeployment) return { read: false, write: false };
+    if (!poolDeployment) return { read: false, write: false, freeze: false, feed: false };
     const code = String((await client.public.getCode({ address: poolDeployment.poolAddress })) ?? "").toLowerCase();
-    poolPriceSupport = { read: code.includes(POOL_PRICE_SEL), write: code.includes(POOL_SET_PRICE_SEL) };
+    poolPriceSupport = {
+      read: code.includes(POOL_SELECTORS.read),
+      write: code.includes(POOL_SELECTORS.write),
+      freeze: code.includes(POOL_SELECTORS.freeze),
+      feed: code.includes(POOL_SELECTORS.feed),
+    };
     return poolPriceSupport;
   };
 
@@ -2805,10 +2814,22 @@ async function main() {
           supported: false,
           canSet: false,
           assets: [],
+          // Name every missing lever, not just the price. A pool with no freeze
+          // and no feed has no way to respond to a collateral asset going wrong,
+          // which is a bigger fact about this deployment than one stale number.
+          missing: [
+            !support.read && "read reserve prices",
+            !support.write && "change a manual price",
+            !support.freeze && "freeze an asset",
+            !support.feed && "wire a live price feed",
+          ].filter(Boolean),
           note:
-            "This pool was deployed before it exposed its reserve prices, so they can't be read or " +
-            "changed from here. It still values collateral internally — borrow limits and health " +
-            "factors are correct — but a stale manual price can only be fixed by redeploying the pool.",
+            "This pool predates the operator risk controls: prices cannot be read or set, assets " +
+            "cannot be frozen, and no live feed can be attached. It still values collateral " +
+            "internally, so borrow limits and health factors are consistent — but if a collateral " +
+            "asset's real price moves away from the one baked in at deployment, there is no lever " +
+            "here to respond with. Redeploying the pool is the only fix; archive and migrate the " +
+            "existing suppliers first.",
         });
         return;
       }

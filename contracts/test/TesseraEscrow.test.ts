@@ -368,3 +368,96 @@ describe("TesseraEscrow", () => {
     expect((await usdc.read.balanceOf([seller.account.address])) - sellerBefore).to.equal(9_950_000n);
   });
 });
+
+describe("TesseraEscrow (the fee is fixed when the escrow is funded)", () => {
+  /**
+   * `protocolFeeBps` is owner-settable. Reading it at payout time meant an owner
+   * could raise the cut *after* a provider had delivered — changing the terms of
+   * a trade that was agreed, and had already been performed, before the change.
+   *
+   * Both sides commit to the fee they could see at `open()`. A later change
+   * applies to later escrows, which is the only version of "the owner can set a
+   * fee" that a counterparty can reason about.
+   */
+
+  /** open -> fulfill at whatever fee is currently set, returning the id. */
+  async function openAndFulfil(fx: any, amount: bigint) {
+    const deadline = await futureDeadline(3600);
+    await (await fx.asEscrow(fx.agent)).write.open([
+      fx.provider.account.address, amount, deadline, quoteHash,
+    ]);
+    const id = (await fx.escrow.read.nextPaymentId()) - 1n;
+    await (await fx.asEscrow(fx.provider)).write.fulfill([id, responseHash]);
+    return id;
+  }
+
+  it("settles at the fee in force when it was opened, not the current one", async () => {
+    const fx = await loadFixture(deployFixture);
+    const { escrow, usdc, agent, provider, treasury } = fx;
+
+    // Opened while the fee is zero.
+    const id = await openAndFulfil(fx, MINT);
+
+    // Owner raises it to the 1% ceiling afterwards.
+    await escrow.write.setProtocolFee([100, treasury.account.address]);
+
+    const before = await usdc.read.balanceOf([provider.account.address]);
+    const tBefore = await usdc.read.balanceOf([treasury.account.address]);
+    await (await fx.asEscrow(agent)).write.settle([id]);
+
+    expect((await usdc.read.balanceOf([provider.account.address])) - before)
+      .to.equal(MINT, "provider keeps the whole amount it agreed to");
+    expect((await usdc.read.balanceOf([treasury.account.address])) - tBefore)
+      .to.equal(0n, "the later fee cannot reach back into this escrow");
+  });
+
+  it("charges the new fee on an escrow opened after the change", async () => {
+    // The other half of the promise: a fee change must actually take effect.
+    const fx = await loadFixture(deployFixture);
+    const { escrow, usdc, agent, treasury } = fx;
+    await escrow.write.setProtocolFee([100, treasury.account.address]);
+
+    const id = await openAndFulfil(fx, MINT);
+    const tBefore = await usdc.read.balanceOf([treasury.account.address]);
+    await (await fx.asEscrow(agent)).write.settle([id]);
+
+    expect((await usdc.read.balanceOf([treasury.account.address])) - tBefore)
+      .to.equal(MINT / 100n, "1% of the amount");
+  });
+
+  it("reports the payout for a specific payment at its own recorded fee", async () => {
+    const fx = await loadFixture(deployFixture);
+    const { escrow, treasury } = fx;
+    const id = await openAndFulfil(fx, MINT);
+    await escrow.write.setProtocolFee([100, treasury.account.address]);
+
+    // The generic quote follows the current setting; the per-payment one does not.
+    const [genericNet] = await escrow.read.quotePayout([MINT]);
+    const [thisNet, thisFee] = await escrow.read.quotePayoutFor([id]);
+    expect(thisNet).to.equal(MINT);
+    expect(thisFee).to.equal(0n);
+    expect(genericNet).to.equal(MINT - MINT / 100n);
+  });
+
+  it("a refund is unaffected either way", async () => {
+    // A refund returns the full amount at any fee, so the snapshot must not
+    // introduce a path where a fee is taken from a failed delivery.
+    const fx = await loadFixture(deployFixture);
+    const { escrow, usdc, agent, treasury } = fx;
+    await escrow.write.setProtocolFee([100, treasury.account.address]);
+
+    const deadline = await futureDeadline(3600);
+    await (await fx.asEscrow(agent)).write.open([
+      fx.provider.account.address, MINT, deadline, quoteHash,
+    ]);
+    const id = (await fx.escrow.read.nextPaymentId()) - 1n;
+
+    const before = await usdc.read.balanceOf([agent.account.address]);
+    const tBefore = await usdc.read.balanceOf([treasury.account.address]);
+    await time.increaseTo(Number(deadline) + 1);
+    await (await fx.asEscrow(agent)).write.refund([id]);
+
+    expect((await usdc.read.balanceOf([agent.account.address])) - before).to.equal(MINT);
+    expect((await usdc.read.balanceOf([treasury.account.address])) - tBefore).to.equal(0n);
+  });
+});

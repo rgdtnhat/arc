@@ -1974,7 +1974,8 @@ const $ = (id) => document.getElementById(id);
           if (r.supported === false) {
             // Not a failure — this pool simply predates the price surface.
             body.innerHTML = `<tr><td colspan="5" class="muted">Reserve prices are not exposed by this pool.</td></tr>`;
-            if (note) { note.className = "feedNote"; note.textContent = r.note || ""; }
+            // A pool with no risk levers is a standing risk, not a footnote.
+            if (note) { note.className = "feedNote bad"; note.textContent = r.note || ""; }
             return;
           }
           body.innerHTML = r.assets

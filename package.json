@@ -23,7 +23,8 @@
     "audit": "npm audit --omit=dev && npm audit --audit-level=moderate",
     "deck": "node scripts/make-deck.mjs && node scripts/check-deck.mjs",
     "deck:check": "node scripts/check-deck.mjs",
-    "deck:pdf": "soffice --headless --norestore --convert-to pdf --outdir docs docs/deck.pptx"
+    "deck:pdf": "soffice --headless --norestore --convert-to pdf --outdir docs docs/deck.pptx",
+    "swap:redeploy": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/redeploy-swap.mjs"
   },
   "overrides": {
     "adm-zip": "^0.6.0",
