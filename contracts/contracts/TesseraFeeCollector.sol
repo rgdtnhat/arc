@@ -170,6 +170,13 @@ contract TesseraFeeCollector {
         if (toLending > 0 && pool != address(0)) {
             asset.approve(pool, toLending);
             try IFeePool(pool).supply(address(asset), toLending) {} catch {
+                // Withdraw the allowance the failed call did not consume. Leaving
+                // it standing would let that sink pull the amount later, outside
+                // any allocation — a leg that did not happen must leave nothing
+                // behind. None of today's sinks can act on it (they all pull from
+                // msg.sender), but an allowance nobody meant to grant should not
+                // depend on that staying true.
+                asset.approve(pool, 0);
                 toLending = 0;
             }
         } else {
@@ -178,6 +185,7 @@ contract TesseraFeeCollector {
         if (toVault > 0 && vault != address(0)) {
             asset.approve(vault, toVault);
             try IFeeVault(vault).deposit(toVault) {} catch {
+                asset.approve(vault, 0);
                 toVault = 0;
             }
         } else {
@@ -188,6 +196,7 @@ contract TesseraFeeCollector {
             // share in it — the app's own position included.
             asset.approve(amm, toSwap);
             try IFeeAmm(amm).fund(ammPoolId, address(asset), toSwap) {} catch {
+                asset.approve(amm, 0);
                 toSwap = 0;
             }
         } else if (toSwap > 0 && swap != address(0)) {
@@ -195,6 +204,7 @@ contract TesseraFeeCollector {
             // `seed` is owner-only on the swap desk; if this collector isn't its
             // owner the call reverts and the amount stays retained here.
             try IFeeSwap(swap).seed(address(asset), toSwap) {} catch {
+                asset.approve(swap, 0);
                 toSwap = 0;
             }
         } else {

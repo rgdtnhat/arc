@@ -199,3 +199,48 @@ describe("TesseraFeeCollector (fee allocation)", () => {
     expect(await swap.read.ammPoolId()).to.equal(3n);
   });
 });
+
+describe("TesseraFeeCollector (a failed leg leaves nothing behind)", () => {
+  /**
+   * Each allocation leg approves its sink and then calls it inside `try`, so one
+   * misconfigured sink cannot block the others. The catch used to zero the
+   * reported amount and nothing else — which left a live allowance to that sink
+   * for money it never took.
+   *
+   * No sink can act on such an allowance today (they all pull from `msg.sender`,
+   * never from an arbitrary holder), so this was never drainable. But an
+   * allowance nobody intended to grant should not be resting on that staying
+   * true through the next refactor, and "the leg did not happen" should mean the
+   * chain looks like it did not happen.
+   */
+  it("clears the approval for a sink whose call reverted", async () => {
+    const { deployer, usdc, pool, vault, collector } = await loadFixture(deployFixture);
+
+    // Freeze supply on the pool's reserve so the lending leg reverts inside its
+    // `try`. The vault leg fails with it: its deposit supplies the same pool.
+    const FREEZE_SUPPLY = 1;
+    await pool.write.setFrozen([usdc.address, FREEZE_SUPPLY]);
+
+    await time.increase(7 * 24 * 60 * 60 + 1);
+    await collector.write.allocateNow();
+
+    expect(await usdc.read.allowance([collector.address, pool.address])).to.equal(0n);
+    expect(await usdc.read.allowance([collector.address, vault.address])).to.equal(0n);
+
+    // And the money is still here — a failed leg retains, it does not burn.
+    // chai's numeric matchers don't take bigint; compare directly.
+    expect(await usdc.read.balanceOf([collector.address]) > 0n).to.equal(true);
+    void deployer;
+  });
+
+  it("still leaves no standing allowance when every leg succeeds", async () => {
+    // The success path consumes the allowance rather than clearing it; assert it
+    // lands at zero either way, so the invariant is "never a resting allowance".
+    const { usdc, pool, vault, collector } = await loadFixture(deployFixture);
+    await time.increase(7 * 24 * 60 * 60 + 1);
+    await collector.write.allocateNow();
+
+    expect(await usdc.read.allowance([collector.address, pool.address])).to.equal(0n);
+    expect(await usdc.read.allowance([collector.address, vault.address])).to.equal(0n);
+  });
+});
