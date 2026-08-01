@@ -17,9 +17,9 @@ async function deployFixture() {
   const pool = await hre.viem.deployContract("TesseraPool", [deployer.account.address]);
 
   // USDC: borrowable, 90% collateral / 95% liability factor, 10% reserve fee.
-  await pool.write.addReserve([usdc.address, 9000, 9500, 1000, true, 6, PRICE]);
+  await pool.write.addReserve([usdc.address, 9000, 9500, 9500, 1000, true, 6, PRICE]);
   // cirBTC: collateral only, 70% collateral factor.
-  await pool.write.addReserve([cbtc.address, 7000, 8000, 1000, false, 8, BTC_PRICE]);
+  await pool.write.addReserve([cbtc.address, 7000, 8000, 8000, 1000, false, 8, BTC_PRICE]);
 
   async function fundAndApprove(who: any, u: bigint, b: bigint) {
     if (u > 0n) {
@@ -167,5 +167,110 @@ describe("TesseraPool (lending & borrowing)", () => {
     expect(borrowApr > 0n).to.equal(true);
     expect(supplyApr > 0n).to.equal(true);
     expect(supplyApr < borrowApr).to.equal(true);
+  });
+});
+
+describe("TesseraPool (borrowing stops before liquidation starts)", () => {
+  /**
+   * The bug these pin: `borrow()` reverted on `!_healthy` and `liquidate()`
+   * reverted on `_healthy` — one line answering both questions. Drawing the last
+   * dollar of available credit therefore landed a borrower exactly on the
+   * seizure boundary, solvent by a wei and liquidatable one block of interest
+   * later. Two risk parameters existed per asset but never formed a buffer.
+   *
+   * Now `cFactor` caps borrowing and `liqFactor` triggers seizure, with
+   * `cFactor < liqFactor` enforced, so borrowing to the limit is an ordinary
+   * thing to do rather than a mistake.
+   */
+
+  /** Alice posts BTC collateral; Bob supplies the USDC she borrows. */
+  async function withCollateral() {
+    const fx = await loadFixture(deployFixture);
+    await fx.fundAndApprove(fx.alice, 0n, BTC("0.1"));
+    await fx.fundAndApprove(fx.bob, USDC("100000"), 0n);
+    await (await fx.as(fx.alice)).write.supply([fx.cbtc.address, BTC("0.1")]);
+    await (await fx.as(fx.bob)).write.supply([fx.usdc.address, USDC("100000")]);
+    return fx;
+  }
+
+  it("the borrow limit sits strictly below the liquidation threshold", async () => {
+    const fx = await withCollateral();
+    const [borrowLimit, liqLimit] = await fx.pool.read.accountLimits([fx.alice.account.address]);
+    expect(liqLimit > borrowLimit).to.equal(
+      true,
+      `liquidation ${liqLimit} must exceed borrow limit ${borrowLimit}`,
+    );
+    // 7000 vs 8000 bps against the same collateral.
+    expect((borrowLimit * 8000n) / 7000n).to.equal(liqLimit);
+  });
+
+  it("a borrower at their exact limit is not liquidatable", async () => {
+    const fx = await withCollateral();
+    const [, , limit] = await fx.pool.read.accountData([fx.alice.account.address]);
+    // PRICE_SCALE is 1e8 and USDC is 6dp, so USD -> USDC units is /100. A debt
+    // also weighs BPS/lFactor against the limit, so the true cap is scaled by
+    // USDC's 9500 liability factor. One unit short of it, to stay inside.
+    const draw = (limit * 9500n) / (10_000n * 100n) - 1n;
+    await (await fx.as(fx.alice)).write.borrow([fx.usdc.address, draw]);
+
+    const [, , , health] = await fx.pool.read.accountData([fx.alice.account.address]);
+    expect(health > WAD).to.equal(true, `fully drawn should still be above 1.0, got ${health}`);
+
+    // And the pool refuses to seize.
+    await fx.fundAndApprove(fx.liquidator, USDC("1000"), 0n);
+    await expect(
+      (await fx.as(fx.liquidator)).write.liquidate([
+        fx.alice.account.address, fx.usdc.address, fx.cbtc.address, draw / 2n,
+      ]),
+    ).to.be.rejectedWith("Healthy");
+  });
+
+  it("health measures distance to liquidation, not to the borrow cap", async () => {
+    // Read off the borrow limit, a fully-drawn position showed 1.00 while still
+    // solvent — the number a borrower watches hit 1 at the moment they were
+    // *allowed* to borrow rather than the moment they could be seized.
+    const fx = await withCollateral();
+    const [, , limit] = await fx.pool.read.accountData([fx.alice.account.address]);
+    await (await fx.as(fx.alice)).write.borrow([
+      fx.usdc.address, (limit * 9500n) / (10_000n * 100n) - 1n,
+    ]);
+
+    const [, , , health] = await fx.pool.read.accountData([fx.alice.account.address]);
+    // liqFactor/cFactor = 8000/7000, so the buffer is ~14% before USDC's own
+    // liability weighting is applied.
+    expect(health > (WAD * 110n) / 100n).to.equal(true, `expected a real buffer, got ${health}`);
+  });
+
+  it("refuses a reserve whose factors leave no buffer", async () => {
+    const { pool } = await loadFixture(deployFixture);
+    const other = await hre.viem.deployContract("MockToken", ["X", "X", 6]);
+    // cFactor == liqFactor collapses the two lines back into one.
+    await expect(
+      pool.write.addReserve([other.address, 8000, 8000, 9000, 1000, true, 6, PRICE]),
+    ).to.be.rejectedWith("cFactor must be below liqFactor");
+    // ...and above it is worse still.
+    await expect(
+      pool.write.addReserve([other.address, 9000, 8000, 9000, 1000, true, 6, PRICE]),
+    ).to.be.rejectedWith("cFactor must be below liqFactor");
+  });
+
+  it("lets an operator retune risk without redeploying the pool", async () => {
+    // The lever the live pool never had: an asset whose real risk changes could
+    // only be answered by redeploying and migrating every supplier.
+    const fx = await withCollateral();
+    const [before] = await fx.pool.read.accountLimits([fx.alice.account.address]);
+
+    await fx.pool.write.setRiskParams([fx.cbtc.address, 5000, 6500, 8000]);
+    const [after, afterLiq] = await fx.pool.read.accountLimits([fx.alice.account.address]);
+
+    expect(after < before).to.equal(true, "tightening cFactor must reduce borrowing power");
+    expect(afterLiq > after).to.equal(true, "the buffer survives a retune");
+  });
+
+  it("only the owner can retune risk", async () => {
+    const { pool, cbtc, bob } = await loadFixture(deployFixture);
+    const asBob = await hre.viem.getContractAt("TesseraPool", pool.address, { client: { wallet: bob } });
+    // `onlyOwner` reverts with the custom error NotOwner(), not a string.
+    await expect(asBob.write.setRiskParams([cbtc.address, 5000, 6500, 8000])).to.be.rejected;
   });
 });

@@ -17,8 +17,8 @@ async function deployFixture() {
   const usdc = await hre.viem.deployContract("MockUSDC");
   const cbtc = await hre.viem.deployContract("MockToken", ["Circle Wrapped Bitcoin (mock)", "cirBTC", 8]);
   const pool = await hre.viem.deployContract("TesseraPool", [deployer.account.address]);
-  await pool.write.addReserve([usdc.address, 9000, 9500, 1000, true, 6, PRICE]);
-  await pool.write.addReserve([cbtc.address, 7000, 8000, 1000, false, 8, BTC_PRICE]);
+  await pool.write.addReserve([usdc.address, 9000, 9500, 9500, 1000, true, 6, PRICE]);
+  await pool.write.addReserve([cbtc.address, 7000, 8000, 8000, 1000, false, 8, BTC_PRICE]);
 
   const vault = await hre.viem.deployContract("TesseraVault", [
     usdc.address,

@@ -645,6 +645,14 @@ const $ = (id) => document.getElementById(id);
           $("lnSupplied").textContent = "$" + ln.account.suppliedUsd;
           $("lnBorrowed").textContent = "$" + ln.account.borrowedUsd;
           $("lnLimit").textContent = "$" + ln.account.borrowLimitUsd;
+          // Only shown when the pool exposes it. An older pool returns null and
+          // the field says so rather than repeating the borrow limit as if the
+          // two lines were the same.
+          if ($("lnLiqLimit")) {
+            $("lnLiqLimit").textContent = ln.account.liquidationLimitUsd
+              ? "$" + ln.account.liquidationLimitUsd
+              : "n/a on this pool";
+          }
           // The collateral limit alone reads as a promise the pool may not be
           // able to keep — a $66,500 limit against $100 of lendable USDC. Show
           // what can actually be drawn, and say which constraint binds.

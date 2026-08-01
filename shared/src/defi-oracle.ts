@@ -369,6 +369,10 @@ export function healthFrom(
   // large means the same thing and must not be rendered as a real number.
   const hf = !hasDebt || healthFactorWad > 10n ** 30n ? null : Number(healthFactorWad) / 1e18;
   const bufferPct = hf === null ? null : round(Math.max(0, (1 - 1 / hf) * 100), 2);
+  // These thresholds only became meaningful once the pool measured health
+  // against the liquidation threshold rather than the borrow cap. Under the old
+  // reading, "hf < 1" meant "has borrowed to the limit" — a normal state — so
+  // the bands described how much credit was drawn, not how close seizure was.
   const band: HealthAnswer["band"] = !hasDebt
     ? "no-debt"
     : hf === null

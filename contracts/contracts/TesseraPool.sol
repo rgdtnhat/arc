@@ -64,7 +64,20 @@ contract TesseraPool is ReentrancyGuard {
         bool enabled;
         bool borrowable;
         uint8 decimals;
-        uint16 cFactor; // collateral factor (bps)
+        // Three risk parameters, and the distance between the first two is the
+        // whole point:
+        //
+        //   cFactor   how much of this collateral you may BORROW against
+        //   liqFactor how much of it you must fall below to be LIQUIDATED
+        //   lFactor   how much a DEBT in this asset counts against you
+        //
+        // `cFactor < liqFactor` is enforced, so a borrower who draws to their
+        // limit still has room before they can be seized. Collapsing the two
+        // into one line — which is what this pool did — means the maximum
+        // borrow lands exactly on the liquidation boundary and the next block
+        // of interest makes the position liquidatable.
+        uint16 cFactor; // collateral factor / max LTV (bps)
+        uint16 liqFactor; // liquidation threshold (bps), > cFactor
         uint16 lFactor; // liability factor (bps)
         uint16 reserveFactor; // protocol cut of interest (bps)
         uint256 price; // USD price, PRICE_SCALE
@@ -125,7 +138,8 @@ contract TesseraPool is ReentrancyGuard {
     mapping(address => mapping(address => uint256)) public supplyShares; // asset => user => shares
     mapping(address => mapping(address => uint256)) public borrowShares; // asset => user => shares
 
-    event ReserveAdded(address indexed asset, uint16 cFactor, uint16 lFactor, bool borrowable);
+    event ReserveAdded(address indexed asset, uint16 cFactor, uint16 liqFactor, uint16 lFactor, bool borrowable);
+    event RiskParamsSet(address indexed asset, uint16 cFactor, uint16 liqFactor, uint16 lFactor);
     event PriceSet(address indexed asset, uint256 price);
     event Supply(address indexed asset, address indexed user, uint256 amount, uint256 shares);
     event Withdraw(address indexed asset, address indexed user, uint256 amount, uint256 shares);
@@ -171,6 +185,7 @@ contract TesseraPool is ReentrancyGuard {
     function addReserve(
         address asset,
         uint16 cFactor,
+        uint16 liqFactor,
         uint16 lFactor,
         uint16 reserveFactor,
         bool borrowable,
@@ -178,12 +193,13 @@ contract TesseraPool is ReentrancyGuard {
         uint256 usdPrice
     ) external onlyOwner {
         require(!reserves[asset].enabled, "exists");
-        require(cFactor <= BPS && lFactor <= BPS && lFactor > 0 && reserveFactor < BPS, "factors");
+        _requireFactors(cFactor, liqFactor, lFactor, reserveFactor);
         reserves[asset] = Reserve({
             enabled: true,
             borrowable: borrowable,
             decimals: decimals_,
             cFactor: cFactor,
+            liqFactor: liqFactor,
             lFactor: lFactor,
             reserveFactor: reserveFactor,
             price: usdPrice,
@@ -194,7 +210,48 @@ contract TesseraPool is ReentrancyGuard {
             lastAccrual: uint64(block.timestamp)
         });
         reserveList.push(asset);
-        emit ReserveAdded(asset, cFactor, lFactor, borrowable);
+        emit ReserveAdded(asset, cFactor, liqFactor, lFactor, borrowable);
+    }
+
+    /**
+     * @dev The invariant that makes the buffer real.
+     *
+     * `cFactor < liqFactor` is the whole safety margin: borrow up to the first,
+     * get seized past the second. Equal values collapse them back into one line.
+     * A zero `lFactor` would divide by zero when weighing a debt.
+     */
+    function _requireFactors(uint16 cFactor, uint16 liqFactor, uint16 lFactor, uint16 reserveFactor)
+        internal
+        pure
+    {
+        require(liqFactor <= BPS, "liqFactor > 100%");
+        require(cFactor < liqFactor, "cFactor must be below liqFactor");
+        require(lFactor > 0 && lFactor <= BPS, "lFactor");
+        require(reserveFactor < BPS, "reserveFactor");
+    }
+
+    /**
+     * @notice Retune one reserve's risk parameters.
+     *
+     * The lever this pool was missing. Without it, an asset whose real risk
+     * changes — a collateral token that turns out to be thinner than it looked,
+     * a price that drifts from the one set at deployment — can only be responded
+     * to by redeploying the whole pool and migrating every supplier.
+     *
+     * Tightening is always safe. Loosening `cFactor` lets existing borrowers
+     * draw more, so it is the one to think about before sending.
+     */
+    function setRiskParams(address asset, uint16 cFactor, uint16 liqFactor, uint16 lFactor)
+        external
+        onlyOwner
+    {
+        Reserve storage r = reserves[asset];
+        require(r.enabled, "unknown reserve");
+        _requireFactors(cFactor, liqFactor, lFactor, r.reserveFactor);
+        r.cFactor = cFactor;
+        r.liqFactor = liqFactor;
+        r.lFactor = lFactor;
+        emit RiskParamsSet(asset, cFactor, liqFactor, lFactor);
     }
 
     /// @notice Manual price, used only while `asset` has no feed configured.
@@ -436,7 +493,9 @@ contract TesseraPool is ReentrancyGuard {
         uint256 repayAmount
     ) external nonReentrant {
         _accrueAll();
-        if (_healthy(user)) revert Healthy();
+        // Not `!_healthy`: exceeding the borrow limit is not grounds for
+        // seizure, only for refusing new debt.
+        if (!_liquidatable(user)) revert Healthy();
         Reserve storage rd = reserves[debtAsset];
         Reserve storage rc = reserves[collateralAsset];
         if (!rd.enabled || !rc.enabled) revert UnknownReserve();
@@ -540,19 +599,47 @@ contract TesseraPool is ReentrancyGuard {
         return r.totalSupplyAssets - r.totalBorrowAssets;
     }
 
+    /// @dev May this user take on more debt? Gated on the borrow limit.
     function _healthy(address user) internal view returns (bool) {
-        (uint256 limit, uint256 liability) = _accountLiquidity(user);
-        return limit >= liability;
+        (uint256 borrowLimit, , uint256 liability) = _accountLiquidity(user);
+        return borrowLimit >= liability;
     }
 
-    function _accountLiquidity(address user) internal view returns (uint256 limit, uint256 liability) {
+    /**
+     * @dev May this user be liquidated? Gated on the *liquidation* threshold,
+     *      which sits above the borrow limit.
+     *
+     * Separate from `_healthy` deliberately. When one function answered both
+     * questions, drawing the last dollar of available credit put a borrower
+     * exactly on the seizure line — solvent by a wei, liquidatable one block of
+     * interest later. The gap between `cFactor` and `liqFactor` is the buffer
+     * that makes borrowing to the limit a normal thing to do rather than a
+     * mistake.
+     */
+    function _liquidatable(address user) internal view returns (bool) {
+        (, uint256 liqLimit, uint256 liability) = _accountLiquidity(user);
+        return liability > liqLimit;
+    }
+
+    function _accountLiquidity(address user)
+        internal
+        view
+        returns (uint256 borrowLimit, uint256 liqLimit, uint256 liability)
+    {
         uint256 n = reserveList.length;
         for (uint256 i = 0; i < n; i++) {
             address asset = reserveList[i];
             Reserve storage r = reserves[asset];
             uint256 s = supplyBalance(asset, user);
-            if (s > 0) limit += (_value(asset, s) * r.cFactor) / BPS;
+            if (s > 0) {
+                uint256 v = _value(asset, s);
+                borrowLimit += (v * r.cFactor) / BPS;
+                liqLimit += (v * r.liqFactor) / BPS;
+            }
             uint256 b = borrowBalance(asset, user);
+            // Per-asset liability factor: a debt in a riskier asset counts for
+            // more than its face value, which is what lets one pool hold assets
+            // of genuinely different quality.
             if (b > 0) liability += (_value(asset, b) * BPS) / r.lFactor;
         }
     }
@@ -566,13 +653,16 @@ contract TesseraPool is ReentrancyGuard {
     {
         uint256 n = reserveList.length;
         uint256 liability;
+        uint256 liqLimit;
         for (uint256 i = 0; i < n; i++) {
             address asset = reserveList[i];
             Reserve storage r = reserves[asset];
             uint256 s = supplyBalance(asset, user);
             if (s > 0) {
-                supplyValue += _value(asset, s);
-                borrowLimit += (_value(asset, s) * r.cFactor) / BPS;
+                uint256 v = _value(asset, s);
+                supplyValue += v;
+                borrowLimit += (v * r.cFactor) / BPS;
+                liqLimit += (v * r.liqFactor) / BPS;
             }
             uint256 b = borrowBalance(asset, user);
             if (b > 0) {
@@ -580,7 +670,22 @@ contract TesseraPool is ReentrancyGuard {
                 liability += (_value(asset, b) * BPS) / r.lFactor;
             }
         }
-        healthFactor = liability == 0 ? type(uint256).max : (borrowLimit * WAD) / liability;
+        // Health is distance to *liquidation*, not distance to the borrow cap.
+        // Measuring it against `borrowLimit` made a fully-drawn position read as
+        // health 1.00 when it was still comfortably solvent — and, worse, made
+        // the number a borrower watches hit 1.00 at the moment they were allowed
+        // to borrow, rather than at the moment they could be seized.
+        healthFactor = liability == 0 ? type(uint256).max : (liqLimit * WAD) / liability;
+    }
+
+    /// @notice The two lines a borrower cares about: where borrowing stops, and
+    ///         where liquidation starts. Both in USD (PRICE_SCALE).
+    function accountLimits(address user)
+        external
+        view
+        returns (uint256 borrowLimit, uint256 liquidationLimit, uint256 liability)
+    {
+        return _accountLiquidity(user);
     }
 
     /// @notice Reserve stats for agents/dashboards: liquidity, utilization, and

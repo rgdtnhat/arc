@@ -874,11 +874,31 @@ async function main() {
     const headroomNum = Number(headroomUsd) / 1e8;
     const borrowableNow = Math.min(headroomNum, borrowableLiquidityUsd);
 
+    // Both lines, when the pool is new enough to expose them. An older pool
+    // returns nothing here and the UI simply omits the second figure rather
+    // than inventing one.
+    const limits = poolClient && poolDeployment
+      ? await poolClient.public
+          .readContract({
+            address: poolDeployment.poolAddress,
+            abi: tesseraPoolAbi,
+            functionName: "accountLimits",
+            args: [agentAccount.address as Hex],
+          })
+          .catch(() => null)
+      : null;
+
     const account = acct
       ? {
           suppliedUsd: fmtUsd(acct.supplyValue),
           borrowedUsd: fmtUsd(acct.borrowValue),
           borrowLimitUsd: fmtUsd(acct.borrowLimit),
+          /**
+           * Where seizure starts, which is a different line from where
+           * borrowing stops. Showing only the borrow limit made "health" and
+           * "limit" look like the same number and hid the buffer between them.
+           */
+          liquidationLimitUsd: limits ? fmtUsd(limits[1]) : null,
           /** Collateral headroom left, before the liquidity cap. */
           headroomUsd: headroomNum.toFixed(2),
           /** What can actually be drawn: the smaller of the two. */

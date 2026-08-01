@@ -284,7 +284,11 @@ async function main() {
     for (let attempt = 1; attempt <= 3; attempt++) {
       console.log(`→ addReserve ${r.symbol} (${r.decimals}d, borrowable)${attempt > 1 ? ` — retry ${attempt - 1}` : ""}…`);
       try {
-        await dSend(pool, tesseraPoolAbi, "addReserve", [r.address, r.cFactor, r.lFactor, r.rf, true, r.decimals, r.price]);
+        // liqFactor sits between cFactor and lFactor: borrow up to cFactor, get
+        // liquidated past liqFactor. The gap is the borrower's buffer.
+        await dSend(pool, tesseraPoolAbi, "addReserve", [
+          r.address, r.cFactor, r.liqFactor ?? r.lFactor, r.lFactor, r.rf, true, r.decimals, r.price,
+        ]);
       } catch (e) {
         console.warn(`   addReserve ${r.symbol} failed: ${String(e.shortMessage ?? e.message).slice(0, 90)}`);
       }

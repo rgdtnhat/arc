@@ -1188,6 +1188,10 @@
               <!-- Two numbers, because they differ and only one is actionable:
                    the collateral limit, and what the pool can actually lend. -->
               <div class="metric"><div class="k">Borrow limit (collateral)</div><div class="v" id="lnLimit">—</div></div>
+              <!-- The seizure line, which is a different number from the borrow
+                   cap. The gap between them is the borrower's buffer; showing
+                   only the cap made the two look like one threshold. -->
+              <div class="metric"><div class="k">Liquidation at</div><div class="v" id="lnLiqLimit">—</div></div>
               <div class="metric">
                 <div class="k">Available to borrow now</div>
                 <div class="v" id="lnBorrowable">—</div>

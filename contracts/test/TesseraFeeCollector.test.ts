@@ -10,7 +10,7 @@ async function deployFixture() {
 
   const usdc = await hre.viem.deployContract("MockUSDC");
   const pool = await hre.viem.deployContract("TesseraPool", [deployer.account.address]);
-  await pool.write.addReserve([usdc.address, 9000, 9500, 1000, true, 6, PRICE]);
+  await pool.write.addReserve([usdc.address, 9000, 9500, 9500, 1000, true, 6, PRICE]);
   const vault = await hre.viem.deployContract("TesseraVault", [
     usdc.address,
     pool.address,
