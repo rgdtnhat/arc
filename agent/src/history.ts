@@ -24,7 +24,13 @@ import { randomUUID } from "node:crypto";
  * claim on the old contract is untouched by that, which is the honest outcome:
  * they end up able to withdraw from either.
  */
-export type ArchiveKind = "pool" | "vault" | "swap" | "collector" | "amm";
+/**
+ * `swap` is the retired inventory desk. It stays in the union so archives
+ * recorded before the desk was removed still load and can still be settled —
+ * dropping it would make those records unreadable, which is the opposite of
+ * what an archive is for. New archives use `router`.
+ */
+export type ArchiveKind = "pool" | "vault" | "swap" | "router" | "collector" | "amm";
 
 export interface HolderBalance {
   /** Holder address, lowercased. */
@@ -158,7 +164,7 @@ export class ArchiveStore {
 
   add(input: ArchiveInput): { ok: true; record: ArchiveRecord } | { ok: false; error: string } {
     if (!isAddress(input.address)) return { ok: false, error: "That doesn't look like a contract address." };
-    const kinds: ArchiveKind[] = ["pool", "vault", "swap", "collector", "amm"];
+    const kinds: ArchiveKind[] = ["pool", "vault", "swap", "router", "collector", "amm"];
     if (!kinds.includes(input.kind)) return { ok: false, error: "Unknown contract kind." };
     // Recording the same contract twice would give two half-truths about one
     // set of balances, and settling one would leave the other looking unpaid.

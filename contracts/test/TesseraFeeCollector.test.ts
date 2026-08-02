@@ -18,22 +18,23 @@ async function deployFixture() {
     8000,
     1500,
   ]);
-  const swap = await hre.viem.deployContract("TesseraSwap", [pool.address, deployer.account.address, 30, 5000]);
+  // The liquidity leg's fallback destination when no AMM is configured. A plain
+  // holding address stands in for it here: the leg is a transfer, and what is
+  // being tested is that the amount lands somewhere rather than vanishing.
+  const [, , liquiditySink] = await hre.viem.getWalletClients();
 
   const collector = await hre.viem.deployContract("TesseraFeeCollector", [
     usdc.address,
     agentWallet.account.address,
     pool.address,
     vault.address,
-    swap.address,
+    liquiditySink.account.address,
   ]);
-  // The collector must own the swap desk to be able to seed it.
-  await swap.write.transferOwnership([collector.address]);
 
   // Fund the collector with 100 USDC of "collected fees".
   await usdc.write.mint([collector.address, USDC("100")]);
 
-  return { deployer, agentWallet, usdc, pool, vault, swap, collector };
+  return { deployer, agentWallet, usdc, pool, vault, liquiditySink, collector };
 }
 
 describe("TesseraFeeCollector (fee allocation)", () => {
@@ -43,13 +44,13 @@ describe("TesseraFeeCollector (fee allocation)", () => {
     expect(s[0]).to.equal(2000); // agent
     expect(s[1]).to.equal(2000); // lending
     expect(s[2]).to.equal(2000); // vault
-    expect(s[3]).to.equal(2000); // swap
+    expect(s[3]).to.equal(2000); // liquidity
     expect(s[4]).to.equal(2000); // retained
     expect(await collector.read.interval()).to.equal(7 * 24 * 3600);
   });
 
-  it("allocates fees across agent, lending, vault, swap and retains the rest", async () => {
-    const { agentWallet, usdc, pool, vault, swap, collector } = await loadFixture(deployFixture);
+  it("allocates fees across agent, lending, vault, liquidity and retains the rest", async () => {
+    const { agentWallet, usdc, pool, vault, liquiditySink, collector } = await loadFixture(deployFixture);
     await collector.write.allocateNow();
 
     // 20 USDC to the agent wallet.
@@ -58,8 +59,8 @@ describe("TesseraFeeCollector (fee allocation)", () => {
     expect(await pool.read.supplyBalance([usdc.address, collector.address])).to.equal(USDC("20"));
     // 20 USDC deposited into the vault (collector holds shares).
     expect((await vault.read.sharesOf([collector.address])) > 0n).to.equal(true);
-    // 20 USDC seeded into swap inventory.
-    expect(await usdc.read.balanceOf([swap.address])).to.equal(USDC("20"));
+    // 20 USDC transferred to the liquidity sink.
+    expect(await usdc.read.balanceOf([liquiditySink.account.address])).to.equal(USDC("20"));
     // ~20 USDC retained here.
     expect(await usdc.read.balanceOf([collector.address])).to.equal(USDC("20"));
   });
@@ -124,7 +125,7 @@ describe("TesseraFeeCollector (fee allocation)", () => {
   // The same contract, pointed at an AMM pool, is the AMM fee collector: the app's
   // half of every AMM swap fee is split 20% back into the pool / 20% lending /
   // 20% vault / 20% agent / 20% retained.
-  it("funds an AMM pool with the swap leg when configured as the AMM collector", async () => {
+  it("funds an AMM pool with the liquidity leg when configured as the AMM collector", async () => {
     const { deployer, agentWallet, usdc, pool, vault, collector } = await loadFixture(deployFixture);
     const eurc = await hre.viem.deployContract("MockToken", ["Euro Coin (mock)", "EURC", 6]);
     const amm = await hre.viem.deployContract("TesseraAMM", [collector.address]);
@@ -150,7 +151,7 @@ describe("TesseraFeeCollector (fee allocation)", () => {
     expect(await usdc.read.balanceOf([collector.address])).to.equal(USDC("20"));
   });
 
-  it("retains the swap leg when the configured AMM pool cannot take it", async () => {
+  it("retains the liquidity leg when the configured AMM pool cannot take it", async () => {
     const { usdc, collector } = await loadFixture(deployFixture);
     const eurc = await hre.viem.deployContract("MockToken", ["Euro Coin (mock)", "EURC", 6]);
     const amm = await hre.viem.deployContract("TesseraAMM", [collector.address]);
@@ -161,42 +162,6 @@ describe("TesseraFeeCollector (fee allocation)", () => {
     await collector.write.allocateNow();
     expect(await usdc.read.balanceOf([amm.address])).to.equal(0n);
     expect(await usdc.read.balanceOf([collector.address])).to.equal(USDC("40")); // 20 retained + 20 undelivered
-  });
-
-  // --- reaching into the desk it owns -----------------------------------------
-
-  it("can withdraw inventory from the swap desk it owns", async () => {
-    const { deployer, usdc, swap, collector } = await loadFixture(deployFixture);
-    // This is the trap the function exists for: deployment gives the collector
-    // ownership so `seed` works, and `withdrawInventory` is owner-gated — so
-    // without a forwarding path the desk's inventory is unreachable by anyone.
-    await collector.write.allocateNow();
-    const inDesk = await usdc.read.balanceOf([swap.address]);
-    expect(inDesk > 0n).to.equal(true);
-    expect((await swap.read.owner()).toLowerCase()).to.equal(collector.address.toLowerCase());
-
-    const before = await usdc.read.balanceOf([deployer.account.address]);
-    await collector.write.withdrawSwapInventory([usdc.address, inDesk, deployer.account.address]);
-    expect(await usdc.read.balanceOf([swap.address])).to.equal(0n);
-    expect(await usdc.read.balanceOf([deployer.account.address])).to.equal(before + inDesk);
-  });
-
-  it("only the collector's owner can pull from the desk", async () => {
-    const { agentWallet, usdc, collector } = await loadFixture(deployFixture);
-    const asOther = await hre.viem.getContractAt("TesseraFeeCollector", collector.address, {
-      client: { wallet: agentWallet },
-    });
-    await expect(
-      asOther.write.withdrawSwapInventory([usdc.address, 1n, agentWallet.account.address])
-    ).to.be.rejected;
-  });
-
-  it("can point the desk it owns at an AMM pool", async () => {
-    const { deployer, swap, collector } = await loadFixture(deployFixture);
-    const amm = await hre.viem.deployContract("TesseraAMM", [deployer.account.address]);
-    await collector.write.setSwapAmm([amm.address, 3n]);
-    expect((await swap.read.amm()).toLowerCase()).to.equal(amm.address.toLowerCase());
-    expect(await swap.read.ammPoolId()).to.equal(3n);
   });
 });
 

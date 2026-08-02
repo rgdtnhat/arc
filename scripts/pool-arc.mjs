@@ -13,8 +13,8 @@ import {
   tesseraPoolBytecode,
   tesseraVaultAbi,
   tesseraVaultBytecode,
-  tesseraSwapAbi,
-  tesseraSwapBytecode,
+  tesseraRouterAbi,
+  tesseraRouterBytecode,
   tesseraFeeCollectorAbi,
   tesseraFeeCollectorBytecode,
   tesseraAmmAbi,
@@ -48,8 +48,6 @@ const bal = async (who, token = ARC_USDC_ADDRESS) =>
 
 const ONLY_CHECK = process.argv.includes("--check");
 
-/** `fund(address,uint256)` — see the bytecode probe further down. */
-const FUND_SELECTOR = "7b1837de";
 
 // Real Circle assets on Arc (not mocks). Addresses can be overridden via env.
 const CIRBTC_ADDRESS = process.env.CIRBTC_ADDRESS ?? "0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF";
@@ -121,7 +119,7 @@ function recordHistory(label, address) {
  *   1. the recorded address, when it still holds code;
  *   2. otherwise the newest address in history that holds code — this is the
  *      safety net that stops a lost record from stranding user funds;
- *   3. otherwise deploy, which for a fund-custody component (vault, swap desk,
+ *   3. otherwise deploy, which for a fund-custody component (vault, AMM,
  *      fee collector) requires an explicit --fresh or --deploy-missing so it can
  *      never happen silently.
  * An unverifiable read aborts rather than guessing.
@@ -200,10 +198,10 @@ function operatorError(message, next) {
  * Run a step whose failure must not stop the deployment.
  *
  * This exists because the script kept dying at the wrong altitude. Seeding
- * inventory, opening the agent's demo position, topping up pool liquidity —
+ * liquidity, opening the agent's demo position, topping up pool liquidity —
  * none of those are the deployment. They are decoration on top of it. But an
  * uncaught revert in any one of them aborted `main()` before later contracts
- * were deployed, so a run that failed to move 2 USDC of swap inventory left the
+ * were deployed, so a run that failed to move 2 USDC of pool liquidity left the
  * AMM undeployed and the app showing "AMM not deployed yet".
  *
  * The rule now: a step is fatal only if a later step depends on it. Deploying a
@@ -353,78 +351,14 @@ async function main() {
   }, { custodial: true });
   const vault = vaultRes.address;
 
-  // 6) TesseraSwap: 0.30% fee, half of it to the app treasury. Seed inventory.
-  const swapRes = await adopt("TesseraSwap", existing.tesseraSwap, FRESH, async () => {
-    console.log("→ deploying TesseraSwap (0.30% fee, 50% to treasury)…");
-    const sh = await dWallet.deployContract({
-      abi: tesseraSwapAbi,
-      bytecode: tesseraSwapBytecode,
-      args: [pool, deployer.address, 30, 5000],
-      account: deployer,
-      chain: arcTestnet,
-    });
-    const addr = (await pub.waitForTransactionReceipt({ hash: sh })).contractAddress;
-    console.log("   swap", addr);
-    await pace();
-    return addr;
-  }, { custodial: true });
-  const swap = swapRes.address;
-
-  // Give the swap desk inventory. It fills user swaps out of its own balance, so
-  // with nothing in it every swap reverts "insufficient inventory".
-  //
-  // Ownership does not gate this, and an earlier version of this script wrongly
-  // assumed it did. `TesseraSwap.swap` measures inventory as
-  // `balanceOf(address(this))` — there is no internal ledger — so tokens sent by
-  // *any* sender become fillable inventory. `seed` being `onlyOwner` only ever
-  // restricted the route that emits an event, not the outcome.
-  //
-  // So: use `fund` when the deployed bytecode has it (visible, emits
-  // InventoryChanged), `seed` when we still own the desk, and otherwise a plain
-  // transfer, which works on the desks deployed before `fund` existed.
-  const swapOwner = await optional("reading the swap desk owner", () =>
-    pub.readContract({ address: swap, abi: tesseraSwapAbi, functionName: "owner" }),
-  );
-  const weOwnSwap = swapOwner && String(swapOwner).toLowerCase() === deployer.address.toLowerCase();
-  // Detected from the deployed bytecode, because the ABI compiled into this
-  // build is newer than the code that may already be on chain.
-  //
-  // Read the selector out of the code rather than simulating the call.
-  // Simulating cannot answer this: `fund` returns nothing, so an `eth_call` that
-  // comes back with empty data is a perfectly valid success — indistinguishable
-  // from the empty data a node returns when the selector isn't there. Solidity's
-  // dispatcher embeds every selector as a PUSH4 constant, so the code either
-  // contains it or does not.
-  const swapHasFund = await optional("checking whether the swap desk has fund()", async () => {
-    const code = await pub.getCode({ address: swap });
-    return typeof code === "string" && code.toLowerCase().includes(FUND_SELECTOR);
-  });
-  const route = swapHasFund ? "fund()" : weOwnSwap ? "seed()" : "transfer";
-  console.log(`   swap inventory route: ${route}${route === "transfer" ? " (this desk predates fund(); its balance is its inventory)" : ""}`);
-  for (const r of LIVE_RESERVES) {
-    const held = await bal(deployer.address, r.address);
-    const want = r.symbol === "cirBTC" ? 10_000n : 2_000_000n; // 0.0001 cirBTC or 2 units
-    const give = want < held ? want : held;
-    if (give === 0n) continue;
-    await optional(`funding swap inventory in ${r.symbol}`, async () => {
-      if (route === "transfer") {
-        await dSend(r.address, erc20Abi, "transfer", [swap, give]);
-      } else {
-        await dSend(r.address, erc20Abi, "approve", [swap, maxUint256]);
-        await dSend(swap, tesseraSwapAbi, route === "fund()" ? "fund" : "seed", [r.address, give]);
-      }
-      console.log(`   swap inventory +${give} ${r.symbol}`);
-    });
-  }
-
   // 6b) TesseraFeeCollector: every app fee lands here, then gets allocated
-  //     20/20/20/20/20 (agent / lending / vault / swap / retained), weekly.
+  //     20/20/20/20/20 (agent / lending / vault / liquidity / retained), weekly.
   const feeRes = await adopt("TesseraFeeCollector", existing.tesseraFeeCollector, FRESH, async () => {
     console.log("→ deploying TesseraFeeCollector (20/20/20/20/20, weekly)…");
     const fh = await dWallet.deployContract({
       abi: tesseraFeeCollectorAbi,
       bytecode: tesseraFeeCollectorBytecode,
-      args: [ARC_USDC_ADDRESS, agent.address, pool, vault, swap],
+      args: [ARC_USDC_ADDRESS, agent.address, pool, vault, "0x0000000000000000000000000000000000000000"],
       account: deployer,
       chain: arcTestnet,
     });
@@ -434,12 +368,10 @@ async function main() {
   if (!feeRes.reused) {
     console.log("   feeCollector", feeCollector);
     await pace();
-    // The collector needs to own the swap desk so its `seed` leg can run, and it
-    // becomes the treasury for both the pool and the vault so fees flow to it.
-    // Each is best-effort: on a reused deployment these may already be set, and
-    // a revert here must not abort the whole run.
+    // The collector becomes the treasury for both the pool and the vault so fees
+    // flow to it. Each is best-effort: on a reused deployment these may already
+    // be set, and a revert here must not abort the whole run.
     for (const [label, fn] of [
-      ["handing the swap desk to the fee collector", () => dSend(swap, tesseraSwapAbi, "transferOwnership", [feeCollector])],
       ["pointing the pool's treasury at the fee collector", () => dSend(pool, tesseraPoolAbi, "setTreasury", [feeCollector])],
       ["pointing the vault's treasury at the fee collector", () => dSend(vault, tesseraVaultAbi, "setTreasury", [feeCollector])],
     ]) {
@@ -507,14 +439,32 @@ async function main() {
     console.log(`   AMM already has ${ammPools} pool(s)`);
   }
 
-  // 6d) Let the swap desk fall back to AMM liquidity when its own inventory runs
-  //     short, so an empty desk quotes and fills instead of reverting. Routed
-  //     through the fee collector because it owns the desk; the desk's own
-  //     `setAmm` is owner-or-admin and the collector is the owner here.
-  await optional("pointing the swap desk at AMM pool 0", async () => {
-    await dSend(feeCollector, tesseraFeeCollectorAbi, "setSwapAmm", [amm, 0n]);
-    console.log("   swap desk falls back to AMM pool 0 when inventory is short");
-  });
+  // 6d) TesseraRouter: the swap surface. It holds no inventory — every trade is
+  //     filled out of the AMM pools above, with a min-out guard and a deadline,
+  //     and it can chain two hops through USDC when no direct pool exists.
+  //
+  //     Point the app's main fee collector's liquidity leg at the AMM too, so
+  //     protocol fees cycle back into the same pools the router trades against
+  //     rather than sitting in a desk nobody swaps with.
+  const routerRes = await adopt("TesseraRouter", existing.tesseraRouter, FRESH, async () => {
+    console.log("→ deploying TesseraRouter (AMM-backed swaps, USDC hub)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraRouterAbi,
+      bytecode: tesseraRouterBytecode,
+      args: [amm, [ARC_USDC_ADDRESS]],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   router", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const router = routerRes.address;
+
+  await optional("cycling protocol fees back into AMM pool 0", () =>
+    dSend(feeCollector, tesseraFeeCollectorAbi, "setAmm", [amm, 0n]),
+  );
 
   // 7) Persist. Merge into whatever record we adopted so escrow/tab and any
   //     other recorded addresses survive.
@@ -522,7 +472,8 @@ async function main() {
   dep.tesseraPool = pool;
   dep.tesseraVault = vault;
   dep.vaultAsset = ARC_USDC_ADDRESS;
-  dep.tesseraSwap = swap;
+  dep.tesseraRouter = router;
+  delete dep.tesseraSwap; // the inventory desk is no longer part of the app
   dep.tesseraFeeCollector = feeCollector;
   dep.tesseraAmm = amm;
   dep.tesseraAmmFeeCollector = ammFeeCollector;
@@ -534,10 +485,10 @@ async function main() {
   // `git reset --hard` can't revert this server to older addresses.
   writeFileSync(new URL("../deployments/arc.local.json", import.meta.url), body);
   if (depUrl) { /* adopted record merged above */ }
-  console.log("\n✅ Pool + Vault + Swap live on Arc:");
+  console.log("\n✅ Pool + Vault + AMM + Router live on Arc:");
   console.log("   pool     ", pool);
   console.log("   vault    ", vault);
-  console.log("   swap     ", swap);
+  console.log("   router   ", router);
   console.log("   fees     ", feeCollector);
   console.log("   amm      ", amm);
   console.log("   amm fees ", ammFeeCollector);

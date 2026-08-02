@@ -17,7 +17,7 @@
  * the part worth testing and the part a buyer would want to reproduce.
  */
 import { createPublicClient, type Chain, type Hex, type PublicClient } from "viem";
-import { tesseraPoolAbi, tesseraVaultAbi, tesseraSwapAbi, tesseraAmmAbi, tesseraEscrowAbi } from "./abi.js";
+import { tesseraPoolAbi, tesseraVaultAbi, tesseraRouterAbi, tesseraAmmAbi, tesseraEscrowAbi } from "./abi.js";
 import { pacedHttp } from "./transport.js";
 
 const WAD = 10n ** 18n;
@@ -33,7 +33,7 @@ export interface OracleConfig {
   rpcUrl: string;
   pool?: Hex;
   vault?: Hex;
-  swap?: Hex;
+  router?: Hex;
   amm?: Hex;
   escrow?: Hex;
   assets: OracleAssets[];
@@ -63,7 +63,8 @@ export interface YieldAnswer {
 // --- routing -----------------------------------------------------------------
 
 export interface RouteLeg {
-  venue: "swap-desk" | "amm";
+  /** `router` is the multi-hop best route; `amm` is a single named pool. */
+  venue: "router" | "amm";
   amountOut: string;
   /** Whole units, for ranking. */
   amountOutNum: number;
@@ -127,9 +128,9 @@ export class DefiOracle {
    * the two drift, and the failure mode is an agent sending funds to a contract
    * this deployment abandoned.
    */
-  get addresses(): Readonly<Pick<OracleConfig, "pool" | "vault" | "swap" | "amm" | "escrow">> {
-    const { pool, vault, swap, amm, escrow } = this.cfg;
-    return { pool, vault, swap, amm, escrow };
+  get addresses(): Readonly<Pick<OracleConfig, "pool" | "vault" | "router" | "amm" | "escrow">> {
+    const { pool, vault, router, amm, escrow } = this.cfg;
+    return { pool, vault, router, amm, escrow };
   }
 
   /** The assets this deployment lists. */
@@ -214,7 +215,15 @@ export class DefiOracle {
     return { best: rankYield(venues), venues, asOf: new Date().toISOString(), unavailable };
   }
 
-  /** Which venue fills a swap better right now: the oracle desk, or the AMM. */
+  /**
+   * The best fill for a swap right now: the router's chosen route, plus each
+   * single pool that could do it directly.
+   *
+   * Both are reported rather than only the winner, because they answer different
+   * questions. The router leg is what a trade would actually get, hops and all.
+   * The per-pool legs are what the liquidity looks like underneath, which is
+   * what tells a caller whether the price they are being quoted is thin.
+   */
   async route(tokenIn: Hex, tokenOut: Hex, amountIn: bigint): Promise<RouteAnswer> {
     const inA = this.byAddress(tokenIn);
     const outA = this.byAddress(tokenOut);
@@ -222,34 +231,32 @@ export class DefiOracle {
     const unavailable: string[] = [];
     const dec = outA?.decimals ?? 6;
 
-    if (this.cfg.swap) {
+    if (this.cfg.router) {
       try {
-        const q = (await this.public.readContract({
-          address: this.cfg.swap,
-          abi: tesseraSwapAbi,
-          functionName: "quote",
+        const r = (await this.public.readContract({
+          address: this.cfg.router,
+          abi: tesseraRouterAbi,
+          functionName: "estimate",
           args: [tokenIn, tokenOut, amountIn],
-        })) as readonly bigint[];
-        const out = q[0] ?? 0n;
-        // A quote the desk cannot actually fill is not a route. Check inventory.
-        const inv = (await this.public.readContract({
-          address: tokenOut,
-          abi: [{ type: "function", name: "balanceOf", stateMutability: "view", inputs: [{ type: "address" }], outputs: [{ type: "uint256" }] }],
-          functionName: "balanceOf",
-          args: [this.cfg.swap],
-        })) as bigint;
-        legs.push({
-          venue: "swap-desk",
-          amountOut: fmt(out, dec),
-          amountOutNum: unitsToNum(out, dec),
-          note:
-            inv >= out
-              ? "Oracle-priced: the rate does not move with size."
-              : `Quoted, but the desk holds only ${fmt(inv, dec)} — it would route to the AMM or revert.`,
-        });
-        if (inv < out) unavailable.push("swap-desk (insufficient inventory to fill this size)");
+        })) as readonly [bigint, readonly bigint[], readonly Hex[]];
+        const out = r[0] ?? 0n;
+        const hops = (r[1] ?? []).length;
+        if (out > 0n) {
+          legs.push({
+            venue: "router",
+            amountOut: fmt(out, dec),
+            amountOutNum: unitsToNum(out, dec),
+            note:
+              hops <= 1
+                ? `Direct through pool #${(r[1] ?? [])[0] ?? 0n}. Price moves with trade size.`
+                : `${hops} hops via ${(r[2] ?? []).slice(1, -1).map((h) => this.byAddress(h)?.symbol ?? h).join(" → ")}. ` +
+                  "Each hop pays its own fee and slippage.",
+          });
+        } else {
+          unavailable.push("router (no route with liquidity for this size)");
+        }
       } catch {
-        unavailable.push("swap-desk");
+        unavailable.push("router");
       }
     }
 
@@ -273,7 +280,7 @@ export class DefiOracle {
                 venue: "amm",
                 amountOut: fmt(out, dec),
                 amountOutNum: unitsToNum(out, dec),
-                note: `Constant-product pool #${i}: the price moves with trade size.`,
+                note: `Pool #${i} on its own, without routing.`,
               });
               break;
             }

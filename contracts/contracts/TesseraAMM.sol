@@ -26,11 +26,17 @@ interface IERC20A {
  * external oracle and cannot be manipulated by moving one.
  *
  * ## Fee split (the part the operator configures)
- * `swapFeeBps` is taken from the input. Of that fee, `lpShareBps` stays in the
- * pool — which is what pays liquidity providers, since their shares become
- * redeemable for more — and the rest is sent to `appFeeCollector`.
+ * `swapFeeBps` is taken from the input and must be one of three tiers — 0.10%,
+ * 0.30% or 1.00%, the Aquarius (Aqua Network) set. Of that fee, `lpShareBps`
+ * stays in the pool — which is what pays liquidity providers, since their shares
+ * become redeemable for more — and the rest is sent to `appFeeCollector`.
  * **`lpShareBps` can never be set below `MIN_LP_SHARE` (50%)**: liquidity
  * providers always keep at least half of the fees they generate.
+ *
+ * ## Routing
+ * Pools register each unordered pair they can trade in `pairPools`, and
+ * `estimateSwap` prices a leg without reverting. Together those are what let
+ * `TesseraRouter` find and chain routes across pools in a single read.
  *
  * ## Share accounting
  * Adding liquidity requires every asset in proportion; shares minted are the
@@ -44,9 +50,26 @@ contract TesseraAMM {
     uint16 internal constant BPS = 10_000;
     /// @notice LPs always keep at least half of the swap fees. Not admin-changeable.
     uint16 public constant MIN_LP_SHARE = 5_000;
-    /// @notice Ceiling on the swap fee any pool may charge (5%).
+    /// @notice Hard ceiling on the swap fee (5%). Kept as the outer bound, but the
+    ///         binding constraint is the tier set below — no pool can reach this.
     uint16 public constant MAX_SWAP_FEE = 500;
     uint256 public constant MINIMUM_LIQUIDITY = 1_000;
+
+    /**
+     * Fee tiers, following Aquarius (Aqua Network) on Stellar.
+     *
+     * Aquarius does not let a pool creator type an arbitrary number into the fee
+     * field: a pool is 0.10%, 0.30% or 1.00% and nothing else. That is a real
+     * design decision rather than a limitation. A free-form fee fragments
+     * liquidity — every distinct number is a separate pool for the same pair,
+     * none of them deep — and it gives an operator a dial they can nudge on a
+     * live pool in ways traders cannot anticipate. Three tiers cover the actual
+     * cases: correlated assets (0.10%), the ordinary pair (0.30%), and the
+     * long-tail pair whose volatility has to pay for itself (1.00%).
+     */
+    uint16 public constant FEE_TIER_STABLE = 10; // 0.10% — near-parity assets
+    uint16 public constant FEE_TIER_STANDARD = 30; // 0.30% — the default pair
+    uint16 public constant FEE_TIER_EXOTIC = 100; // 1.00% — volatile / thin
 
     struct Pool {
         bool exists;
@@ -78,6 +101,10 @@ contract TesseraAMM {
     mapping(uint256 => uint16) public amp;
     /// @notice Bounds on `amp`. 1 is nearly constant product; 5000 is very flat.
     uint16 public constant MAX_AMP = 5_000;
+
+    /// @dev keccak(sorted pair) => poolIds that hold both assets. Lets a router
+    ///      discover routes without walking every pool and every asset.
+    mapping(bytes32 => uint256[]) private pairPools;
 
     address public owner;
     address public appFeeCollector;
@@ -151,6 +178,59 @@ contract TesseraAMM {
         balances = new uint256[](p.assets.length);
         for (uint256 i = 0; i < p.assets.length; i++) balances[i] = reserves[poolId][p.assets[i]];
         return (p.assets, balances, p.swapFeeBps, p.lpShareBps, p.totalShares, p.frozen, p.name);
+    }
+
+    /// @notice The three fee tiers a pool may use, low to high.
+    function feeTiers() external pure returns (uint16[3] memory) {
+        return [FEE_TIER_STABLE, FEE_TIER_STANDARD, FEE_TIER_EXOTIC];
+    }
+
+    /// @dev Aquarius-style: a pool's fee is one of three tiers, never free-form.
+    function _requireFeeTier(uint16 feeBps) internal pure {
+        require(
+            feeBps == FEE_TIER_STABLE || feeBps == FEE_TIER_STANDARD || feeBps == FEE_TIER_EXOTIC,
+            "fee must be 10, 30 or 100 bps"
+        );
+    }
+
+    /// @dev Order-independent key for a pair, so A/B and B/A index the same slot.
+    function _pairKey(address a, address b) internal pure returns (bytes32) {
+        return a < b ? keccak256(abi.encodePacked(a, b)) : keccak256(abi.encodePacked(b, a));
+    }
+
+    /**
+     * @notice Every pool that holds both assets. Best-first is *not* implied —
+     *         the caller quotes each and picks. Used by the router to find routes.
+     */
+    function poolsForPair(address tokenA, address tokenB) external view returns (uint256[] memory) {
+        return pairPools[_pairKey(tokenA, tokenB)];
+    }
+
+    function pairPoolCount(address tokenA, address tokenB) external view returns (uint256) {
+        return pairPools[_pairKey(tokenA, tokenB)].length;
+    }
+
+    /**
+     * @notice `quote` that answers 0 instead of reverting.
+     *
+     * Aquarius exposes an estimate call precisely so a router can price a dozen
+     * candidate routes in one read without a single bad leg aborting the batch.
+     * `quote` reverts — correctly, since a swap that cannot happen must not
+     * silently price at zero — so routing needs this second door.
+     */
+    function estimateSwap(uint256 poolId, address tokenIn, address tokenOut, uint256 amountIn)
+        external
+        view
+        returns (uint256 amountOut, uint256 lpFee, uint256 appFee)
+    {
+        if (poolId >= pools.length || !pools[poolId].exists || pools[poolId].frozen) return (0, 0, 0);
+        if (tokenIn == tokenOut || amountIn == 0) return (0, 0, 0);
+        if (reserves[poolId][tokenIn] == 0 || reserves[poolId][tokenOut] == 0) return (0, 0, 0);
+        try this.quote(poolId, tokenIn, tokenOut, amountIn) returns (uint256 o, uint256 l, uint256 a) {
+            return (o, l, a);
+        } catch {
+            return (0, 0, 0);
+        }
     }
 
     /**
@@ -399,7 +479,7 @@ contract TesseraAMM {
         string calldata name
     ) external onlyOwner returns (uint256 poolId) {
         require(assets.length >= 2 && assets.length <= maxAssetsPerPool, "asset count");
-        require(swapFeeBps <= MAX_SWAP_FEE, "fee");
+        _requireFeeTier(swapFeeBps);
         require(lpShareBps >= MIN_LP_SHARE && lpShareBps <= BPS, "lp share");
         for (uint256 i = 0; i < assets.length; i++) {
             require(assets[i] != address(0), "zero asset");
@@ -413,6 +493,14 @@ contract TesseraAMM {
         p.swapFeeBps = swapFeeBps;
         p.lpShareBps = lpShareBps;
         p.name = name;
+        // Index every unordered pair this pool can trade, so routing is a lookup
+        // rather than a scan. A 4-asset pool registers 6 pairs — done once, here,
+        // because a pool's assets never change after creation.
+        for (uint256 i = 0; i < assets.length; i++) {
+            for (uint256 j = i + 1; j < assets.length; j++) {
+                pairPools[_pairKey(assets[i], assets[j])].push(poolId);
+            }
+        }
         emit PoolCreated(poolId, assets, swapFeeBps, lpShareBps, name);
     }
 
@@ -437,11 +525,11 @@ contract TesseraAMM {
         emit AmpSet(poolId, amp_);
     }
 
-    /// @notice Retune one pool's fee and LP split (LP share stays >= 50%).
+    /// @notice Retune one pool's fee tier and LP split (LP share stays >= 50%).
     function configurePool(uint256 poolId, uint16 swapFeeBps, uint16 lpShareBps) public onlyOwner {
         Pool storage p = pools[poolId];
         require(p.exists, "no pool");
-        require(swapFeeBps <= MAX_SWAP_FEE, "fee");
+        _requireFeeTier(swapFeeBps);
         require(lpShareBps >= MIN_LP_SHARE && lpShareBps <= BPS, "lp share");
         p.swapFeeBps = swapFeeBps;
         p.lpShareBps = lpShareBps;

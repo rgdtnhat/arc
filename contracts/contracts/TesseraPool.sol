@@ -6,6 +6,7 @@ import {ReentrancyGuard} from "./ReentrancyGuard.sol";
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
 }
 
 /**
@@ -50,15 +51,115 @@ contract TesseraPool is ReentrancyGuard {
     uint256 internal constant PRICE_SCALE = 1e8; // USD price scale (Chainlink-like)
     uint256 internal constant SECONDS_PER_YEAR = 365 days;
 
-    // Kinked interest-rate model (annual, WAD). rate(u) rises gently to the kink,
-    // then steeply — pushing utilization back toward target.
-    uint256 internal constant BASE_RATE = 0.01e18; // 1% at 0% utilization
-    uint256 internal constant SLOPE_1 = 0.04e18; // +4% up to the kink (→5% at kink)
-    uint256 internal constant SLOPE_2 = 1.00e18; // +100% from kink to 100%
-    uint256 internal constant KINK = 0.80e18; // 80% target utilization
+    /**
+     * Three-slope interest-rate model, following Blend Capital.
+     *
+     * The familiar two-slope curve has one kink and a single steep leg above it.
+     * Blend splits that upper leg in two, and the split matters: the middle slope
+     * carries utilization from target up to `MAX_UTIL` (95%) at a rate that is
+     * uncomfortable but survivable, and only past 95% does the third slope go
+     * near-vertical. That last zone is not a pricing region, it is a fence — it
+     * exists so the pool cannot be drained to literally 100% utilization, which
+     * is the state where suppliers cannot withdraw at any price.
+     *
+     *   U <= U_T          ir = RM * (rBase + (U/U_T) * r1)
+     *   U_T < U <= 0.95   ir = RM * (rBase + r1 + ((U-U_T)/(0.95-U_T)) * r2)
+     *   U > 0.95          ir = RM * (rBase + r1 + r2) + ((U-0.95)/0.05) * r3
+     *
+     * `RM` deliberately does not scale the third slope: the panic-zone rate is
+     * absolute, not something a drifting modifier can soften.
+     */
+    uint256 internal constant MAX_UTIL = 0.95e18; // where the third slope starts
+
+    /// @notice Defaults applied to a reserve added without explicit rate params.
+    uint256 internal constant DEFAULT_R_BASE = 0.01e18; // 1% at zero utilization
+    uint256 internal constant DEFAULT_R1 = 0.04e18; // +4% to target (→5% at target)
+    uint256 internal constant DEFAULT_R2 = 0.20e18; // +20% from target to 95%
+    uint256 internal constant DEFAULT_R3 = 1.00e18; // +100% across the last 5%
+    uint16 internal constant DEFAULT_TARGET_UTIL = 8_000; // 80%
+
+    /**
+     * Reactive rate modifier, also from Blend.
+     *
+     * A static curve prices utilization but never learns from it. If an asset
+     * sits at 95% for a week the curve keeps quoting the same rate, because its
+     * only input is where utilization *is*, not how long it has been wrong. `RM`
+     * is the integral of that error: it drifts up while utilization is above
+     * target and down while it is below, multiplying the whole curve (except the
+     * panic slope) as it goes. A persistently over-borrowed asset gets more
+     * expensive every block until borrowers leave or suppliers arrive; a
+     * persistently idle one gets cheaper until it is used. Bounded hard at both
+     * ends so it can never run away in either direction.
+     */
+    uint256 internal constant MIN_RATE_MODIFIER = 0.1e18;
+    uint256 internal constant MAX_RATE_MODIFIER = 100e18;
+    /// @notice Default reactivity: roughly 1x drift per day at 20 points of error.
+    uint256 internal constant DEFAULT_REACTIVITY = 5.8e13;
+    uint256 internal constant MAX_REACTIVITY = 1e15;
 
     uint256 public constant CLOSE_FACTOR = 5_000; // max 50% of a debt per liquidation
     uint256 public constant LIQ_BONUS = 1_000; // 10% collateral bonus to liquidator
+
+    /**
+     * Liquidation auctions, following Blend.
+     *
+     * `liquidate` below is the immediate path: repay up to `CLOSE_FACTOR` of a
+     * debt, seize collateral at a fixed `LIQ_BONUS`. It is fine for a small
+     * position and it is what the app reaches for by default.
+     *
+     * It is the wrong tool for a large one, for two reasons. A fixed bonus is a
+     * guess — 10% is too much for a position that would clear at 2% and too
+     * little for one nobody will touch under 20% — and a 50% close factor cannot
+     * finish the job when a position needs more than half of it repaid.
+     *
+     * So there is a second path. An auction ramps the terms: it opens at a price
+     * no liquidator would take and improves every second until someone does. The
+     * clearing point is the market's answer to "what is this worth", not the
+     * operator's. A fill can take up to 100% of the auctioned debt, and fills can
+     * be partial — Blend's own reasoning is that partial fills lower the capital
+     * a liquidator needs, so more parties can participate and positions clear
+     * faster.
+     *
+     * The ramp has two halves. In the first, the **lot** (collateral offered)
+     * scales 0% → 100% while the **bid** (debt repaid) stays at 100%. In the
+     * second, the lot is full and the bid falls 100% → 0%. The midpoint is the
+     * fair exchange; before it the liquidator overpays, after it they are being
+     * paid to take the position on. Time-based rather than block-based, because
+     * on an EVM chain block times are not a schedule anyone can price against.
+     */
+    uint64 public constant AUCTION_HALF_LIFE = 10 minutes;
+    uint64 public constant AUCTION_DURATION = 20 minutes;
+
+    /**
+     * @notice Floor under the descending bid. A deliberate departure from Blend.
+     *
+     * Blend lets the bid decay all the way to zero, so a late filler takes the
+     * collateral and assumes no debt at all. That works there because the
+     * backstop can itself be auctioned and the protocol's overriding interest is
+     * clearing the position at any price.
+     *
+     * Here it would be a griefing vector rather than a backstop: wait out the
+     * ramp, take the whole lot for free, and leave a debt with no collateral
+     * behind it for the backstop and then the suppliers to absorb. A 10% floor
+     * keeps the price discovery — the bid still falls by 90%, which is far more
+     * range than any real liquidation needs — while ensuring a fill always
+     * removes some debt rather than only removing collateral.
+     */
+    uint16 public constant MIN_BID_BPS = 1_000;
+
+    /**
+     * The health-factor band an auction must leave the borrower in.
+     *
+     * Blend requires the creator to pick a percentage that lands the account
+     * between 1.03 and 1.15 once fully filled. The band does two jobs at once.
+     * The floor stops under-liquidation: clearing a position back to exactly
+     * 1.00 leaves it liquidatable again on the next tick of interest, which is
+     * how a borrower gets seized repeatedly for one episode of distress. The
+     * ceiling stops over-liquidation: there is no reason to sell 90% of
+     * someone's collateral to fix a position that 30% would have fixed.
+     */
+    uint256 public constant HF_TARGET_MIN = 1.03e18;
+    uint256 public constant HF_TARGET_MAX = 1.15e18;
 
     struct Reserve {
         bool enabled;
@@ -88,8 +189,60 @@ contract TesseraPool is ReentrancyGuard {
         uint64 lastAccrual;
     }
 
+    /// @notice Per-reserve interest-rate curve and its reactive state.
+    struct IrConfig {
+        uint128 rBase; // WAD, rate at zero utilization
+        uint128 r1; // WAD, added across 0 → target
+        uint128 r2; // WAD, added across target → 95%
+        uint128 r3; // WAD, added across 95% → 100% (not scaled by the modifier)
+        uint64 reactivity; // WAD per second per unit of utilization error
+        uint64 rateModifier; // WAD; drifts with sustained error. 0 reads as 1.0
+        uint16 targetUtil; // bps
+    }
+
+    /// @notice A running Dutch liquidation auction against one borrower.
+    struct Auction {
+        uint64 startedAt; // 0 = no auction
+        address debtAsset;
+        address collateralAsset;
+        uint256 debtAmount; // full bid at 100%, in debtAsset units
+        uint256 collateralAmount; // full lot at 100%, in collateralAsset units
+        uint16 filledBps; // cumulative fill; 10_000 = finished
+    }
+
     address public owner;
     address public treasury; // receives the reserveFactor cut (app-owner revenue)
+
+    /**
+     * @notice First-loss capital. Takes losses before suppliers do.
+     *
+     * Blend's insight is that a lending pool needs someone standing in front of
+     * its depositors, and that this someone should be paid for it rather than
+     * volunteered into it. `backstopTakeRate` diverts a slice of every unit of
+     * borrower interest into the backstop pot; in exchange, when a position ends
+     * up with liabilities and no collateral left, that bad debt is paid out of
+     * the pot before it is allowed to touch supplier balances.
+     *
+     * Exits are queued rather than immediate — see `queueBackstopExit`. First-loss
+     * capital that can leave the instant it is needed is not first-loss capital.
+     */
+    uint16 public backstopTakeRate; // bps of interest routed to the backstop
+    uint64 public constant BACKSTOP_QUEUE_PERIOD = 21 days;
+
+    /// @dev asset => pooled first-loss capital, in asset units.
+    mapping(address => uint256) public backstopBalance;
+    /// @dev asset => total backstop shares outstanding.
+    mapping(address => uint256) public backstopTotalShares;
+    /// @dev asset => user => backstop shares held (queued shares included).
+    mapping(address => mapping(address => uint256)) public backstopShares;
+    /// @dev asset => user => shares queued for exit.
+    mapping(address => mapping(address => uint256)) public backstopQueued;
+    /// @dev asset => user => timestamp the queued shares unlock.
+    mapping(address => mapping(address => uint64)) public backstopUnlockAt;
+
+    mapping(address => IrConfig) public irConfig;
+    /// @dev borrower => their open auction, if any.
+    mapping(address => Auction) public auctions;
 
     /**
      * @notice Per-action freeze flags, as a bitmask.
@@ -160,6 +313,31 @@ contract TesseraPool is ReentrancyGuard {
 
     event PriceFeedSet(address indexed asset, address feed, uint32 staleAfter);
 
+    event IrConfigSet(address indexed asset, uint128 rBase, uint128 r1, uint128 r2, uint128 r3, uint16 targetUtil);
+    event RateModifierUpdated(address indexed asset, uint64 rateModifier);
+    event BackstopTakeRateSet(uint16 takeRate);
+    event BackstopDeposit(address indexed asset, address indexed user, uint256 amount, uint256 shares);
+    event BackstopQueued(address indexed asset, address indexed user, uint256 shares, uint64 unlockAt);
+    event BackstopWithdraw(address indexed asset, address indexed user, uint256 amount, uint256 shares);
+    event BackstopFunded(address indexed asset, uint256 amount);
+    event AuctionStarted(
+        address indexed user,
+        address debtAsset,
+        address collateralAsset,
+        uint256 debtAmount,
+        uint256 collateralAmount
+    );
+    event AuctionFilled(
+        address indexed user,
+        address indexed filler,
+        uint16 fillBps,
+        uint256 repaid,
+        uint256 seized,
+        uint16 filledBps
+    );
+    event AuctionCancelled(address indexed user);
+    event BadDebtCleared(address indexed user, address indexed asset, uint256 amount, uint256 fromBackstop);
+
     error NotOwner();
     error ActionFrozen();
     error BadOracle();
@@ -169,6 +347,11 @@ contract TesseraPool is ReentrancyGuard {
     error Unhealthy();
     error Healthy();
     error ZeroAmount();
+    error NoAuction();
+    error AuctionExists();
+    error BadFillPercent();
+    error HealthOutOfBand();
+    error StillLocked();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -210,7 +393,78 @@ contract TesseraPool is ReentrancyGuard {
             lastAccrual: uint64(block.timestamp)
         });
         reserveList.push(asset);
+        irConfig[asset] = IrConfig({
+            rBase: uint128(DEFAULT_R_BASE),
+            r1: uint128(DEFAULT_R1),
+            r2: uint128(DEFAULT_R2),
+            r3: uint128(DEFAULT_R3),
+            reactivity: uint64(DEFAULT_REACTIVITY),
+            rateModifier: uint64(WAD),
+            targetUtil: DEFAULT_TARGET_UTIL
+        });
         emit ReserveAdded(asset, cFactor, liqFactor, lFactor, borrowable);
+        emit IrConfigSet(
+            asset,
+            uint128(DEFAULT_R_BASE),
+            uint128(DEFAULT_R1),
+            uint128(DEFAULT_R2),
+            uint128(DEFAULT_R3),
+            DEFAULT_TARGET_UTIL
+        );
+    }
+
+    /**
+     * @notice Retune one reserve's interest-rate curve.
+     * @param targetUtil Target utilization in bps; must sit below `MAX_UTIL`.
+     * @param reactivity_ How fast the modifier drifts; 0 pins it (a static curve).
+     * @dev Changing the curve does **not** reset the reactive modifier. The
+     *      modifier is a record of how this asset has actually behaved, and
+     *      discarding it on a parameter tweak would hand anyone holding the owner
+     *      key a quiet way to erase a rate the market spent a week earning. Use
+     *      `resetRateModifier` when that is genuinely what is wanted.
+     */
+    function setIrConfig(
+        address asset,
+        uint128 rBase,
+        uint128 r1,
+        uint128 r2,
+        uint128 r3,
+        uint16 targetUtil,
+        uint64 reactivity_
+    ) external onlyOwner {
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        require(targetUtil > 0 && (uint256(targetUtil) * WAD) / BPS < MAX_UTIL, "targetUtil");
+        require(reactivity_ <= MAX_REACTIVITY, "reactivity");
+        _accrue(asset); // settle at the old curve before the new one applies
+        IrConfig storage c = irConfig[asset];
+        c.rBase = rBase;
+        c.r1 = r1;
+        c.r2 = r2;
+        c.r3 = r3;
+        c.targetUtil = targetUtil;
+        c.reactivity = reactivity_;
+        if (c.rateModifier == 0) c.rateModifier = uint64(WAD);
+        emit IrConfigSet(asset, rBase, r1, r2, r3, targetUtil);
+    }
+
+    /// @notice Put the reactive modifier back to 1.0.
+    function resetRateModifier(address asset) external onlyOwner {
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        _accrue(asset);
+        irConfig[asset].rateModifier = uint64(WAD);
+        emit RateModifierUpdated(asset, uint64(WAD));
+    }
+
+    /**
+     * @notice Set the backstop's cut of borrower interest.
+     * @dev Capped at 50%. A backstop that could take everything would leave
+     *      suppliers earning nothing while still carrying the residual risk,
+     *      which inverts the arrangement it exists to create.
+     */
+    function setBackstopTakeRate(uint16 takeRate) external onlyOwner {
+        require(takeRate <= 5_000, "take rate");
+        backstopTakeRate = takeRate;
+        emit BackstopTakeRateSet(takeRate);
     }
 
     /**
@@ -532,6 +786,373 @@ contract TesseraPool is ReentrancyGuard {
         emit Liquidate(msg.sender, user, debtAsset, collateralAsset, pay, seize);
     }
 
+    // --- liquidation auctions -------------------------------------------------
+
+    /**
+     * @notice The lot and bid percentages an auction is currently offering.
+     * @return lotBps Share of the collateral lot on offer right now.
+     * @return bidBps Share of the debt a filler must repay right now.
+     *
+     * First half: the lot climbs 0% → 100% at a full bid. Second half: the lot is
+     * full and the bid decays toward `MIN_BID_BPS`. Anyone can read this before
+     * deciding whether the trade is worth taking.
+     */
+    function auctionTerms(address user) public view returns (uint16 lotBps, uint16 bidBps) {
+        Auction storage a = auctions[user];
+        if (a.startedAt == 0) return (0, 0);
+        uint256 elapsed = block.timestamp - a.startedAt;
+        lotBps = elapsed >= AUCTION_HALF_LIFE ? uint16(BPS) : uint16((elapsed * BPS) / AUCTION_HALF_LIFE);
+        if (elapsed <= AUCTION_HALF_LIFE) {
+            bidBps = uint16(BPS);
+        } else if (elapsed >= AUCTION_DURATION) {
+            bidBps = MIN_BID_BPS;
+        } else {
+            uint256 decayed = ((elapsed - AUCTION_HALF_LIFE) * (BPS - MIN_BID_BPS)) / AUCTION_HALF_LIFE;
+            bidBps = uint16(BPS - decayed);
+        }
+    }
+
+    /**
+     * @notice Open a Dutch auction over part of a borrower's position.
+     * @param percentBps How much of the borrower's `debtAsset` debt to auction.
+     *
+     * The percentage is the creator's judgement call and it is checked, not
+     * trusted: a full fill has to leave the account's health factor inside
+     * [HF_TARGET_MIN, HF_TARGET_MAX]. Too small a percentage leaves the position
+     * still liquidatable and the borrower gets seized again on the next tick;
+     * too large a one sells more of their collateral than the problem required.
+     * Both are rejected here rather than discovered afterwards.
+     */
+    function startLiquidationAuction(
+        address user,
+        address debtAsset,
+        address collateralAsset,
+        uint16 percentBps
+    ) external nonReentrant {
+        _accrueAll();
+        if (auctions[user].startedAt != 0) revert AuctionExists();
+        if (!_liquidatable(user)) revert Healthy();
+        if (percentBps == 0 || percentBps > BPS) revert BadFillPercent();
+        Reserve storage rd = reserves[debtAsset];
+        Reserve storage rc = reserves[collateralAsset];
+        if (!rd.enabled || !rc.enabled) revert UnknownReserve();
+
+        uint256 debtAmount = (borrowBalance(debtAsset, user) * percentBps) / BPS;
+        if (debtAmount == 0) revert ZeroAmount();
+        uint256 lot = _amountForValue(collateralAsset, (_value(debtAsset, debtAmount) * (BPS + LIQ_BONUS)) / BPS);
+        uint256 userCollateral = supplyBalance(collateralAsset, user);
+        if (lot > userCollateral) lot = userCollateral;
+        if (lot == 0) revert ZeroAmount();
+
+        _requireLandsInBand(user, debtAsset, collateralAsset, debtAmount, lot);
+
+        auctions[user] = Auction({
+            startedAt: uint64(block.timestamp),
+            debtAsset: debtAsset,
+            collateralAsset: collateralAsset,
+            debtAmount: debtAmount,
+            collateralAmount: lot,
+            filledBps: 0
+        });
+        emit AuctionStarted(user, debtAsset, collateralAsset, debtAmount, lot);
+    }
+
+    /**
+     * @dev Reject a percentage that would leave the borrower outside the band.
+     *
+     * Split out of `startLiquidationAuction` purely so that function's local
+     * variables fit; the check is the substance of Blend's rule.
+     */
+    function _requireLandsInBand(
+        address user,
+        address debtAsset,
+        address collateralAsset,
+        uint256 debtAmount,
+        uint256 lot
+    ) internal view {
+        (, uint256 liqLimit, uint256 liability) = _accountLiquidity(user);
+        uint256 lostLimit = (_value(collateralAsset, lot) * reserves[collateralAsset].liqFactor) / BPS;
+        uint256 clearedLiability = (_value(debtAsset, debtAmount) * BPS) / reserves[debtAsset].lFactor;
+        uint256 newLimit = liqLimit > lostLimit ? liqLimit - lostLimit : 0;
+        uint256 newLiability = liability > clearedLiability ? liability - clearedLiability : 0;
+        // No debt left is the best possible outcome, not an out-of-band one.
+        if (newLiability == 0) return;
+        uint256 hf = (newLimit * WAD) / newLiability;
+        if (hf < HF_TARGET_MIN || hf > HF_TARGET_MAX) revert HealthOutOfBand();
+    }
+
+    /**
+     * @notice Fill part or all of a running auction.
+     * @param fillBps Share of the *remaining* auction to take, 1…10000.
+     *
+     * Partial fills are the point. Requiring a single liquidator to have the
+     * whole repayment on hand is what leaves large positions sitting unliquidated
+     * while the pool bleeds; letting five parties take a fifth each clears the
+     * same position out of capital that already exists.
+     */
+    function fillLiquidationAuction(address user, uint16 fillBps)
+        external
+        nonReentrant
+        returns (uint256 repaid, uint256 seized)
+    {
+        Auction storage a = auctions[user];
+        if (a.startedAt == 0) revert NoAuction();
+        if (fillBps == 0 || fillBps > BPS) revert BadFillPercent();
+        _accrueAll();
+
+        uint16 remaining = uint16(BPS) - a.filledBps;
+        uint16 take = fillBps > remaining ? remaining : fillBps;
+        if (take == 0) revert BadFillPercent();
+
+        (uint16 lotBps, uint16 bidBps) = auctionTerms(user);
+        repaid = (((a.debtAmount * take) / BPS) * bidBps) / BPS;
+        seized = (((a.collateralAmount * take) / BPS) * lotBps) / BPS;
+        if (repaid == 0 || seized == 0) revert ZeroAmount();
+
+        address debtAsset = a.debtAsset;
+        address collateralAsset = a.collateralAsset;
+
+        // Never seize past what the borrower actually still holds, and never
+        // repay past what they still owe — both can have moved since the auction
+        // opened, through interest, another fill, or a repayment of their own.
+        uint256 debtLeft = borrowBalance(debtAsset, user);
+        if (repaid > debtLeft) repaid = debtLeft;
+        uint256 collateralLeft = supplyBalance(collateralAsset, user);
+        if (seized > collateralLeft) seized = collateralLeft;
+        if (repaid == 0 || seized == 0) revert ZeroAmount();
+
+        a.filledBps += take;
+        _settleFill(user, debtAsset, collateralAsset, repaid, seized);
+        emit AuctionFilled(user, msg.sender, take, repaid, seized, a.filledBps);
+        if (a.filledBps >= BPS) delete auctions[user];
+    }
+
+    /// @dev Move the debt and the collateral. Separated so the caller's stack fits.
+    function _settleFill(
+        address user,
+        address debtAsset,
+        address collateralAsset,
+        uint256 repaid,
+        uint256 seized
+    ) internal {
+        Reserve storage rd = reserves[debtAsset];
+        Reserve storage rc = reserves[collateralAsset];
+
+        uint256 dShares = (repaid * rd.totalBorrowShares) / rd.totalBorrowAssets;
+        borrowShares[debtAsset][user] -= dShares;
+        rd.totalBorrowShares -= dShares;
+        rd.totalBorrowAssets -= repaid;
+        _pull(debtAsset, msg.sender, repaid);
+
+        uint256 cShares = (seized * rc.totalSupplyShares) / rc.totalSupplyAssets;
+        supplyShares[collateralAsset][user] -= cShares;
+        supplyShares[collateralAsset][msg.sender] += cShares;
+    }
+
+    /**
+     * @notice Close an auction that should no longer be running.
+     *
+     * Permissionless, and gated on the auction genuinely being finished with:
+     * either the borrower has recovered and is no longer liquidatable, or the
+     * auction has been sitting unfilled for long enough that it is stale. Without
+     * this an abandoned auction would block every future one against the same
+     * borrower, which is a denial of service anyone could mount for the price of
+     * opening an auction they never intend to fill.
+     */
+    function cancelLiquidationAuction(address user) external nonReentrant {
+        Auction storage a = auctions[user];
+        if (a.startedAt == 0) revert NoAuction();
+        _accrueAll();
+        bool stale = block.timestamp >= uint256(a.startedAt) + (uint256(AUCTION_DURATION) * 4);
+        if (!stale && _liquidatable(user)) revert Healthy();
+        delete auctions[user];
+        emit AuctionCancelled(user);
+    }
+
+    /// @notice An auction and its live terms, for agents and dashboards.
+    function auctionData(address user)
+        external
+        view
+        returns (
+            uint64 startedAt,
+            address debtAsset,
+            address collateralAsset,
+            uint256 debtAmount,
+            uint256 collateralAmount,
+            uint16 filledBps,
+            uint16 lotBps,
+            uint16 bidBps
+        )
+    {
+        Auction storage a = auctions[user];
+        (lotBps, bidBps) = auctionTerms(user);
+        return (
+            a.startedAt,
+            a.debtAsset,
+            a.collateralAsset,
+            a.debtAmount,
+            a.collateralAmount,
+            a.filledBps,
+            lotBps,
+            bidBps
+        );
+    }
+
+    // --- backstop -------------------------------------------------------------
+
+    /**
+     * @notice Deposit first-loss capital for one asset.
+     *
+     * Backstop depositors are paid `backstopTakeRate` of every unit of interest
+     * that asset's borrowers pay, and in return they are the first balance a bad
+     * debt is written against. Shares work like the supply side: the pot grows
+     * with interest and shrinks with losses, and a share is a claim on a slice of
+     * whatever the pot is worth at the moment it is redeemed.
+     */
+    function backstopDeposit(address asset, uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        _accrue(asset);
+        uint256 total = backstopTotalShares[asset];
+        uint256 shares = total == 0 || backstopBalance[asset] == 0
+            ? amount
+            : (amount * total) / backstopBalance[asset];
+        if (shares == 0) revert ZeroAmount();
+        backstopShares[asset][msg.sender] += shares;
+        backstopTotalShares[asset] = total + shares;
+        backstopBalance[asset] += amount;
+        _pull(asset, msg.sender, amount);
+        emit BackstopDeposit(asset, msg.sender, amount, shares);
+    }
+
+    /**
+     * @notice Start the exit queue for some of your backstop shares.
+     *
+     * The delay is the whole mechanism. Capital that can leave the instant a
+     * loss becomes visible is not insurance — it is a bet with an escape hatch,
+     * and the escape hatch is used precisely when the pool needs the capital.
+     * Twenty-one days is Blend's period and it is long enough that the exit
+     * decision has to be made before the outcome is known.
+     *
+     * Queuing again replaces the outstanding request and restarts the clock;
+     * queued shares keep earning, and keep absorbing losses, until withdrawn.
+     */
+    function queueBackstopExit(address asset, uint256 shares) external nonReentrant {
+        if (shares == 0 || shares > backstopShares[asset][msg.sender]) revert ZeroAmount();
+        backstopQueued[asset][msg.sender] = shares;
+        uint64 unlockAt = uint64(block.timestamp) + BACKSTOP_QUEUE_PERIOD;
+        backstopUnlockAt[asset][msg.sender] = unlockAt;
+        emit BackstopQueued(asset, msg.sender, shares, unlockAt);
+    }
+
+    /// @notice Cancel a pending exit and put the shares back to work immediately.
+    function cancelBackstopExit(address asset) external nonReentrant {
+        backstopQueued[asset][msg.sender] = 0;
+        backstopUnlockAt[asset][msg.sender] = 0;
+        emit BackstopQueued(asset, msg.sender, 0, 0);
+    }
+
+    /// @notice Withdraw shares whose queue period has elapsed.
+    function withdrawBackstop(address asset) external nonReentrant returns (uint256 amount) {
+        uint256 shares = backstopQueued[asset][msg.sender];
+        if (shares == 0) revert ZeroAmount();
+        uint64 unlockAt = backstopUnlockAt[asset][msg.sender];
+        if (unlockAt == 0 || block.timestamp < unlockAt) revert StillLocked();
+        _accrue(asset);
+
+        // Re-read the holding: a loss between queuing and withdrawing may have
+        // burned some of it, and the queue is a request to exit, not a claim on
+        // a number fixed at request time.
+        uint256 held = backstopShares[asset][msg.sender];
+        if (shares > held) shares = held;
+        if (shares == 0) revert ZeroAmount();
+
+        uint256 total = backstopTotalShares[asset];
+        amount = (backstopBalance[asset] * shares) / total;
+
+        // The backstop pot grows with accrued interest, which is a claim on
+        // future repayments rather than tokens sitting here now. So a withdrawal
+        // is bounded by cash the suppliers do not already have a claim on —
+        // otherwise the first backstop exit could pay itself out of the money
+        // depositors are owed, which is the exact inversion this module exists
+        // to prevent.
+        Reserve storage r = reserves[asset];
+        uint256 cash = IERC20(asset).balanceOf(address(this));
+        uint256 supplierClaim = _available(r);
+        uint256 free = cash > supplierClaim ? cash - supplierClaim : 0;
+        if (amount > free) revert InsufficientLiquidity();
+
+        backstopShares[asset][msg.sender] = held - shares;
+        backstopTotalShares[asset] = total - shares;
+        backstopBalance[asset] -= amount;
+        backstopQueued[asset][msg.sender] = 0;
+        backstopUnlockAt[asset][msg.sender] = 0;
+        if (amount > 0) _push(asset, msg.sender, amount);
+        emit BackstopWithdraw(asset, msg.sender, amount, shares);
+    }
+
+    /// @notice Top the backstop up out of your own pocket, minting no shares.
+    function fundBackstop(address asset, uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        backstopBalance[asset] += amount;
+        _pull(asset, msg.sender, amount);
+        emit BackstopFunded(asset, amount);
+    }
+
+    /// @notice What one holder's backstop position is currently worth.
+    function backstopBalanceOf(address asset, address user) external view returns (uint256) {
+        uint256 total = backstopTotalShares[asset];
+        if (total == 0) return 0;
+        return (backstopBalance[asset] * backstopShares[asset][user]) / total;
+    }
+
+    /**
+     * @notice Write off a borrower's remaining debt once their collateral is gone.
+     *
+     * The end of the line for a position that went underwater faster than anyone
+     * could liquidate it. The debt is real and someone has to carry it: first the
+     * backstop, out of the pot its depositors were paid to provide, and only if
+     * that is exhausted the suppliers of that reserve, whose share balances all
+     * become redeemable for proportionally less.
+     *
+     * Permissionless on purpose. Bad debt that sits unrecognised is worse than
+     * bad debt that is written off, because every supplier who withdraws in the
+     * meantime is paid out at a rate that silently overcharges whoever is left.
+     * Clearing it early makes the loss land on the people who were actually
+     * exposed to it.
+     */
+    function clearBadDebt(address user, address asset) external nonReentrant {
+        _accrueAll();
+        Reserve storage r = reserves[asset];
+        if (!r.enabled) revert UnknownReserve();
+        uint256 debt = borrowBalance(asset, user);
+        if (debt == 0) revert ZeroAmount();
+
+        // Only when there is nothing left to seize anywhere in the pool. While
+        // any collateral remains, this is a liquidation, not a write-off.
+        (, uint256 liqLimit, ) = _accountLiquidity(user);
+        if (liqLimit != 0) revert Healthy();
+
+        uint256 shares = borrowShares[asset][user];
+        borrowShares[asset][user] = 0;
+        r.totalBorrowShares -= shares;
+        r.totalBorrowAssets -= debt;
+
+        uint256 fromBackstop = backstopBalance[asset];
+        if (fromBackstop > debt) fromBackstop = debt;
+        if (fromBackstop > 0) backstopBalance[asset] -= fromBackstop;
+
+        // Whatever the backstop could not cover comes off the supply side. The
+        // share count is untouched, so every supplier's claim shrinks pro rata —
+        // which is the honest accounting: the assets genuinely are not there.
+        uint256 socialised = debt - fromBackstop;
+        if (socialised > 0) {
+            r.totalSupplyAssets = r.totalSupplyAssets > socialised ? r.totalSupplyAssets - socialised : 0;
+        }
+        emit BadDebtCleared(user, asset, debt, fromBackstop);
+    }
+
     // --- interest accrual -----------------------------------------------------
 
     function _accrueAll() internal {
@@ -543,16 +1164,36 @@ contract TesseraPool is ReentrancyGuard {
         Reserve storage r = reserves[asset];
         uint256 dt = block.timestamp - r.lastAccrual;
         if (dt == 0) return;
+        uint256 u = r.totalSupplyAssets == 0 ? 0 : (r.totalBorrowAssets * WAD) / r.totalSupplyAssets;
+
         if (r.totalBorrowAssets > 0 && r.totalSupplyAssets > 0) {
-            uint256 u = (r.totalBorrowAssets * WAD) / r.totalSupplyAssets;
-            uint256 ratePerYear = _borrowRatePerYear(u);
+            uint256 ratePerYear = _borrowRatePerYear(asset, u);
             uint256 factor = (ratePerYear * dt) / SECONDS_PER_YEAR; // WAD
             uint256 interest = (r.totalBorrowAssets * factor) / WAD;
             if (interest > 0) {
                 r.totalBorrowAssets += interest;
+                // Interest splits three ways: the protocol's take, the backstop's
+                // take, and whatever is left for suppliers. The two takes are
+                // carved off the same pot rather than stacked on top of it, so a
+                // borrower's cost is the rate they were quoted regardless of how
+                // the operator has configured the split.
                 uint256 reserveCut = (interest * r.reserveFactor) / BPS;
+                uint256 backstopCut = (interest * backstopTakeRate) / BPS;
+                // The two takes are bounded independently but not jointly, so
+                // clamp rather than trust: a combined take above 100% must cost
+                // suppliers their whole share, never underflow into a huge one.
+                if (reserveCut > interest) reserveCut = interest;
                 uint256 supplierInterest = interest - reserveCut;
+                if (backstopCut > supplierInterest) backstopCut = supplierInterest;
+                supplierInterest -= backstopCut;
                 r.totalSupplyAssets += supplierInterest;
+                if (backstopCut > 0) {
+                    // Straight into the pot, minting no shares: the existing
+                    // backstop depositors' shares simply become worth more, the
+                    // same way LP fees work.
+                    backstopBalance[asset] += backstopCut;
+                    emit BackstopFunded(asset, backstopCut);
+                }
                 if (reserveCut > 0) {
                     uint256 feeShares = r.totalSupplyAssets == 0
                         ? reserveCut
@@ -563,14 +1204,81 @@ contract TesseraPool is ReentrancyGuard {
                 }
             }
         }
+        _driftRateModifier(asset, u, dt);
         r.lastAccrual = uint64(block.timestamp);
     }
 
-    function _borrowRatePerYear(uint256 u) internal pure returns (uint256) {
-        if (u <= KINK) {
-            return BASE_RATE + (SLOPE_1 * u) / KINK;
+    /**
+     * @dev Move the reactive modifier by the time-integrated utilization error.
+     *
+     * Written as two unsigned branches rather than signed arithmetic because the
+     * clamp differs at each end: upward drift saturates at `MAX_RATE_MODIFIER`,
+     * downward drift saturates at `MIN_RATE_MODIFIER`, and expressing both as one
+     * signed add would still need the two comparisons.
+     */
+    function _driftRateModifier(address asset, uint256 u, uint256 dt) internal {
+        IrConfig storage c = irConfig[asset];
+        uint256 rm = c.rateModifier == 0 ? WAD : c.rateModifier;
+        if (c.reactivity == 0) {
+            if (c.rateModifier == 0) c.rateModifier = uint64(WAD);
+            return;
         }
-        return BASE_RATE + SLOPE_1 + (SLOPE_2 * (u - KINK)) / (WAD - KINK);
+        uint256 target = (uint256(c.targetUtil) * WAD) / BPS;
+        if (target == 0) target = (uint256(DEFAULT_TARGET_UTIL) * WAD) / BPS;
+
+        uint256 err = u > target ? u - target : target - u;
+        // rm * reactivity * err * dt, divided back down twice for the two WADs.
+        uint256 delta = (((rm * c.reactivity) / WAD) * err * dt) / WAD;
+        uint256 next;
+        if (u > target) {
+            next = rm + delta;
+            if (next > MAX_RATE_MODIFIER) next = MAX_RATE_MODIFIER;
+        } else {
+            next = delta >= rm ? MIN_RATE_MODIFIER : rm - delta;
+            if (next < MIN_RATE_MODIFIER) next = MIN_RATE_MODIFIER;
+        }
+        if (next != rm) {
+            c.rateModifier = uint64(next);
+            emit RateModifierUpdated(asset, uint64(next));
+        } else if (c.rateModifier == 0) {
+            c.rateModifier = uint64(WAD);
+        }
+    }
+
+    /// @notice The three-slope borrow rate for `asset` at utilization `u` (WAD).
+    function _borrowRatePerYear(address asset, uint256 u) internal view returns (uint256) {
+        IrConfig storage c = irConfig[asset];
+        // A reserve added before this config existed reads as all-zero. Fall back
+        // to the defaults rather than quoting a 0% borrow rate, which would be a
+        // silent gift of every supplier's yield.
+        uint256 rBase = c.rBase;
+        uint256 r1 = c.r1;
+        uint256 r2 = c.r2;
+        uint256 r3 = c.r3;
+        uint256 target = (uint256(c.targetUtil) * WAD) / BPS;
+        if (c.targetUtil == 0) {
+            rBase = DEFAULT_R_BASE;
+            r1 = DEFAULT_R1;
+            r2 = DEFAULT_R2;
+            r3 = DEFAULT_R3;
+            target = (uint256(DEFAULT_TARGET_UTIL) * WAD) / BPS;
+        }
+        uint256 rm = c.rateModifier == 0 ? WAD : c.rateModifier;
+
+        if (u <= target) {
+            return (rm * (rBase + (r1 * u) / target)) / WAD;
+        }
+        if (u <= MAX_UTIL) {
+            return (rm * (rBase + r1 + (r2 * (u - target)) / (MAX_UTIL - target))) / WAD;
+        }
+        // Past 95% the modifier stops applying to the panic slope: this leg is a
+        // fence, and a modifier that had drifted down to 0.1 would flatten it.
+        return (rm * (rBase + r1 + r2)) / WAD + (r3 * (u - MAX_UTIL)) / (WAD - MAX_UTIL);
+    }
+
+    /// @notice The borrow rate this reserve would charge at utilization `u` (WAD).
+    function borrowRateAt(address asset, uint256 u) external view returns (uint256) {
+        return _borrowRatePerYear(asset, u > WAD ? WAD : u);
     }
 
     // --- views ----------------------------------------------------------------
@@ -705,9 +1413,14 @@ contract TesseraPool is ReentrancyGuard {
         cash = _available(r);
         totalBorrows = r.totalBorrowAssets;
         utilizationWad = r.totalSupplyAssets == 0 ? 0 : (r.totalBorrowAssets * WAD) / r.totalSupplyAssets;
-        borrowAprWad = _borrowRatePerYear(utilizationWad);
-        // suppliers earn borrow APR × utilization × (1 − reserveFactor).
-        supplyAprWad = (borrowAprWad * utilizationWad / WAD) * (BPS - r.reserveFactor) / BPS;
+        borrowAprWad = _borrowRatePerYear(asset, utilizationWad);
+        // Suppliers earn borrow APR × utilization × whatever is left after the
+        // protocol's take and the backstop's. Both are subtracted here for the
+        // same reason: neither reaches suppliers, so quoting a supply APR that
+        // ignores them would overstate the yield by exactly the take rates.
+        uint256 takenBps = uint256(r.reserveFactor) + backstopTakeRate;
+        uint256 keptBps = takenBps >= BPS ? 0 : BPS - takenBps;
+        supplyAprWad = ((borrowAprWad * utilizationWad) / WAD) * keptBps / BPS;
     }
 
     function reserveCount() external view returns (uint256) {

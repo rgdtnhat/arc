@@ -37,16 +37,21 @@ the public `/api/swap/quote`.
 
 ### 3. Vault & swap contract review — no exploitable findings
 
-`TesseraVault` and `TesseraSwap` were reviewed for the usual DeFi failure modes:
+`TesseraVault` and the swap path were reviewed for the usual DeFi failure
+modes. The swap path is now `TesseraRouter` over `TesseraAMM`; the rows that
+used to be about the oracle desk's inventory are gone because the inventory is:
 
 | Checked | Result |
 |---|---|
 | Reentrancy | `nonReentrant` on every entry point; shares burned **before** external transfers |
 | First-deposit share inflation | Blocked — `MINIMUM_LIQUIDITY` (1000) dead shares burned on first deposit (Uniswap-style) |
 | Fee on principal | Impossible — the performance fee is charged only on `totalAssets` **growth** since the last checkpoint |
-| Unbounded admin fees | Hard caps in code: performance fee ≤ 30%, swap fee ≤ 5%, app fee share ≤ 100% of the fee, vault reserve ratio ≥ 80%, AMM LP fee share ≥ 50% |
-| Swap paying out more than it holds | Blocked — solvency check requires `balance ≥ amountOut + appFee` before any transfer |
-| Slippage | `minOut` enforced on every swap |
+| Unbounded admin fees | Hard caps in code: performance fee ≤ 30%, vault reserve ratio ≥ 80%, AMM LP fee share ≥ 50%, and an AMM pool fee that must be one of three fixed tiers (0.10% / 0.30% / 1.00%) rather than a free-form number |
+| Swap paying out more than it holds | Not reachable — the router holds nothing; a swap is filled from pool reserves, and the AMM's own output check keeps `amountOut < balOut` |
+| Slippage | `minOut` enforced on every swap, covering the **final** output of a multi-hop route |
+| Stale-price arbitrage on swaps | Not reachable — swap pricing reads the pool's reserves, so no oracle sits in the path to go stale |
+| A swap sitting in the mempool | `deadline` on every router entry point, so a transaction cannot be filled later at a drifted price |
+| Router allowance left standing | Each leg approves the exact amount and clears it after the swap; a post-swap allowance of zero is asserted in tests |
 | Rebalance bricking withdrawals | `_rebalance()` is wrapped in `try/catch`, so a pool hiccup can't block a deposit/withdraw |
 
 ## Two custody modes (and why they differ)
@@ -79,7 +84,8 @@ are mostly about what an operator **cannot** do:
 |---|---|
 | Providers keep ≥ 50% of swap fees | `MIN_LP_SHARE = 5000` is a `constant`; `createPool` and `configurePool` both reject less. There is no admin path to change it — only a redeploy. |
 | Fee rounding never favours the app | The app's cut is computed first and rounded **down**; the LP cut takes the remainder, so an odd wei always lands with providers. |
-| No oracle to manipulate | Price comes from the pool's own reserves (constant product on the traded pair). Nothing external feeds it, so there is no oracle to move ahead of a trade. |
+| No oracle to manipulate | Price comes from the pool's own reserves. Nothing external feeds it, so there is no oracle to move ahead of a trade. |
+| Fees cannot be dialled arbitrarily | Following Aquarius (Aqua Network), a pool's fee must be one of three tiers — 0.10%, 0.30% or 1.00%. A free-form fee fragments liquidity across near-identical pools and hands an operator a dial traders cannot anticipate. |
 | First-depositor share inflation | `MINIMUM_LIQUIDITY` (1000) shares are burned to `address(0)` on the first deposit, exactly as in Uniswap v2. |
 | Unbalanced deposits can't mint free value | Shares minted are the **minimum** ratio across every asset, so skewing one side donates the excess rather than buying shares. |
 | A kill-switch can't trap funds | `setFrozen` blocks swaps and deposits; `removeLiquidity` is deliberately exempt, so providers can always exit a frozen pool. |
@@ -122,16 +128,38 @@ The vault is deliberately conservative:
    four fifths of TVL is always redeemable instantly, so this can only bite a
    withdrawal of more than 80% of TVL during full utilisation. Funds are not
    lost — they're illiquid.
-2. **Prices with no feed wired.** Where no oracle is configured, the pool and
-   the swap desk fall back to the operator-set price, and a stale one lets an
-   arbitrageur drain the underpriced side of the swap inventory. Wiring a
-   Chainlink-compatible feed per asset removes this (see below); until one is
-   wired for a given asset, the risk stands for that asset.
-3. **Trusted operator key.** The owner can change fees (within caps), prices, the
-   treasury, and can withdraw swap inventory. This is a custodial trust
-   assumption, not a trustless design.
+2. **Prices with no feed wired.** Where no oracle is configured, the lending
+   pool falls back to the operator-set price, and a stale one lets someone
+   borrow against a mispriced asset. Wiring a Chainlink-compatible feed per
+   asset removes this (see below); until one is wired for a given asset, the
+   risk stands for that asset. Swaps are **not** exposed to this: they price
+   from AMM reserves, with no oracle in the path.
+3. **Trusted operator key.** The owner can change fees (within caps), prices and
+   the treasury. This is a custodial trust assumption, not a trustless design.
+   It is a narrower one than it was: with the inventory desk gone there is no
+   app-owned trading stock for an operator to withdraw, and the router holds
+   nothing an owner could take.
 4. **Unaudited.** No third-party audit has been performed. Do not use with real
    funds until one has.
+
+## Money-market safety model (lending, borrowing, liquidation)
+
+The pool follows Blend Capital's structure. Each mechanism below exists because
+the simpler version of it has a specific failure:
+
+| Property | How it is guaranteed |
+|---|---|
+| Borrowing to the limit is not immediately liquidatable | `cFactor` (how much you may borrow against collateral) is enforced strictly below `liqFactor` (where seizure starts). One shared threshold put the maximum borrow exactly on the seizure line, so the next block of interest made a just-opened position liquidatable. |
+| A riskier debt costs more limit than its face value | Per-asset `lFactor`: a liability is weighed as `value × 10000 / lFactor`, so one pool can hold assets of genuinely different quality. |
+| Utilisation cannot be driven to 100% | A third interest slope above 95% utilisation that the reactive modifier does **not** scale. Full utilisation is the state where suppliers cannot withdraw at any price, so the last five points are priced as a fence rather than a rate. |
+| A persistently mispriced asset self-corrects | The reactive rate modifier integrates the utilisation error over time and multiplies the curve, bounded hard to [0.1×, 100×]. A static curve keeps quoting the same number no matter how long an asset has been wrong. |
+| Suppliers are not first in line for a loss | The backstop is paid `backstopTakeRate` of borrower interest and absorbs bad debt before supplier balances are touched. Exits are queued for 21 days: capital that can leave the moment a loss becomes visible is not insurance. |
+| Bad debt is recognised, not hidden | `clearBadDebt` is permissionless. Unrecognised bad debt means every supplier who withdraws in the meantime is paid at a rate that silently overcharges whoever is left. |
+| Liquidation cannot over- or under-shoot | An auction's percentage must leave the borrower's health factor inside [1.03, 1.15] once fully filled. Below the floor they are liquidatable again on the next tick; above the ceiling more collateral was sold than the problem required. |
+| A large position can actually be cleared | Auctions can take up to 100% of the auctioned debt and can be **partially filled**, so several liquidators can clear together instead of one needing the whole repayment on hand. |
+| The liquidation bonus is discovered, not guessed | A descending auction: the lot ramps 0% → 100% over ten minutes at a full bid, then the bid decays over the next ten. A fixed bonus is too much for a position that would clear at 2% and too little for one nobody will touch under 20%. |
+| A late filler cannot take collateral for free | `MIN_BID_BPS = 1000` floors the descending bid — a deliberate departure from Blend, which lets it reach zero. Without the floor, waiting out the ramp takes the whole lot while removing no debt at all. |
+| An abandoned auction cannot block future ones | `cancelLiquidationAuction` is permissionless once the borrower recovers, or once the auction is stale. Otherwise opening an auction nobody intends to fill is a denial of service. |
 
 ## Price oracle
 

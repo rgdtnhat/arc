@@ -251,15 +251,32 @@ describe("TesseraPool — Chainlink-compatible price oracle", () => {
     expect(feed.address).to.be.a("string");
   });
 
-  it("the swap desk quotes from the same oracle the pool uses", async () => {
+  it("a dead feed stops the lending pool without stopping swaps", async () => {
     const { deployer, usdc, btc, pool, feed } = await loadFixture(oracleFixture);
-    const swap = await hre.viem.deployContract("TesseraSwap", [pool.address, deployer.account.address, 30, 5000]);
-    await feed.write.set([200_000_000n, BigInt(await time.latest())]); // USDC "worth" $2
+    await feed.write.set([200_000_000n, BigInt(await time.latest())]);
     await pool.write.setPriceFeed([usdc.address, feed.address, 3600]);
-    const [p] = await swap.read.priceOf([usdc.address]);
-    expect(p).to.equal(200_000_000n);
-    // And a dead feed stops the desk quoting rather than quoting at a stale rate.
+    expect(await pool.read.price([usdc.address])).to.equal(200_000_000n);
+
+    // Swaps used to be priced off exactly this feed, through the oracle desk,
+    // so a feed outage took the swap surface down with the money market. They
+    // are priced by the AMM's own reserves now, which is the point of routing
+    // through pool liquidity: there is no oracle in the path to go stale.
+    const amm = await hre.viem.deployContract("TesseraAMM", [deployer.account.address]);
+    await amm.write.createPool([[usdc.address, btc.address], 30, 5000, "USDC / cirBTC"]);
+    const router = await hre.viem.deployContract("TesseraRouter", [amm.address, [usdc.address]]);
+    for (const [token, kind] of [[usdc, "MockUSDC"], [btc, "MockToken"]] as const) {
+      await token.write.mint([deployer.account.address, U("10000")]);
+      const c = await hre.viem.getContractAt(kind, token.address, { client: { wallet: deployer } });
+      await c.write.approve([amm.address, U("10000")]);
+    }
+    await amm.write.addLiquidity([0n, [U("5000"), U("5000")], 0n]);
+
     await feed.write.setReverting([true]);
-    await expect(swap.read.quote([usdc.address, btc.address, U("1")])).to.be.rejected;
+    // The money market stops, correctly: borrowing against a mispriced asset is
+    // exactly what a stale feed enables.
+    await expect(pool.read.price([usdc.address])).to.be.rejected;
+    // The swap still quotes.
+    const [out] = await router.read.estimate([usdc.address, btc.address, U("100")]);
+    expect(out > 0n).to.equal(true);
   });
 });

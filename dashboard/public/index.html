@@ -995,7 +995,7 @@
         <section id="features">
           <div class="sectionHead reveal">
             <h2>Everything in one settlement layer</h2>
-            <p>Escrowed payments, a money market, a yield vault and a swap desk — all denominated in USDC on Arc.</p>
+            <p>Escrowed payments, a money market, a yield vault and an AMM-backed swap — all denominated in USDC on Arc.</p>
           </div>
           <div class="featGrid">
             <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">🔐</div><h3>Programmable escrow</h3>
@@ -1010,7 +1010,7 @@
               <p>Supply USDC, EURC or cirBTC for yield, or borrow against collateral with health-factor liquidation.</p></div>
             <div class="feat reveal" data-goto="defi#vaultCard" role="link" tabindex="0"><div class="ico">🏛</div><h3>Yield vault</h3>
               <p>Deposit USDC and earn the pool's APR automatically, with a large liquid reserve kept for instant exits.</p></div>
-            <div class="feat reveal" data-goto="defi#swapCard" role="link" tabindex="0"><div class="ico">🔁</div><h3>Swap desk</h3>
+            <div class="feat reveal" data-goto="defi#swapCard" role="link" tabindex="0"><div class="ico">🔁</div><h3>Swap</h3>
               <p>Oracle-priced swaps between every pool asset, with the rate and both balances shown before you commit.</p></div>
             <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">🛡</div><h3>Guardian policy</h3>
               <p>A spending cap keeps the agent autonomous for small buys and escalates anything larger to a human co-signer.</p></div>
@@ -1078,7 +1078,7 @@
                 <span><b style="color:var(--text)">Nanopayment tabs</b> — one deposit, then gasless signed vouchers per call, settled once.</span>
                 <span><b style="color:var(--text)">Lending &amp; borrowing</b> — supply for yield or borrow against collateral, with per-action freeze controls.</span>
                 <span><b style="color:var(--text)">Yield vault</b> — 80% held liquid by contract floor; the app's fee touches yield only, never principal.</span>
-                <span><b style="color:var(--text)">Swap desk</b> — oracle-priced swaps between pool assets.</span>
+                <span><b style="color:var(--text)">Swap</b> — routed through AMM pool liquidity, priced by the pool.</span>
                 <span><b style="color:var(--text)">Liquidity pools (AMM)</b> — provide liquidity, keep at least 50% of every swap fee.</span>
                 <span><b style="color:var(--text)">Agent workspace</b> — live news, FX, crypto, stocks, commodities and derived market analysis.</span>
                 <span><b style="color:var(--text)">Operator controls</b> — fee allocation, notices, price feeds, contract history and fund recovery.</span>
@@ -1092,7 +1092,7 @@
               <div class="metric"><div class="k">Vault TVL</div><div class="v" id="dashVaultTvl">—</div></div>
               <div class="metric"><div class="k">Pool liquidity</div><div class="v" id="dashPoolCash">—</div></div>
               <div class="metric"><div class="k">Pool borrowed</div><div class="v" id="dashPoolBorrows">—</div></div>
-              <div class="metric"><div class="k">Swap inventory</div><div class="v" id="dashSwapInv">—</div></div>
+              <div class="metric"><div class="k">Routable liquidity</div><div class="v" id="dashSwapInv">—</div></div>
               <div class="metric"><div class="k">Vault liquid buffer</div><div class="v" id="dashBuffer">—</div></div>
               <div class="metric"><div class="k">AMM pools</div><div class="v" id="dashAmmPools">—</div></div>
             </div>
@@ -1159,7 +1159,7 @@
               <button class="sheetTab" data-defitab="swap" role="tab">
                 <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M4 8.5h13.5l-3-3M20 15.5H6.5l3 3"/>
-                </svg></span>Swap desk
+                </svg></span>Swap
               </button>
               <button class="sheetTab" data-defitab="fees" role="tab">
                 <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1357,12 +1357,16 @@
           <div class="card" id="swapCard">
             <h2>🔁 Swap</h2>
             <div class="notready" id="swapNotReady" style="display:none">
-              Swap desk not deployed yet — run <span class="mono">npm run pool:arc:init</span> to deploy
-              <span class="mono">TesseraSwap</span>, then <span class="mono">npm run swap:fund</span> to give it
-              inventory. Quotes work as soon as it's live; fills need inventory.
+              Router not deployed yet — run <span class="mono">npm run router:deploy</span>. It needs no
+              funding of its own; every trade is filled from the liquidity pools, so quotes start working as
+              soon as a pool has depth on both sides.
             </div>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
-              Oracle-priced swaps between pool assets. A 0.30% fee applies; part of it is the app's revenue.
+              Swaps are filled from <a href="#" data-goto="defi#ammCard">liquidity pool</a> depth, so the price
+              you get is the pool's own — it moves with trade size, and it can't be quoted off a stale oracle.
+              Each pool charges its own fee tier (0.10% / 0.30% / 1.00%); at least half of every fee goes to
+              the providers who supplied the liquidity, and the rest is the app's revenue. Routes of up to two
+              hops through USDC are found automatically.
             </div>
             <div class="row-actions">
               <input id="swAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
@@ -1377,34 +1381,22 @@
             <div id="swQuoteOut" style="font-size:13px;margin-top:8px;font-weight:600"></div>
             <div class="kv" id="swapMsg" style="margin-top:9px;display:none"></div>
 
-            <!-- Inventory. The desk fills out of its own balance, so an empty
-                 desk fails every swap — worth showing plainly rather than
-                 letting a swap fail with "insufficient inventory". -->
+            <!-- Routable depth. What replaced the desk's inventory table: the
+                 answer to "can this trade be filled" is now pool depth, not a
+                 balance the operator had to keep stocked. -->
             <div class="menuSep" style="margin:14px 0 10px"></div>
             <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:7px">
-              Desk inventory
+              Routable liquidity
             </div>
             <div class="tblWrap auto"><table class="data" style="min-width:0">
-              <thead><tr><th>Asset</th><th class="num">Available to fill</th><th>Status</th></tr></thead>
+              <thead><tr><th>Asset</th><th class="num">In the pools</th><th>Status</th></tr></thead>
               <tbody id="swInvRows"></tbody>
             </table></div>
-            <div id="swFundBox" style="display:none;margin-top:11px">
-              <div class="row-actions">
-                <input id="swFundAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
-                <select id="swFundAsset" class="field"></select>
-                <button class="btn" id="swFund">Add inventory</button>
-                <button class="btn" id="swWithdraw">Withdraw</button>
-              </div>
-              <div style="font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.55">
-                Inventory is <b>app-owned</b>: adding to it is a donation to the desk, not a deposit —
-                there are no shares and no claim on it, and only the operator can withdraw it. For a
-                position you can withdraw with a share of the fees, use
-                <a href="#" data-goto="defi#ammCard">Liquidity pools</a> instead.
-              </div>
-              <!-- Whether this deployment can actually withdraw. An old desk
-                   owned by an old collector has no path at all, and finding that
-                   out from a revert is no way to learn it. -->
-              <p class="feedNote" id="swAuthority" style="margin-top:8px"></p>
+            <div style="font-size:11.5px;color:var(--muted);margin-top:9px;line-height:1.55">
+              This is depth <b>liquidity providers</b> put in, not app-owned inventory — there is nothing here
+              for an operator to top up or withdraw. If a pair can't be filled, the fix is
+              <a href="#" data-goto="defi#ammCard">adding liquidity</a>, and whoever adds it earns a share of
+              every swap fee it goes on to serve.
             </div>
           </div>
 
@@ -1412,8 +1404,8 @@
                fee history. Both are read from the chain; a short log scan is
                reported rather than silently dropping holders. -->
           <div class="card" id="holdSwapCard">
-            <h2>📦 Desk inventory — what the desk can fill from</h2>
-            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">The swap desk fills out of its own balance. There are no depositors and no shares, so what follows is inventory, not a leaderboard.</div>
+            <h2>📦 Swap — who earns from it</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">The router holds nothing: it takes your input, routes it through the pools, and pays the output out in the same transaction. So there is no leaderboard here — the people who earn from your swap are the liquidity providers, on the <a href="#" data-goto="defi#ammCard">Liquidity pool</a> tab.</div>
             <div class="tblWrap auto"><table class="data" style="min-width:0">
               <thead><tr>
                 <th style="width:34px">#</th><th>Address</th>
@@ -1535,7 +1527,7 @@
               </div>
               <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
                 Every app fee lands in <span class="mono">TesseraFeeCollector</span> and is split across the
-                agent, the lending pool, the vault and the swap desk, with a retained remainder. Figures below
+                agent, the lending pool, the vault and the AMM pools, with a retained remainder. Figures below
                 are read from the contract's own <span class="mono">Allocated</span> events, so they can be
                 checked against the chain.
               </div>
@@ -1567,7 +1559,7 @@
                 </div>
                 <div style="font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.55">
                   Withdrawing reaches only what is still sitting in the collector. Shares already sent on to the
-                  pool, the vault or the swap desk belong to those contracts — pull those from their own tabs.
+                  pool, the vault or the AMM belong to those contracts — pull those from their own tabs.
                 </div>
                 <div class="kv" id="feeMsg" style="margin-top:9px;display:none"></div>
               </div>
@@ -2115,7 +2107,7 @@
                 <option value="pool">Pool</option>
                 <option value="vault">Vault</option>
                 <option value="amm">AMM</option>
-                <option value="swap">Swap desk</option>
+                <option value="router">Router</option>
                 <option value="collector">Fee collector</option>
               </select>
               <button class="btn" id="cfgHiUseCurrent" title="Fill in the address the app is using now">Use current</button>
@@ -2156,7 +2148,7 @@
               <select id="cfgDeployKind" style="width:112px">
                 <option value="vault">Vault</option>
                 <option value="pool">Pool</option>
-                <option value="swap">Swap desk</option>
+                <option value="router">Router</option>
                 <option value="collector">Fee collector</option>
                 <option value="amm">AMM</option>
               </select>

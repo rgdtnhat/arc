@@ -194,7 +194,7 @@ const $ = (id) => document.getElementById(id);
       const HOLD_VENUES = {
         Lending: { kind: "lending", series: "toLending", label: "lending pool" },
         Vault: { kind: "vault", series: "toVault", label: "vault" },
-        Swap: { kind: "swap", series: "toSwap", label: "swap desk" },
+        Swap: { kind: "swap", series: "toSwap", label: "AMM pools" },
         Amm: { kind: "amm", series: "toSwap", label: "AMM pools" },
       };
       const HOLD_SIZES = [5, 10, 25, 50];
@@ -628,7 +628,7 @@ const $ = (id) => document.getElementById(id);
           setAll("dashPoolCash", "—"); setAll("dashPoolBorrows", "—"); setAll("landLiquidity", "—");
         }
         if (s.swap && s.swap.ready && s.swap.assets.length) {
-          setAll("dashSwapInv", s.swap.assets.map((a) => `${a.inventory} ${a.symbol}`).join(" · "));
+          setAll("dashSwapInv", s.swap.assets.map((a) => `${a.liquidity} ${a.symbol}`).join(" · "));
         } else {
           setAll("dashSwapInv", "—");
         }
@@ -711,20 +711,19 @@ const $ = (id) => document.getElementById(id);
           $("vBuffer").textContent = vt.bufferPct + "%";
         }
 
-        // Swap desk — always visible.
+        // Swap — always visible.
         const sw = s.swap;
         const swReady = !!(sw && sw.ready && sw.assets && sw.assets.length);
         setPanelReady("swap", swReady, ["swAmount", "swIn", "swOut", "swQuote", "swExecute"], sw && sw.deployed);
         if (swReady) {
           window.__swap = sw;
-          // Inventory first, and independently of the quote panel. It must not
+          // Depth first, and independently of the quote panel. It must not
           // depend on the pickers being populated: `renderSwapBalances` bails out
-          // when no valid pair is selected, which on the very first paint (and on
-          // a single-asset desk) is exactly when you most want to see that the
-          // desk is empty.
+          // when no valid pair is selected, which on the very first paint (and
+          // when only one asset has depth) is exactly when you most want to see
+          // that there is nothing to trade against.
           renderSwapInventory();
           renderSwapBalances();
-          loadSwapAuthority();
           const syms = sw.assets.map((a) => a.symbol).join(",");
           if ($("swIn").dataset.symbols !== syms) {
             const opts = sw.assets.map((a) => `<option value="${esc(a.address)}" data-sym="${esc(a.symbol)}" data-dec="${Number(a.decimals) || 6}">${esc(a.symbol)}</option>`).join("");
@@ -1254,7 +1253,7 @@ const $ = (id) => document.getElementById(id);
       /**
        * Show the exchange rate in both directions plus the balances that decide
        * how much can actually be traded: the user's holding of the input asset
-       * and the desk's inventory of the output asset.
+       * and the pooled depth of the output asset.
        */
       window.renderSwapBalances = function renderSwapBalances() {
         const s = swapSelected();
@@ -1283,41 +1282,18 @@ const $ = (id) => document.getElementById(id);
           `<div>${esc(rate)}</div>` +
           `<div style="margin-top:4px">Your ${esc(ai.symbol)}: <b>${esc(yours)}</b>` +
           `${mine != null ? ' <span style="opacity:.7">(your wallet)</span>' : ""}` +
-          ` · desk has <b>${esc(ao.inventory)}</b> ${esc(ao.symbol)} to give</div>`;
+          ` · <b>${esc(ao.liquidity)}</b> ${esc(ao.symbol)} in the pools</div>`;
       };
 
       /**
-       * Can this deployment withdraw desk inventory at all?
+       * Routable depth, per asset.
        *
-       * Checked up front so the answer is visible before the button is pressed,
-       * and so a desk that genuinely cannot be drained says so with its reason
-       * rather than reverting.
-       */
-      async function loadSwapAuthority() {
-        const el = $("swAuthority");
-        if (!el) return;
-        try {
-          const r = await (await fetch("/api/swap/authority")).json();
-          if (!r.ok) { el.textContent = ""; return; }
-          el.className = r.canWithdraw ? "feedNote" : "feedNote bad";
-          el.textContent = r.reason || "";
-          const btn = $("swWithdraw");
-          if (btn) {
-            btn.disabled = !r.canWithdraw;
-            btn.title = r.canWithdraw ? "" : r.reason || "";
-          }
-        } catch {
-          el.textContent = "";
-        }
-      }
-
-      /**
-       * The desk's inventory, per asset.
-       *
-       * Worth its own table: the desk fills swaps out of its own balance, so an
-       * empty asset means every swap *into* that asset reverts. Showing it up
-       * front beats letting someone discover it as "insufficient inventory"
-       * after filling in an amount.
+       * The successor to the desk's inventory table, and it answers a different
+       * question. Inventory was a balance the app stocked and that ran out;
+       * this is what liquidity providers have put into the pools, which is what
+       * a trade is actually filled from. An asset with nothing in any pool still
+       * can't be bought — but the fix is adding liquidity, not topping up a
+       * desk, and the table says so.
        */
       window.renderSwapInventory = function renderSwapInventory() {
         const body = $("swInvRows");
@@ -1329,26 +1305,15 @@ const $ = (id) => document.getElementById(id);
         }
         body.innerHTML = assets
           .map((a) => {
-            const empty = !parseFloat(a.inventory);
+            const empty = !parseFloat(a.liquidity);
             return (
               `<tr><td><b>${esc(a.symbol)}</b></td>` +
-              `<td class="num ${empty ? "down" : ""}">${esc(a.inventory)}</td>` +
+              `<td class="num ${empty ? "down" : ""}">${esc(a.liquidity)}</td>` +
               `<td><span class="tag ${empty ? "warn" : "ok"}">` +
-              `${empty ? "empty — swaps into this asset will fail" : "can fill"}</span></td></tr>`
+              `${empty ? "no pool depth — add liquidity to trade it" : "routable"}</span></td></tr>`
             );
           })
           .join("");
-        // The fund control spends the app wallet, so it is operator-only.
-        const box = $("swFundBox");
-        if (box) {
-          box.style.display = adminId ? "" : "none";
-          const sel = $("swFundAsset");
-          if (adminId && sel && sel.options.length !== assets.length) {
-            sel.innerHTML = assets
-              .map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`)
-              .join("");
-          }
-        }
       };
       async function swapQuote() {
         const s = swapSelected(); if (!s) return null;
@@ -1375,23 +1340,21 @@ const $ = (id) => document.getElementById(id);
         )).json();
         if (!r.ok) { $("swQuoteOut").textContent = "Quote failed: " + r.error; return null; }
         const out = fmtUnitsJs(r.out, s.decOut);
-        const fee = fmtUnitsJs(r.fee, s.decOut);
-        const appFee = fmtUnitsJs(r.appFee, s.decOut);
         const eff = Number(out) > 0 && Number(human) > 0 ? (Number(out) / Number(human)) : 0;
-        // What the desk must actually part with — output *plus* the app's fee.
-        // The inventory table shows its balance, which is why a trade that looked
-        // affordable reverted: the fee pushes the requirement above it.
-        const needed = r.needed ? fmtUnitsJs(r.needed, s.decOut) : out;
+        // Name the route. A two-hop fill pays two pools' fees and takes two lots
+        // of slippage, which is worth seeing before signing rather than
+        // inferring from a rate that looks worse than expected.
         const routeNote =
-          r.route === "amm" ? " · filling from the AMM (price moves with size)"
-          : r.route === "inventory" ? " · filling from desk inventory at the oracle price"
+          r.route === "multi-hop" && r.pathSymbols
+            ? ` · routed ${r.pathSymbols.map(esc).join(" → ")} (${r.hops} hops, each pays its own fee)`
+          : r.route === "direct" ? ` · direct through pool #${esc(String((r.poolIds || [])[0] ?? 0))}`
           : "";
         $("swQuoteOut").innerHTML =
           `You pay <b>${esc(human)} ${esc(s.symIn)}</b> → you receive <b>${esc(out)} ${esc(s.symOut)}</b><br>` +
           `<span style="font-weight:400;color:var(--muted)">effective rate 1 ${esc(s.symIn)} = ` +
-          `${eff ? eff.toPrecision(6) : "—"} ${esc(s.symOut)} · total fee ${esc(fee)} ${esc(s.symOut)} ` +
-          `(app keeps ${esc(appFee)}) · desk parts with ${esc(needed)} ${esc(s.symOut)}` +
-          `${routeNote} · 1% max slippage</span>` +
+          `${eff ? eff.toPrecision(6) : "—"} ${esc(s.symOut)}` +
+          `${routeNote} · fees are taken inside the pool and are already in this figure` +
+          ` · 1% max slippage</span>` +
           // Say up front what would revert, instead of after the fact.
           ((r.blockers || []).length
             ? `<div style="margin-top:8px;font-weight:400;font-size:12px;color:var(--warn)">${
@@ -1409,7 +1372,7 @@ const $ = (id) => document.getElementById(id);
       $("swIn").addEventListener("change", () => { renderSwapBalances(); $("swQuoteOut").textContent = ""; });
       $("swOut").addEventListener("change", () => { renderSwapBalances(); $("swQuoteOut").textContent = ""; });
       /**
-       * Max on the swap desk: your whole balance of the input asset.
+       * Max on a swap: your whole balance of the input asset.
        *
        * Prefers the connected wallet's own figure when self-custody is on —
        * filling the agent's balance into a form that will spend the user's is a
@@ -1466,9 +1429,9 @@ const $ = (id) => document.getElementById(id);
           msg.textContent = `You only have ${held} ${q.symIn} — reduce the amount.`;
           return;
         }
-        if (ao && Number(ao.inventory) < Number(fmtUnitsJs(q.out, q.decOut))) {
+        if (!q.out || BigInt(q.out) === 0n) {
           msg.style.display = "block"; msg.style.color = "var(--warn)";
-          msg.textContent = `The desk only holds ${ao.inventory} ${q.symOut} — try a smaller amount.`;
+          msg.textContent = `No pool can fill ${q.symIn} → ${q.symOut} at that size. Try less, or add liquidity for the pair.`;
           return;
         }
         // 1% slippage floor.
@@ -1478,11 +1441,18 @@ const $ = (id) => document.getElementById(id);
         if (selfMode()) {
           btn.disabled = true;
           await selfCustody("swapMsg", `swap ${q.symIn} → ${q.symOut}`, async (from, cfg) => {
-            await ensureAllowance(from, q.tokenIn, cfg.swap, q.amountIn);
+            await ensureAllowance(from, q.tokenIn, cfg.router, q.amountIn);
+            // Five minutes. The router rejects anything mined after this, which
+            // is what stops a transaction that sat in the mempool from being
+            // filled at a price nobody agreed to.
+            const deadline = String(Math.floor(Date.now() / 1000) + 300);
             return sendTx(
               from,
-              cfg.swap,
-              callData(cfg.selectors.swapExec, encAddr(q.tokenIn), encAddr(q.tokenOut), encUint(q.amountIn), encUint(minOut)),
+              cfg.router,
+              callData(
+                cfg.selectors.swapExec,
+                encAddr(q.tokenIn), encAddr(q.tokenOut), encUint(q.amountIn), encUint(minOut), encUint(deadline),
+              ),
             );
           });
           btn.disabled = false;
@@ -1498,73 +1468,6 @@ const $ = (id) => document.getElementById(id);
           msg.style.display = "block"; msg.textContent = "request failed"; msg.style.color = "var(--warn)";
         } finally { btn.disabled = false; tick(); }
       });
-
-      // Add inventory to the desk (operator only — it spends the app wallet).
-      if ($("swFund")) {
-        $("swFund").addEventListener("click", async () => {
-          const msg = $("swapMsg");
-          const show = (text, colour) => {
-            msg.style.display = "block"; msg.textContent = text; msg.style.color = colour;
-          };
-          const addr = $("swFundAsset").value;
-          const a = swAsset(addr);
-          const human = $("swFundAmount").value.trim();
-          if (!a) return show("Pick an asset.", "var(--warn)");
-          if (!human || !(parseFloat(human) > 0)) return show("Enter an amount above zero.", "var(--warn)");
-          if (Number(a.wallet) < Number(human)) {
-            return show(`The app wallet only holds ${a.wallet} ${a.symbol}.`, "var(--warn)");
-          }
-          const raw = toRaw(human, a.decimals);
-          const btn = $("swFund");
-          btn.disabled = true;
-          try {
-            const r = await (await postAuthed(`/api/swap/fund?token=${addr}&amount=${raw}`)).json();
-            show(
-              r.ok
-                ? `desk inventory +${human} ${a.symbol} ✓ (via ${r.route}) — tx ${String(r.txHash).slice(0, 12)}…`
-                : `failed: ${r.error}`,
-              r.ok ? "var(--good)" : "var(--warn)",
-            );
-            if (r.ok) $("swFundAmount").value = "";
-          } catch {
-            show("request failed", "var(--warn)");
-          } finally { btn.disabled = false; tick(); }
-        });
-      }
-
-      // Take inventory back out (operator only). The counterpart to funding —
-      // and the reason the desk keeps an admin key separate from its owner.
-      if ($("swWithdraw")) {
-        $("swWithdraw").addEventListener("click", async () => {
-          const msg = $("swapMsg");
-          const show = (text, colour) => {
-            msg.style.display = "block"; msg.textContent = text; msg.style.color = colour;
-          };
-          const addr = $("swFundAsset").value;
-          const a = swAsset(addr);
-          const human = $("swFundAmount").value.trim();
-          if (!a) return show("Pick an asset.", "var(--warn)");
-          if (!human || !(parseFloat(human) > 0)) return show("Enter an amount above zero.", "var(--warn)");
-          if (Number(a.inventory) < Number(human)) {
-            return show(`The desk only holds ${a.inventory} ${a.symbol}.`, "var(--warn)");
-          }
-          const raw = toRaw(human, a.decimals);
-          const btn = $("swWithdraw");
-          btn.disabled = true;
-          try {
-            const r = await (await postAuthed(`/api/swap/withdraw?token=${addr}&amount=${raw}`)).json();
-            show(
-              r.ok
-                ? `withdrew ${human} ${a.symbol} ✓ (via ${r.route}) — tx ${String(r.txHash).slice(0, 12)}…`
-                : `failed: ${r.error}`,
-              r.ok ? "var(--good)" : "var(--warn)",
-            );
-            if (r.ok) $("swFundAmount").value = "";
-          } catch {
-            show("request failed", "var(--warn)");
-          } finally { btn.disabled = false; tick(); }
-        });
-      }
 
       /* ===================================================================
        * App fees — intake, split, and the daily chart.
@@ -1620,7 +1523,7 @@ const $ = (id) => document.getElementById(id);
             ["Agent wallet", r.split.agentBps, r.totals.toAgent],
             ["Lending pool", r.split.lendingBps, r.totals.toLending],
             ["Yield vault", r.split.vaultBps, r.totals.toVault],
-            ["Swap desk / AMM", r.split.swapBps, r.totals.toSwap],
+            ["AMM pools", r.split.swapBps, r.totals.toSwap],
             ["Retained", r.split.retainedBps, r.totals.retained],
           ];
           $("feeSplitRows").innerHTML = rows
@@ -2720,7 +2623,7 @@ const $ = (id) => document.getElementById(id);
         if (e && (e.code === 4001 || s.includes("user rejected") || s.includes("user denied"))) return "You cancelled it in your wallet.";
         if (s.includes("no browser wallet")) return "No browser wallet detected — install or enable one, then reconnect.";
         if (s.includes("insufficient funds") || s.includes("gas")) return "Not enough USDC in your wallet to cover network fees.";
-        if (s.includes("insufficient inventory")) return "The swap desk can't fill that size right now. Try less.";
+        if (s.includes("noroute") || s.includes("no route")) return "No pool can fill that size right now. Try less, or add liquidity for the pair.";
         if (s.includes("slippage")) return "Price moved — get a fresh quote and retry.";
         if (s.includes("pool illiquid") || s.includes("insufficientliquidity")) return "Not enough free liquidity for that amount right now.";
         if (s.includes("unhealthy")) return "That would exceed your safe collateral limit.";
@@ -4565,8 +4468,8 @@ const $ = (id) => document.getElementById(id);
                 ].join("") + lnRows
               : row("Lending", "not available")) +
             section("Liquidity pools", ammRows || row("AMM", "no position")) +
-            section("Swap desk", sw && sw.ready
-              ? sw.assets.map((a) => row(a.symbol, a.inventory + " available", "≈ $" + a.priceUsd)).join("")
+            section("Swap", sw && sw.ready
+              ? sw.assets.map((a) => row(a.symbol, a.liquidity + " routable", "≈ $" + a.priceUsd)).join("")
               : row("Swap", "not available"));
           return;
         }
@@ -4614,7 +4517,7 @@ const $ = (id) => document.getElementById(id);
               c("Nanopayment tabs", live.tesseraTab),
               c("Lending pool", live.tesseraPool),
               c("Vault", live.tesseraVault),
-              c("Swap desk", live.tesseraSwap),
+              c("Router", live.tesseraRouter),
               c("AMM", live.tesseraAmm),
               c("Fee collector", live.tesseraFeeCollector),
               c("AMM fee collector", live.tesseraAmmFeeCollector),

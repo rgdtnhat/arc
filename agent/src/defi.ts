@@ -10,7 +10,7 @@ import {
 } from "viem";
 import {
   tesseraVaultAbi,
-  tesseraSwapAbi,
+  tesseraRouterAbi,
   tesseraAmmAbi,
   tesseraFeeCollectorAbi,
   erc20Abi,
@@ -121,65 +121,44 @@ export class VaultClient {
   }
 }
 
-/** `fund(address,uint256)` and `seed(address,uint256)` — see `fundInventory`. */
-const FUND_SELECTOR = "7b1837de";
-const SEED_SELECTOR = "5684d86a";
-/** `amm()` — present only on desks built with the AMM fallback. */
-const AMM_GETTER_SELECTOR = "2a943945";
-/** `admin()` — absent on desks built before the admin key existed. */
-const ADMIN_GETTER_SELECTOR = "f851a440";
-/** `withdrawSwapInventory(address,uint256,address)` on the fee collector. */
-const FORWARD_WITHDRAW_SELECTOR = "b668a956";
-
-/** Client for the TesseraSwap (oracle-priced swap desk). */
-export class SwapClient {
+/**
+ * Client for TesseraRouter — swaps backed by AMM pool liquidity.
+ *
+ * Replaces the old `SwapClient`, which drove an inventory desk. The desk had a
+ * balance to fund, a balance to withdraw, and an owner/admin question about who
+ * was allowed to do either; a router has none of those, because it holds nothing
+ * between calls. What is left is quoting and swapping.
+ */
+export class RouterClient {
   readonly public: PublicClient;
   readonly wallet: WalletClient;
-  /** Probed once from the deployed bytecode; a contract's code never changes. */
-  private ammFallback: boolean | null = null;
-
-  /**
-   * Does the *deployed* desk have the AMM fallback, and is it wired to one?
-   *
-   * The ABI in this build has it; a desk deployed earlier does not, and on that
-   * desk a trade the inventory can't cover reverts with "insufficient
-   * inventory" no matter how much liquidity the AMM holds. Reading the selector
-   * out of the code is the only way to tell — an `amm()` call on a contract
-   * without the getter and one that returns the zero address are equally empty.
-   */
-  async hasAmmFallback(): Promise<boolean> {
-    if (this.ammFallback !== null) return this.ammFallback;
-    const code = String((await this.public.getCode({ address: this.swap })) ?? "").toLowerCase();
-    if (!code.includes(AMM_GETTER_SELECTOR)) {
-      this.ammFallback = false;
-      return false;
-    }
-    const amm = await this.public
-      .readContract({ address: this.swap, abi: tesseraSwapAbi, functionName: "amm" })
-      .catch(() => null);
-    this.ammFallback = typeof amm === "string" && /^0x[0-9a-f]{40}$/i.test(amm) && BigInt(amm) !== 0n;
-    return this.ammFallback;
-  }
 
   constructor(
     private readonly cfg: Cfg,
-    readonly swap: Hex,
+    readonly router: Hex,
   ) {
     this.public = createPublicClient({ chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl), batch: { multicall: true } });
     this.wallet = createWalletClient({ account: cfg.account, chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl) });
   }
 
-  quote(tokenIn: Hex, tokenOut: Hex, amountIn: bigint): Promise<readonly [bigint, bigint, bigint]> {
+  /** The best route the router can find, and what it would pay out. */
+  estimate(tokenIn: Hex, tokenOut: Hex, amountIn: bigint): Promise<readonly [bigint, readonly bigint[], readonly Hex[]]> {
     return this.public.readContract({
-      address: this.swap,
-      abi: tesseraSwapAbi,
-      functionName: "quote",
+      address: this.router,
+      abi: tesseraRouterAbi,
+      functionName: "estimate",
       args: [tokenIn, tokenOut, amountIn],
-    }) as Promise<readonly [bigint, bigint, bigint]>;
+    }) as Promise<readonly [bigint, readonly bigint[], readonly Hex[]]>;
   }
 
-  inventory(token: Hex): Promise<bigint> {
-    return this.public.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [this.swap] }) as Promise<bigint>;
+  /** Price a route the caller already chose. */
+  estimateChained(poolIds: readonly bigint[], path: readonly Hex[], amountIn: bigint): Promise<bigint> {
+    return this.public.readContract({
+      address: this.router,
+      abi: tesseraRouterAbi,
+      functionName: "estimateChained",
+      args: [poolIds, path, amountIn],
+    }) as Promise<bigint>;
   }
 
   private async ensureApproval(token: Hex, min: bigint) {
@@ -187,27 +166,41 @@ export class SwapClient {
       address: token,
       abi: erc20Abi,
       functionName: "allowance",
-      args: [this.cfg.account.address, this.swap],
+      args: [this.cfg.account.address, this.router],
     })) as bigint;
     if (allowance >= min) return;
     const hash = await this.wallet.writeContract({
       address: token,
       abi: erc20Abi,
       functionName: "approve",
-      args: [this.swap, maxUint256],
+      args: [this.router, maxUint256],
       chain: this.cfg.chain,
       account: this.cfg.account,
     });
     await this.public.waitForTransactionReceipt({ hash });
   }
 
-  async execute(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, minOut: bigint): Promise<Hex> {
+  /**
+   * Swap, letting the router pick the route.
+   *
+   * @param deadlineSeconds How long the transaction stays valid. The default is
+   *   short on purpose: a swap that sits in the mempool is a free option written
+   *   against the sender, and the pool it prices against keeps moving.
+   */
+  async execute(
+    tokenIn: Hex,
+    tokenOut: Hex,
+    amountIn: bigint,
+    minOut: bigint,
+    deadlineSeconds = 300,
+  ): Promise<Hex> {
     await this.ensureApproval(tokenIn, amountIn);
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + deadlineSeconds);
     const { request } = await this.public.simulateContract({
-      address: this.swap,
-      abi: tesseraSwapAbi,
+      address: this.router,
+      abi: tesseraRouterAbi,
       functionName: "swap",
-      args: [tokenIn, tokenOut, amountIn, minOut],
+      args: [tokenIn, tokenOut, amountIn, minOut, deadline],
       account: this.cfg.account,
     });
     const hash = await this.wallet.writeContract(request);
@@ -215,204 +208,41 @@ export class SwapClient {
     return hash;
   }
 
-  /**
-   * Add inventory so the desk can fill swaps.
-   *
-   * Three routes, because a desk deployed before `fund()` existed is still live
-   * and still needs topping up. `swap` measures inventory as the desk's own
-   * balance, so all three end in the same place:
-   *
-   *   1. `fund()`  — permissionless, emits InventoryChanged. Preferred.
-   *   2. `seed()`  — owner-only; used when we still own the desk and (1) is absent.
-   *   3. `transfer` — a plain ERC-20 send. Works on any desk, always has.
-   *
-   * The route is *probed*, not assumed: the ABI compiled into this build is
-   * newer than the bytecode that may already be deployed, so only the contract
-   * can say which functions it has.
-   */
-  async fundInventory(token: Hex, amount: bigint): Promise<{ txHash: Hex; route: "fund" | "seed" | "transfer" }> {
-    if (amount <= 0n) throw new Error("amount must be positive");
-
-    // Which entry points does the *deployed* code have? Read the selectors out
-    // of the bytecode rather than simulating a call: `fund` and `seed` return
-    // nothing, so an `eth_call` returning empty data is a valid success and is
-    // indistinguishable from the empty data a node gives for a selector that
-    // isn't there. Solidity embeds each selector as a PUSH4 constant.
-    const code = String((await this.public.getCode({ address: this.swap })) ?? "").toLowerCase();
-    const has = (selector: string) => code.includes(selector);
-    const owner = await this.public
-      .readContract({ address: this.swap, abi: tesseraSwapAbi, functionName: "owner" })
-      .catch(() => null);
-    const weOwnIt =
-      typeof owner === "string" && owner.toLowerCase() === this.cfg.account.address.toLowerCase();
-
-    const route: "fund" | "seed" | "transfer" = has(FUND_SELECTOR)
-      ? "fund"
-      : has(SEED_SELECTOR) && weOwnIt
-        ? "seed"
-        : "transfer";
-
-    if (route !== "transfer") {
-      await this.ensureApproval(token, amount);
-      const { request } = await this.public.simulateContract({
-        address: this.swap,
-        abi: tesseraSwapAbi,
-        functionName: route,
-        args: [token, amount],
-        account: this.cfg.account,
-      });
-      const hash = await this.wallet.writeContract(request);
-      await this.public.waitForTransactionReceipt({ hash });
-      return { txHash: hash, route };
-    }
-
-    // No callable entry point: send the tokens directly. The desk's balance *is*
-    // its inventory, so this lands in the same place — it just emits no
-    // InventoryChanged event.
-    const hash = await this.wallet.writeContract({
-      address: token,
-      abi: erc20Abi,
-      functionName: "transfer",
-      args: [this.swap, amount],
-      chain: this.cfg.chain,
+  /** Swap along an explicit route, with one guard on the final output. */
+  async executeChained(
+    poolIds: readonly bigint[],
+    path: readonly Hex[],
+    amountIn: bigint,
+    minOut: bigint,
+    deadlineSeconds = 300,
+  ): Promise<Hex> {
+    if (path.length < 2) throw new Error("a route needs at least two tokens");
+    await this.ensureApproval(path[0]!, amountIn);
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + deadlineSeconds);
+    const { request } = await this.public.simulateContract({
+      address: this.router,
+      abi: tesseraRouterAbi,
+      functionName: "swapChained",
+      args: [poolIds, path, amountIn, minOut, deadline],
       account: this.cfg.account,
     });
+    const hash = await this.wallet.writeContract(request);
     await this.public.waitForTransactionReceipt({ hash });
-    return { txHash: hash, route: "transfer" };
+    return hash;
   }
 
-  /**
-   * Take inventory back out of the desk.
-   *
-   * Two routes, because withdrawal is gated and which gate the caller can pass
-   * depends on how the desk was deployed:
-   *
-   *   1. **Direct** — the desk's `withdrawInventory`, if this wallet is its
-   *      `owner` or its `admin`.
-   *   2. **Via the fee collector** — deployment hands the desk's ownership to
-   *      `TesseraFeeCollector` so its `seed` leg works, which on a desk with no
-   *      `admin` key leaves the collector as the only account that can withdraw.
-   *      The collector's `withdrawSwapInventory` forwards the call for its own
-   *      owner.
-   *
-   * A desk predating both (`withdrawInventory` owner-only, collector with no
-   * forwarder) genuinely cannot be drained — reported as such rather than
-   * failing obscurely.
-   */
-  /**
-   * Who, if anyone, can pull inventory out of this desk.
-   *
-   * Worth answering before the attempt rather than after. `withdrawInventory`
-   * is `onlyOwnerOrAdmin` in current source, but a desk deployed before the
-   * `admin` key existed is `onlyOwner` — and deployment hands ownership to the
-   * fee collector so its `seed` leg works. If that collector also predates the
-   * `withdrawSwapInventory` forwarder, there is no code path from anyone's key
-   * to the desk's balance. That is a real state a live deployment can be in, and
-   * "the contract rejected this transaction" is a useless way to learn it.
-   */
-  async withdrawAuthority(feeCollector?: Hex): Promise<{
-    canWithdraw: boolean;
-    owner: Hex | null;
-    admin: Hex | null;
-    /** Whether the desk exposes the admin key at all (older ones do not). */
-    hasAdmin: boolean;
-    /** Whether the owning collector can forward a withdrawal. */
-    collectorCanForward: boolean;
-    reason: string;
-  }> {
-    const me = this.cfg.account.address.toLowerCase();
-    const code = String((await this.public.getCode({ address: this.swap })) ?? "").toLowerCase();
-    const hasAdmin = code.includes(ADMIN_GETTER_SELECTOR);
-
-    const read = async (address: Hex, abi: unknown, functionName: string) =>
-      this.public
-        .readContract({ address, abi: abi as never, functionName: functionName as never })
-        .catch(() => null) as Promise<Hex | null>;
-
-    const owner = await read(this.swap, tesseraSwapAbi, "owner");
-    const admin = hasAdmin ? await read(this.swap, tesseraSwapAbi, "admin") : null;
-
-    const isMine = (a: Hex | null) => typeof a === "string" && a.toLowerCase() === me;
-    if (isMine(owner) || isMine(admin)) {
-      return { canWithdraw: true, owner, admin, hasAdmin, collectorCanForward: false,
-        reason: isMine(admin) ? "This key is the desk's admin." : "This key owns the desk." };
+  /** The assets the router will try as a middle leg when no direct pool exists. */
+  async hubTokens(): Promise<Hex[]> {
+    const n = (await this.public.readContract({
+      address: this.router, abi: tesseraRouterAbi, functionName: "hubTokenCount",
+    })) as bigint;
+    const out: Hex[] = [];
+    for (let i = 0n; i < n; i++) {
+      out.push((await this.public.readContract({
+        address: this.router, abi: tesseraRouterAbi, functionName: "hubTokens", args: [i],
+      })) as Hex);
     }
-
-    // Not us directly. The owner may be the fee collector, which can forward —
-    // but only if it was deployed with the forwarder, and only for its own owner.
-    let collectorCanForward = false;
-    if (feeCollector && typeof owner === "string" && owner.toLowerCase() === feeCollector.toLowerCase()) {
-      const cCode = String((await this.public.getCode({ address: feeCollector })) ?? "").toLowerCase();
-      const cOwner = await read(feeCollector, tesseraFeeCollectorAbi, "owner");
-      collectorCanForward = cCode.includes(FORWARD_WITHDRAW_SELECTOR) && isMine(cOwner);
-      if (collectorCanForward) {
-        return { canWithdraw: true, owner, admin, hasAdmin, collectorCanForward,
-          reason: "The fee collector owns the desk and can forward the withdrawal for its owner." };
-      }
-    }
-
-    const why = !hasAdmin
-      ? "This desk predates the admin key, so only its owner can withdraw"
-      : "This key is neither the desk's owner nor its admin";
-    const andThe = feeCollector && typeof owner === "string" && owner.toLowerCase() === feeCollector.toLowerCase()
-      ? ", and the fee collector that owns it has no forwarder to pass the call through"
-      : "";
-    return {
-      canWithdraw: false, owner, admin, hasAdmin, collectorCanForward,
-      reason:
-        `${why}${andThe}. The inventory is not lost — it is the desk's trading stock, so it can still be ` +
-        `bought out by swapping into it at the oracle price (minus the 0.30% fee). To get an admin ` +
-        `withdrawal back, redeploy the desk; current contracts keep the admin key with the deployer ` +
-        `precisely so handing ownership to the collector cannot strand it again.`,
-    };
-  }
-
-  async withdrawInventory(
-    token: Hex,
-    amount: bigint,
-    to: Hex,
-    feeCollector?: Hex,
-  ): Promise<{ txHash: Hex; route: "direct" | "collector" }> {
-    if (amount <= 0n) throw new Error("amount must be positive");
-
-    const attempt = async (address: Hex, abi: typeof tesseraSwapAbi | typeof tesseraFeeCollectorAbi,
-                           functionName: string, args: unknown[]) => {
-      const { request } = await this.public.simulateContract({
-        address, abi: abi as never, functionName: functionName as never,
-        args: args as never, account: this.cfg.account,
-      });
-      const hash = await this.wallet.writeContract(request);
-      await this.public.waitForTransactionReceipt({ hash });
-      return hash;
-    };
-
-    let directError = "";
-    try {
-      return { txHash: await attempt(this.swap, tesseraSwapAbi, "withdrawInventory", [token, amount, to]), route: "direct" };
-    } catch (e) {
-      directError = String((e as { shortMessage?: string })?.shortMessage ?? (e as Error)?.message ?? e)
-        .split("\n")[0]
-        .slice(0, 120);
-    }
-
-    if (feeCollector) {
-      try {
-        return {
-          txHash: await attempt(feeCollector, tesseraFeeCollectorAbi, "withdrawSwapInventory", [token, amount, to]),
-          route: "collector",
-        };
-      } catch (e) {
-        const via = String((e as { shortMessage?: string })?.shortMessage ?? (e as Error)?.message ?? e)
-          .split("\n")[0]
-          .slice(0, 120);
-        throw new Error(
-          `Neither route could withdraw. Directly: ${directError}. Via the fee collector: ${via}. ` +
-            `A swap desk deployed before the admin key and the collector's forwarder existed cannot be ` +
-            `drained — redeploy with \`npm run pool:arc -- --fresh\` to move to one that can.`,
-        );
-      }
-    }
-    throw new Error(directError || "withdrawInventory failed");
+    return out;
   }
 }
 

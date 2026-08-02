@@ -182,9 +182,12 @@ export class ArchiveScanner {
   }
 
   /**
-   * Swap desk and fee collector hold **no per-user balances** — their inventory
-   * belongs to the app. Archiving one records what the contract still holds so
-   * it can be swept, with the treasury named as the single "holder".
+   * The fee collector, the router, and the retired swap desk hold **no per-user
+   * balances** — whatever is in them belongs to the app. Archiving one records
+   * what the contract still holds so it can be swept, with the treasury named as
+   * the single "holder". For a router the answer is normally zero, since it
+   * holds nothing between calls; a non-zero reading means stray tokens worth
+   * sweeping.
    */
   async scanTreasury(
     contract: Hex,
@@ -228,6 +231,7 @@ export class ArchiveScanner {
       case "amm":
         return this.scanAmm(address, opts.poolId ?? 0);
       case "swap":
+      case "router":
       case "collector":
         if (!opts.treasury) throw new Error("A treasury archive needs the destination address.");
         return this.scanTreasury(address, assets, opts.treasury);

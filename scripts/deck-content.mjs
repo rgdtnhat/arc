@@ -48,7 +48,7 @@ export const SLIDES = [
     ],
     stats: [
       ["Live on Arc testnet", "chainId 5042002 · USDC as gas"],
-      ["8 contracts deployed", "escrow, tabs, pool, vault, swap, AMM, 2 collectors"],
+      ["8 contracts deployed", "escrow, tabs, pool, vault, router, AMM, 2 collectors"],
       ["238 automated tests", "104 contract · 134 agent · CI on every push"],
     ],
     note:
@@ -131,7 +131,7 @@ export const SLIDES = [
     cards: [
       ["◆ Lending & borrowing", "Supply for yield or borrow against collateral. Kinked-utilisation interest, health-factor liquidation, per-action freeze controls.", C.accent],
       ["◆ Yield vault", "80% held liquid by a contract floor no admin can lower. The app's fee touches yield only — never principal.", C.good],
-      ["◆ Swap desk", "Oracle-priced swaps between pool assets, with a configurable fee split.", C.warn],
+      ["◆ Swap", "Routed through AMM pool liquidity — up to two hops, min-out and a deadline. No inventory, no oracle in the path.", C.warn],
       ["◆ Liquidity pools (AMM)", "Multi-asset pools where providers keep at least 50% of every swap fee — a constant in the contract, not a setting.", C.accent],
     ],
     note:

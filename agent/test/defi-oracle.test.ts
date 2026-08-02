@@ -79,7 +79,7 @@ test("no venues means no answer, not a fabricated one", () => {
 
 test("bestRoute picks the leg that returns most", () => {
   const best = rankRoutes([
-    leg({ venue: "swap-desk", amountOutNum: 99.7, amountOut: "99.70" }),
+    leg({ venue: "router", amountOutNum: 99.7, amountOut: "99.70" }),
     leg({ venue: "amm", amountOutNum: 101.2, amountOut: "101.20" }),
   ]);
   assert.equal(best?.venue, "amm");
@@ -88,9 +88,9 @@ test("bestRoute picks the leg that returns most", () => {
 test("a leg that returns nothing is skipped", () => {
   const best = rankRoutes([
     leg({ venue: "amm", amountOutNum: 0 }),
-    leg({ venue: "swap-desk", amountOutNum: 5 }),
+    leg({ venue: "router", amountOutNum: 5 }),
   ]);
-  assert.equal(best?.venue, "swap-desk");
+  assert.equal(best?.venue, "router");
 });
 
 test("no usable leg means no route", () => {

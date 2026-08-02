@@ -70,11 +70,11 @@ describe("TesseraAMM (multi-asset liquidity pools)", () => {
   it("never lets the app round a wei away from liquidity providers", async () => {
     const { deployer, usdc, eurc, amm } = await loadFixture(deployFixture);
     const asOwner = await hre.viem.getContractAt("TesseraAMM", amm.address, { client: { wallet: deployer } });
-    await asOwner.write.configurePool([0n, 300, 5000]); // 3% fee so odd totals are easy to hit
+    await asOwner.write.configurePool([0n, 100, 5000]); // top tier (1%) — odd totals are easy to hit
     // 33 units in → fee = 0 (rounds down) up to a fee of 1 wei at the right size.
     for (const raw of [333n, 3333n, 33333n, 777n]) {
       const [, lpFee, appFee] = await amm.read.quote([0n, usdc.address, eurc.address, raw]);
-      const fee = (raw * 300n) / 10_000n;
+      const fee = (raw * 100n) / 10_000n;
       expect(lpFee + appFee).to.equal(fee);
       expect(lpFee >= appFee).to.equal(true);
     }
@@ -199,7 +199,7 @@ describe("TesseraAMM (multi-asset liquidity pools)", () => {
     expect(await amm.read.MIN_LP_SHARE()).to.equal(5000);
     await expect(asOwner.write.configurePool([0n, SWAP_FEE, 4999])).to.be.rejected;
     await expect(asOwner.write.createPool([[usdc.address, eurc.address], SWAP_FEE, 0, "greedy"])).to.be.rejected;
-    await expect(asOwner.write.configurePool([0n, 501, 5000])).to.be.rejected; // fee ceiling
+    await expect(asOwner.write.configurePool([0n, 501, 5000])).to.be.rejected; // not a fee tier
     // Raising the LP share above the floor is fine.
     await asOwner.write.configurePool([0n, SWAP_FEE, 8000]);
     expect((await amm.read.poolInfo([0n]))[3]).to.equal(8000);
@@ -475,5 +475,72 @@ describe("TesseraAMM (amplified curve for near-parity pairs)", () => {
     const { amm, bob } = await loadFixture(deployFixture);
     const asBob = await hre.viem.getContractAt("TesseraAMM", amm.address, { client: { wallet: bob } });
     await expect(asBob.write.setAmp([0n, 200])).to.be.rejectedWith("not owner");
+  });
+});
+
+/**
+ * Rules taken from Aquarius (Aqua Network) on Stellar, the reference this AMM
+ * follows: a fixed set of fee tiers rather than a free-form number, a pair index
+ * so a router can find pools, and an estimate call that answers instead of
+ * reverting.
+ */
+describe("TesseraAMM — Aquarius rules", () => {
+  it("accepts only the three fee tiers", async () => {
+    const { deployer, usdc, eurc, amm } = await loadFixture(deployFixture);
+    const asOwner = await hre.viem.getContractAt("TesseraAMM", amm.address, { client: { wallet: deployer } });
+    expect(await amm.read.feeTiers()).to.deep.equal([10, 30, 100]);
+
+    for (const tier of [10, 30, 100]) {
+      await asOwner.write.createPool([[usdc.address, eurc.address], tier, LP_SHARE, `tier ${tier}`]);
+    }
+    // A free-form fee fragments liquidity across near-identical pools and gives
+    // an operator a dial traders cannot anticipate, so it is rejected outright.
+    for (const bad of [0, 5, 25, 29, 31, 50, 200]) {
+      await expect(asOwner.write.createPool([[usdc.address, eurc.address], bad, LP_SHARE, "bad"])).to.be.rejected;
+      await expect(asOwner.write.configurePool([0n, bad, LP_SHARE])).to.be.rejected;
+    }
+  });
+
+  it("indexes every pair a pool can trade, in either order", async () => {
+    const { deployer, usdc, eurc, btc, amm } = await loadFixture(deployFixture);
+    const asOwner = await hre.viem.getContractAt("TesseraAMM", amm.address, { client: { wallet: deployer } });
+
+    expect(await amm.read.poolsForPair([usdc.address, eurc.address])).to.deep.equal([0n]);
+    // Order must not matter: A/B and B/A are one pair, not two.
+    expect(await amm.read.poolsForPair([eurc.address, usdc.address])).to.deep.equal([0n]);
+    expect(await amm.read.pairPoolCount([usdc.address, btc.address])).to.equal(0n);
+
+    // A three-asset pool registers all three of its pairs.
+    await asOwner.write.createPool([[usdc.address, eurc.address, btc.address], 30, LP_SHARE, "tri"]);
+    expect(await amm.read.poolsForPair([usdc.address, btc.address])).to.deep.equal([1n]);
+    expect(await amm.read.poolsForPair([eurc.address, btc.address])).to.deep.equal([1n]);
+    // The pair the first pool already had now lists both.
+    expect(await amm.read.poolsForPair([usdc.address, eurc.address])).to.deep.equal([0n, 1n]);
+  });
+
+  it("estimates without reverting where quote would", async () => {
+    const { usdc, eurc, btc, amm } = await loadFixture(deployFixture);
+    const [q] = await amm.read.quote([0n, usdc.address, eurc.address, U("100")]);
+    const [e] = await amm.read.estimateSwap([0n, usdc.address, eurc.address, U("100")]);
+    expect(e).to.equal(q);
+
+    // Each of these makes `quote` revert. A router pricing a dozen candidate
+    // routes in one read must not be aborted by the worst of them.
+    await expect(amm.read.quote([0n, usdc.address, btc.address, U("100")])).to.be.rejected;
+    for (const args of [
+      [0n, usdc.address, btc.address, U("100")],
+      [0n, usdc.address, usdc.address, U("100")],
+      [0n, usdc.address, eurc.address, 0n],
+      [99n, usdc.address, eurc.address, U("100")],
+    ] as const) {
+      expect((await amm.read.estimateSwap(args as never))[0]).to.equal(0n);
+    }
+  });
+
+  it("estimates zero for a frozen pool", async () => {
+    const { deployer, usdc, eurc, amm } = await loadFixture(deployFixture);
+    const asOwner = await hre.viem.getContractAt("TesseraAMM", amm.address, { client: { wallet: deployer } });
+    await asOwner.write.setFrozen([0n, true]);
+    expect((await amm.read.estimateSwap([0n, usdc.address, eurc.address, U("100")]))[0]).to.equal(0n);
   });
 });

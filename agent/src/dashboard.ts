@@ -18,11 +18,11 @@ import {
   tesseraAmmAbi,
   tesseraPoolAbi,
   tesseraVaultAbi,
-  tesseraSwapAbi,
+  tesseraRouterAbi,
   erc20Abi,
   tesseraPoolBytecode,
   tesseraVaultBytecode,
-  tesseraSwapBytecode,
+  tesseraRouterBytecode,
   tesseraFeeCollectorBytecode,
   tesseraAmmBytecode,
 } from "@tessera/shared";
@@ -53,7 +53,7 @@ interface PoolDeploymentRef {
 }
 import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient } from "./pool.js";
-import { VaultClient, SwapClient, AmmClient } from "./defi.js";
+import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
 import { priceImpact, maxInputWithin, IMPACT_MAX_PCT } from "./impact.js";
@@ -129,7 +129,7 @@ const CLIENT_SELECTORS = Object.fromEntries(
     balanceOfAssets: "function balanceOfAssets(address)",
     maxWithdraw: "function maxWithdraw(address)",
     swapQuote: "function quote(address,address,uint256)",
-    swapExec: "function swap(address,address,uint256,uint256)",
+    swapExec: "function swap(address,address,uint256,uint256,uint256)",
     // AMM. `ammAdd`/`ammRemove` take dynamic arrays, so the browser encodes them
     // with an offset + length header rather than the flat static layout.
     ammQuote: "function quote(uint256,address,address,uint256)",
@@ -229,7 +229,7 @@ async function main() {
     rpcUrl,
     pool: (liveDeployment.tesseraPool as Hex) ?? undefined,
     vault: (liveDeployment.tesseraVault as Hex) ?? undefined,
-    swap: (liveDeployment.tesseraSwap as Hex) ?? undefined,
+    router: (liveDeployment.tesseraRouter as Hex) ?? undefined,
     amm: (liveDeployment.tesseraAmm as Hex) ?? undefined,
     escrow: escrowAddress,
     // Same fallback the pool reference uses: a bare deployment still lists USDC,
@@ -278,8 +278,8 @@ async function main() {
         (liveDeployment.vaultAsset as Hex) ?? usdcAddress,
       )
     : undefined;
-  const swapClient = liveDeployment.tesseraSwap
-    ? new SwapClient({ chain, rpcUrl, account: agentAccount }, liveDeployment.tesseraSwap as Hex)
+  const routerClient = liveDeployment.tesseraRouter
+    ? new RouterClient({ chain, rpcUrl, account: agentAccount }, liveDeployment.tesseraRouter as Hex)
     : undefined;
   const ammClient = liveDeployment.tesseraAmm
     ? new AmmClient({ chain, rpcUrl, account: agentAccount }, liveDeployment.tesseraAmm as Hex)
@@ -712,7 +712,9 @@ async function main() {
     const table: [RegExp, string][] = [
       [/request limit|rate limit|too many requests|429|-32005/, "The Arc network is rate-limiting us right now. Wait a few seconds and try again."],
       [/timeout|timed out|fetch failed|socket|econnreset|network/, "Couldn't reach the Arc network. Check your connection and try again."],
-      [/insufficient inventory/, "The swap desk doesn't hold enough of that asset to fill this trade. Try a smaller amount."],
+      [/noroute|no route/, "No AMM pool can fill that trade right now. Try a smaller amount, or add liquidity for the pair."],
+      [/expired|deadline/, "The order sat too long before it was mined and expired. Try again — this protects you from being filled at a stale price."],
+      [/badpath|bad path/, "That swap route isn't valid. Pick two different assets."],
       [/slippage/, "The price moved while the order was being sent. Get a fresh quote and try again."],
       [/pool illiquid/, "The pool doesn't have enough free liquidity for that amount right now. Try withdrawing less."],
       [/insufficientliquidity/, "The pool is fully lent out at the moment — not enough free liquidity. Try a smaller amount."],
@@ -723,10 +725,13 @@ async function main() {
       [/zero ?amount|zero in|zero out|no shares|\bzero\b/, "Enter an amount greater than zero."],
       [/not borrowable/, "That asset can't be borrowed from this pool."],
       [/unknownreserve/, "That asset isn't a reserve in this pool."],
-      [/\breverted with the following reason:\s*in\b|"in"/, "The desk couldn't take your input token — approve it for the swap desk first, and check the balance."],
-      [/\breverted with the following reason:\s*out\b|"out"/, "The desk couldn't send the output token. Its inventory may have moved since the quote — get a fresh quote."],
-      [/app fee/, "The desk couldn't pay the app's fee out of the output token. Its inventory is short by the fee amount — try a smaller trade."],
-      [/amm returned nothing/, "The AMM had nothing to fill this with. The pool is empty for that pair."],
+      [/insufficient liquidity/, "The pool is too shallow to fill that trade. Try a smaller amount, or add liquidity for the pair."],
+      [/\breverted with the following reason:\s*in\b|"in"/, "Couldn't take your input token — approve it for the router first, and check the balance."],
+      [/\breverted with the following reason:\s*out\b|"out"/, "Couldn't send the output token. The pool may have moved since the quote — get a fresh quote."],
+      [/healthoutofband/, "That liquidation percentage would leave the borrower outside the target health band. Pick a percentage that lands them between 1.03 and 1.15."],
+      [/noauction/, "There is no open auction for that account."],
+      [/auctionexists/, "That account already has an open auction. Fill it or cancel it first."],
+      [/stilllocked/, "Those backstop shares are still in the queue period. They unlock 21 days after they were queued."],
       [/allowance|transferfrom/, "Token approval failed — approve the spender first, or check the wallet holds enough of that token."],
       [/exceeds balance|insufficient balance|\bbalance\b/, "Not enough balance for that amount."],
       [/insufficient funds|gas required|out of gas/, "Not enough USDC to cover network fees. Top up the wallet at faucet.circle.com."],
@@ -1059,53 +1064,61 @@ async function main() {
     );
   }
 
-  // --- Swap snapshot: per-asset price + wallet balance + desk inventory -------
+  // --- Swap snapshot: per-asset price, wallet balance, and routable depth -----
   // The UI needs these to show a human rate ("1 EURC ≈ 1.08 USDC") and to tell
   // the user how much they can actually swap. Background-refreshed like the rest.
   type SwapSnap = {
     deployed: boolean;
     ready: boolean;
     address: Hex;
-    assets: { symbol: string; address: Hex; decimals: number; priceUsd: string; wallet: string; inventory: string }[];
+    assets: { symbol: string; address: Hex; decimals: number; priceUsd: string; wallet: string; liquidity: string }[];
   };
   let lastSwap: SwapSnap | null = null;
   let swapRefreshing = false;
   let swapAt = 0;
   /**
-   * Swap snapshot. Price, decimals and wallet balance are reused from the
-   * lending snapshot (the same reserve data) so this only reads the one thing it
-   * uniquely needs — the desk's inventory. Re-reading everything here doubled
-   * the RPC load and was a big part of why reads were being throttled.
+   * Swap snapshot. Price, decimals and wallet balance come from the lending
+   * snapshot (the same reserve data) and depth from the AMM snapshot, so this
+   * reads nothing of its own. Re-reading everything here doubled the RPC load
+   * and was a big part of why reads were being throttled.
+   *
+   * `liquidity` replaced the old `inventory` column, and the difference is the
+   * point of the change. Inventory was a balance the app had to stock and that
+   * ran out; liquidity is the depth providers have put into the pools, which is
+   * what a trade is filled from now.
    */
   async function readSwap(): Promise<SwapSnap> {
-    const prevBySymbol = new Map((lastSwap?.assets ?? []).map((a) => [a.address.toLowerCase(), a]));
-    const assets = await Promise.all(
-      (poolDeployment?.assets ?? []).map(async (a) => {
+    const prevByAddr = new Map((lastSwap?.assets ?? []).map((a) => [a.address.toLowerCase(), a]));
+    // Sum each asset's reserves across every pool that holds it. One number per
+    // asset is the honest headline: a trade may route through more than one
+    // pool, so no individual pool's balance is the ceiling.
+    const depth = new Map<string, bigint>();
+    for (const pool of ammSnapshot()?.pools ?? []) {
+      if (pool.frozen) continue;
+      for (const a of pool.assets) {
         const key = a.address.toLowerCase();
-        const cached = assetCache.get(key);
-        try {
-          const inventory = await swapClient!.inventory(a.address);
-          const decimals = cached?.decimals ?? prevBySymbol.get(key)?.decimals ?? 6;
-          return {
-            symbol: a.symbol,
-            address: a.address,
-            decimals,
-            priceUsd: cached?.priceUsd ?? prevBySymbol.get(key)?.priceUsd ?? "0",
-            wallet: cached?.position.wallet ?? prevBySymbol.get(key)?.wallet ?? "0",
-            inventory: fmtUnits(inventory, decimals),
-          };
-        } catch {
-          // Keep the asset listed with its previous inventory.
-          return prevBySymbol.get(key) ?? null;
-        }
-      }),
-    );
-    const ok = assets.filter((a): a is NonNullable<typeof a> => a !== null);
+        depth.set(key, (depth.get(key) ?? 0n) + BigInt(a.raw ?? "0"));
+      }
+    }
+    const assets = (poolDeployment?.assets ?? []).map((a) => {
+      const key = a.address.toLowerCase();
+      const cached = assetCache.get(key);
+      const prev = prevByAddr.get(key);
+      const decimals = cached?.decimals ?? prev?.decimals ?? 6;
+      return {
+        symbol: a.symbol,
+        address: a.address,
+        decimals,
+        priceUsd: cached?.priceUsd ?? prev?.priceUsd ?? "0",
+        wallet: cached?.position.wallet ?? prev?.wallet ?? "0",
+        liquidity: fmtUnits(depth.get(key) ?? 0n, decimals),
+      };
+    });
     // Sticky, like lending: don't flip back to "loading" on a throttled poll.
-    return { deployed: true, ready: ok.length > 0 || !!lastSwap?.ready, address: swapClient!.swap, assets: ok };
+    return { deployed: true, ready: assets.length > 0 || !!lastSwap?.ready, address: routerClient!.router, assets };
   }
   function swapSnapshot(): SwapSnap | null {
-    if (!swapClient || !poolClient) return null;
+    if (!routerClient || !poolClient) return null;
     if (!swapRefreshing && Date.now() - swapAt > READ_TTL) {
       swapRefreshing = true;
       readSwap()
@@ -1113,9 +1126,7 @@ async function main() {
         .catch((e) => console.error(`[swap] refresh failed: ${String(e).slice(0, 120)}`))
         .finally(() => (swapRefreshing = false));
     }
-    return (
-      lastSwap ?? { deployed: true, ready: false, address: swapClient.swap, assets: [] }
-    );
+    return lastSwap ?? { deployed: true, ready: false, address: routerClient.router, assets: [] };
   }
 
   /** Shown when an owner-gated action is attempted without a deployer key. */
@@ -1416,64 +1427,59 @@ async function main() {
     }
   });
 
-  // --- Swap (TesseraSwap) ---------------------------------------------------
+  // --- Swap (TesseraRouter, backed by AMM liquidity) -------------------------
   // Public quote so anyone can price a swap before connecting a wallet.
   app.get("/api/swap/quote", async (req, res) => {
-    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
+    if (!routerClient) { res.status(404).json({ ok: false, error: "router not deployed" }); return; }
     try {
       const tokenIn = req.query.tokenIn as Hex;
       const tokenOut = req.query.tokenOut as Hex;
       const amountIn = BigInt((req.query.amountIn as string) ?? "0");
-      const [out, fee, appFee] = await swapClient.quote(tokenIn, tokenOut, amountIn);
+      const [out, poolIds, path] = await routerClient.estimate(tokenIn, tokenOut, amountIn);
 
-      /* Preflight. A quote proves the desk can *price* the trade; it says
-       * nothing about whether the trade would go through. The two things that
-       * actually stop it are invisible from the quote: the desk needs
-       * `amountOut + appFee` of the output token (not just `amountOut`, which
-       * is what the inventory table shows), and the caller has to have approved
-       * the desk for the input. Both were showing up as "the contract rejected
-       * this transaction" after the fact. */
-      const need = out + appFee;
+      /* Preflight. A quote proves a route exists and prices it; it says nothing
+       * about whether *this caller's* trade would go through. What actually
+       * stops it is the caller's own balance and their approval to the router,
+       * and both were previously surfacing only as "the contract rejected this
+       * transaction" after the fact. */
 
-      // Whose balance and allowance actually matter. This endpoint serves two
-      // callers: the operator path, where the agent wallet spends, and the
-      // self-custody path, where the user's own connected wallet does. Checking
-      // the agent's wallet for both told a self-custody user with plenty of USDC
-      // that they were short — a false blocker about somebody else's money.
+      // Whose balance and allowance matter. This endpoint serves two callers:
+      // the operator path, where the agent wallet spends, and the self-custody
+      // path, where the user's own connected wallet does. Checking the agent's
+      // wallet for both told a self-custody user with plenty of USDC that they
+      // were short — a false blocker about somebody else's money.
       const fromParam = String(req.query.from ?? "");
       const spender = /^0x[0-9a-fA-F]{40}$/.test(fromParam)
         ? (fromParam as Hex)
         : (agentAccount.address as Hex);
       const spenderIsAgent = spender.toLowerCase() === (agentAccount.address as string).toLowerCase();
 
-      const [deskHas, allowance, callerHas] = (await client.public.multicall({
+      const [allowance, callerHas] = (await client.public.multicall({
         contracts: [
-          { address: tokenOut, abi: erc20Abi, functionName: "balanceOf", args: [swapClient.swap] },
-          { address: tokenIn, abi: erc20Abi, functionName: "allowance", args: [spender, swapClient.swap] },
+          { address: tokenIn, abi: erc20Abi, functionName: "allowance", args: [spender, routerClient.router] },
           { address: tokenIn, abi: erc20Abi, functionName: "balanceOf", args: [spender] },
         ] as never,
         allowFailure: true,
       })).map((r) => (r?.status === "success" ? (r.result as bigint) : 0n));
 
-      // Where it would fill. `ammPoolId` alone isn't enough — a desk deployed
-      // before the fallback existed has no `amm` at all, so probe the code.
-      const routed = deskHas < need;
-      const ammWired = await swapClient.hasAmmFallback().catch(() => false);
       const outMeta = assetMeta(tokenOut);
       const inMeta = assetMeta(tokenIn);
+      const hops = poolIds.length;
 
       const blockers: string[] = [];
-      if (routed && !ammWired) {
+      if (out === 0n || hops === 0) {
+        // There is no inventory to top up any more, so the answer to "no route"
+        // is always liquidity in a pool. Say that rather than leaving the user
+        // to guess at a desk that no longer exists.
         blockers.push(
-          `The desk holds ${fmtUnits(deskHas, outMeta.decimals)} ${outMeta.symbol} but needs ` +
-          `${fmtUnits(need, outMeta.decimals)} (output plus the app's fee), and it has no AMM fallback ` +
-          `configured — so this reverts with "insufficient inventory". Trade a smaller amount, add ` +
-          `inventory, or wire the AMM.`,
+          `No AMM pool can fill ${fmtUnits(amountIn, inMeta.decimals)} ${inMeta.symbol} → ${outMeta.symbol} ` +
+          `right now. Either no pool holds the pair, or the one that does is too shallow for this size. ` +
+          `Try a smaller amount, or add liquidity on the Liquidity pool tab.`,
         );
       }
       if (callerHas < amountIn) {
         // Name the wallet. "The wallet holds…" is ambiguous the moment there are
-        // two of them, and the wrong one is worse than none.
+        // two of them, and naming the wrong one is worse than naming none.
         const whose = spenderIsAgent ? "The agent wallet" : `${spender.slice(0, 10)}…`;
         blockers.push(
           `${whose} holds ${fmtUnits(callerHas, inMeta.decimals)} ${inMeta.symbol}, less than the ` +
@@ -1484,15 +1490,16 @@ async function main() {
       res.json({
         ok: true,
         out: out.toString(),
-        fee: fee.toString(),
-        appFee: appFee.toString(),
-        // What the desk must part with, which is more than `out`.
-        needed: need.toString(),
-        deskBalance: deskHas.toString(),
-        route: routed ? (ammWired ? "amm" : "blocked") : "inventory",
-        ammWired,
-        // Which wallet these two are about, so a caller can tell whether the
-        // answer applies to them.
+        // The app's cut is taken inside the pool, out of the input, and is
+        // already reflected in `out` — unlike the desk, where it was a second
+        // amount the desk itself had to be holding.
+        route: hops === 0 ? "none" : hops === 1 ? "direct" : "multi-hop",
+        hops,
+        poolIds: poolIds.map((id) => id.toString()),
+        path,
+        pathSymbols: path.map((t) => assetMeta(t as Hex).symbol),
+        // Which wallet the two checks below are about, so a caller can tell
+        // whether the answer applies to them.
         spender,
         approvalNeeded: allowance < amountIn,
         blockers,
@@ -1851,7 +1858,7 @@ async function main() {
    *
    * `sweep` on the contract. Note what this can and cannot reach: fees still
    * sitting in the collector, yes — but not the shares already sent on to the
-   * pool, the vault or the swap desk, which belong to those contracts now. The
+   * pool, the vault or the AMM, which belong to those contracts now. The
    * response says so rather than letting a partial withdrawal look like a full
    * one.
    */
@@ -2267,7 +2274,7 @@ async function main() {
     })(),
     amm: ammClient?.amm,
     poolId,
-    swap: swapClient?.swap,
+    router: routerClient?.router,
     assets: (poolDeployment?.assets ?? []).map((a) => ({ address: a.address, ...assetMeta(a.address) })),
   });
 
@@ -2322,7 +2329,7 @@ async function main() {
       current: {
         pool: poolDeployment?.poolAddress ?? null,
         vault: vaultClient?.vault ?? null,
-        swap: swapClient?.swap ?? null,
+        router: routerClient?.router ?? null,
         collector: (liveDeployment.tesseraFeeCollector as Hex) ?? null,
         amm: ammClient?.amm ?? null,
       },
@@ -2505,7 +2512,7 @@ async function main() {
     if (rec.kind !== "pool" && rec.kind !== "vault" && rec.kind !== "amm") {
       res.status(400).json({
         ok: false,
-        error: "Only pool, vault and AMM records hold user positions. Use Return funds for a swap desk or collector.",
+        error: "Only pool, vault and AMM records hold user positions. Use Return funds for a router or collector.",
       });
       return;
     }
@@ -2570,7 +2577,7 @@ async function main() {
   });
 
   /**
-   * Deploy a replacement pool / vault / swap desk / collector / AMM.
+   * Deploy a replacement pool / vault / router / collector / AMM.
    *
    * The contract being replaced is archived **first**. If archiving fails the
    * deployment doesn't happen at all: a new contract with no record of the old
@@ -2588,7 +2595,7 @@ async function main() {
     const current: Record<string, Hex | null> = {
       pool: (poolDeployment?.poolAddress as Hex) ?? null,
       vault: (vaultClient?.vault as Hex) ?? null,
-      swap: (swapClient?.swap as Hex) ?? null,
+      router: (routerClient?.router as Hex) ?? null,
       collector: (liveDeployment.tesseraFeeCollector as Hex) ?? null,
       amm: (ammClient?.amm as Hex) ?? null,
     };
@@ -2633,12 +2640,13 @@ async function main() {
         address = await owner.deploy(tesseraPoolAbi, tesseraPoolBytecode, [
           (liveDeployment.tesseraFeeCollector as Hex) ?? owner.account.address,
         ]);
-      } else if (kind === "swap") {
-        address = await owner.deploy(tesseraSwapAbi, tesseraSwapBytecode, [
-          poolDeployment?.poolAddress ?? usdcAddress,
-          (liveDeployment.tesseraFeeCollector as Hex) ?? owner.account.address,
-          Number(req.body?.swapFeeBps ?? 30),
-          Number(req.body?.appFeeShareBps ?? 5000),
+      } else if (kind === "router") {
+        // A router is deployed pointing at the AMM it trades against, with USDC
+        // as the hub every two-hop route passes through. It takes no fee
+        // parameters of its own: the fee belongs to the pool, per pool.
+        address = await owner.deploy(tesseraRouterAbi, tesseraRouterBytecode, [
+          (ammClient?.amm as Hex) ?? usdcAddress,
+          [usdcAddress],
         ]);
       } else if (kind === "collector") {
         address = await owner.deploy(tesseraFeeCollectorAbi, tesseraFeeCollectorBytecode, [
@@ -2646,7 +2654,7 @@ async function main() {
           agentAccount.address as Hex,
           poolDeployment?.poolAddress ?? usdcAddress,
           (vaultClient?.vault as Hex) ?? usdcAddress,
-          (swapClient?.swap as Hex) ?? "0x0000000000000000000000000000000000000000",
+          (ammClient?.amm as Hex) ?? "0x0000000000000000000000000000000000000000",
         ]);
       } else {
         address = await owner.deploy(tesseraAmmAbi, tesseraAmmBytecode, [
@@ -2656,27 +2664,9 @@ async function main() {
         ]);
       }
 
-      // 2b) Wire a fresh swap desk to the AMM, while we still own it.
-      //
-      //     A desk deployed here is owned *and* admin'd by the deployer, so
-      //     `setAmm` is a direct call. The bootstrap script routes this through
-      //     the fee collector's `setSwapAmm` instead, which only works if that
-      //     collector has the forwarder — the reason the live desk has no
-      //     fallback today. Doing it here, before ownership goes anywhere, means
-      //     a redeployed desk can reach AMM liquidity when its inventory is
-      //     short instead of reverting "insufficient inventory".
-      //
-      //     Best-effort: a desk with no AMM to point at is fine, and a failure
-      //     here must not lose the address we just deployed.
+      // A router needs no post-deployment wiring: its AMM and hub list are
+      //  constructor arguments, and it holds nothing that has to be funded.
       const wired: string[] = [];
-      if (kind === "swap" && ammClient?.amm) {
-        try {
-          await owner.write(address, tesseraSwapAbi, "setAmm", [ammClient.amm, BigInt(req.body?.ammPoolId ?? 0)]);
-          wired.push(`AMM fallback pointed at pool ${Number(req.body?.ammPoolId ?? 0)}`);
-        } catch (e) {
-          wired.push(`could not wire the AMM fallback: ${friendlyError(e)}`);
-        }
-      }
 
       // 3) Record it where the app reads addresses from. arc.local.json is
       //    gitignored and wins over arc.json, so a later `git reset --hard`
@@ -2684,7 +2674,7 @@ async function main() {
       const key = {
         pool: "tesseraPool",
         vault: "tesseraVault",
-        swap: "tesseraSwap",
+        router: "tesseraRouter",
         collector: "tesseraFeeCollector",
         amm: "tesseraAmm",
       }[kind];
@@ -2711,9 +2701,9 @@ async function main() {
           ? `Deployed and recorded. Restart the app to start using it — the running process keeps ` +
             `the previous ${kind} until then, on purpose.` +
             (archived ? ` The previous ${kind} was archived first; its holders can still be paid out or migrated.` : "") +
-            (kind === "swap"
-              ? ` The new desk starts empty — fund it with "Add inventory", or every swap into an asset it ` +
-                `does not hold will revert. This deployment owns it directly, so withdrawals work.`
+            (kind === "router"
+              ? ` The router needs no funding — it holds nothing and fills every trade from AMM pool ` +
+                `liquidity. If a quote comes back with no route, the answer is liquidity in the pool.`
               : "")
           : `Deployed at ${address}, but the deployment file could not be written — set it by hand before restarting.`,
       });
@@ -3222,7 +3212,7 @@ async function main() {
       pool: poolDeployment?.poolAddress ?? null,
       vault: vaultClient?.vault ?? null,
       vaultAsset: (liveDeployment.vaultAsset as Hex) ?? usdcAddress,
-      swap: swapClient?.swap ?? null,
+      router: routerClient?.router ?? null,
       amm: ammClient?.amm ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
@@ -3233,13 +3223,16 @@ async function main() {
   });
 
   app.post("/api/swap", requireOperator, async (req, res) => {
-    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
+    if (!routerClient) { res.status(404).json({ ok: false, error: "router not deployed" }); return; }
     try {
       const tokenIn = req.query.tokenIn as Hex;
       const tokenOut = req.query.tokenOut as Hex;
       const amountIn = BigInt((req.query.amountIn as string) ?? "0");
       const minOut = BigInt((req.query.minOut as string) ?? "0");
-      const txHash = await swapClient.execute(tokenIn, tokenOut, amountIn, minOut);
+      // The router picks the route at execution time from the same reserves the
+      // swap will hit, so the quote this was priced against and the fill cannot
+      // disagree about which pools exist. `minOut` still binds either way.
+      const txHash = await routerClient.execute(tokenIn, tokenOut, amountIn, minOut);
       logTx(req, {
         category: "defi", action: "swap", status: "success",
         assetAddress: tokenIn, raw: amountIn, txHash,
@@ -3253,95 +3246,6 @@ async function main() {
         assetAddress: req.query.tokenIn as string,
         raw: BigInt((req.query.amountIn as string) ?? "0"),
         detail: friendlyError(e),
-      });
-      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
-    }
-  });
-
-  /**
-   * Top up the swap desk's inventory.
-   *
-   * Operator-only because it spends the app wallet, not because the contract
-   * requires it — `TesseraSwap` reads inventory as its own token balance, so
-   * adding to it was never ownership-gated. See `fundInventory`.
-   */
-  app.post("/api/swap/fund", requireOperator, async (req, res) => {
-    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
-    const token = req.query.token as Hex;
-    const raw = BigInt((req.query.amount as string) ?? "0");
-    try {
-      if (raw <= 0n) throw new Error("Enter an amount above zero.");
-      const { txHash, route } = await swapClient.fundInventory(token, raw);
-      logTx(req, {
-        category: "defi", action: "swap-fund", status: "success",
-        assetAddress: token, raw, txHash,
-        detail: `desk inventory +${assetMeta(token).symbol} via ${route}`,
-      });
-      invalidateAll();
-      res.json({ ok: true, txHash, route });
-    } catch (e) {
-      logTx(req, {
-        category: "defi", action: "swap-fund", status: "failed",
-        assetAddress: token, raw, detail: friendlyError(e),
-      });
-      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
-    }
-  });
-
-  /**
-   * Withdraw inventory from the swap desk.
-   *
-   * The counterpart to `/api/swap/fund`. Operator-only, and it needs to be —
-   * unlike funding, this takes app-owned assets out.
-   */
-  /**
-   * Who can pull inventory out of this desk, and if nobody, why.
-   *
-   * Read before offering the button. `withdrawInventory` is `onlyOwnerOrAdmin`
-   * in current source, but deployment hands ownership to the fee collector so
-   * its `seed` leg works — and on a desk built before the `admin` key existed,
-   * paired with a collector built before the forwarder, there is no code path
-   * from any key we hold to that balance. Discovering that as "the contract
-   * rejected this transaction" tells an operator nothing.
-   */
-  app.get("/api/swap/authority", async (_req, res) => {
-    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
-    try {
-      const a = await swapClient.withdrawAuthority((liveDeployment.tesseraFeeCollector as Hex) ?? undefined);
-      res.json({ ok: true, desk: swapClient.swap, ...a });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: friendlyError(e) });
-    }
-  });
-
-  app.post("/api/swap/withdraw", requireOperator, async (req, res) => {
-    if (!swapClient) { res.status(404).json({ ok: false, error: "swap not deployed" }); return; }
-    const token = req.query.token as Hex;
-    const raw = BigInt((req.query.amount as string) ?? "0");
-    const to = (req.query.to as Hex) || (agentAccount.address as Hex);
-    try {
-      if (raw <= 0n) throw new Error("Enter an amount above zero.");
-      const authority = await swapClient
-        .withdrawAuthority((liveDeployment.tesseraFeeCollector as Hex) ?? undefined)
-        .catch(() => null);
-      if (authority && !authority.canWithdraw) throw new Error(authority.reason);
-      const { txHash, route } = await swapClient.withdrawInventory(
-        token,
-        raw,
-        to,
-        (liveDeployment.tesseraFeeCollector as Hex) ?? undefined,
-      );
-      logTx(req, {
-        category: "defi", action: "swap-withdraw", status: "success",
-        assetAddress: token, raw, txHash,
-        detail: `desk inventory −${assetMeta(token).symbol} via ${route}`,
-      });
-      invalidateAll();
-      res.json({ ok: true, txHash, route });
-    } catch (e) {
-      logTx(req, {
-        category: "defi", action: "swap-withdraw", status: "failed",
-        assetAddress: token, raw, detail: friendlyError(e),
       });
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -3371,7 +3275,7 @@ async function main() {
     const jobs: Promise<unknown>[] = [];
     if (poolClient) jobs.push(readLending().then((d) => { lastLending = d; lendingAt = Date.now(); }).catch(() => {}));
     if (vaultClient) jobs.push(readVault().then((d) => { lastVault = d; vaultAt = Date.now(); }).catch(() => {}));
-    if (swapClient) jobs.push(readSwap().then((d) => { lastSwap = d; swapAt = Date.now(); }).catch(() => {}));
+    if (routerClient) jobs.push(readSwap().then((d) => { lastSwap = d; swapAt = Date.now(); }).catch(() => {}));
     if (ammClient) jobs.push(readAmm().then((d) => { lastAmm = d; ammAt = Date.now(); }).catch(() => {}));
     jobs.push(refreshChain().catch(() => {}));
     await Promise.race([

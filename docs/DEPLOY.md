@@ -18,56 +18,55 @@ replacing them, and it separates steps that matter from steps that don't:
 - **Fatal** — deploying a contract, registering a reserve, writing the deployment
   record. These stop the run, because everything after them depends on them.
 - **Optional** — moving tokens: seeding pool liquidity, the agent's starting
-  position, swap-desk inventory. A revert here prints `⚠ skipped …` and the run
+  position, AMM pool liquidity. A revert here prints `⚠ skipped …` and the run
   continues. Each one is listed again in a block at the end.
 
-### The swap desk needs inventory
+### Swaps come from pool liquidity, not from inventory
 
-`TesseraSwap` fills swaps out of its **own token balance** — there is no internal
-ledger, and `swap` checks `balanceOf(address(this))`. An empty desk therefore
-reverts every swap into that asset with `insufficient inventory`, even though
-quotes still work. The dashboard's **Desk inventory** table shows this per asset,
-and flags an empty one.
+There is no swap desk any more. `TesseraSwap` held its own stock of every asset,
+priced from the lending pool's oracle, and reverted `insufficient inventory` when
+it ran out — so someone had to keep it funded, someone had to be able to withdraw
+from it, and getting that authority wrong left balances stranded behind an owner
+that was a contract with no forwarding function.
 
-Three ways to top it up, all landing in the same place:
+`TesseraRouter` replaces it and has none of those properties:
+
+- **It holds nothing.** It pulls the input from the caller, routes it through
+  `TesseraAMM` pools, and forwards the output in the same transaction. Its
+  balances are zero between calls, so there is nothing to fund and nothing to
+  strand. The `sweep` function exists only to recover a stray transfer.
+- **It prices from the pool's own reserves.** No oracle sits in the swap path, so
+  a feed outage stops the money market without stopping trading, and there is no
+  operator-set price to arbitrage against.
+- **It routes.** Direct pools first, then up to two hops through a hub token
+  (USDC on this deployment), with one `minOut` guard covering the whole chain and
+  a deadline on every call.
+
+`pool:arc` deploys it as part of a normal run. To deploy or replace only the
+router against an AMM that is already live:
 
 ```bash
-npm run swap:fund              # top every reserve up to a default target
-npm run swap:fund -- --check   # report inventory, send nothing
-npm run swap:fund -- USDC=5 EURC=2 cirBTC=0.0002
+npm run router:deploy            # deploy, record, report
+npm run router:deploy -- --check # report only, change nothing
 ```
 
-…or the **Add inventory** control on the Swap card when signed in as operator,
-or nothing at all — `pool:arc` funds the desk on every run.
+The router works against an AMM deployed before the routing helpers existed: it
+uses `poolsForPair` when the AMM has that index and falls back to walking
+`poolCount` when it does not, so no liquidity provider has to migrate.
 
-Ownership does **not** gate this, and an earlier build wrongly assumed it did.
-`seed` is `onlyOwner`, so that build skipped inventory whenever the fee collector
-owned the desk (which it does from the first run onward) and printed
-`(skip swap inventory …)`. That left the desk empty with no route offered. But
-since inventory is just the desk's balance, a plain ERC-20 transfer from *any*
-sender has always counted — the owner-only gate restricted the route that emits
-an event, not the outcome. `TesseraSwap.fund` is now permissionless for exactly
-that reason, and the tooling picks a route from the deployed bytecode:
+If a quote comes back with **no route**, the answer is liquidity in the pool, not
+inventory in the router — add it on the Liquidity pool tab, where it earns a
+share of every swap fee it goes on to serve.
 
-| Route | When |
-|---|---|
-| `fund()` | the deployed code has it — emits `InventoryChanged` |
-| `seed()` | no `fund()`, and the caller owns the desk |
-| `transfer` | neither — works on any desk, including ones deployed before `fund()` |
-
-The route is read from the bytecode (the selector is a `PUSH4` constant), not
-probed by simulation: `fund` returns nothing, so an `eth_call` coming back empty
-is a valid success and cannot be told apart from a missing selector.
-
-Inventory is **app-owned**. Funding the desk is a donation to it: there are no
-shares and no claim, and only the owner can `withdrawInventory`. For a position
-you can withdraw with a share of the fees, use `TesseraAMM`.
+The old desk, if this deployment had one, keeps whatever it held. Those balances
+were always its trading stock rather than a withdrawable balance; the app simply
+no longer offers it.
 
 The run has succeeded when you see:
 
 ```
-✅ Pool + Vault + Swap live on Arc:
-   pool / vault / swap / fees / amm / amm fees   0x…
+✅ Pool + Vault + AMM + Router live on Arc:
+   pool / vault / router / fees / amm / amm fees   0x…
 ```
 
 A failure leads with a single line — `❌ pool:arc stopped: <reason>` — before the

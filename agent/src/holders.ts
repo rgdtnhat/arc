@@ -59,7 +59,7 @@ export interface HolderReport {
   total: string;
   partial: boolean;
   block: string;
-  /** Set when the venue has no per-wallet positions at all (the swap desk). */
+  /** Set when the venue has no per-wallet positions at all (the router). */
   note?: string;
   /** A scan is running; these figures will be replaced. Poll again. */
   scanning?: boolean;
@@ -73,7 +73,7 @@ export interface HolderReport {
 function emptyReport(kind: HolderKind): HolderReport {
   const rankLabel = kind === "lending" ? "Supplied (USD)"
     : kind === "amm" ? "LP shares"
-    : kind === "swap" ? "Inventory" : "Shares";
+    : kind === "swap" ? "—" : "Shares";
   return { kind, contract: null, rankLabel, assets: [], holders: [], total: "0", partial: false, block: "0" };
 }
 
@@ -149,7 +149,7 @@ export class HolderReader {
       vaultAsset?: { address: Hex; symbol: string; decimals: number };
       amm?: Hex;
       poolId?: number;
-      swap?: Hex;
+      router?: Hex;
       assets?: { address: Hex; symbol: string; decimals: number }[];
       force?: boolean;
     },
@@ -195,7 +195,7 @@ export class HolderReader {
     if (kind === "lending") return this.lending(opts.pool, opts.assets ?? []);
     if (kind === "vault") return this.vault(opts.vault, opts.vaultAsset);
     if (kind === "amm") return this.amm(opts.amm, opts.poolId ?? 0);
-    return this.swap(opts.swap, opts.assets ?? []);
+    return this.swap(opts.router);
   }
 
   // --- lending ---------------------------------------------------------------
@@ -317,45 +317,28 @@ export class HolderReader {
     return this.finish("amm", amm, "LP shares", meta, block, progress, rows);
   }
 
-  // --- swap desk -------------------------------------------------------------
+  // --- swap (router) ---------------------------------------------------------
 
   /**
-   * The desk has no depositors. Its inventory *is* its token balance, so there
-   * is no per-wallet position to rank — an empty leaderboard here would read as
-   * a bug. Report the inventory instead, and say why. No index needed.
+   * The router has no holders, and unlike the desk it replaced it has no
+   * inventory either — that is the point of it. It pulls the input from the
+   * caller, routes through AMM pools, and forwards the output in the same
+   * transaction, so between calls its balances are zero.
+   *
+   * An empty leaderboard here would read as a scan that failed. So report the
+   * absence deliberately and point at the venue that does have holders: the
+   * people who put liquidity into the pools the router trades against are on the
+   * Liquidity pool tab, and they are who a swap actually pays.
    */
-  private async swap(
-    swap: Hex | undefined,
-    assets: { address: Hex; symbol: string; decimals: number }[],
-  ): Promise<HolderReport> {
-    const meta = assets.map((a) => ({ ...a, address: a.address.toLowerCase() }));
-    const base: HolderReport = {
-      ...emptyReport("swap"),
-      contract: swap ?? null,
-      assets: meta,
-      note:
-        "The swap desk has no depositors — its inventory is its own token balance, so there are no " +
-        "per-wallet shares to rank. What it holds is shown below; the app owns all of it.",
-    };
-    if (!swap || !assets.length) return base;
-
-    const res = await this.public.multicall({
-      contracts: assets.map(
-        (a) => ({ address: a.address, abi: erc20Abi, functionName: "balanceOf", args: [swap] }) as const,
-      ) as never,
-      allowFailure: true,
-    });
-    const balances: Record<string, string> = {};
-    assets.forEach((a, i) => {
-      const v = res[i]?.status === "success" ? (res[i].result as bigint) : 0n;
-      balances[a.address.toLowerCase()] = v.toString();
-    });
-    const block = (await this.public.getBlockNumber()).toString();
-    const anything = Object.values(balances).some((v) => v !== "0");
+  private async swap(router: Hex | undefined): Promise<HolderReport> {
     return {
-      ...base,
-      block,
-      holders: anything ? [{ address: swap.toLowerCase(), balances, rank: "0", pct: 100, isApp: true }] : [],
+      ...emptyReport("swap"),
+      contract: router ?? null,
+      block: (await this.public.getBlockNumber().catch(() => 0n)).toString(),
+      note:
+        "Swaps are filled from AMM pool liquidity, so there is nothing held here — the router takes the " +
+        "input, routes it through the pools, and pays the output out in the same transaction. The people " +
+        "who earn from your swap are the liquidity providers; they are listed on the Liquidity pool tab.",
     };
   }
 

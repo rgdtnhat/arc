@@ -28,7 +28,7 @@ const blind: ServiceContext = {
 /** A context whose oracle answers with fixed, obviously-synthetic values. */
 function stubbed(overrides: Record<string, unknown> = {}): ServiceContext {
   const oracle = {
-    addresses: { vault: "0x00000000000000000000000000000000000000v1", pool: "0x0", swap: "0x0", amm: "0x0", escrow: "0x0" },
+    addresses: { vault: "0x00000000000000000000000000000000000000v1", pool: "0x0", router: "0x0", amm: "0x0", escrow: "0x0" },
     assets: [],
     bestYield: async () => ({
       best: { venue: "vault", asset: "USDC", assetAddress: TOKEN_A, aprPct: 4.2, liquidity: 100, note: "derived" },

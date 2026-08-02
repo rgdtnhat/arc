@@ -6,7 +6,7 @@
  * uncaught, and `main()` aborted *before later contracts were deployed*. The
  * visible symptom was the app saying "AMM not deployed yet — run npm run
  * pool:arc" after a run that looked like it had failed for an unrelated reason
- * (moving 2 USDC of swap inventory). Reading the code was not enough to catch
+ * (moving 2 USDC of pool liquidity). Reading the code was not enough to catch
  * it the first time, so this runs the real script instead.
  *
  * ## How
@@ -17,9 +17,9 @@
  * code, not a paraphrase of it.
  *
  * The fake node is deliberately hostile in the way the real chain was: it
- * reverts `seed` (owner-only, and the fee collector owns the desk after the
- * first run) and reverts the agent's `borrow`. A run against it must still
- * deploy every contract and write a complete deployment record.
+ * reverts the agent's `borrow` and whatever else a case asks it to. A run
+ * against it must still deploy every contract and write a complete deployment
+ * record.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -34,7 +34,7 @@ import {
   erc20Abi,
   tesseraPoolAbi,
   tesseraVaultAbi,
-  tesseraSwapAbi,
+  tesseraRouterAbi,
   tesseraFeeCollectorAbi,
   tesseraAmmAbi,
 } from "@tessera/shared";
@@ -54,17 +54,17 @@ const CIRBTC = "0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF";
 const EXISTING = {
   tesseraPool: "0x0000000000000000000000000000000000000a01",
   tesseraVault: "0x0000000000000000000000000000000000000a02",
-  tesseraSwap: "0x0000000000000000000000000000000000000a03",
+  tesseraRouter: "0x0000000000000000000000000000000000000a03",
   tesseraFeeCollector: "0x0000000000000000000000000000000000000a04",
 };
-/** Owns the swap desk in the steady state — which is why `seed` reverts. */
+/** The fee collector, which owns the pool and vault treasuries. */
 const COLLECTOR = EXISTING.tesseraFeeCollector;
 
 const ABIS: Abi[] = [
   erc20Abi as Abi,
   tesseraPoolAbi as Abi,
   tesseraVaultAbi as Abi,
-  tesseraSwapAbi as Abi,
+  tesseraRouterAbi as Abi,
   tesseraFeeCollectorAbi as Abi,
   tesseraAmmAbi as Abi,
 ];
@@ -103,7 +103,7 @@ interface NodeOptions {
    * was added.
    */
   missing?: string[];
-  /** Who `owner()` reports for the swap desk. */
+  /** Who `owner()` reports for a contract that has one. */
   swapOwner?: string;
   /** What `poolCount()` reports. */
   poolCount?: bigint;
@@ -322,10 +322,10 @@ const BASE_RECORD = {
   ...EXISTING,
 };
 
-test("a revert while funding the swap desk does not stop the AMM from deploying", async (t) => {
-  // The exact production failure, generalised: every route into the desk fails.
+test("a revert in an optional funding step does not stop the AMM from deploying", async (t) => {
+  // The exact production failure, generalised: every token movement fails.
   // Everything after it must still happen.
-  const node = await startNode({ revert: ["seed", "fund", "transfer"], swapOwner: COLLECTOR });
+  const node = await startNode({ revert: ["approve", "transfer", "supply"], swapOwner: COLLECTOR });
   const dir = scratchTree(BASE_RECORD);
   t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
 
@@ -342,21 +342,21 @@ test("a revert while funding the swap desk does not stop the AMM from deploying"
   // The pre-existing contracts were reused, not replaced.
   assert.equal(record.tesseraPool, EXISTING.tesseraPool);
   assert.equal(record.tesseraVault, EXISTING.tesseraVault);
-  assert.equal(record.tesseraSwap, EXISTING.tesseraSwap);
+  assert.equal(record.tesseraRouter, EXISTING.tesseraRouter);
 
   // Pools were created against the AMM.
   assert.equal(node.sent.filter((n) => n === "createPool").length, 2, "one pool per non-USDC reserve");
   assert.ok(node.sent.includes("setAmm"), "the AMM collector was linked to pool 0");
 
-  // The failed funding is reported, not silent, and not fatal.
-  assert.match(out, /skipped funding swap inventory/);
-  assert.match(stdout, /Pool \+ Vault \+ Swap live on Arc/);
+  // The failures are reported, not silent, and not fatal.
+  assert.match(out, /optional step\(s\) skipped/);
+  assert.match(stdout, /Pool \+ Vault \+ AMM \+ Router live on Arc/);
 });
 
 test("a reverting optional step is reported as skipped, not as a failure", async (t) => {
   // `borrow` reverting is the other shape of the same problem: a step inside
   // the agent's demo position that has nothing to do with the deployment.
-  const node = await startNode({ revert: ["borrow", "seed"], swapOwner: COLLECTOR });
+  const node = await startNode({ revert: ["borrow"], swapOwner: COLLECTOR });
   const dir = scratchTree(BASE_RECORD);
   t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
 
@@ -369,39 +369,26 @@ test("a reverting optional step is reported as skipped, not as a failure", async
   assert.ok(record.tesseraAmm);
 });
 
-test("the desk is funded even when the fee collector owns it", async (t) => {
-  // The regression this replaces: the script used to *skip* inventory whenever
-  // the deployer was not the owner. Ownership does not gate adding inventory —
-  // `swap` reads the desk's own balance — so skipping left the desk empty and
-  // every swap reverting "insufficient inventory". `fund` is permissionless.
+test("the router is deployed pointing at the AMM, with USDC as its hub", async (t) => {
+  // The swap surface has no inventory to stock any more, so what has to be true
+  // after a run is different: a router exists, it was given the AMM this run
+  // deployed, and the fee collector's liquidity leg cycles fees back into that
+  // same AMM rather than into a desk nobody trades with.
   const node = await startNode({ swapOwner: COLLECTOR });
-  const dir = scratchTree(BASE_RECORD);
+  const dir = scratchTree({ ...BASE_RECORD, tesseraRouter: undefined });
   t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
 
   const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
 
-  assert.match(stdout, /swap inventory route: fund\(\)/);
-  assert.ok(node.sent.includes("fund"), "inventory was funded");
-  assert.equal(node.sent.includes("seed"), false, "the owner-only route was not attempted");
-  assert.doesNotMatch(stdout, /skip swap inventory/);
+  assert.match(stdout, /deploying TesseraRouter/);
   const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
-  assert.ok(record.tesseraAmm);
-});
-
-test("a desk deployed before fund() existed is funded by plain transfer", async (t) => {
-  // The live desk on Arc predates `fund`. Inventory is its token balance, so a
-  // transfer reaches exactly the same place — the script must fall back to it
-  // rather than reporting the desk unfundable.
-  const node = await startNode({ swapOwner: COLLECTOR, missing: ["fund"] });
-  const dir = scratchTree(BASE_RECORD);
-  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
-
-  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
-
-  assert.match(stdout, /swap inventory route: transfer/);
-  assert.match(stdout, /predates fund\(\)/);
-  assert.ok(node.sent.includes("transfer"), "inventory was sent directly");
-  assert.equal(node.sent.includes("fund"), false, "the absent function was not called");
+  assert.match(record.tesseraRouter, /^0x[0-9a-fA-F]{40}$/);
+  assert.notEqual(record.tesseraRouter, record.tesseraAmm);
+  // The retired desk must not survive in the record — an address the app no
+  // longer knows how to use is worse than no address at all.
+  assert.equal(record.tesseraSwap, undefined);
+  // Both collectors point their liquidity leg at an AMM pool.
+  assert.ok(node.sent.filter((n) => n === "setAmm").length >= 2, "app and AMM collectors both linked");
 });
 
 test("an existing AMM with pools is not given duplicates", async (t) => {

@@ -2,7 +2,7 @@
  * App-fee visibility: what the collector has taken in, and where it went.
  *
  * `TesseraFeeCollector` splits every fee it holds across five sinks — the agent
- * wallet, the lending pool, the vault, the swap desk (or an AMM pool) and a
+ * wallet, the lending pool, the vault, an AMM pool and a
  * retained remainder — on a cadence, and emits `Allocated` with the exact
  * amounts each time. Current state comes from the contract; the history and the
  * running totals come from those logs, so nothing here is estimated.

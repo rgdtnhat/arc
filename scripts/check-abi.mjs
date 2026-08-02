@@ -111,7 +111,7 @@ const shortBytecode = [...bytecodeTs.matchAll(/export const (\w+)Bytecode = "(0x
 check(!shortBytecode.length, "no deploy bytecode is suspiciously short", shortBytecode.join(", "));
 
 // The contracts the deploy scripts actually instantiate must have bytecode.
-const DEPLOYED = ["tesseraPool", "tesseraVault", "tesseraSwap", "tesseraFeeCollector", "tesseraAmm"];
+const DEPLOYED = ["tesseraPool", "tesseraVault", "tesseraRouter", "tesseraFeeCollector", "tesseraAmm"];
 const notDeployable = DEPLOYED.filter((n) => !declares(bytecodeTs, n, "Bytecode"));
 check(!notDeployable.length, `every contract pool:arc deploys has bytecode (${DEPLOYED.length})`,
   notDeployable.join(", "));
