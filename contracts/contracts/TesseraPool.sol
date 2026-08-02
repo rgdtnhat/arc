@@ -265,6 +265,23 @@ contract TesseraPool is ReentrancyGuard {
     mapping(address => mapping(address => uint64)) public backstopUnlockAt;
 
     /**
+     * Exposure caps, per reserve, in asset units. Zero means uncapped.
+     *
+     * Every other risk control here is priced — rates rise with utilization,
+     * factors haircut collateral, auctions clear bad positions. None of them
+     * bound the *size* of the hole. A reserve can be perfectly healthy by every
+     * ratio the pool tracks and still be holding more of one long-tail asset
+     * than its liquidity could ever unwind. Caps are the blunt instrument that
+     * fixes that: they say how much of a thing this pool is willing to be wrong
+     * about, in absolute terms, regardless of how attractive the rate looks.
+     *
+     * They bind on new exposure only — see `_supplyFor` and `borrow`. Interest
+     * accrual is never blocked by a cap.
+     */
+    mapping(address => uint256) public supplyCap;
+    mapping(address => uint256) public borrowCap;
+
+    /**
      * Efficiency mode, following Aave's e-mode and Blend's isolated categories.
      *
      * A single set of risk factors per asset has to be sized for the worst
@@ -371,6 +388,7 @@ contract TesseraPool is ReentrancyGuard {
     );
 
     event ReserveFrozen(address indexed asset, uint8 mask);
+    event CapsSet(address indexed asset, uint256 supplyCap, uint256 borrowCap);
     event ReserveRenamed(address indexed asset, string name);
     event ReserveVisibility(address indexed asset, bool hidden);
 
@@ -418,6 +436,8 @@ contract TesseraPool is ReentrancyGuard {
     error FlashLoanNotRepaid(uint256 owed, uint256 got);
     error UnknownCategory();
     error PriceOutOfBand(uint256 given, uint256 referencePrice, uint256 deviationBps);
+    error SupplyCapReached(uint256 cap, uint256 would);
+    error BorrowCapReached(uint256 cap, uint256 would);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -654,6 +674,44 @@ contract TesseraPool is ReentrancyGuard {
     }
 
     /**
+     * @notice Cap how much of `asset` this pool will hold and lend. Zero is uncapped.
+     * @dev Lowering a cap below current usage is allowed and is the normal way to
+     *      wind a reserve down: existing positions are untouched and keep accruing,
+     *      but nothing new can be added until the reserve shrinks back under the
+     *      line. The alternative — refusing to set a cap you are already over —
+     *      would mean the control is unavailable exactly when it is needed.
+     */
+    function setCaps(address asset, uint256 supplyCap_, uint256 borrowCap_) external onlyOwner {
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        supplyCap[asset] = supplyCap_;
+        borrowCap[asset] = borrowCap_;
+        emit CapsSet(asset, supplyCap_, borrowCap_);
+    }
+
+    /**
+     * @notice How much more could be supplied and borrowed before the caps bind.
+     * @dev Read against the totals as of the last accrual, like `reserveData`.
+     *      Interest since then can only have grown those totals, so both numbers
+     *      are upper bounds — a caller sitting within a few wei of a cap should
+     *      expect the transaction to revert anyway. Each is `type(uint256).max`
+     *      when the matching cap is unset.
+     */
+    function capacityOf(address asset) external view returns (uint256 supplyRoom, uint256 borrowRoom) {
+        Reserve storage r = reserves[asset];
+        uint256 sCap = supplyCap[asset];
+        uint256 bCap = borrowCap[asset];
+        supplyRoom = sCap == 0
+            ? type(uint256).max
+            : (sCap > r.totalSupplyAssets ? sCap - r.totalSupplyAssets : 0);
+        borrowRoom = bCap == 0
+            ? type(uint256).max
+            : (bCap > r.totalBorrowAssets ? bCap - r.totalBorrowAssets : 0);
+        // Borrowing is bounded by cash on hand as well as by the cap.
+        uint256 avail = _available(r);
+        if (borrowRoom > avail) borrowRoom = avail;
+    }
+
+    /**
      * @notice Freeze some or all actions on a reserve.
      * @param mask Bitwise OR of FREEZE_SUPPLY / FREEZE_WITHDRAW / FREEZE_BORROW /
      *        FREEZE_REPAY; 0 unfreezes everything, FREEZE_ALL stops all four.
@@ -803,6 +861,12 @@ contract TesseraPool is ReentrancyGuard {
         if (!r.enabled) revert UnknownReserve();
         _requireNotFrozen(asset, FREEZE_SUPPLY);
         _accrue(asset);
+        // Checked after accrual, so the cap binds on the reserve's real size
+        // rather than on a stale total.
+        uint256 sCap = supplyCap[asset];
+        if (sCap != 0 && r.totalSupplyAssets + amount > sCap) {
+            revert SupplyCapReached(sCap, r.totalSupplyAssets + amount);
+        }
         uint256 shares = r.totalSupplyShares == 0 ? amount : (amount * r.totalSupplyShares) / r.totalSupplyAssets;
         if (shares == 0) revert ZeroAmount();
         supplyShares[asset][user] += shares;
@@ -838,6 +902,10 @@ contract TesseraPool is ReentrancyGuard {
         _requireNotFrozen(asset, FREEZE_BORROW);
         _accrueAll();
         if (amount > _available(r)) revert InsufficientLiquidity();
+        uint256 bCap = borrowCap[asset];
+        if (bCap != 0 && r.totalBorrowAssets + amount > bCap) {
+            revert BorrowCapReached(bCap, r.totalBorrowAssets + amount);
+        }
         uint256 shares = r.totalBorrowShares == 0 ? amount : (amount * r.totalBorrowShares) / r.totalBorrowAssets;
         borrowShares[asset][msg.sender] += shares;
         r.totalBorrowShares += shares;
