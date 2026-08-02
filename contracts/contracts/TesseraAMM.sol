@@ -571,6 +571,61 @@ contract TesseraAMM {
         emit Swapped(poolId, msg.sender, tokenIn, tokenOut, amountIn, amountOut, lpFee, appFee);
     }
 
+    // --- share transfers ------------------------------------------------------
+
+    /**
+     * A minimal transfer surface on LP shares.
+     *
+     * Shares live in a `poolId => holder` mapping, which makes them a position
+     * rather than a token: nothing else on chain can hold one, price one or
+     * take one as collateral. `TesseraLpToken` turns a pool's shares into an
+     * ordinary ERC-20 by holding them on a depositor's behalf, and to do that it
+     * needs exactly two things — the ability to move shares it has been approved
+     * for, and the ability to move its own back out.
+     *
+     * Deliberately not a full ERC-20 per pool. That would mean deploying a token
+     * for every pool whether anyone wanted one or not, and putting the balance
+     * accounting for the AMM's core position in a second place.
+     */
+    mapping(uint256 => mapping(address => mapping(address => uint256))) public shareAllowance;
+
+    event SharesTransferred(uint256 indexed poolId, address indexed from, address indexed to, uint256 shares);
+    event ShareApproval(uint256 indexed poolId, address indexed owner, address indexed spender, uint256 shares);
+
+    /// @notice Move your own shares in `poolId` to `to`.
+    function transferShares(uint256 poolId, address to, uint256 shares) external {
+        _moveShares(poolId, msg.sender, to, shares);
+    }
+
+    /// @notice Let `spender` move up to `shares` of your position in `poolId`.
+    function approveShares(uint256 poolId, address spender, uint256 shares) external {
+        shareAllowance[poolId][msg.sender][spender] = shares;
+        emit ShareApproval(poolId, msg.sender, spender, shares);
+    }
+
+    /// @notice Move shares you have been approved for.
+    function transferSharesFrom(uint256 poolId, address from, address to, uint256 shares) external {
+        uint256 allowed = shareAllowance[poolId][from][msg.sender];
+        require(allowed >= shares, "share allowance");
+        // An infinite approval is left alone, the ERC-20 convention, so a
+        // long-lived wrapper does not rewrite storage on every wrap.
+        if (allowed != type(uint256).max) shareAllowance[poolId][from][msg.sender] = allowed - shares;
+        _moveShares(poolId, from, to, shares);
+    }
+
+    function _moveShares(uint256 poolId, address from, address to, uint256 shares) internal {
+        require(pools[poolId].exists, "no pool");
+        require(to != address(0), "zero to");
+        // The burned minimum is what makes the first-depositor attack
+        // unprofitable. It has to stay burned.
+        require(to != address(0) && from != address(0), "zero party");
+        uint256 have = sharesOf[poolId][from];
+        require(shares > 0 && shares <= have, "shares");
+        sharesOf[poolId][from] = have - shares;
+        sharesOf[poolId][to] += shares;
+        emit SharesTransferred(poolId, from, to, shares);
+    }
+
     // --- admin ----------------------------------------------------------------
 
     function createPool(
