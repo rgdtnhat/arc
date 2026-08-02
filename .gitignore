@@ -31,3 +31,7 @@ deployments/arc.history.json
 # Scratch trees created by agent/test/pool-arc.test.ts. They are removed when
 # the test finishes; this catches the case where a run is interrupted.
 .pool-arc-test-*/
+
+# Records which holders a pool reset has already paid; deleting it and re-running
+# would pay every one of them a second time.
+deployments/reset-state.json

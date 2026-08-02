@@ -58,6 +58,50 @@ If a quote comes back with **no route**, the answer is liquidity in the pool, no
 inventory in the router — add it on the Liquidity pool tab, where it earns a
 share of every swap fee it goes on to serve.
 
+### Resetting the pools onto the new contracts
+
+`router:deploy` gets swaps working against the AMM already deployed. It does not
+get you the **Blend** or **Aqua** behaviour, because those live in contracts that
+are not deployed yet: the pool on Arc today has no backstop, no three-slope curve
+and no auctions — the functions do not exist on it, so there is nothing to switch
+on. Same for the AMM's fee tiers and pair index.
+
+`pools:reset` deploys the replacements and re-creates every position in them.
+
+```bash
+npm run pools:reset                        # scan and report, change nothing
+npm run pools:reset -- --confirm           # do it
+npm run pools:reset -- --confirm --abandon # deploy fresh, migrate nobody
+```
+
+**Positions are re-created, not transferred.** No contract here has an admin
+function that moves someone else's position — that primitive is a rug pull with
+better branding — so migration works the only honest way it can: the deployer
+pays in on each holder's behalf via `supplyFor` / `depositFor` /
+`addLiquidityFor`. Two things follow:
+
+- **It costs the deployer**, an amount equal to the total migrated. The dry run
+  prices it per asset against the deployer's balance and refuses to start if it
+  is short, so a run cannot strand half the holders part-way through.
+- **The old contracts are untouched.** Everyone keeps their claim there as well
+  and can withdraw from either. Nothing is taken from anyone, which is what makes
+  this safe to run.
+
+What the script does that is not obvious:
+
+| Behaviour | Why |
+|---|---|
+| Skips holders that are contracts | The vault supplies into the pool, so the vault *is* a pool supplier — but its position is the derived shadow of its depositors, who are being migrated already. Re-creating both pays for the same money twice, and pays it to an address with no function that could ever withdraw it. Each skipped contract is named; `--include-contracts` overrides. |
+| Takes the first deposit in each fresh venue itself | The vault and AMM burn `MINIMUM_LIQUIDITY` dead shares on a first deposit. During a migration the "first depositor" is whichever holder happens to go first, and they silently end up short by exactly that much. Priming puts the burn on the deployer. For the AMM it also sets the pool's ratio — taken from the old pool, so nobody is credited against a price nobody chose. |
+| Records every leg before the next one starts | A crashed run resumes rather than re-paying. `deployments/reset-state.json` is the record; keep it until you are happy with the result, because deleting it and re-running would pay every holder a second time. |
+| Refuses to run twice | A finished run rewrites `arc.local.json` with the new addresses, so on a second run the "old" contracts in the record *are* the new ones — it would scan them, find the positions it just created, and credit them again. Verified on a test migration: the guard is what stops it. |
+| Stops on a partial log scan | A truncated scan under-reports *who*, never *how much*, so holders would be silently left behind. `--accept-partial` proceeds knowingly. |
+| Refuses to migrate an AMM pool whose assets do not line up | `addLiquidityFor` takes amounts positionally. A mismatched order would credit the wrong side and hand someone a different position from the one they had. |
+
+After it finishes: restart the app, seed the AMM pools with liquidity (a pool with
+an empty side quotes no route), and optionally put up backstop cover on the
+Lending tab so first-loss capital exists.
+
 The old desk, if this deployment had one, keeps whatever it held. Those balances
 were always its trading stock rather than a withdrawable balance; the app simply
 no longer offers it.
