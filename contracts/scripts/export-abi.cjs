@@ -26,6 +26,8 @@ const router = readArtifact("TesseraRouter");
 const feeCollector = readArtifact("TesseraFeeCollector");
 const amm = readArtifact("TesseraAMM");
 const mockToken = readArtifact("MockToken");
+const spendPolicy = readArtifact("TesseraSpendPolicy");
+const priceGuard = readArtifact("TesseraPriceGuard");
 
 const outDir = path.resolve(root, "..", "shared", "src");
 fs.mkdirSync(outDir, { recursive: true });
@@ -40,7 +42,9 @@ const abiTs =
   `export const tesseraRouterAbi = ${JSON.stringify(router.abi)} as const;\n\n` +
   `export const tesseraFeeCollectorAbi = ${JSON.stringify(feeCollector.abi)} as const;\n\n` +
   `export const tesseraAmmAbi = ${JSON.stringify(amm.abi)} as const;\n\n` +
-  `export const mockTokenAbi = ${JSON.stringify(mockToken.abi)} as const;\n`;
+  `export const mockTokenAbi = ${JSON.stringify(mockToken.abi)} as const;\n\n` +
+  `export const tesseraSpendPolicyAbi = ${JSON.stringify(spendPolicy.abi)} as const;\n\n` +
+  `export const tesseraPriceGuardAbi = ${JSON.stringify(priceGuard.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 
 // Bytecode is only needed to deploy the mock locally from a plain viem script.
@@ -54,7 +58,9 @@ const bytecodeTs =
   `export const tesseraRouterBytecode = "${router.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const tesseraFeeCollectorBytecode = "${feeCollector.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const tesseraAmmBytecode = "${amm.bytecode}" as \`0x\${string}\`;\n\n` +
-  `export const mockTokenBytecode = "${mockToken.bytecode}" as \`0x\${string}\`;\n`;
+  `export const mockTokenBytecode = "${mockToken.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraSpendPolicyBytecode = "${spendPolicy.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraPriceGuardBytecode = "${priceGuard.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);
 
 console.log("[export-abi] wrote shared/src/abi.ts and shared/src/bytecode.ts");

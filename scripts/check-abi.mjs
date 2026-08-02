@@ -55,6 +55,7 @@ const bytecodeTs = readFileSync(path.join(ROOT, "shared/src/bytecode.ts"), "utf8
 const NOT_EXPORTED = {
   ReentrancyGuard: "abstract base contract, never deployed on its own",
   MockAggregator: "test-only Chainlink feed stub, used from the Hardhat tests directly",
+  MockFlashBorrower: "test-only flash-loan callback, used from the Hardhat tests directly",
 };
 
 // --- 1. structural ----------------------------------------------------------
