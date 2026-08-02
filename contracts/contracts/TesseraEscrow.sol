@@ -7,6 +7,20 @@ import {ReentrancyGuard} from "./ReentrancyGuard.sol";
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/// @notice The routing surface used to accept payment in an asset the buyer
+///         holds and deliver the one the provider quoted in.
+interface IEscrowRouter {
+    function estimate(address tokenIn, address tokenOut, uint256 amountIn)
+        external
+        view
+        returns (uint256 amountOut, uint256[] memory poolIds, address[] memory path);
+    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut, uint256 deadline)
+        external
+        returns (uint256 amountOut);
 }
 
 /**
@@ -60,6 +74,28 @@ contract TesseraEscrow is ReentrancyGuard {
         uint256 earned; // total USDC released to the provider
     }
 
+    /**
+     * The buyer's side of the record.
+     *
+     * This exists because the refund path was a free option. An agent could take
+     * delivery and then, any time inside `DISPUTE_WINDOW`, call `refund`: it got
+     * 100% of the escrow back, the provider's `failed` count went up, and the
+     * provider's stake was slashed. The agent paid nothing. Reputation was
+     * written only for providers, so there was no record anywhere that the buyer
+     * was the problem.
+     *
+     * Making the buyer's behaviour visible does not, on its own, stop a
+     * determined griefer. What it does is let providers price them: an address
+     * that has disputed forty of its last hundred deliveries is one a provider
+     * can decline, or quote higher, before doing the work rather than after.
+     * That is the cheapest correction available, and it needs no new economics.
+     */
+    struct BuyerRecord {
+        uint128 settled; // payments the buyer released to the provider
+        uint128 disputed; // fulfilled payments the buyer reclaimed instead
+        uint256 spent; // total released, gross
+    }
+
     IERC20 public immutable usdc;
 
     /// @notice On an SLA breach, this share of the payment is slashed from the
@@ -75,6 +111,8 @@ contract TesseraEscrow is ReentrancyGuard {
     uint256 public nextPaymentId = 1;
     mapping(uint256 => Payment) public payments;
     mapping(address => Reputation) public reputationOf;
+    /// @notice The buyer-side counterpart to `reputationOf`. See `BuyerRecord`.
+    mapping(address => BuyerRecord) public buyerRecordOf;
     /// @notice USDC a provider has bonded as skin-in-the-game.
     mapping(address => uint256) public stakeOf;
 
@@ -93,6 +131,9 @@ contract TesseraEscrow is ReentrancyGuard {
     event Staked(address indexed provider, uint256 amount, uint256 total);
     event Unstaked(address indexed provider, uint256 amount, uint256 total);
     event Slashed(address indexed provider, uint256 indexed paymentId, uint256 amount, address indexed to);
+    event PaymentDisputed(uint256 indexed paymentId, address indexed agent, address indexed provider);
+    event RouterSet(address router);
+    event PaymentRouted(uint256 indexed paymentId, address indexed tokenIn, uint256 amountIn, uint256 amountOut);
 
     error NotAgent();
     error NotProvider();
@@ -102,6 +143,8 @@ contract TesseraEscrow is ReentrancyGuard {
     error DeadlineNotReached();
     error DisputeWindowOpen();
     error TransferFailed();
+    error NoRouter();
+    error RouteShortfall(uint256 got, uint256 wanted);
 
     /**
      * @notice Escrow-as-a-service: a protocol fee on settled payments.
@@ -126,6 +169,8 @@ contract TesseraEscrow is ReentrancyGuard {
     uint16 public protocolFeeBps; // starts at 0
     address public owner;
     address public treasury;
+    /// @notice Optional TesseraRouter, enabling `openWith`. Zero disables it.
+    address public router;
 
     event ProtocolFeeSet(uint16 bps, address treasury);
     event ProtocolFeeTaken(uint256 indexed paymentId, uint256 amount);
@@ -154,6 +199,12 @@ contract TesseraEscrow is ReentrancyGuard {
     function transferOwnership(address o) external onlyOwner {
         require(o != address(0), "owner=0");
         owner = o;
+    }
+
+    /// @notice Point `openWith` at a router, or clear it with the zero address.
+    function setRouter(address router_) external onlyOwner {
+        router = router_;
+        emit RouterSet(router_);
     }
 
     /**
@@ -210,9 +261,21 @@ contract TesseraEscrow is ReentrancyGuard {
 
         if (!usdc.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
 
+        paymentId = _record(msg.sender, provider, amount, deadline, quoteHash);
+    }
+
+    /// @dev The one place a payment comes into existence, so the direct and the
+    ///      routed entry point cannot record one differently.
+    function _record(
+        address agent,
+        address provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash
+    ) internal returns (uint256 paymentId) {
         paymentId = nextPaymentId++;
         payments[paymentId] = Payment({
-            agent: msg.sender,
+            agent: agent,
             provider: provider,
             amount: amount,
             deadline: deadline,
@@ -222,8 +285,88 @@ contract TesseraEscrow is ReentrancyGuard {
             status: Status.Escrowed,
             feeBps: protocolFeeBps
         });
+        emit PaymentOpened(paymentId, agent, provider, amount, deadline, quoteHash);
+    }
 
-        emit PaymentOpened(paymentId, msg.sender, provider, amount, deadline, quoteHash);
+    /**
+     * @notice Open a payment funded with an asset the buyer holds rather than
+     *         the one the provider quoted in.
+     *
+     * The escrow settles in one asset — that is what makes a quote a quote. But
+     * a buyer holding only EURC and a provider quoting USDC could not trade at
+     * all, which is a strange limitation on a chain that ships three Circle
+     * assets and a router that connects them.
+     *
+     * So: pull `maxIn` of whatever the buyer has, route it into the escrow
+     * asset, and open the payment for the exact `amount` quoted. Anything the
+     * route did not need goes back in the same transaction, because holding a
+     * buyer's change is not this contract's business.
+     *
+     * @param tokenIn What the buyer is paying with.
+     * @param maxIn   The most of it they will part with — their slippage bound.
+     * @param amount  The quoted price, in the escrow asset. Exact.
+     */
+    function openWith(
+        address tokenIn,
+        uint256 maxIn,
+        address provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash
+    ) external nonReentrant returns (uint256 paymentId) {
+        if (amount == 0 || maxIn == 0) revert ZeroAmount();
+        if (deadline <= block.timestamp) revert DeadlinePassed();
+        if (router == address(0)) revert NoRouter();
+
+        if (!IERC20(tokenIn).transferFrom(msg.sender, address(this), maxIn)) revert TransferFailed();
+
+        uint256 received;
+        if (tokenIn == address(usdc)) {
+            // Nothing to route. Accepting this rather than rejecting it lets a
+            // caller always use `openWith` and leave the decision here.
+            received = maxIn;
+        } else {
+            uint256 heldBefore = usdc.balanceOf(address(this));
+            IERC20(tokenIn).approve(router, 0);
+            if (!IERC20(tokenIn).approve(router, maxIn)) revert TransferFailed();
+            // `amount` as the floor: the route delivers the full quoted price or
+            // the whole call reverts. A partial fill would open a payment for
+            // less than the provider agreed to.
+            IEscrowRouter(router).swap(tokenIn, address(usdc), maxIn, amount, block.timestamp);
+            IERC20(tokenIn).approve(router, 0);
+            // Measured, not taken from the return value: the balance is what
+            // this contract can actually pay out, and it stays true even if the
+            // router ever behaves differently from its ABI.
+            received = usdc.balanceOf(address(this)) - heldBefore;
+        }
+        if (received < amount) revert RouteShortfall(received, amount);
+
+        paymentId = _record(msg.sender, provider, amount, deadline, quoteHash);
+        emit PaymentRouted(paymentId, tokenIn, maxIn, received);
+
+        uint256 change = received - amount;
+        if (change > 0 && !usdc.transfer(msg.sender, change)) revert TransferFailed();
+    }
+
+    /// @notice What `openWith` would get for `amountIn` of `tokenIn`, and how
+    ///         many hops it would take. Returns 0 when there is no route rather
+    ///         than reverting, so a caller can ask about anything.
+    function quoteOpenWith(address tokenIn, uint256 amountIn)
+        external
+        view
+        returns (uint256 amountOut, uint256 hops)
+    {
+        if (router == address(0) || amountIn == 0) return (0, 0);
+        if (tokenIn == address(usdc)) return (amountIn, 0);
+        try IEscrowRouter(router).estimate(tokenIn, address(usdc), amountIn) returns (
+            uint256 out,
+            uint256[] memory poolIds,
+            address[] memory
+        ) {
+            return (out, poolIds.length);
+        } catch {
+            return (0, 0);
+        }
     }
 
     /**
@@ -231,6 +374,22 @@ contract TesseraEscrow is ReentrancyGuard {
      * @param responseHash commitment (e.g. keccak256 of the response body).
      */
     function fulfill(uint256 paymentId, bytes32 responseHash) external {
+        _fulfill(paymentId, responseHash);
+    }
+
+    /**
+     * @notice Record delivery of many payments at once.
+     * @dev Both arrays must be the same length; each hash belongs to the id at
+     *      its own index. A mismatch reverts rather than truncating — a provider
+     *      marking N deliveries against N-1 hashes has made a mistake, and
+     *      committing to the wrong payload hash is not a recoverable one.
+     */
+    function fulfillMany(uint256[] calldata paymentIds, bytes32[] calldata responseHashes) external {
+        require(paymentIds.length == responseHashes.length, "length mismatch");
+        for (uint256 i = 0; i < paymentIds.length; i++) _fulfill(paymentIds[i], responseHashes[i]);
+    }
+
+    function _fulfill(uint256 paymentId, bytes32 responseHash) internal {
         Payment storage p = payments[paymentId];
         if (msg.sender != p.provider) revert NotProvider();
         if (p.status != Status.Escrowed) revert BadState(p.status, Status.Escrowed);
@@ -246,6 +405,28 @@ contract TesseraEscrow is ReentrancyGuard {
      * @notice Agent confirms the SLA was met; releases escrow to the provider.
      */
     function settle(uint256 paymentId) external nonReentrant {
+        _settle(paymentId);
+    }
+
+    /**
+     * @notice Settle many payments in one transaction.
+     *
+     * A per-call economy is three transactions per call — open, fulfill,
+     * settle — and at a tenth of a cent per call the gas *is* the economy. This
+     * is the cheap half of fixing that: one transaction, one signature, one base
+     * cost, N settlements. The expensive half (a Merkle root covering N
+     * deliveries, so the per-payment storage goes too) is a different trust
+     * model and is deliberately not in here.
+     *
+     * @dev Reverts the whole batch if any leg is not settleable. That is the
+     *      right default for a settlement run: a batch that silently drops the
+     *      legs it could not do leaves an operator believing they are paid.
+     */
+    function settleMany(uint256[] calldata paymentIds) external nonReentrant {
+        for (uint256 i = 0; i < paymentIds.length; i++) _settle(paymentIds[i]);
+    }
+
+    function _settle(uint256 paymentId) internal {
         Payment storage p = payments[paymentId];
         if (msg.sender != p.agent) revert NotAgent();
         if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
@@ -259,6 +440,10 @@ contract TesseraEscrow is ReentrancyGuard {
         // What the provider actually received, not the gross — `earned` is read
         // as a track record of income, and gross would overstate it.
         r.earned += net;
+
+        BuyerRecord storage b = buyerRecordOf[p.agent];
+        b.settled += 1;
+        b.spent += p.amount;
 
         emit PaymentSettled(paymentId, p.provider, net);
     }
@@ -285,6 +470,13 @@ contract TesseraEscrow is ReentrancyGuard {
         r.fulfilled += 1;
         r.earned += net;
 
+        // The buyer went quiet rather than settling, but the payment did land
+        // with the provider — counting it keeps `settled + disputed` equal to
+        // the number of deliveries this buyer has actually received.
+        BuyerRecord storage b = buyerRecordOf[p.agent];
+        b.settled += 1;
+        b.spent += p.amount;
+
         emit PaymentClaimed(paymentId, p.provider, net);
     }
 
@@ -296,6 +488,16 @@ contract TesseraEscrow is ReentrancyGuard {
      *         Either way the provider's `failed` count increments.
      */
     function refund(uint256 paymentId) external nonReentrant {
+        _refund(paymentId);
+    }
+
+    /// @notice Reclaim many payments at once — typically a sweep of everything
+    ///         that timed out while the agent was offline.
+    function refundMany(uint256[] calldata paymentIds) external nonReentrant {
+        for (uint256 i = 0; i < paymentIds.length; i++) _refund(paymentIds[i]);
+    }
+
+    function _refund(uint256 paymentId) internal {
         Payment storage p = payments[paymentId];
 
         bool agentReject = msg.sender == p.agent && p.status == Status.Fulfilled;
@@ -312,6 +514,15 @@ contract TesseraEscrow is ReentrancyGuard {
 
         p.status = Status.Refunded;
         reputationOf[p.provider].failed += 1;
+
+        // Only an agent rejecting a *delivered* response is a dispute. A refund
+        // after the deadline with nothing delivered is the provider failing to
+        // show up, and holding that against the buyer would punish them for
+        // being let down.
+        if (agentReject) {
+            buyerRecordOf[p.agent].disputed += 1;
+            emit PaymentDisputed(paymentId, p.agent, p.provider);
+        }
 
         // SLA breach: compensate the agent from the provider's stake (if any).
         uint256 slashAmount = (p.amount * SLASH_BPS) / 10_000;
@@ -354,6 +565,20 @@ contract TesseraEscrow is ReentrancyGuard {
     {
         Reputation storage r = reputationOf[provider];
         return (r.fulfilled, r.failed, r.earned);
+    }
+
+    /**
+     * @notice A buyer's track record: deliveries paid for, deliveries disputed.
+     * @dev The mirror of `reputation`. A provider reads this before accepting
+     *      work the same way an agent reads `reputation` before buying.
+     */
+    function buyerRecord(address agent)
+        external
+        view
+        returns (uint128 settled, uint128 disputed, uint256 spent)
+    {
+        BuyerRecord storage b = buyerRecordOf[agent];
+        return (b.settled, b.disputed, b.spent);
     }
 
     /// @notice Full payment record (structs aren't auto-exposed with enums cleanly in some tooling).

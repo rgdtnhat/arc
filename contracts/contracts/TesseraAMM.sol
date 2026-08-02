@@ -106,6 +106,28 @@ contract TesseraAMM {
     ///      discover routes without walking every pool and every asset.
     mapping(bytes32 => uint256[]) private pairPools;
 
+    /**
+     * Time-weighted price accumulators, Uniswap-v2 style.
+     *
+     * Spot price in an AMM is worth very little as an oracle: anyone can move it
+     * within a block and move it back, so a consumer reading it is reading
+     * whatever the last transaction wanted them to read. What cannot be faked
+     * cheaply is the price *integrated over time* — holding a pool away from its
+     * true price for an hour costs an hour of arbitrage.
+     *
+     * So the pool accumulates `price x seconds` on every state change, and a
+     * consumer that snapshots the accumulator twice divides the difference by
+     * the elapsed time to get the average over that window. Only two-asset pools
+     * accumulate: with more than two there is no single pair to be the price.
+     */
+    uint256 public constant PRICE_UNIT = 1e18;
+    /// @dev poolId => sum of (reserve1/reserve0) x seconds, at PRICE_UNIT scale.
+    mapping(uint256 => uint256) public price0Cumulative;
+    /// @dev poolId => sum of (reserve0/reserve1) x seconds, at PRICE_UNIT scale.
+    mapping(uint256 => uint256) public price1Cumulative;
+    /// @dev poolId => when the accumulators were last advanced.
+    mapping(uint256 => uint64) public observedAt;
+
     address public owner;
     address public appFeeCollector;
     /// @notice Upper bound on assets in a single pool, set by the operator.
@@ -120,6 +142,7 @@ contract TesseraAMM {
     bool private _locked;
 
     event AmpSet(uint256 indexed poolId, uint16 amp);
+    event Observed(uint256 indexed poolId, uint256 price0Cumulative, uint256 price1Cumulative, uint64 at);
     event PoolCreated(uint256 indexed poolId, address[] assets, uint16 swapFeeBps, uint16 lpShareBps, string name);
     event LiquidityAdded(uint256 indexed poolId, address indexed provider, uint256[] amounts, uint256 shares);
     event LiquidityRemoved(uint256 indexed poolId, address indexed provider, uint256[] amounts, uint256 shares);
@@ -273,6 +296,80 @@ contract TesseraAMM {
         return y;
     }
 
+    /**
+     * @dev Advance the accumulators to now, using the reserves as they stand
+     *      *before* the caller changes them.
+     *
+     *      Called at the top of every function that moves a balance. The
+     *      ordering is what makes the average honest: crediting the elapsed time
+     *      at the new price would let a trade retroactively rewrite a window it
+     *      was not present for.
+     */
+    function _observe(uint256 poolId) internal {
+        Pool storage p = pools[poolId];
+        uint64 last = observedAt[poolId];
+        uint64 nowTs = uint64(block.timestamp);
+        if (last == 0) {
+            observedAt[poolId] = nowTs;
+            return;
+        }
+        uint256 elapsed = nowTs - last;
+        if (elapsed == 0) return;
+        if (p.assets.length == 2) {
+            uint256 r0 = reserves[poolId][p.assets[0]];
+            uint256 r1 = reserves[poolId][p.assets[1]];
+            if (r0 > 0 && r1 > 0) {
+                price0Cumulative[poolId] += ((r1 * PRICE_UNIT) / r0) * elapsed;
+                price1Cumulative[poolId] += ((r0 * PRICE_UNIT) / r1) * elapsed;
+            }
+        }
+        observedAt[poolId] = nowTs;
+        emit Observed(poolId, price0Cumulative[poolId], price1Cumulative[poolId], nowTs);
+    }
+
+    /**
+     * @notice Advance the accumulators without trading.
+     *
+     * Permissionless, and needed: the accumulators only move when someone
+     * touches the pool, so a quiet pool's last observation can be hours old and
+     * a consumer would be averaging a window that ended back then. A keeper
+     * calling this on a schedule keeps the window current.
+     */
+    function sync(uint256 poolId) external {
+        require(pools[poolId].exists, "no pool");
+        _observe(poolId);
+    }
+
+    /**
+     * @notice The accumulator and clock a consumer needs to snapshot.
+     * @return cumulative The running total for `token`, priced in the other asset.
+     * @return at When it was last advanced.
+     * @return spot The instantaneous price, for reference only — it is the
+     *         number an attacker can move, which is why it is not the answer.
+     */
+    function observe(uint256 poolId, address token)
+        external
+        view
+        returns (uint256 cumulative, uint64 at, uint256 spot)
+    {
+        Pool storage p = pools[poolId];
+        require(p.exists && p.assets.length == 2, "not a 2-asset pool");
+        bool isZero = p.assets[0] == token;
+        require(isZero || p.assets[1] == token, "not in pool");
+        uint256 r0 = reserves[poolId][p.assets[0]];
+        uint256 r1 = reserves[poolId][p.assets[1]];
+
+        cumulative = isZero ? price0Cumulative[poolId] : price1Cumulative[poolId];
+        at = observedAt[poolId];
+        if (r0 > 0 && r1 > 0) {
+            spot = isZero ? (r1 * PRICE_UNIT) / r0 : (r0 * PRICE_UNIT) / r1;
+            // Include the time since the last write, so a caller reading twice
+            // across a quiet gap sees the gap rather than a flat line.
+            uint256 elapsed = block.timestamp - at;
+            if (elapsed > 0) cumulative += spot * elapsed;
+        }
+    }
+
     /// @notice Output, LP fee and app fee for a swap, without executing it.
     function quote(uint256 poolId, address tokenIn, address tokenOut, uint256 amountIn)
         public
@@ -349,6 +446,7 @@ contract TesseraAMM {
         require(p.exists, "no pool");
         require(!p.frozen, "pool frozen");
         require(amounts.length == p.assets.length, "amounts length");
+        _observe(poolId);
 
         if (p.totalShares == 0) {
             // First deposit sets the initial ratio. Shares are the sum of the
@@ -404,6 +502,7 @@ contract TesseraAMM {
         require(p.exists, "no pool");
         require(shares > 0 && shares <= sharesOf[poolId][msg.sender], "shares");
         require(minAmounts.length == p.assets.length, "amounts length");
+        _observe(poolId);
 
         amounts = new uint256[](p.assets.length);
         // Effects before interactions.
@@ -435,6 +534,7 @@ contract TesseraAMM {
         require(p.exists, "no pool");
         require(amount > 0, "zero amount");
         require(reserves[poolId][token] > 0, "asset not in pool");
+        _observe(poolId);
         require(IERC20A(token).transferFrom(msg.sender, address(this), amount), "transferFrom");
         reserves[poolId][token] += amount;
         emit PoolFunded(poolId, msg.sender, token, amount);
@@ -450,6 +550,7 @@ contract TesseraAMM {
         Pool storage p = pools[poolId];
         require(p.exists, "no pool");
         require(!p.frozen, "pool frozen");
+        _observe(poolId);
         uint256 lpFee;
         uint256 appFee;
         (amountOut, lpFee, appFee) = quote(poolId, tokenIn, tokenOut, amountIn);

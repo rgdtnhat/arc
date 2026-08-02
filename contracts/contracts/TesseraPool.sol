@@ -25,6 +25,30 @@ interface IAggregatorV3 {
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
+/// @notice Optional sanity band on manually-set prices. See TesseraPriceGuard.
+interface IPriceGuard {
+    function check(address asset, uint256 usdPrice)
+        external
+        view
+        returns (bool ok, uint256 referencePrice, uint256 deviationBps);
+}
+
+/// @notice What a flash-loan borrower implements. Anything else reverts.
+interface IFlashBorrower {
+    /**
+     * @param initiator Who called `flashLoan` — check it if you approve this
+     *        pool, or anyone could make your contract pay a fee.
+     * @return The magic value `keccak256("TesseraPool.onFlashLoan")`.
+     */
+    function onFlashLoan(
+        address initiator,
+        address asset,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external returns (bytes32);
+}
+
 /**
  * @title TesseraPool
  * @notice An isolated lending & borrowing pool (money market).
@@ -240,6 +264,41 @@ contract TesseraPool is ReentrancyGuard {
     /// @dev asset => user => timestamp the queued shares unlock.
     mapping(address => mapping(address => uint64)) public backstopUnlockAt;
 
+    /**
+     * Efficiency mode, following Aave's e-mode and Blend's isolated categories.
+     *
+     * A single set of risk factors per asset has to be sized for the worst
+     * borrow that asset could back. USDC collateral is priced at 90% because
+     * someone might borrow cirBTC against it — but a borrower who supplies USDC
+     * and borrows *EURC* is not taking that risk. Two assets that track each
+     * other can safely support a much higher ratio, and charging them the
+     * long-tail rate is leaving capital on the floor.
+     *
+     * A category groups assets that move together. While every position an
+     * account holds sits inside one category, that category's factors apply
+     * instead of the per-asset ones. Touch anything outside it and the account
+     * silently falls back to the conservative numbers — no opt-in, no toggle to
+     * forget, and no way to be in e-mode for an exposure it does not cover.
+     */
+    struct EmodeParams {
+        bool enabled;
+        uint16 cFactor; // borrow LTV within the category
+        uint16 liqFactor; // liquidation threshold within the category
+        uint16 lFactor; // liability factor within the category
+        string label;
+    }
+    /// @dev asset => category id. 0 means the asset belongs to no category.
+    mapping(address => uint8) public emodeOf;
+    /// @dev category id => the factors that replace the per-asset ones.
+    mapping(uint8 => EmodeParams) public emodeParams;
+
+    /// @notice Optional TesseraPriceGuard. Zero leaves manual prices unchecked.
+    address public priceGuard;
+
+    /// @notice Flash-loan fee, in bps of the principal. Paid to suppliers.
+    uint16 public flashFeeBps = 9; // 0.09%, the Aave-v2 number
+    uint16 public constant MAX_FLASH_FEE = 100; // 1%, hard ceiling
+
     mapping(address => IrConfig) public irConfig;
     /// @dev borrower => their open auction, if any.
     mapping(address => Auction) public auctions;
@@ -293,6 +352,10 @@ contract TesseraPool is ReentrancyGuard {
 
     event ReserveAdded(address indexed asset, uint16 cFactor, uint16 liqFactor, uint16 lFactor, bool borrowable);
     event RiskParamsSet(address indexed asset, uint16 cFactor, uint16 liqFactor, uint16 lFactor);
+    event EmodeCategorySet(uint8 indexed category, uint16 cFactor, uint16 liqFactor, uint16 lFactor, string label);
+    event EmodeAssetSet(address indexed asset, uint8 category);
+    event FlashLoan(address indexed asset, address indexed receiver, uint256 amount, uint256 fee);
+    event PriceGuardSet(address guard);
     event PriceSet(address indexed asset, uint256 price);
     event Supply(address indexed asset, address indexed user, uint256 amount, uint256 shares);
     event Withdraw(address indexed asset, address indexed user, uint256 amount, uint256 shares);
@@ -352,6 +415,9 @@ contract TesseraPool is ReentrancyGuard {
     error BadFillPercent();
     error HealthOutOfBand();
     error StillLocked();
+    error FlashLoanNotRepaid(uint256 owed, uint256 got);
+    error UnknownCategory();
+    error PriceOutOfBand(uint256 given, uint256 referencePrice, uint256 deviationBps);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -456,6 +522,52 @@ contract TesseraPool is ReentrancyGuard {
     }
 
     /**
+     * @notice Define or retune an e-mode category.
+     * @param category Non-zero id. Assets are attached with `setEmodeAsset`.
+     * @dev The same `cFactor < liqFactor` invariant applies here as anywhere
+     *      else — the boosted numbers are still a borrow line and a seizure
+     *      line, and collapsing them would put a fully-drawn e-mode borrower
+     *      exactly on the liquidation boundary, which is the bug this pool
+     *      already fixed once for the per-asset factors.
+     */
+    function setEmodeCategory(
+        uint8 category,
+        uint16 cFactor,
+        uint16 liqFactor,
+        uint16 lFactor,
+        string calldata label
+    ) external onlyOwner {
+        if (category == 0) revert UnknownCategory();
+        _requireFactors(cFactor, liqFactor, lFactor, 0);
+        require(bytes(label).length <= 32, "label");
+        emodeParams[category] =
+            EmodeParams({enabled: true, cFactor: cFactor, liqFactor: liqFactor, lFactor: lFactor, label: label});
+        emit EmodeCategorySet(category, cFactor, liqFactor, lFactor, label);
+    }
+
+    /**
+     * @notice Turn a category off.
+     * @dev Accounts inside it revert to the per-asset factors, which are
+     *      stricter — so this can make an account liquidatable. Tightening risk
+     *      parameters always can; that is what makes them a control rather than
+     *      a display. Nothing is seized by this call itself.
+     */
+    function setEmodeEnabled(uint8 category, bool on) external onlyOwner {
+        EmodeParams storage e = emodeParams[category];
+        if (e.cFactor == 0) revert UnknownCategory();
+        e.enabled = on;
+        emit EmodeCategorySet(category, e.cFactor, e.liqFactor, e.lFactor, e.label);
+    }
+
+    /// @notice Attach an asset to a category, or detach it with category 0.
+    function setEmodeAsset(address asset, uint8 category) external onlyOwner {
+        if (!reserves[asset].enabled) revert UnknownReserve();
+        if (category != 0 && emodeParams[category].cFactor == 0) revert UnknownCategory();
+        emodeOf[asset] = category;
+        emit EmodeAssetSet(asset, category);
+    }
+
+    /**
      * @notice Set the backstop's cut of borrower interest.
      * @dev Capped at 50%. A backstop that could take everything would leave
      *      suppliers earning nothing while still carrying the residual risk,
@@ -508,11 +620,33 @@ contract TesseraPool is ReentrancyGuard {
         emit RiskParamsSet(asset, cFactor, liqFactor, lFactor);
     }
 
-    /// @notice Manual price, used only while `asset` has no feed configured.
+    /**
+     * @notice Manual price, used only while `asset` has no feed configured.
+     * @dev When a price guard is wired, the new price must land inside a band
+     *      around the AMM's time-weighted average. That is not an oracle — the
+     *      pools are too shallow to be one — it is a check against the two
+     *      things that actually go wrong with a hand-set price: leaving it
+     *      untouched while the market moved, and a misplaced decimal.
+     */
     function setPrice(address asset, uint256 usdPrice) external onlyOwner {
         if (!reserves[asset].enabled) revert UnknownReserve();
+        if (priceGuard != address(0)) {
+            (bool ok, uint256 ref, uint256 dev) = IPriceGuard(priceGuard).check(asset, usdPrice);
+            if (!ok) revert PriceOutOfBand(usdPrice, ref, dev);
+        }
         reserves[asset].price = usdPrice;
         emit PriceSet(asset, usdPrice);
+    }
+
+    /**
+     * @notice Point manual prices at a sanity band, or clear it with address(0).
+     * @dev Deliberately clearable. A guard that could not be removed would be a
+     *      way to permanently freeze an asset's price if its reference pool were
+     *      ever drained — the guard causing the outage it exists to prevent.
+     */
+    function setPriceGuard(address guard) external onlyOwner {
+        priceGuard = guard;
+        emit PriceGuardSet(guard);
     }
 
     function setTreasury(address t) external onlyOwner {
@@ -784,6 +918,66 @@ contract TesseraPool is ReentrancyGuard {
         supplyShares[collateralAsset][msg.sender] += cShares;
 
         emit Liquidate(msg.sender, user, debtAsset, collateralAsset, pay, seize);
+    }
+
+    // --- flash loans ----------------------------------------------------------
+
+    /**
+     * @notice Borrow any amount of a reserve within a single transaction.
+     *
+     * This is here mostly to make the liquidation auctions work. An auction is
+     * only as good as the set of people who can fill it, and requiring a
+     * liquidator to already hold thousands of USDC of the right asset excludes
+     * almost everyone — which is how positions sit unliquidated while a pool
+     * accrues bad debt its suppliers eventually eat. With a flash loan the
+     * capital requirement is the *profit*, not the principal.
+     *
+     * @dev The balance is measured before and after rather than trusted. A
+     *      borrower that repays by any route satisfies the check, and one that
+     *      quietly keeps the money does not, whatever it returns.
+     */
+    function flashLoan(address asset, uint256 amount, bytes calldata data) external nonReentrant {
+        Reserve storage r = reserves[asset];
+        if (!r.enabled) revert UnknownReserve();
+        if (amount == 0) revert ZeroAmount();
+        uint256 heldBefore = IERC20(asset).balanceOf(address(this));
+        if (amount > heldBefore) revert InsufficientLiquidity();
+
+        uint256 fee = (amount * flashFeeBps) / BPS;
+        _push(asset, msg.sender, amount);
+
+        if (
+            IFlashBorrower(msg.sender).onFlashLoan(msg.sender, asset, amount, fee, data) !=
+            keccak256("TesseraPool.onFlashLoan")
+        ) revert FlashLoanNotRepaid(amount + fee, 0);
+
+        uint256 got = IERC20(asset).balanceOf(address(this));
+        if (got < heldBefore + fee) revert FlashLoanNotRepaid(heldBefore + fee, got);
+
+        // The fee is not the pool's — it belongs to the people whose deposits
+        // made the loan possible. Crediting `totalSupplyAssets` without minting
+        // shares hands it to them pro rata, the same way LP fees work.
+        if (fee > 0) {
+            _accrue(asset);
+            r.totalSupplyAssets += fee;
+        }
+        emit FlashLoan(asset, msg.sender, amount, fee);
+    }
+
+    /// @notice What a flash loan of `amount` would cost.
+    function flashFee(uint256 amount) external view returns (uint256) {
+        return (amount * flashFeeBps) / BPS;
+    }
+
+    /**
+     * @notice Set the flash-loan fee. Capped in the bytecode at 1%.
+     * @dev The cap matters: the fee is charged on the *principal*, and a
+     *      principal is unbounded, so an uncapped fee would be an unbounded
+     *      claim on anyone who used this.
+     */
+    function setFlashFee(uint16 bps) external onlyOwner {
+        require(bps <= MAX_FLASH_FEE, "flash fee");
+        flashFeeBps = bps;
     }
 
     // --- liquidation auctions -------------------------------------------------
@@ -1329,27 +1523,85 @@ contract TesseraPool is ReentrancyGuard {
         return liability > liqLimit;
     }
 
-    function _accountLiquidity(address user)
+    /**
+     * @notice The e-mode category an account currently qualifies for, or 0.
+     *
+     * Qualifying means every position — supplied or borrowed — sits in the same
+     * enabled category. One position outside it and the answer is 0, because
+     * the boosted factors were only ever justified by the assets moving
+     * together, and an exposure outside the group breaks exactly that premise.
+     */
+    function emodeCategoryOf(address user) public view returns (uint8) {
+        uint256 n = reserveList.length;
+        uint8 found = 0;
+        for (uint256 i = 0; i < n; i++) {
+            address asset = reserveList[i];
+            if (supplyBalance(asset, user) == 0 && borrowBalance(asset, user) == 0) continue;
+            uint8 c = emodeOf[asset];
+            if (c == 0 || !emodeParams[c].enabled) return 0;
+            if (found == 0) found = c;
+            else if (found != c) return 0;
+        }
+        return found;
+    }
+
+    /// @dev The factors that apply to `asset` for an account in category `cat`.
+    function _factors(address asset, uint8 cat)
         internal
         view
-        returns (uint256 borrowLimit, uint256 liqLimit, uint256 liability)
+        returns (uint16 cFactor, uint16 liqFactor, uint16 lFactor)
     {
+        if (cat != 0) {
+            EmodeParams storage e = emodeParams[cat];
+            if (e.enabled) return (e.cFactor, e.liqFactor, e.lFactor);
+        }
+        Reserve storage r = reserves[asset];
+        return (r.cFactor, r.liqFactor, r.lFactor);
+    }
+
+    /**
+     * @dev The whole of an account's position, in one pass.
+     *
+     * `accountData` used to run its own copy of this loop. Two loops computing
+     * the same limits are two chances to disagree, and the one people read on a
+     * dashboard disagreeing with the one that decides liquidation is the worst
+     * possible place for that to happen.
+     */
+    function _liquidity(address user)
+        internal
+        view
+        returns (uint256 supplyValue, uint256 borrowValue, uint256 borrowLimit, uint256 liqLimit, uint256 liability)
+    {
+        uint8 cat = emodeCategoryOf(user);
         uint256 n = reserveList.length;
         for (uint256 i = 0; i < n; i++) {
             address asset = reserveList[i];
-            Reserve storage r = reserves[asset];
-            uint256 s = supplyBalance(asset, user);
-            if (s > 0) {
-                uint256 v = _value(asset, s);
-                borrowLimit += (v * r.cFactor) / BPS;
-                liqLimit += (v * r.liqFactor) / BPS;
+            (uint16 cF, uint16 liqF, uint16 lF) = _factors(asset, cat);
+            uint256 sup = supplyBalance(asset, user);
+            if (sup > 0) {
+                uint256 v = _value(asset, sup);
+                supplyValue += v;
+                borrowLimit += (v * cF) / BPS;
+                liqLimit += (v * liqF) / BPS;
             }
             uint256 b = borrowBalance(asset, user);
             // Per-asset liability factor: a debt in a riskier asset counts for
             // more than its face value, which is what lets one pool hold assets
             // of genuinely different quality.
-            if (b > 0) liability += (_value(asset, b) * BPS) / r.lFactor;
+            if (b > 0) {
+                uint256 bv = _value(asset, b);
+                borrowValue += bv;
+                liability += (bv * BPS) / lF;
+            }
         }
+    }
+
+    function _accountLiquidity(address user)
+        internal
+        view
+        returns (uint256 borrowLimit, uint256 liqLimit, uint256 liability)
+    {
+        (, , borrowLimit, liqLimit, liability) = _liquidity(user);
     }
 
     /// @notice Account view for agents/dashboards: USD values (PRICE_SCALE) and a
@@ -1359,25 +1611,9 @@ contract TesseraPool is ReentrancyGuard {
         view
         returns (uint256 supplyValue, uint256 borrowValue, uint256 borrowLimit, uint256 healthFactor)
     {
-        uint256 n = reserveList.length;
-        uint256 liability;
         uint256 liqLimit;
-        for (uint256 i = 0; i < n; i++) {
-            address asset = reserveList[i];
-            Reserve storage r = reserves[asset];
-            uint256 s = supplyBalance(asset, user);
-            if (s > 0) {
-                uint256 v = _value(asset, s);
-                supplyValue += v;
-                borrowLimit += (v * r.cFactor) / BPS;
-                liqLimit += (v * r.liqFactor) / BPS;
-            }
-            uint256 b = borrowBalance(asset, user);
-            if (b > 0) {
-                borrowValue += _value(asset, b);
-                liability += (_value(asset, b) * BPS) / r.lFactor;
-            }
-        }
+        uint256 liability;
+        (supplyValue, borrowValue, borrowLimit, liqLimit, liability) = _liquidity(user);
         // Health is distance to *liquidation*, not distance to the borrow cap.
         // Measuring it against `borrowLimit` made a fully-drawn position read as
         // health 1.00 when it was still comfortably solvent — and, worse, made
