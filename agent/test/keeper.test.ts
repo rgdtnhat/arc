@@ -8,6 +8,9 @@ import {
   auctionTerms,
   shouldFill,
   planSweep,
+  planDeleverage,
+  DELEVERAGE_TRIGGER,
+  DELEVERAGE_TARGET,
   HF_TARGET_MIN,
   HF_TARGET_MAX,
   AUCTION_HALF_LIFE,
@@ -183,4 +186,182 @@ test("says so rather than failing when the vault is empty", () => {
   const p = planSweep({ wallet: U(10), vault: 0n, buffer: U(500), tolerance: U(20), minMove: U(1) });
   assert.equal(p.deltaIn, 0n);
   assert.match(p.reason, /nothing in the vault/);
+});
+
+// --- protecting the agent's own position -------------------------------------
+//
+// Being liquidated is strictly worse than deleveraging: the liquidation bonus
+// comes out of the borrower's collateral. These pin that the agent acts while
+// that is still avoidable.
+
+const WAD = 10n ** 18n;
+/**
+ * 1 cirBTC marked to $27,500 (80% liquidation factor) against a 20,000 USDC
+ * debt. Health lands at ~1.04: still solvent, no auction possible yet, and
+ * already past the point where the agent should be doing something.
+ */
+const TIGHT = {
+  liquidationLimit: USD(22_000),
+  borrowLimit: USD(19_250),
+  liability: (USD(20_000) * 10_000n) / 9_500n,
+};
+
+test("does nothing while health is above the trigger", () => {
+  const healthy = { liquidationLimit: USD(24_000), borrowLimit: USD(21_000), liability: USD(10_000) };
+  const p = planDeleverage({
+    limits: healthy,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(50_000),
+  });
+  assert.equal(p.action, "none");
+  assert.equal(p.repayValue, 0n);
+});
+
+test("does nothing when there is no debt at all", () => {
+  const p = planDeleverage({
+    limits: { liquidationLimit: USD(24_000), borrowLimit: USD(21_000), liability: 0n },
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(50_000),
+  });
+  assert.equal(p.action, "none");
+  assert.match(p.reason, /no debt/);
+});
+
+test("acts above 1.0, while liquidation is still avoidable", () => {
+  // Health here is ~1.14 — comfortably solvent, and already worth unwinding.
+  assert.ok(healthFactor(TIGHT) > WAD);
+  assert.ok(healthFactor(TIGHT) < DELEVERAGE_TRIGGER);
+  const p = planDeleverage({
+    limits: TIGHT,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(50_000),
+  });
+  assert.equal(p.action, "repay");
+  assert.ok(p.repayValue > 0n);
+});
+
+test("repays enough to reach the target, not merely to clear the trigger", () => {
+  const p = planDeleverage({
+    limits: TIGHT,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(50_000),
+  });
+  // Landing on the trigger would put the account back under it on the next
+  // tick of interest, and it would pay gas to discover that every block.
+  assert.ok(p.healthAfter >= DELEVERAGE_TARGET, `${p.healthAfter} < ${DELEVERAGE_TARGET}`);
+  assert.equal(p.partial, false);
+});
+
+test("repays what it can when it cannot repay everything", () => {
+  const p = planDeleverage({
+    limits: TIGHT,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(500),
+  });
+  assert.equal(p.action, "repay");
+  assert.equal(p.partial, true);
+  assert.equal(p.repayValue, USD(500));
+  // Partial help is still help: health improves even though it misses target.
+  assert.ok(p.healthAfter > p.healthNow);
+  assert.ok(p.healthAfter < DELEVERAGE_TARGET);
+});
+
+test("prefers repaying to posting more collateral", () => {
+  // Both routes are open. Adding collateral to a failing position increases the
+  // amount at risk, which is the wrong direction when the collateral is what
+  // fell.
+  const p = planDeleverage({
+    limits: TIGHT,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(50_000),
+    collateralLiqFactorBps: 8_000n,
+    topUpAvailableValue: USD(50_000),
+  });
+  assert.equal(p.action, "repay");
+  assert.equal(p.topUpValue, 0n);
+});
+
+test("posts collateral only when there is nothing to repay with", () => {
+  const p = planDeleverage({
+    limits: TIGHT,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: 0n,
+    collateralLiqFactorBps: 8_000n,
+    topUpAvailableValue: USD(50_000),
+  });
+  assert.equal(p.action, "topUp");
+  assert.ok(p.topUpValue > 0n);
+  assert.ok(p.healthAfter >= DELEVERAGE_TARGET);
+});
+
+test("says so plainly when it can do neither", () => {
+  const p = planDeleverage({
+    limits: TIGHT,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: 0n,
+  });
+  assert.equal(p.action, "none");
+  assert.match(p.reason, /nothing to repay/);
+});
+
+test("acts on a position that is already underwater, rather than giving up", () => {
+  // Past the seizure line the agent is being auctioned. Repaying still helps —
+  // every unit of health recovered is bonus it does not hand to a liquidator.
+  assert.ok(isLiquidatable(UNDERWATER));
+  const p = planDeleverage({
+    limits: UNDERWATER,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(50_000),
+  });
+  assert.equal(p.action, "repay");
+  assert.ok(p.healthAfter > p.healthNow);
+});
+
+test("the trigger sits above 1.0 and below the target", () => {
+  // The band is the whole design: act before the auction opens, and leave
+  // enough room that ordinary interest does not immediately re-trigger.
+  assert.ok(DELEVERAGE_TRIGGER > WAD);
+  assert.ok(DELEVERAGE_TARGET > DELEVERAGE_TRIGGER);
+});
+
+test("a plan it carries out leaves the account above the trigger", () => {
+  // The property that matters end to end: after acting, the agent is not
+  // immediately back in the same place.
+  const p = planDeleverage({
+    limits: TIGHT,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(50_000),
+  });
+  const after = {
+    ...TIGHT,
+    liability: TIGHT.liability - (p.repayValue * 10_000n) / 9_500n,
+  };
+  const settled = planDeleverage({
+    limits: after,
+    triggerHealth: DELEVERAGE_TRIGGER,
+    targetHealth: DELEVERAGE_TARGET,
+    debtLFactorBps: 9_500n,
+    repayableValue: USD(50_000),
+  });
+  assert.equal(settled.action, "none");
 });
