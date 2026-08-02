@@ -19,6 +19,12 @@ import {
   tesseraFeeCollectorBytecode,
   tesseraAmmAbi,
   tesseraAmmBytecode,
+  tesseraPriceGuardAbi,
+  tesseraPriceGuardBytecode,
+  tesseraStreamAbi,
+  tesseraStreamBytecode,
+  tesseraSubscriptionAbi,
+  tesseraSubscriptionBytecode,
   formatUsdc,
   pacedHttp,
 } from "@tessera/shared";
@@ -466,6 +472,99 @@ async function main() {
     dSend(feeCollector, tesseraFeeCollectorAbi, "setAmm", [amm, 0n]),
   );
 
+  // 6e) TesseraPriceGuard: a sanity band around the pool's manual prices.
+  //
+  //     The pool takes prices from an owner call. That is fine until the call is
+  //     wrong — a fat-fingered decimal re-marks every position at once, and the
+  //     first thing that happens is a wave of liquidations at a price nobody
+  //     traded at. The guard compares each new price against the AMM's TWAP and
+  //     rejects anything outside the band.
+  const guardRes = await adopt("TesseraPriceGuard", existing.tesseraPriceGuard, FRESH, async () => {
+    console.log("→ deploying TesseraPriceGuard (TWAP sanity band on manual prices)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraPriceGuardAbi,
+      bytecode: tesseraPriceGuardBytecode,
+      args: [amm, pool],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   guard", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const priceGuard = guardRes.address;
+
+  // Point each non-USDC reserve at the AMM pool that prices it. A reserve with
+  // no feed is simply unguarded — the guard answers "ok" rather than blocking,
+  // so a missing feed can never be the reason an asset's price freezes.
+  {
+    let poolId = 0n;
+    for (const r of LIVE_RESERVES.filter((x) => x.address.toLowerCase() !== ARC_USDC_ADDRESS.toLowerCase())) {
+      const id = poolId++;
+      await optional(`pointing the price guard at ${r.symbol} (AMM pool ${id})`, () =>
+        // 25% band over a 30-minute window: wide enough that ordinary
+        // volatility does not block an honest re-mark, tight enough to catch a
+        // decimal slip.
+        dSend(priceGuard, tesseraPriceGuardAbi, "setFeed", [r.address, id, ARC_USDC_ADDRESS, 2500, 1800]),
+      );
+    }
+  }
+  await optional("arming the pool's price guard", () =>
+    dSend(pool, tesseraPoolAbi, "setPriceGuard", [priceGuard]),
+  );
+
+  // 6f) Exposure caps. Every other control in the pool is a ratio; none of them
+  //     bound how large a single reserve can get. Sized generously — these exist
+  //     to stop a runaway, not to shape ordinary use.
+  for (const r of LIVE_RESERVES) {
+    const isUsdc = r.address.toLowerCase() === ARC_USDC_ADDRESS.toLowerCase();
+    const unit = 10n ** BigInt(r.decimals);
+    // USDC is the unit of account here and carries the least price risk, so it
+    // gets the loosest cap; everything else is held to a tighter line.
+    const supplyCap = isUsdc ? 5_000_000n * unit : 250_000n * unit;
+    const borrowCap = isUsdc ? 4_000_000n * unit : 100_000n * unit;
+    await optional(`capping ${r.symbol} exposure`, () =>
+      dSend(pool, tesseraPoolAbi, "setCaps", [r.address, supplyCap, borrowCap]),
+    );
+  }
+
+  // 6g) The two payment shapes the rail was missing: streaming (pay by the
+  //     second, for work measured in time) and subscriptions (prepaid credit an
+  //     agent can draw on while its funder is offline). Neither takes an owner —
+  //     they hold only what their users put in them.
+  const streamRes = await adopt("TesseraStream", existing.tesseraStream, FRESH, async () => {
+    console.log("→ deploying TesseraStream (pay by the second)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraStreamAbi,
+      bytecode: tesseraStreamBytecode,
+      args: [],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   stream", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const stream = streamRes.address;
+
+  const subRes = await adopt("TesseraSubscription", existing.tesseraSubscription, FRESH, async () => {
+    console.log("→ deploying TesseraSubscription (prepaid credit, capped per period)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraSubscriptionAbi,
+      bytecode: tesseraSubscriptionBytecode,
+      args: [],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   subs  ", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const subscription = subRes.address;
+
   // 7) Persist. Merge into whatever record we adopted so escrow/tab and any
   //     other recorded addresses survive.
   const dep = { ...existing };
@@ -477,6 +576,9 @@ async function main() {
   dep.tesseraFeeCollector = feeCollector;
   dep.tesseraAmm = amm;
   dep.tesseraAmmFeeCollector = ammFeeCollector;
+  dep.tesseraPriceGuard = priceGuard;
+  dep.tesseraStream = stream;
+  dep.tesseraSubscription = subscription;
   dep.poolAssets = LIVE_RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
   const body = JSON.stringify(dep, null, 2) + "\n";
@@ -492,6 +594,9 @@ async function main() {
   console.log("   fees     ", feeCollector);
   console.log("   amm      ", amm);
   console.log("   amm fees ", ammFeeCollector);
+  console.log("   guard    ", priceGuard);
+  console.log("   stream   ", stream);
+  console.log("   subs     ", subscription);
   for (const r of LIVE_RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
   console.log("   explorer ", `https://testnet.arcscan.app/address/${pool}`);
 

@@ -107,6 +107,12 @@ interface NodeOptions {
   swapOwner?: string;
   /** What `poolCount()` reports. */
   poolCount?: bigint;
+  /**
+   * Extra addresses that should report code. `adopt` only reuses an address
+   * that has some, so a test asserting "this was not redeployed" has to say
+   * that the recorded address is a real contract.
+   */
+  extraCode?: string[];
 }
 
 interface FakeNode {
@@ -128,7 +134,7 @@ async function startNode(opts: NodeOptions = {}): Promise<FakeNode> {
   // Every known address holds code, so `adopt` reuses. Freshly deployed ones are
   // added as they are created.
   const hasCode = new Set(
-    [...Object.values(EXISTING), USDC, EURC, CIRBTC].map((a) => a.toLowerCase()),
+    [...Object.values(EXISTING), USDC, EURC, CIRBTC, ...(opts.extraCode ?? [])].map((a) => a.toLowerCase()),
   );
   const pending = new Map<string, { name: string; contractAddress: string | null }>();
   let nonce = 0;
@@ -443,4 +449,52 @@ test("an unreadable pool count creates nothing rather than risking duplicates", 
   // The AMM itself still deployed and was recorded.
   const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
   assert.ok(record.tesseraAmm);
+});
+
+test("the guard, caps, and the two new payment shapes all land in one run", async (t) => {
+  // These were built and then not deployed, which is the same as not existing.
+  // A run has to produce all three addresses and arm the pool with them.
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
+
+  assert.match(stdout, /deploying TesseraPriceGuard/);
+  assert.match(stdout, /deploying TesseraStream/);
+  assert.match(stdout, /deploying TesseraSubscription/);
+
+  const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
+  for (const key of ["tesseraPriceGuard", "tesseraStream", "tesseraSubscription"]) {
+    assert.match(record[key], /^0x[0-9a-fA-F]{40}$/, `${key} recorded`);
+  }
+  // Three distinct contracts, not one address written three times.
+  const addrs = new Set([record.tesseraPriceGuard, record.tesseraStream, record.tesseraSubscription]);
+  assert.equal(addrs.size, 3);
+
+  // The guard is only useful if the pool is actually pointed at it, and the
+  // caps are only useful if they were set.
+  assert.ok(node.sent.includes("setPriceGuard"), "pool armed with the guard");
+  assert.ok(node.sent.includes("setCaps"), "exposure caps set");
+});
+
+test("a run against an existing record does not redeploy the new contracts", async (t) => {
+  // Redeploying a stream contract would strand every open stream in the old one.
+  const kept = {
+    tesseraPriceGuard: "0x0000000000000000000000000000000000000b01",
+    tesseraStream: "0x0000000000000000000000000000000000000b02",
+    tesseraSubscription: "0x0000000000000000000000000000000000000b03",
+  };
+  const node = await startNode({ swapOwner: COLLECTOR, extraCode: Object.values(kept) });
+  const dir = scratchTree({ ...BASE_RECORD, ...kept });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
+
+  assert.doesNotMatch(stdout, /deploying TesseraStream/);
+  assert.doesNotMatch(stdout, /deploying TesseraSubscription/);
+
+  const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
+  assert.equal(record.tesseraStream, "0x0000000000000000000000000000000000000b02");
+  assert.equal(record.tesseraSubscription, "0x0000000000000000000000000000000000000b03");
 });

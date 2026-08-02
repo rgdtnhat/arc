@@ -33,6 +33,14 @@ import { createProviderApp, type ProviderEvent } from "@tessera/providers";
 import { CATALOG } from "@tessera/providers/catalog";
 import { TesseraClient } from "./client.js";
 import { TesseraAgent, type AgentEvent, type LedgerEntry } from "./agent.js";
+import {
+  planDeleverage,
+  planLiquidation,
+  planSweep,
+  isLiquidatable,
+  DELEVERAGE_TRIGGER,
+  DELEVERAGE_TARGET,
+} from "./keeper.js";
 import { TrustMemory } from "./memory.js";
 import { describePolicy } from "./policy.js";
 import { AGENT_TASK, AGENT_POLICY } from "./scenario.js";
@@ -84,6 +92,18 @@ const PROVIDERS_PORT = 8788;
 // Cloud hosts inject $PORT; default to 8787 locally. Providers stay internal.
 const DASHBOARD_PORT = Number(process.env.PORT ?? 8787);
 const DASHBOARD_HOST = process.env.HOST ?? "0.0.0.0";
+
+/**
+ * How the keeper sizes the agent's operating float, in USDC base units.
+ *
+ * The float exists so the agent never has to wait for a vault withdrawal before
+ * it can buy something, so the buffer is set by liveness rather than by yield.
+ * The tolerance is the dead band that stops a balance sitting near the line from
+ * depositing and withdrawing on alternating ticks and paying gas for both.
+ */
+const KEEPER_BUFFER = 25_000_000n; // 25 USDC on hand
+const KEEPER_TOLERANCE = 5_000_000n; // 5 USDC either side
+const KEEPER_MIN_MOVE = 2_000_000n; // never pay gas to move less than 2 USDC
 const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
 
 // The Arc testnet deployment (contracts + wallets) recorded in deployments/arc.json.
@@ -1161,6 +1181,139 @@ async function main() {
         bidBps: a.bidBps,
         repayNow: fmtUnits(repayNow, debt.decimals),
         seizeNow: fmtUnits(seizeNow, col.decimals),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * What the keeper thinks should happen, right now.
+   *
+   * The decision functions in `keeper.ts` were pure and well tested and nothing
+   * called them, which is the same as not having them. This runs all three
+   * against live chain state and reports the answers: whether the agent's own
+   * position needs unwinding, whether its idle cash should move, and whether a
+   * given borrower can be auctioned and at what percentage.
+   *
+   * Read-only on purpose. Acting on any of these already has an endpoint behind
+   * `requireOperator`; what was missing was the judgement, not the buttons.
+   */
+  app.get("/api/keeper", async (req, res) => {
+    if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    try {
+      const me = client.account.address;
+      const target = String(req.query.user ?? me);
+      const watched = /^0x[0-9a-fA-F]{40}$/.test(target) ? (target as Hex) : me;
+
+      const [mine, theirs, walletBal] = await Promise.all([
+        poolClient.accountLimits(me),
+        watched.toLowerCase() === me.toLowerCase()
+          ? Promise.resolve(null)
+          : poolClient.accountLimits(watched),
+        client.usdcBalance().catch(() => 0n),
+      ]);
+
+      // The pool speaks in USD, the wallet in USDC base units. Everything the
+      // keeper compares against a limit has to be converted first — passing a
+      // raw token balance where a USD value is expected is off by the price
+      // scale, and the plan it produces is quietly wrong rather than obviously
+      // broken. Read the price and decimals the pool itself is using rather than
+      // assuming USDC is marked at exactly one dollar.
+      const usdcReserve = (await poolClient.public
+        .readContract({
+          address: poolClient.pool,
+          abi: tesseraPoolAbi,
+          functionName: "reserves",
+          args: [ARC_USDC_ADDRESS],
+        })
+        .catch(() => null)) as readonly unknown[] | null;
+      // Reserve tuple: enabled, borrowable, decimals, cFactor, liqFactor,
+      // lFactor, reserveFactor, price — price is index 7, after all four of the
+      // uint16 risk parameters.
+      const usdcDecimals = usdcReserve ? BigInt(usdcReserve[2] as number) : 6n;
+      const usdcPrice = usdcReserve ? (usdcReserve[7] as bigint) : 0n;
+      const toUsd = (amount: bigint) =>
+        usdcPrice === 0n ? 0n : (amount * usdcPrice) / 10n ** usdcDecimals;
+
+      // 1) The agent's own position. Being liquidated costs the liquidation
+      //    bonus, so this is the one that matters most.
+      let selfPlan: ReturnType<typeof planDeleverage> | null = null;
+      if (mine) {
+        selfPlan = planDeleverage({
+          limits: mine,
+          triggerHealth: DELEVERAGE_TRIGGER,
+          targetHealth: DELEVERAGE_TARGET,
+          // USDC's liability factor, the asset the agent borrows.
+          debtLFactorBps: 9_500n,
+          repayableValue: toUsd(walletBal),
+        });
+      }
+
+      // 2) Idle cash. Sized off the wallet and the vault position.
+      const vaultAssets = vaultClient
+        ? await vaultClient.snapshot(me).then((s) => s.userAssets).catch(() => 0n)
+        : 0n;
+      const sweep = planSweep({
+        wallet: walletBal,
+        vault: vaultAssets,
+        buffer: KEEPER_BUFFER,
+        tolerance: KEEPER_TOLERANCE,
+        minMove: KEEPER_MIN_MOVE,
+      });
+
+      // 3) Somebody else's position, if one was named.
+      let liquidation: { user: string; plan: ReturnType<typeof planLiquidation> } | null = null;
+      const other = theirs;
+      if (other && isLiquidatable(other)) {
+        liquidation = {
+          user: watched,
+          plan: planLiquidation({
+            limits: other,
+            totalDebtValue: other.liability,
+            collateralLiqFactorBps: 8_000n,
+            debtLFactorBps: 9_500n,
+            maxLotValue: other.liquidationLimit,
+          }),
+        };
+      }
+
+      const asStr = (v: bigint) => v.toString();
+      res.json({
+        ok: true,
+        agent: me,
+        self: selfPlan && mine
+          ? {
+              action: selfPlan.action,
+              healthNow: asStr(selfPlan.healthNow),
+              healthAfter: asStr(selfPlan.healthAfter),
+              repayValue: asStr(selfPlan.repayValue),
+              // The USD figure is what the plan reasons in; this is what an
+              // operator would actually pass to `repay`.
+              repayUsdc:
+                usdcPrice === 0n
+                  ? null
+                  : formatUsdc((selfPlan.repayValue * 10n ** usdcDecimals) / usdcPrice),
+              topUpValue: asStr(selfPlan.topUpValue),
+              partial: selfPlan.partial,
+              reason: selfPlan.reason,
+              liquidatable: isLiquidatable(mine),
+            }
+          : null,
+        float: {
+          walletUsdc: formatUsdc(walletBal),
+          vaultUsdc: formatUsdc(vaultAssets),
+          deltaIn: asStr(sweep.deltaIn),
+          direction: sweep.deltaIn > 0n ? "deposit" : sweep.deltaIn < 0n ? "withdraw" : "hold",
+          reason: sweep.reason,
+        },
+        liquidation: liquidation?.plan
+          ? {
+              user: liquidation.user,
+              percentBps: liquidation.plan.percentBps,
+              healthAfter: asStr(liquidation.plan.healthAfter),
+            }
+          : null,
       });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
