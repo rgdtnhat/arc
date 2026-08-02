@@ -17,6 +17,7 @@ import {
   formatUsdc,
   PaymentStatus,
   quoteTypedData,
+  receiptFromPayment,
   pacedHttp,
   type DefiOracle,
 } from "@tessera/shared";
@@ -454,7 +455,7 @@ export function createProviderApp(config: ProviderConfig): Express {
       res.status(400).json({ error: "unreadable paymentId" });
       return;
     }
-    const [, payProvider, amount, , qHash, , status] = payment;
+    const [payAgent, payProvider, amount, , qHash, , status] = payment;
 
     const known = issued.get(qHash);
     const ok =
@@ -517,7 +518,31 @@ export function createProviderApp(config: ProviderConfig): Express {
         txHash,
       });
       markInvoicePaid(svc.resource);
-      res.set(HEADERS.quote, rHash).json(body);
+
+      // Sign a receipt for what was actually served. The chain now says this
+      // payment was fulfilled against `rHash`; the receipt is what ties that
+      // hash to this body, this buyer, and this moment — the part a third party
+      // would need to adjudicate a dispute.
+      const issuedAt = BigInt(Math.floor(Date.now() / 1000));
+      const receiptSig = await wallet.signTypedData({
+        account: wallet.account!,
+        ...receiptFromPayment(
+          config.chain.id,
+          config.escrowAddress,
+          BigInt(paymentId),
+          { agent: getAddress(payAgent), provider, amount, responseHash: rHash },
+          svc.resource,
+          issuedAt,
+        ),
+      });
+
+      res
+        .set({
+          [HEADERS.quote]: rHash,
+          [HEADERS.receiptSig]: receiptSig,
+          [HEADERS.receiptIssued]: issuedAt.toString(),
+        })
+        .json(body);
     } catch (err) {
       res.status(500).json({ error: "fulfillment failed", detail: String(err) });
     }

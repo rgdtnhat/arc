@@ -12,6 +12,7 @@ import {
   HEADERS,
   PaymentStatus,
   arcTestnet,
+  receiptFromPayment,
   ARC_USDC_ADDRESS,
   tesseraFeeCollectorAbi,
   tesseraEscrowAbi,
@@ -3543,6 +3544,7 @@ async function main() {
         paymentId: e.paymentId,
         txs: e.txs,
         data: e.data,
+        receipt: e.receipt,
       })),
       events: events.map((e) => ({
         ts: e.ts,
@@ -3620,6 +3622,43 @@ async function main() {
     const approved = req.params.verdict === "approve";
     const ok = agent.approvals.resolve(id, approved);
     res.status(ok ? 200 : 404).json({ ok });
+  });
+
+  /**
+   * A receipt in the form a third party could actually check.
+   *
+   * The dashboard shows a green tick, but a tick is a claim about a check we
+   * ran ourselves. This returns the typed-data payload and the signature, so
+   * anyone can recover the signer independently and see that the provider
+   * committed to serving exactly this response for exactly this payment.
+   */
+  app.get("/api/receipt/:resource", async (req, res) => {
+    const entry = ledgerRef.find((e) => e.resource === req.params.resource);
+    if (!entry?.receipt || !entry.paymentId) {
+      res.status(404).json({ error: "no signed receipt for that resource" });
+      return;
+    }
+    const typed = receiptFromPayment(
+      client.public.chain!.id,
+      client.escrow,
+      BigInt(entry.paymentId),
+      {
+        agent: client.account.address,
+        provider: entry.provider,
+        amount: entry.receipt.amount,
+        responseHash: entry.receipt.responseHash,
+      },
+      entry.resource,
+      BigInt(entry.receipt.issuedAt),
+    );
+    res.json({
+      resource: entry.resource,
+      signature: entry.receipt.signature,
+      verified: entry.receipt.valid,
+      // Serialised so the JSON stays valid; the bigints are the whole point.
+      typedData: JSON.parse(JSON.stringify(typed, (_k, v) => (typeof v === "bigint" ? v.toString() : v))),
+      verifyWith: "viem verifyTypedData({ address: provider, signature, ...typedData })",
+    });
   });
 
   app.post("/api/run", requireOperator, async (_req, res) => {

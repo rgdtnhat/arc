@@ -5,6 +5,7 @@ import {
   PaymentStatus,
   arcscanTx,
   quoteTypedData,
+  receiptFromPayment,
   type Quote,
 } from "@tessera/shared";
 import { TesseraClient } from "./client.js";
@@ -58,6 +59,25 @@ export interface LedgerEntry {
   paymentId?: string;
   txs: { open?: string; settle?: string; refund?: string };
   data?: unknown;
+  /**
+   * The provider's signed statement of what it served. Kept alongside the
+   * response because the response on its own proves nothing — this is the half
+   * that a third party could check.
+   */
+  receipt?: {
+    signature: Hex;
+    issuedAt: string;
+    responseHash: Hex;
+    /**
+     * The escrowed amount the provider actually signed over, which is not
+     * necessarily the quoted price — the escrow only requires `amount >= price`.
+     * Kept so the receipt can be rebuilt exactly; rebuilding it from the quote
+     * would produce a payload that fails to verify whenever a buyer overpaid.
+     */
+    amount: bigint;
+    /** Whether the signature recovered to the provider that was paid. */
+    valid: boolean;
+  };
 }
 
 export interface AgentEvent {
@@ -356,6 +376,8 @@ export class TesseraAgent {
 
     // 3) Re-request with proof of payment.
     let body: unknown;
+    let receiptSig: Hex | null = null;
+    let receiptIssued: string | null = null;
     try {
       const res = await fetch(`${this.cfg.providersBaseUrl}${quote.url}`, {
         headers: { [HEADERS.payment]: paymentId.toString() },
@@ -363,6 +385,8 @@ export class TesseraAgent {
         // SLA deadline drive a refund instead.
         signal: AbortSignal.timeout(30_000),
       });
+      receiptSig = res.headers.get(HEADERS.receiptSig) as Hex | null;
+      receiptIssued = res.headers.get(HEADERS.receiptIssued);
       body = await res.json();
     } catch (err) {
       body = undefined;
@@ -374,6 +398,49 @@ export class TesseraAgent {
     if (payment.status === PaymentStatus.Fulfilled) {
       const integrity = keccak256(toHex(JSON.stringify(body))) === payment.responseHash;
       const quality = passesQuality(svc.resource, body);
+
+      // Keep the provider's signed receipt. This is evidence, not a gate: the
+      // chain already proves the payment was fulfilled against this hash, and
+      // refusing to settle over a missing signature would let a provider that
+      // genuinely delivered be punished for a dropped header.
+      if (receiptSig && receiptIssued) {
+        let valid = false;
+        try {
+          valid = await verifyTypedData({
+            address: quote.provider,
+            signature: receiptSig,
+            ...receiptFromPayment(
+              this.cfg.client.public.chain!.id,
+              this.cfg.client.escrow,
+              paymentId,
+              {
+                agent: this.cfg.client.account.address,
+                provider: quote.provider,
+                amount: payment.amount,
+                responseHash: payment.responseHash,
+              },
+              svc.resource,
+              BigInt(receiptIssued),
+            ),
+          });
+        } catch {
+          valid = false;
+        }
+        entry.receipt = {
+          signature: receiptSig,
+          issuedAt: receiptIssued,
+          responseHash: payment.responseHash,
+          amount: payment.amount,
+          valid,
+        };
+        if (!valid) {
+          this.emit({
+            level: "skip",
+            resource: svc.resource,
+            message: `Receipt signature from ${svc.name} did not verify — settling anyway, but the receipt is worthless`,
+          });
+        }
+      }
       if (integrity && quality.ok) {
         const settleTx = await this.cfg.client.settle(paymentId);
         entry.status = "settled";
