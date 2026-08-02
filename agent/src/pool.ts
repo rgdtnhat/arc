@@ -108,6 +108,118 @@ export class TesseraPoolClient {
     return this.write("repay", [asset, amount]);
   }
 
+  // --- backstop (first-loss capital) ----------------------------------------
+
+  async backstopDeposit(asset: Hex, amount: bigint): Promise<Hex> {
+    await this.ensureApproval(asset, amount);
+    return this.write("backstopDeposit", [asset, amount]);
+  }
+  async fundBackstop(asset: Hex, amount: bigint): Promise<Hex> {
+    await this.ensureApproval(asset, amount);
+    return this.write("fundBackstop", [asset, amount]);
+  }
+  async queueBackstopExit(asset: Hex, shares: bigint): Promise<Hex> {
+    return this.write("queueBackstopExit", [asset, shares]);
+  }
+  async cancelBackstopExit(asset: Hex): Promise<Hex> {
+    return this.write("cancelBackstopExit", [asset]);
+  }
+  async withdrawBackstop(asset: Hex): Promise<Hex> {
+    return this.write("withdrawBackstop", [asset]);
+  }
+
+  /**
+   * One asset's backstop state for a holder.
+   *
+   * `allowFailure` throughout because a pool deployed before the backstop
+   * existed has none of these selectors, and the app must show that pool
+   * without the section rather than failing to render the lending tab at all.
+   */
+  async backstopOf(asset: Hex, user?: Hex) {
+    const who = user ?? this.account.address;
+    const c = (functionName: string, args: unknown[]) =>
+      ({ address: this.pool, abi: tesseraPoolAbi, functionName, args }) as const;
+    const res = await this.public.multicall({
+      contracts: [
+        c("backstopBalance", [asset]),
+        c("backstopBalanceOf", [asset, who]),
+        c("backstopShares", [asset, who]),
+        c("backstopQueued", [asset, who]),
+        c("backstopUnlockAt", [asset, who]),
+        c("backstopTakeRate", []),
+      ] as never,
+      allowFailure: true,
+    });
+    const big = (i: number) => (res[i]?.status === "success" ? (res[i].result as bigint) : 0n);
+    return {
+      // The take-rate read is the tell for "does this pool have a backstop":
+      // it is the one call that cannot legitimately fail on a pool that does.
+      supported: res[5]?.status === "success",
+      pot: big(0),
+      myValue: big(1),
+      myShares: big(2),
+      queuedShares: big(3),
+      unlockAt: Number(big(4)),
+      takeRateBps: res[5]?.status === "success" ? Number(res[5].result) : 0,
+    };
+  }
+
+  // --- liquidation auctions --------------------------------------------------
+
+  async startAuction(user: Hex, debtAsset: Hex, collateralAsset: Hex, percentBps: number): Promise<Hex> {
+    return this.write("startLiquidationAuction", [user, debtAsset, collateralAsset, percentBps]);
+  }
+  async fillAuction(user: Hex, debtAsset: Hex, fillBps: number): Promise<Hex> {
+    // The filler pays the debt asset, so the pool needs an allowance for it.
+    // Approving the maximum here rather than the exact bid: the bid moves with
+    // the auction ramp between the read and the fill, and an approval that was
+    // exact a block ago is the most common way a fill reverts.
+    await this.ensureApproval(debtAsset, maxUint256 / 2n);
+    return this.write("fillLiquidationAuction", [user, fillBps]);
+  }
+  async cancelAuction(user: Hex): Promise<Hex> {
+    return this.write("cancelLiquidationAuction", [user]);
+  }
+  async clearBadDebt(user: Hex, asset: Hex): Promise<Hex> {
+    return this.write("clearBadDebt", [user, asset]);
+  }
+
+  /** An account's open auction and the terms it is offering right now. */
+  async auctionOf(user: Hex) {
+    const r = await this.public
+      .readContract({ address: this.pool, abi: tesseraPoolAbi, functionName: "auctionData", args: [user] })
+      .catch(() => null);
+    if (!r) return { supported: false, open: false } as const;
+    const [startedAt, debtAsset, collateralAsset, debtAmount, collateralAmount, filledBps, lotBps, bidBps] =
+      r as readonly [bigint, Hex, Hex, bigint, bigint, number, number, number];
+    return {
+      supported: true,
+      open: startedAt > 0n,
+      startedAt: Number(startedAt),
+      debtAsset,
+      collateralAsset,
+      debtAmount,
+      collateralAmount,
+      filledBps,
+      lotBps,
+      bidBps,
+    } as const;
+  }
+
+  /** The two lines a borrower cares about, plus their weighted liability. */
+  async accountLimits(user?: Hex) {
+    const r = (await this.public
+      .readContract({
+        address: this.pool,
+        abi: tesseraPoolAbi,
+        functionName: "accountLimits",
+        args: [user ?? this.account.address],
+      })
+      .catch(() => null)) as readonly [bigint, bigint, bigint] | null;
+    if (!r) return null;
+    return { borrowLimit: r[0], liquidationLimit: r[1], liability: r[2] };
+  }
+
   async accountData(user?: Hex): Promise<{
     supplyValue: bigint;
     borrowValue: bigint;

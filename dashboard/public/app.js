@@ -1947,6 +1947,246 @@ const $ = (id) => document.getElementById(id);
       }
 
       /** Everything one DeFi tab needs beyond its own card. */
+      /* ===================================================================
+       * Backstop and liquidation auctions.
+       *
+       * Both are read-public. Cover is what a supplier is really relying on, so
+       * hiding it behind a login would be hiding the risk; and a descending
+       * auction that only the operator can see clears at its floor instead of
+       * at what the market would actually pay.
+       * =================================================================== */
+      let backstopAssets = [];
+
+      async function loadBackstop() {
+        const body = $("backstopRows");
+        if (!body) return;
+        try {
+          const r = await (await fetch("/api/lending/backstop")).json();
+          const notReady = $("backstopNotReady");
+          if (!r.ok) { body.innerHTML = emptyRow(4, "Backstop unavailable."); return; }
+          if (!r.supported) {
+            // A pool deployed before the backstop existed has none of these
+            // functions. Say which, rather than showing an empty table that
+            // reads as "nobody has put up cover".
+            if (notReady) { notReady.style.display = ""; notReady.textContent = r.note || "This pool has no backstop."; }
+            body.innerHTML = emptyRow(4, "Not available on this pool.");
+            const box = $("backstopBox"); if (box) box.style.display = "none";
+            return;
+          }
+          if (notReady) notReady.style.display = "none";
+          backstopAssets = r.assets || [];
+          const rate = $("backstopRate");
+          if (rate) {
+            // Its own element rather than rewriting the paragraph: this refreshes
+            // on every poll, and appending to innerHTML would stack a new
+            // sentence onto the last one each time.
+            rate.innerHTML = r.takeRateBps
+              ? `<b>Currently ${esc(String(r.takeRateBps / 100))}% of borrower interest</b> is routed here.`
+              : "<b>No share of interest is routed here yet</b> — an operator sets the take rate.";
+          }
+          body.innerHTML = backstopAssets
+            .map((a) => {
+              const queued = a.queuedShares !== "0";
+              const ready = queued && a.unlockIn === 0;
+              const days = Math.ceil(a.unlockIn / 86400);
+              const queueCell = !queued
+                ? '<span style="color:var(--muted)">—</span>'
+                : ready
+                  ? '<span class="tag ok">unlocked — withdrawable now</span>'
+                  : `<span class="tag warn">${esc(String(days))} day${days === 1 ? "" : "s"} left</span>`;
+              return (
+                `<tr><td><b>${esc(a.symbol)}</b></td>` +
+                `<td class="num">${esc(a.pot)}</td>` +
+                `<td class="num">${esc(a.myValue)}</td>` +
+                `<td>${queueCell}</td></tr>`
+              );
+            })
+            .join("") || emptyRow(4, "No reserves.");
+
+          const box = $("backstopBox");
+          if (box) {
+            box.style.display = adminId ? "" : "none";
+            const sel = $("bsAsset");
+            if (sel && sel.options.length !== backstopAssets.length) {
+              sel.innerHTML = backstopAssets
+                .map((a) => `<option value="${esc(a.address)}" data-dec="${Number(a.decimals) || 6}">${esc(a.symbol)}</option>`)
+                .join("");
+            }
+          }
+        } catch {
+          body.innerHTML = emptyRow(4, "Backstop unavailable.");
+        }
+      }
+
+      function bsShow(text, colour) {
+        const m = $("backstopMsg");
+        if (!m) return;
+        m.style.display = "block"; m.textContent = text; m.style.color = colour;
+      }
+
+      function wireBackstop() {
+        const pick = () => {
+          const sel = $("bsAsset");
+          const addr = sel && sel.value;
+          return backstopAssets.find((a) => a.address === addr) || null;
+        };
+        const post = async (path, query, label) => {
+          try {
+            const r = await (await postAuthed(path + (query ? "?" + query : ""))).json();
+            bsShow(r.ok ? `${label} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`,
+                   r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) { $("bsAmount").value = ""; loadBackstop(); afterTx(); }
+          } catch {
+            bsShow("request failed", "var(--warn)");
+          }
+        };
+        const amountAction = (btnId, action, label, sharesNotAssets) => {
+          const btn = $(btnId);
+          if (!btn) return;
+          btn.addEventListener("click", () => {
+            const a = pick();
+            if (!a) return bsShow("Pick an asset.", "var(--warn)");
+            const human = $("bsAmount").value.trim();
+            if (!human || !(parseFloat(human) > 0)) return bsShow("Enter an amount above zero.", "var(--warn)");
+            // Queueing an exit is denominated in *shares*, not assets: a share
+            // is a claim on a pot whose value moves, so asking for "50 USDC out"
+            // would be a number that stops meaning anything the moment interest
+            // accrues or a loss lands.
+            const raw = sharesNotAssets ? String(BigInt(Math.floor(Number(human)))) : toRaw(human, a.decimals);
+            post(`/api/lending/backstop/${action}`, `asset=${a.address}&amount=${raw}`, label);
+          });
+        };
+        amountAction("bsDeposit", "deposit", "cover deposited", false);
+        amountAction("bsQueue", "queue", "exit queued", true);
+        for (const [btnId, action, label] of [
+          ["bsCancel", "cancel", "exit cancelled"],
+          ["bsWithdraw", "withdraw", "cover withdrawn"],
+        ]) {
+          const btn = $(btnId);
+          if (!btn) continue;
+          btn.addEventListener("click", () => {
+            const a = pick();
+            if (!a) return bsShow("Pick an asset.", "var(--warn)");
+            post(`/api/lending/backstop/${action}`, `asset=${a.address}`, label);
+          });
+        }
+      }
+
+      function auShow(text, colour) {
+        const m = $("auctionMsg");
+        if (!m) return;
+        m.style.display = "block"; m.textContent = text; m.style.color = colour;
+      }
+
+      async function loadAuction() {
+        const status = $("auStatus");
+        if (!status) return;
+        const user = ($("auUser").value || "").trim();
+        const openBox = $("auOpenBox"), actions = $("auActions");
+        if (!/^0x[0-9a-fA-F]{40}$/.test(user)) {
+          status.textContent = "Enter a borrower address to look up.";
+          if (openBox) openBox.style.display = "none";
+          if (actions) actions.style.display = "none";
+          return;
+        }
+        // Populate the asset pickers from the same list the backstop uses, so
+        // the two cards can never disagree about which reserves exist.
+        for (const id of ["auDebt", "auCollateral", "auDebtAsset2"]) {
+          const sel = $(id);
+          if (sel && sel.options.length !== backstopAssets.length && backstopAssets.length) {
+            sel.innerHTML = backstopAssets.map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`).join("");
+          }
+        }
+        try {
+          const r = await (await fetch(`/api/lending/auction?user=${encodeURIComponent(user)}`)).json();
+          if (!r.ok) { status.textContent = `Lookup failed: ${r.error}`; return; }
+          if (!r.supported) {
+            status.textContent = "This pool was deployed before auctions existed.";
+            if (openBox) openBox.style.display = "none";
+            if (actions) actions.style.display = "none";
+            return;
+          }
+          if (actions) actions.style.display = adminId ? "" : "none";
+          if (!r.open) {
+            if (openBox) openBox.style.display = "none";
+            status.innerHTML = r.liquidatable
+              ? '<span class="tag warn">liquidatable</span> No auction is running against this account yet. ' +
+                "Pick a percentage that lands its health factor inside the band and start one."
+              : '<span class="tag ok">healthy</span> This account is above its liquidation threshold, so no auction can be opened against it.';
+            return;
+          }
+          if (openBox) openBox.style.display = "";
+          const phase = r.bidBps >= 10000
+            ? "ramping up — the lot is still growing, the full debt is demanded"
+            : "past the midpoint — the whole lot is on offer and the debt demanded is falling";
+          status.innerHTML =
+            `<span class="tag warn">auction open</span> ${esc(String(Math.floor(r.elapsed / 60)))}m ${esc(String(r.elapsed % 60))}s in · ${esc(phase)}`;
+          const row = (k, v) => `<tr><td style="color:var(--muted)">${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`;
+          $("auRows").innerHTML =
+            row("Debt auctioned", `${r.debtAmount} ${r.debtSymbol}`) +
+            row("Collateral lot", `${r.collateralAmount} ${r.collateralSymbol}`) +
+            row("Filled so far", `${r.filledBps / 100}%`) +
+            row("Lot on offer now", `${r.lotBps / 100}%`) +
+            row("Debt demanded now", `${r.bidBps / 100}%`) +
+            // The two numbers a liquidator actually decides on. The percentages
+            // above are the mechanism; these are the trade.
+            row("Take the rest now: you pay", `${r.repayNow} ${r.debtSymbol}`) +
+            row("…and receive", `${r.seizeNow} ${r.collateralSymbol}`);
+        } catch {
+          status.textContent = "Lookup failed.";
+        }
+      }
+
+      function wireAuction() {
+        if ($("auLoad")) $("auLoad").addEventListener("click", () => loadAuction());
+        if ($("auUser")) {
+          $("auUser").addEventListener("keydown", (e) => { if (e.key === "Enter") loadAuction(); });
+        }
+        const user = () => ($("auUser").value || "").trim();
+        const post = async (path, body, label) => {
+          if (!/^0x[0-9a-fA-F]{40}$/.test(user())) return auShow("Enter a borrower address first.", "var(--warn)");
+          try {
+            const r = await (await postJson(path, body)).json();
+            auShow(r.ok ? `${label} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`,
+                   r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) { loadAuction(); afterTx(); }
+          } catch {
+            auShow("request failed", "var(--warn)");
+          }
+        };
+        const pct = () => {
+          const v = parseFloat(($("auPct").value || "").trim());
+          return Number.isFinite(v) && v > 0 && v <= 100 ? Math.round(v * 100) : null;
+        };
+        if ($("auStart")) {
+          $("auStart").addEventListener("click", () => {
+            const p = pct();
+            if (p === null) return auShow("Enter a percentage between 0 and 100.", "var(--warn)");
+            post("/api/lending/auction/start", {
+              user: user(), percentBps: p,
+              debtAsset: $("auDebt").value, collateralAsset: $("auCollateral").value,
+            }, "auction started");
+          });
+        }
+        if ($("auFill")) {
+          $("auFill").addEventListener("click", () => {
+            const p = pct();
+            if (p === null) return auShow("Enter a percentage between 0 and 100.", "var(--warn)");
+            post("/api/lending/auction/fill", { user: user(), fillBps: p }, "auction filled");
+          });
+        }
+        if ($("auCancel")) {
+          $("auCancel").addEventListener("click", () => post("/api/lending/auction/cancel", { user: user() }, "auction cancelled"));
+        }
+        if ($("auClearDebt")) {
+          $("auClearDebt").addEventListener("click", () =>
+            post("/api/lending/auction/cleardebt", { user: user(), asset: $("auDebtAsset2").value }, "bad debt cleared"));
+        }
+      }
+
+      wireBackstop();
+      wireAuction();
+
       function loadVenuePanels(key) {
         // Only the visible venue polls; leaving a tab mid-scan shouldn't keep
         // a timer alive for a card nobody is looking at.
@@ -1955,7 +2195,7 @@ const $ = (id) => document.getElementById(id);
         }
         loadHolders(key);
         loadVenueChart(key);
-        if (key === "Lending") loadPoolPrices();
+        if (key === "Lending") { loadPoolPrices(); loadBackstop(); loadAuction(); }
       }
 
       /** Reverse a swap pair. Two selects, one click — the common second trade. */

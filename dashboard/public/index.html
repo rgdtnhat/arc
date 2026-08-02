@@ -1258,6 +1258,87 @@
             <p class="feedNote" id="poolPriceNote" style="margin-top:8px"></p>
           </div>
 
+          <!-- First-loss capital and the auction that clears a bad position.
+               Both are read-public on purpose: someone deciding whether to
+               supply here should see how much cover stands in front of them,
+               and a descending auction nobody can watch clears at the floor
+               rather than at the market's answer. -->
+          <div class="card" id="backstopCard">
+            <h2>🛡️ Backstop — who takes the loss first</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px" id="backstopIntro">
+              A lending pool needs someone standing in front of its depositors, and that someone should
+              be paid for it rather than volunteered. Backstop depositors earn a share of every unit of
+              borrower interest; in exchange, when a position ends up with debt and no collateral, that
+              loss is paid out of the backstop <b>before</b> it reaches supplier balances. Exits are
+              queued for 21 days — capital that can leave the moment a loss becomes visible is not
+              insurance. <span id="backstopRate"></span>
+            </div>
+            <div class="notready" id="backstopNotReady" style="display:none"></div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr>
+                <th>Asset</th><th class="num">Cover in the pot</th>
+                <th class="num">Your position</th><th>Exit queue</th>
+              </tr></thead>
+              <tbody id="backstopRows"></tbody>
+            </table></div>
+            <div id="backstopBox" style="display:none;margin-top:11px">
+              <div class="row-actions">
+                <input id="bsAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
+                <select id="bsAsset" class="field"></select>
+                <button class="btn" id="bsDeposit">Deposit cover</button>
+                <button class="btn" id="bsQueue">Queue exit</button>
+                <button class="btn" id="bsCancel">Cancel exit</button>
+                <button class="btn" id="bsWithdraw">Withdraw</button>
+              </div>
+              <div class="kv" id="backstopMsg" style="margin-top:9px;display:none"></div>
+            </div>
+          </div>
+
+          <div class="card" id="auctionCard">
+            <h2>⚖️ Liquidation auction — clearing a position at a discovered price</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
+              The immediate path repays up to half a debt at a fixed 10% bonus, which is a guess: too
+              much for a position that would clear at 2%, too little for one nobody will touch under
+              20%. An auction ramps instead — it opens at terms no liquidator would take and improves
+              every second until someone does. It can take the whole debt rather than half, and it can
+              be filled in parts, so several liquidators can clear a position together instead of one
+              needing the entire repayment on hand. The percentage must leave the borrower's health
+              factor between <b>1.03</b> and <b>1.15</b>: below that they are liquidatable again on the
+              next tick of interest, above it more collateral was sold than the problem required.
+            </div>
+            <div class="row-actions">
+              <input id="auUser" class="field mono" placeholder="Borrower address (0x…)" style="min-width:270px;flex:1" />
+              <button class="btn" id="auLoad">Look up</button>
+            </div>
+            <div id="auStatus" style="font-size:13px;margin-top:10px"></div>
+            <div id="auOpenBox" style="display:none;margin-top:11px">
+              <div class="tblWrap auto"><table class="data" style="min-width:0">
+                <tbody id="auRows"></tbody>
+              </table></div>
+            </div>
+            <div id="auActions" style="display:none;margin-top:11px">
+              <div class="row-actions">
+                <input id="auPct" class="field" inputmode="numeric" placeholder="Percent" style="width:110px" />
+                <select id="auDebt" class="field"></select>
+                <select id="auCollateral" class="field"></select>
+                <button class="btn" id="auStart">Start auction</button>
+                <button class="btn primary" id="auFill">Fill</button>
+                <button class="btn" id="auCancel">Cancel</button>
+              </div>
+              <div style="font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.55">
+                Percent is of the borrower's debt when starting, and of what is <b>left</b> of the
+                auction when filling. A position with debt and no collateral left cannot be auctioned at
+                all — it is written off with <b>Clear bad debt</b>, which pays it out of the backstop
+                first and only then reduces every supplier's claim pro rata.
+              </div>
+              <div class="row-actions" style="margin-top:9px">
+                <select id="auDebtAsset2" class="field"></select>
+                <button class="btn" id="auClearDebt">Clear bad debt</button>
+              </div>
+              <div class="kv" id="auctionMsg" style="margin-top:9px;display:none"></div>
+            </div>
+          </div>
+
           <div class="card" id="holdLendingCard">
             <h2>👥 Suppliers — who is lending into this pool</h2>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">Every address the pool has ever credited, ranked by the pool's own USD valuation of their supply — the same figure it lends and liquidates against.</div>

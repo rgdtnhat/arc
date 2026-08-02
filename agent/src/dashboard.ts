@@ -56,6 +56,7 @@ import { TesseraPoolClient } from "./pool.js";
 import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
+import { fillPreview } from "./auction.js";
 import { priceImpact, maxInputWithin, IMPACT_MAX_PCT } from "./impact.js";
 import { DefiOracle } from "@tessera/shared";
 import { AdminAuth } from "./auth.js";
@@ -1001,6 +1002,215 @@ async function main() {
         category: "defi", action: req.params.action, status: "failed",
         assetAddress: asset, raw: amount, detail: friendlyError(e),
       });
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* --- Backstop: first-loss capital -----------------------------------------
+   *
+   * A depositor here is paid a share of borrower interest and is the first
+   * balance a bad debt is written against. Reads are public — anyone deciding
+   * whether to supply to this pool should be able to see how much cover stands
+   * in front of them — while the writes spend the app wallet and are operator
+   * gated like every other DeFi action. */
+  /**
+   * Chain time, not wall time.
+   *
+   * Both the auction ramp and the backstop queue are decided by the chain's
+   * clock, so a countdown derived from `Date.now()` can disagree with the terms
+   * printed next to it — by the block interval normally, and by however far the
+   * server has drifted otherwise. Reading the head block costs one call and
+   * makes the two numbers describe the same instant.
+   */
+  async function chainSeconds(): Promise<number> {
+    try {
+      return Number(await client.chainTime());
+    } catch {
+      return Math.floor(Date.now() / 1000);
+    }
+  }
+
+  app.get("/api/lending/backstop", async (req, res) => {
+    if (!poolClient || !poolDeployment) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    try {
+      const now = await chainSeconds();
+      const who = /^0x[0-9a-fA-F]{40}$/.test(String(req.query.user ?? ""))
+        ? (req.query.user as Hex)
+        : (agentAccount.address as Hex);
+      const rows = await Promise.all(
+        (poolDeployment.assets ?? []).map(async (a) => {
+          const b = await poolClient!.backstopOf(a.address as Hex, who);
+          const { decimals, symbol } = assetMeta(a.address as Hex);
+          return {
+            symbol,
+            address: a.address,
+            decimals,
+            supported: b.supported,
+            pot: fmtUnits(b.pot, decimals),
+            myValue: fmtUnits(b.myValue, decimals),
+            myShares: b.myShares.toString(),
+            queuedShares: b.queuedShares.toString(),
+            unlockAt: b.unlockAt,
+            // Seconds until the queued shares can be withdrawn; 0 = now.
+            unlockIn: b.unlockAt === 0 ? 0 : Math.max(0, b.unlockAt - now),
+            takeRateBps: b.takeRateBps,
+          };
+        }),
+      );
+      const supported = rows.some((r) => r.supported);
+      res.json({
+        ok: true,
+        supported,
+        user: who,
+        takeRateBps: rows.find((r) => r.supported)?.takeRateBps ?? 0,
+        queuePeriodDays: 21,
+        assets: rows,
+        note: supported
+          ? undefined
+          : "This pool was deployed before the backstop existed. Deploy a replacement pool to get it.",
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/lending/backstop/:action", requireOperator, async (req, res) => {
+    if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    const asset = (req.query.asset as Hex) ?? usdcAddress;
+    const amount = BigInt((req.query.amount as string) ?? "0");
+    const a = req.params.action;
+    try {
+      const p = poolClient;
+      const txHash =
+        a === "deposit" ? await p.backstopDeposit(asset, amount)
+        : a === "fund" ? await p.fundBackstop(asset, amount)
+        : a === "queue" ? await p.queueBackstopExit(asset, amount)
+        : a === "cancel" ? await p.cancelBackstopExit(asset)
+        : a === "withdraw" ? await p.withdrawBackstop(asset)
+        : null;
+      if (txHash === null) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
+      logTx(req, {
+        category: "defi", action: `backstop-${a}`, status: "success",
+        assetAddress: asset, raw: amount, txHash,
+      });
+      invalidateAll();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      logTx(req, {
+        category: "defi", action: `backstop-${a}`, status: "failed",
+        assetAddress: asset, raw: amount, detail: friendlyError(e),
+      });
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* --- Liquidation auctions --------------------------------------------------
+   *
+   * The read is public because an auction only works if anyone can see it: a
+   * descending price nobody is watching clears at the floor rather than at the
+   * market's answer. */
+  app.get("/api/lending/auction", async (req, res) => {
+    if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    const user = String(req.query.user ?? "");
+    if (!/^0x[0-9a-fA-F]{40}$/.test(user)) { res.status(400).json({ ok: false, error: "user address required" }); return; }
+    try {
+      const [a, now] = await Promise.all([poolClient.auctionOf(user as Hex), chainSeconds()]);
+      if (!a.supported) { res.json({ ok: true, supported: false, open: false }); return; }
+      if (!a.open) {
+        const limits = await poolClient.accountLimits(user as Hex);
+        res.json({
+          ok: true,
+          supported: true,
+          open: false,
+          // Whether an auction *could* be opened, so the UI can say "healthy"
+          // rather than leaving a start button that always reverts.
+          liquidatable: limits ? limits.liability > limits.liquidationLimit : false,
+        });
+        return;
+      }
+      const debt = assetMeta(a.debtAsset);
+      const col = assetMeta(a.collateralAsset);
+      // What a filler taking the whole remainder would pay and receive at the
+      // terms on offer right now. This is the number a liquidator decides on;
+      // the raw lot and bid percentages on their own are not. Computed by the
+      // same shared helper the unit tests exercise, in the contract's own
+      // multiply-then-divide order, so the preview and the fill agree to the wei.
+      const { repay: repayNow, seize: seizeNow } = fillPreview(
+        a.debtAmount,
+        a.collateralAmount,
+        a.filledBps,
+        10_000,
+        { lotBps: a.lotBps, bidBps: a.bidBps },
+      );
+      res.json({
+        ok: true,
+        supported: true,
+        open: true,
+        user,
+        startedAt: a.startedAt,
+        elapsed: Math.max(0, now - a.startedAt),
+        debtAsset: a.debtAsset,
+        debtSymbol: debt.symbol,
+        collateralAsset: a.collateralAsset,
+        collateralSymbol: col.symbol,
+        debtAmount: fmtUnits(a.debtAmount, debt.decimals),
+        collateralAmount: fmtUnits(a.collateralAmount, col.decimals),
+        filledBps: a.filledBps,
+        lotBps: a.lotBps,
+        bidBps: a.bidBps,
+        repayNow: fmtUnits(repayNow, debt.decimals),
+        seizeNow: fmtUnits(seizeNow, col.decimals),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/lending/auction/:action", requireOperator, async (req, res) => {
+    if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    const user = String(req.body?.user ?? req.query.user ?? "");
+    if (!/^0x[0-9a-fA-F]{40}$/.test(user)) { res.status(400).json({ ok: false, error: "user address required" }); return; }
+    const a = req.params.action;
+    try {
+      const p = poolClient;
+      let txHash: Hex;
+      if (a === "start") {
+        const pct = Number(req.body?.percentBps ?? req.query.percentBps ?? 0);
+        if (!Number.isInteger(pct) || pct <= 0 || pct > 10_000) {
+          res.status(400).json({ ok: false, error: "percentBps must be 1…10000" });
+          return;
+        }
+        txHash = await p.startAuction(
+          user as Hex,
+          (req.body?.debtAsset ?? req.query.debtAsset ?? usdcAddress) as Hex,
+          (req.body?.collateralAsset ?? req.query.collateralAsset ?? usdcAddress) as Hex,
+          pct,
+        );
+      } else if (a === "fill") {
+        const pct = Number(req.body?.fillBps ?? req.query.fillBps ?? 0);
+        if (!Number.isInteger(pct) || pct <= 0 || pct > 10_000) {
+          res.status(400).json({ ok: false, error: "fillBps must be 1…10000" });
+          return;
+        }
+        // Read the auction rather than trusting the caller for the debt asset:
+        // an allowance approved for the wrong token is a revert with no useful
+        // message attached.
+        const live = await p.auctionOf(user as Hex);
+        if (!live.supported || !live.open) { res.status(400).json({ ok: false, error: "no open auction" }); return; }
+        txHash = await p.fillAuction(user as Hex, live.debtAsset, pct);
+      } else if (a === "cancel") {
+        txHash = await p.cancelAuction(user as Hex);
+      } else if (a === "cleardebt") {
+        txHash = await p.clearBadDebt(user as Hex, (req.body?.asset ?? req.query.asset ?? usdcAddress) as Hex);
+      } else {
+        res.status(400).json({ ok: false, error: "unknown action" });
+        return;
+      }
+      logTx(req, { category: "defi", action: `auction-${a}`, status: "success", txHash, detail: user });
+      invalidateAll();
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      logTx(req, { category: "defi", action: `auction-${a}`, status: "failed", detail: friendlyError(e) });
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
