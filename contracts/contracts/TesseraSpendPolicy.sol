@@ -317,6 +317,115 @@ contract TesseraSpendPolicy is ReentrancyGuard {
         emit PaymentClosed(paymentId, refunded, credit);
     }
 
+    // --- delegating to a sub-agent -------------------------------------------
+    //
+    // One agent, one key, one flat cap does not describe how agentic work
+    // actually runs. An agent that spawns a sub-task wants to hand it a budget
+    // it *cannot* exceed and cannot reach past — otherwise delegating means
+    // handing over the whole allowance and hoping.
+    //
+    // A delegation is a slice of this policy's budget, not a new pot: a
+    // sub-agent's spending is charged to the parent's caps as well as its own,
+    // so a parent can never delegate its way around its own limit. Ten children
+    // with 50 each still cannot move more than the parent's period cap between
+    // them.
+
+    struct Delegation {
+        bool active;
+        uint256 cap;   // most this sub-agent may spend per parent period
+        uint256 spent; // within `window`
+        uint256 window;
+    }
+
+    /// @notice sub-agent => what it may spend on this policy's behalf.
+    mapping(address => Delegation) public delegationOf;
+
+    event Delegated(address indexed subAgent, uint256 cap);
+    event DelegationRevoked(address indexed subAgent);
+    event SubSpent(address indexed subAgent, address indexed to, uint256 amount, uint256 remaining);
+
+    error NotDelegate();
+    error DelegationCapExceeded(uint256 requested, uint256 remaining);
+
+    /**
+     * @notice Give a sub-agent a slice of this policy's allowance.
+     * @dev Agent or guardian. The agent may delegate because splitting work is
+     *      the agent's job; it cannot thereby spend more than it already could,
+     *      since every sub-spend is charged to the parent caps too.
+     */
+    function delegate(address subAgent, uint256 cap) external {
+        if (msg.sender != agent && msg.sender != guardian) revert NotAgent();
+        if (subAgent == address(0) || subAgent == agent) revert NotAllowed(subAgent);
+        if (cap == 0) revert ZeroAmount();
+        Delegation storage d = delegationOf[subAgent];
+        d.active = true;
+        d.cap = cap;
+        emit Delegated(subAgent, cap);
+    }
+
+    /**
+     * @notice End a delegation.
+     * @dev Guardian too, not only the agent — a sub-agent that has gone wrong is
+     *      most likely to need stopping when the agent that spawned it is the
+     *      thing that went wrong.
+     */
+    function revokeDelegation(address subAgent) external {
+        if (msg.sender != agent && msg.sender != guardian) revert NotAgent();
+        delegationOf[subAgent].active = false;
+        emit DelegationRevoked(subAgent);
+    }
+
+    /// @notice What a sub-agent may still spend this period.
+    function remainingForDelegate(address subAgent) public view returns (uint256) {
+        Delegation storage d = delegationOf[subAgent];
+        if (!d.active) return 0;
+        uint256 w = _window(policy.periodSeconds);
+        uint256 used = d.window == w ? d.spent : 0;
+        // The delegation's own headroom. The parent's caps bind as well, but
+        // they are per-token and this view is not, so `subSpend` is where both
+        // are actually checked — a caller that needs the true figure should ask
+        // for `remainingThisPeriod(token)` too and take the smaller.
+        return d.cap > used ? d.cap - used : 0;
+    }
+
+    /**
+     * @notice Spend as a sub-agent, against both its own cap and the parent's.
+     * @dev Charged twice on purpose. Its own cap is what makes the delegation
+     *      bounded; the parent's is what stops delegation being a way around the
+     *      policy. Failing either refuses the spend.
+     */
+    function subSpend(address token, address to, uint256 amount)
+        external
+        nonReentrant
+        returns (uint256 remaining)
+    {
+        Delegation storage d = delegationOf[msg.sender];
+        if (!d.active) revert NotDelegate();
+        if (paused) revert IsPaused();
+        if (amount == 0) revert ZeroAmount();
+        if (to == address(0)) revert NotAllowed(to);
+
+        Policy memory p = policy;
+        if (p.expiresAt != 0 && block.timestamp > p.expiresAt) revert Expired();
+        if (p.allowlistOnly && !allowed[to]) revert NotAllowed(to);
+
+        uint256 w = _window(p.periodSeconds);
+        uint256 used = d.window == w ? d.spent : 0;
+        if (used + amount > d.cap) {
+            revert DelegationCapExceeded(amount, d.cap > used ? d.cap - used : 0);
+        }
+
+        // The parent's caps apply as well, and revert first if they bind.
+        _charge(p, token, to, amount);
+
+        d.window = w;
+        d.spent = used + amount;
+
+        if (!IERC20P(token).transfer(to, amount)) revert TransferFailed();
+        remaining = d.cap - d.spent;
+        emit SubSpent(msg.sender, to, amount, remaining);
+    }
+
     /**
      * @notice Anyone may add funds. Topping up somebody's spending limit can
      *         only ever help them, so there is nothing to gate.

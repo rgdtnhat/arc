@@ -202,3 +202,93 @@ describe("TesseraSpendPolicy paying through the escrow", () => {
     ).to.be.rejected;
   });
 });
+
+/**
+ * Delegation.
+ *
+ * One agent, one key, one flat cap is not how agentic work runs. An agent that
+ * spawns a sub-task wants to hand it a budget it cannot exceed and cannot reach
+ * past — and, crucially, delegating must not be a way around the agent's own
+ * limit.
+ */
+describe("TesseraSpendPolicy — sub-agent budgets", () => {
+  it("lets a sub-agent spend its slice", async () => {
+    const { guardian, agent, provider, other, usdc, policy, as } = await loadFixture(deployFixture);
+    await (await as(agent)).write.delegate([other.account.address, U(100)]);
+    await (await as(other)).write.subSpend([usdc.address, provider.account.address, U(40)]);
+    expect(await usdc.read.balanceOf([provider.account.address])).to.equal(U(40));
+    expect(await policy.read.remainingForDelegate([other.account.address])).to.equal(U(60));
+    void guardian;
+  });
+
+  it("stops the sub-agent at its own cap", async () => {
+    const { agent, provider, other, usdc, as } = await loadFixture(deployFixture);
+    await (await as(agent)).write.delegate([other.account.address, U(100)]);
+    await (await as(other)).write.subSpend([usdc.address, provider.account.address, U(100)]);
+    await expect((await as(other)).write.subSpend([usdc.address, provider.account.address, U(1)])).to.be.rejected;
+  });
+
+  it("charges the parent too, so delegation is not a way around the cap", async () => {
+    // The property that matters. The parent may spend 500 a day; handing out
+    // three 400-budgets must not make that 1200.
+    const { guardian, agent, provider, other, usdc, policy, as } = await loadFixture(deployFixture);
+    const [, , , , kid2, kid3] = await hre.viem.getWalletClients();
+    for (const kid of [other, kid2, kid3]) {
+      await (await as(agent)).write.delegate([kid.account.address, U(400)]);
+    }
+
+    let moved = 0n;
+    for (const kid of [other, kid2, kid3]) {
+      try {
+        await (await as(kid)).write.subSpend([usdc.address, provider.account.address, U(180)]);
+        moved += U(180);
+      } catch { /* parent cap bit */ }
+    }
+    expect(moved <= U(500), `three children moved ${moved} against a 500 parent cap`).to.equal(true);
+    expect(await policy.read.remainingThisPeriod([usdc.address])).to.be.a("bigint");
+    void guardian;
+  });
+
+  it("refuses a stranger with no delegation", async () => {
+    const { provider, other, usdc, as } = await loadFixture(deployFixture);
+    await expect((await as(other)).write.subSpend([usdc.address, provider.account.address, U(1)])).to.be.rejected;
+  });
+
+  it("revokes, and the sub-agent stops immediately", async () => {
+    const { agent, provider, other, usdc, as } = await loadFixture(deployFixture);
+    await (await as(agent)).write.delegate([other.account.address, U(100)]);
+    await (await as(other)).write.subSpend([usdc.address, provider.account.address, U(10)]);
+    await (await as(agent)).write.revokeDelegation([other.account.address]);
+    await expect((await as(other)).write.subSpend([usdc.address, provider.account.address, U(10)])).to.be.rejected;
+  });
+
+  it("lets the guardian revoke as well as the agent", async () => {
+    // A sub-agent most needs stopping when the agent that spawned it is the
+    // thing that went wrong.
+    const { guardian, agent, provider, other, usdc, as } = await loadFixture(deployFixture);
+    await (await as(agent)).write.delegate([other.account.address, U(100)]);
+    await (await as(guardian)).write.revokeDelegation([other.account.address]);
+    await expect((await as(other)).write.subSpend([usdc.address, provider.account.address, U(10)])).to.be.rejected;
+  });
+
+  it("resets a sub-agent's allowance when the parent period turns", async () => {
+    const { agent, provider, other, usdc, policy, as } = await loadFixture(deployFixture);
+    await (await as(agent)).write.delegate([other.account.address, U(100)]);
+    await (await as(other)).write.subSpend([usdc.address, provider.account.address, U(100)]);
+    expect(await policy.read.remainingForDelegate([other.account.address])).to.equal(0n);
+    await time.increase(DAY + 1);
+    expect(await policy.read.remainingForDelegate([other.account.address])).to.equal(U(100));
+  });
+
+  it("stops every sub-agent when the guardian pauses the policy", async () => {
+    const { guardian, agent, provider, other, usdc, as } = await loadFixture(deployFixture);
+    await (await as(agent)).write.delegate([other.account.address, U(100)]);
+    await (await as(guardian)).write.setPaused([true]);
+    await expect((await as(other)).write.subSpend([usdc.address, provider.account.address, U(10)])).to.be.rejected;
+  });
+
+  it("will not delegate to the agent itself", async () => {
+    const { agent, as } = await loadFixture(deployFixture);
+    await expect((await as(agent)).write.delegate([agent.account.address, U(100)])).to.be.rejected;
+  });
+});

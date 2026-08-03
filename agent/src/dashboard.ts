@@ -15,6 +15,7 @@ import {
   receiptFromPayment,
   tesseraStreamAbi,
   tesseraSubscriptionAbi,
+  tesseraOracleAbi,
   ARC_USDC_ADDRESS,
   tesseraFeeCollectorAbi,
   tesseraEscrowAbi,
@@ -1493,6 +1494,111 @@ async function main() {
       }
 
       res.json({ ok: true, agent: me, streams, plans });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * How the pool itself is doing, as an operator would want to be told.
+   *
+   * `/api/keeper` reports the *agent's* position. Nothing watched the pool:
+   * utilization pinned at 100% so nobody can withdraw, a reserve sitting on its
+   * cap, an oracle whose sources have diverged, a price nobody has refreshed in
+   * days. Those are the conditions you want to hear about before a depositor
+   * tells you about them.
+   *
+   * Every item carries a severity and a plain sentence, because an operator
+   * woken at 3am needs to know what is wrong, not to read a number and work it
+   * out.
+   */
+  app.get("/api/pool/health", async (_req, res) => {
+    if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    try {
+      const assets = ((liveDeployment.poolAssets as { symbol: string; address: string }[] | undefined) ?? []);
+      const alerts: { level: "warn" | "critical"; asset?: string; message: string }[] = [];
+      const reserves: unknown[] = [];
+
+      const oracleAddr = liveDeployment.tesseraOracle as Hex | undefined;
+      const armed = (await poolClient.public
+        .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "riskOracle" })
+        .catch(() => null)) as Hex | null;
+      const oracleLive = !!armed && armed !== "0x0000000000000000000000000000000000000000";
+
+      for (const a of assets) {
+        const addr = a.address as Hex;
+        const stats = await poolClient.reserveData(addr).catch(() => null);
+        if (!stats) continue;
+
+        const utilPct = Number(stats.utilizationWad) / 1e16;
+        const [supplyRoom, borrowRoom] = ((await poolClient.public
+          .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "capacityOf", args: [addr] })
+          .catch(() => [0n, 0n])) as readonly [bigint, bigint]);
+
+        // Utilization is the one that strands depositors: at 100% the cash is
+        // gone and a withdrawal reverts for reasons the withdrawer did not cause.
+        if (utilPct >= 99) {
+          alerts.push({ level: "critical", asset: a.symbol, message: `${a.symbol} is ${utilPct.toFixed(1)}% utilised — withdrawals will revert until borrowers repay` });
+        } else if (utilPct >= 90) {
+          alerts.push({ level: "warn", asset: a.symbol, message: `${a.symbol} is ${utilPct.toFixed(1)}% utilised — little cash left for withdrawals` });
+        }
+        if (supplyRoom === 0n) {
+          alerts.push({ level: "warn", asset: a.symbol, message: `${a.symbol} is at its supply cap — no new deposits will be accepted` });
+        }
+
+        let oracle: Record<string, unknown> | null = null;
+        if (oracleAddr) {
+          const st = (await poolClient.public
+            .readContract({ address: oracleAddr, abi: tesseraOracleAbi, functionName: "status", args: [addr] })
+            .catch(() => null)) as readonly [boolean, boolean, bigint, bigint, bigint, bigint, bigint, bigint] | null;
+          if (st && st[0]) {
+            const [, ok, low, high, spreadBps, sources, , updatedAt] = st;
+            oracle = {
+              ok, sources: Number(sources), spreadBps: Number(spreadBps),
+              low: low.toString(), high: high.toString(), updatedAt: Number(updatedAt),
+            };
+            if (!ok) {
+              alerts.push({
+                level: "critical",
+                asset: a.symbol,
+                // While this holds, the pool refuses borrowing and liquidation
+                // against every asset — which is the intended behaviour and also
+                // the thing somebody needs to know is happening.
+                message: `${a.symbol} price sources disagree by ${(Number(spreadBps) / 100).toFixed(2)}% — borrowing and liquidation are frozen pool-wide`,
+              });
+            }
+            if (Number(sources) < 2 && oracleLive) {
+              alerts.push({ level: "warn", asset: a.symbol, message: `${a.symbol} has only one usable price source — nothing to cross-check it against` });
+            }
+          }
+        }
+
+        reserves.push({
+          symbol: a.symbol,
+          address: addr,
+          utilisationPct: Number(utilPct.toFixed(2)),
+          cashUsdc: formatUsdc(stats.cash),
+          borrowedUsdc: formatUsdc(stats.totalBorrows),
+          borrowAprPct: Number((Number(stats.borrowAprWad) / 1e16).toFixed(2)),
+          supplyAprPct: Number((Number(stats.supplyAprWad) / 1e16).toFixed(2)),
+          supplyRoom: supplyRoom === (1n << 256n) - 1n ? null : formatUsdc(supplyRoom),
+          borrowRoom: formatUsdc(borrowRoom),
+          oracle,
+        });
+      }
+
+      if (oracleAddr && !oracleLive) {
+        alerts.push({ level: "warn", message: "the risk oracle is deployed but not armed — the pool is pricing from a single owner-set mark" });
+      }
+
+      alerts.sort((x, y) => (x.level === y.level ? 0 : x.level === "critical" ? -1 : 1));
+      res.json({
+        ok: true,
+        healthy: alerts.filter((x) => x.level === "critical").length === 0,
+        oracleArmed: oracleLive,
+        alerts,
+        reserves,
+      });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
