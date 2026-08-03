@@ -230,3 +230,41 @@ describe("TesseraSubscription (prepaid credit, drawn per call)", () => {
     expect(second > 0n && second <= BigInt(HOUR)).to.equal(true);
   });
 });
+
+/** Same reason as the stream index: a plan the app cannot enumerate is a plan
+ *  the app cannot show. */
+describe("TesseraSubscription (finding your own plans)", () => {
+  it("indexes a new plan against both sides", async () => {
+    const { buyer, provider, sub, openPlan } = await loadFixture(deployFixture);
+    const id = await openPlan();
+    expect(await sub.read.plansAsBuyer([buyer.account.address])).to.deep.equal([id]);
+    expect(await sub.read.plansAsProvider([provider.account.address])).to.deep.equal([id]);
+  });
+
+  it("lists a provider's plans across different buyers", async () => {
+    const { buyer, provider, stranger, usdc, sub, as, openPlan } = await loadFixture(deployFixture);
+    await openPlan();
+    await (await as(stranger)).write.subscribe([
+      provider.account.address, usdc.address, U("200"), U("50"), 3600n,
+    ]);
+    expect(await sub.read.plansAsProvider([provider.account.address])).to.deep.equal([1n, 2n]);
+    expect(await sub.read.plansAsBuyer([buyer.account.address])).to.deep.equal([1n]);
+    expect(await sub.read.plansAsBuyer([stranger.account.address])).to.deep.equal([2n]);
+  });
+
+  it("keeps a cancelled plan listed", async () => {
+    const { buyer, sub, as, openPlan } = await loadFixture(deployFixture);
+    const id = await openPlan();
+    await (await as(buyer)).write.cancel([id]);
+    expect(await sub.read.plansAsBuyer([buyer.account.address])).to.deep.equal([id]);
+    expect((await sub.read.planData([id]))[9]).to.equal(true);
+  });
+
+  it("returns nothing for an address with no plans", async () => {
+    const { stranger, sub } = await loadFixture(deployFixture);
+    expect(await sub.read.plansAsProvider([stranger.account.address])).to.deep.equal([]);
+    const [a, b] = await sub.read.planCounts([stranger.account.address]);
+    expect(a).to.equal(0n);
+    expect(b).to.equal(0n);
+  });
+});

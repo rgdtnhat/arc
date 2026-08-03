@@ -60,6 +60,21 @@ contract TesseraStream is ReentrancyGuard {
     uint256 public nextStreamId = 1;
     mapping(uint256 => Stream) public streams;
 
+    /**
+     * Who is party to which stream.
+     *
+     * Without this a stream is only reachable by an id somebody already knows.
+     * "Show me my streams" would mean scanning `StreamOpened` logs from the
+     * deployment block — which a dashboard cannot do quickly, and cannot do at
+     * all against an RPC that prunes. Two words per side at open is a small
+     * price for the contract being able to answer the question itself.
+     *
+     * Both sides are indexed because both sides need it: the payer to see what
+     * it is spending, the recipient to see what it is owed.
+     */
+    mapping(address => uint256[]) private _asPayer;
+    mapping(address => uint256[]) private _asRecipient;
+
     event StreamOpened(
         uint256 indexed streamId,
         address indexed payer,
@@ -119,7 +134,24 @@ contract TesseraStream is ReentrancyGuard {
             stopAt: stopAt,
             cancelledAt: 0
         });
+        _asPayer[msg.sender].push(streamId);
+        _asRecipient[recipient].push(streamId);
         emit StreamOpened(streamId, msg.sender, recipient, token, deposit, ratePerSecond, startAt, stopAt);
+    }
+
+    /// @notice Streams this address is paying for.
+    function streamsAsPayer(address who) external view returns (uint256[] memory) {
+        return _asPayer[who];
+    }
+
+    /// @notice Streams this address is being paid by.
+    function streamsAsRecipient(address who) external view returns (uint256[] memory) {
+        return _asRecipient[who];
+    }
+
+    /// @notice How many streams this address is party to, on each side.
+    function streamCounts(address who) external view returns (uint256 asPayer, uint256 asRecipient) {
+        return (_asPayer[who].length, _asRecipient[who].length);
     }
 
     /**

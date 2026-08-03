@@ -227,3 +227,53 @@ describe("TesseraStream (paying by the second)", () => {
     await expect((await as(recipient)).write.withdraw([99n])).to.be.rejected;
   });
 });
+
+/**
+ * A stream reachable only by an id somebody already knows is a stream the app
+ * cannot show. Reconstructing that from logs is not something an RPC that
+ * prunes will answer, so the contract has to.
+ */
+describe("TesseraStream (finding your own streams)", () => {
+  it("indexes a new stream against both sides", async () => {
+    const { payer, recipient, stream, openOne } = await loadFixture(deployFixture);
+    const id = await openOne();
+    expect(await stream.read.streamsAsPayer([payer.account.address])).to.deep.equal([id]);
+    expect(await stream.read.streamsAsRecipient([recipient.account.address])).to.deep.equal([id]);
+  });
+
+  it("does not list a stream against the other side's role", async () => {
+    const { payer, recipient, stream, openOne } = await loadFixture(deployFixture);
+    await openOne();
+    // The payer is not a recipient of its own stream, and vice versa.
+    expect(await stream.read.streamsAsRecipient([payer.account.address])).to.deep.equal([]);
+    expect(await stream.read.streamsAsPayer([recipient.account.address])).to.deep.equal([]);
+  });
+
+  it("accumulates several streams in order", async () => {
+    const { payer, recipient, stream, as, usdc, RATE } = await loadFixture(deployFixture);
+    for (let i = 0; i < 3; i++) {
+      await (await as(payer)).write.open([recipient.account.address, usdc.address, RATE * 100n, RATE]);
+    }
+    expect(await stream.read.streamsAsPayer([payer.account.address])).to.deep.equal([1n, 2n, 3n]);
+    const [asPayer, asRecipient] = await stream.read.streamCounts([payer.account.address]);
+    expect(asPayer).to.equal(3n);
+    expect(asRecipient).to.equal(0n);
+  });
+
+  it("keeps a cancelled stream listed, because it still has a history", async () => {
+    const { payer, stream, as, openOne } = await loadFixture(deployFixture);
+    const id = await openOne();
+    await (await as(payer)).write.cancel([id]);
+    // Dropping it would hide what was paid; the flag is on the stream itself.
+    expect(await stream.read.streamsAsPayer([payer.account.address])).to.deep.equal([id]);
+    expect((await stream.read.streamData([id]))[9]).to.equal(true);
+  });
+
+  it("returns nothing for an address with no streams", async () => {
+    const { stranger, stream } = await loadFixture(deployFixture);
+    expect(await stream.read.streamsAsPayer([stranger.account.address])).to.deep.equal([]);
+    const [a, b] = await stream.read.streamCounts([stranger.account.address]);
+    expect(a).to.equal(0n);
+    expect(b).to.equal(0n);
+  });
+});

@@ -70,6 +70,15 @@ contract TesseraSubscription is ReentrancyGuard {
     uint256 public nextPlanId = 1;
     mapping(uint256 => Plan) public plans;
 
+    /**
+     * Who is party to which plan. See the note in TesseraStream — same reason:
+     * a plan reachable only by an id somebody already knows is a plan a
+     * dashboard cannot show, and reconstructing it from logs is not something an
+     * RPC that prunes will answer.
+     */
+    mapping(address => uint256[]) private _asBuyer;
+    mapping(address => uint256[]) private _asProvider;
+
     event Subscribed(
         uint256 indexed planId,
         address indexed buyer,
@@ -123,7 +132,24 @@ contract TesseraSubscription is ReentrancyGuard {
             startedAt: uint64(block.timestamp),
             cancelledAt: 0
         });
+        _asBuyer[msg.sender].push(planId);
+        _asProvider[provider].push(planId);
         emit Subscribed(planId, msg.sender, provider, token, deposit, periodCap, periodSeconds);
+    }
+
+    /// @notice Plans this address is funding.
+    function plansAsBuyer(address who) external view returns (uint256[] memory) {
+        return _asBuyer[who];
+    }
+
+    /// @notice Plans this address can charge against.
+    function plansAsProvider(address who) external view returns (uint256[] memory) {
+        return _asProvider[who];
+    }
+
+    /// @notice How many plans this address is party to, on each side.
+    function planCounts(address who) external view returns (uint256 asBuyer, uint256 asProvider) {
+        return (_asBuyer[who].length, _asProvider[who].length);
     }
 
     /**

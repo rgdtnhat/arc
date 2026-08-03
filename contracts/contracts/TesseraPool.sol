@@ -389,6 +389,7 @@ contract TesseraPool is ReentrancyGuard {
 
     event ReserveFrozen(address indexed asset, uint8 mask);
     event CapsSet(address indexed asset, uint256 supplyCap, uint256 borrowCap);
+    event OwnerSet(address indexed owner);
     event ReserveRenamed(address indexed asset, string name);
     event ReserveVisibility(address indexed asset, bool hidden);
 
@@ -686,6 +687,28 @@ contract TesseraPool is ReentrancyGuard {
         supplyCap[asset] = supplyCap_;
         borrowCap[asset] = borrowCap_;
         emit CapsSet(asset, supplyCap_, borrowCap_);
+    }
+
+    /**
+     * @notice Hand the owner powers to another address — in practice, a timelock.
+     *
+     * @dev Without this the owner was whoever deployed the pool, forever, and
+     *      every risk parameter moved the instant that key signed. There was no
+     *      way to put a delay in front of it because there was no way to give it
+     *      away.
+     *
+     *      One step, not two. A mistyped address here is unrecoverable, which
+     *      argues for propose-and-accept — but the intended new owner is a
+     *      timelock, and once one is in place this call is itself queued and
+     *      visible for the delay before it lands. That window is the check;
+     *      spending scarce contract size on a second one buys little. The
+     *      initial handover is the exposed step, and it is a single transaction
+     *      an operator makes once.
+     */
+    function transferOwnership(address o) external onlyOwner {
+        if (o == address(0)) revert BadOracle();
+        owner = o;
+        emit OwnerSet(o);
     }
 
     /**
