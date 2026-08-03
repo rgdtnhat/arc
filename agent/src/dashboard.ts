@@ -16,6 +16,7 @@ import {
   tesseraStreamAbi,
   tesseraSubscriptionAbi,
   tesseraOracleAbi,
+  tesseraTabAbi,
   ARC_USDC_ADDRESS,
   tesseraFeeCollectorAbi,
   tesseraEscrowAbi,
@@ -45,6 +46,7 @@ import {
   DELEVERAGE_TRIGGER,
   DELEVERAGE_TARGET,
 } from "./keeper.js";
+import { EventIndex, indexOnce } from "./indexer.js";
 import { TrustMemory } from "./memory.js";
 import { describePolicy } from "./policy.js";
 import { AGENT_TASK, AGENT_POLICY } from "./scenario.js";
@@ -378,6 +380,41 @@ async function main() {
   // Cache of on-chain reads for /api/state (see readChainState). Invalidated
   // after a run or a faucet drip so balances refresh promptly.
   let chainCache: { at: number; providers: any[]; agentBalance: bigint } | null = null;
+
+  /**
+   * The local event index, and the loop that fills it.
+   *
+   * Opt-in via TESSERA_INDEX_DB. Off by default because it writes a file and
+   * makes a steady trickle of RPC calls — neither is something a demo should
+   * start doing without being asked, and on a rate-limited public endpoint the
+   * trickle competes with the app's own reads.
+   */
+  const eventIndex = process.env.TESSERA_INDEX_DB ? new EventIndex(process.env.TESSERA_INDEX_DB) : null;
+  if (eventIndex) {
+    const indexed = [
+      liveDeployment.tesseraEscrow && { address: liveDeployment.tesseraEscrow as Hex, abi: tesseraEscrowAbi as never, label: "escrow" },
+      liveDeployment.tesseraPool && { address: liveDeployment.tesseraPool as Hex, abi: tesseraPoolAbi as never, label: "pool" },
+      liveDeployment.tesseraTab && { address: liveDeployment.tesseraTab as Hex, abi: tesseraTabAbi as never, label: "tab" },
+      liveDeployment.tesseraStream && { address: liveDeployment.tesseraStream as Hex, abi: tesseraStreamAbi as never, label: "stream" },
+      liveDeployment.tesseraSubscription && { address: liveDeployment.tesseraSubscription as Hex, abi: tesseraSubscriptionAbi as never, label: "subscription" },
+    ].filter(Boolean) as { address: Hex; abi: never; label: string }[];
+
+    console.log(`🗂  Indexing ${indexed.length} contract(s) into ${process.env.TESSERA_INDEX_DB}`);
+    const tick = async () => {
+      try {
+        const r = await indexOnce({ client: client.public, index: eventIndex, contracts: indexed });
+        // Only log when something happened. A heartbeat that fires every ten
+        // seconds on a quiet chain buries the lines that matter.
+        if (r && r.stored > 0) console.log(`🗂  indexed ${r.stored} event(s) from blocks ${r.from}–${r.to}`);
+      } catch (e) {
+        // A failed window is retried next tick — progress only advances on
+        // success, so nothing is skipped.
+        console.warn(`🗂  index tick failed: ${String((e as Error).message).slice(0, 120)}`);
+      }
+    };
+    void tick();
+    setInterval(tick, Number(process.env.TESSERA_INDEX_INTERVAL_MS ?? 15_000)).unref();
+  }
   // Wallet-style balance timeline for the dashboard sparkline.
   const balanceHistory: { ts: number; balance: string }[] = [];
   onEventPushed = () => {
@@ -1512,6 +1549,45 @@ async function main() {
    * woken at 3am needs to know what is wrong, not to read a number and work it
    * out.
    */
+  /**
+   * The chain's history, from the local index.
+   *
+   * Everything else in this app reads on demand and forgets. That answers "what
+   * is true now" and cannot answer "what happened last week" — reconstructing
+   * that from logs at request time is a scan a pruning RPC will not serve.
+   *
+   * Read-only and explicitly a cache: anything that moves money still reads the
+   * contracts, because an indexer a payment depended on would turn a lagging
+   * tail into a wrong answer rather than a stale one.
+   */
+  app.get("/api/history", async (req, res) => {
+    if (!eventIndex) { res.status(404).json({ ok: false, error: "the indexer is not running" }); return; }
+    try {
+      const actor = typeof req.query.actor === "string" ? req.query.actor : undefined;
+      if (actor && !/^0x[0-9a-fA-F]{40}$/.test(actor)) {
+        res.status(400).json({ ok: false, error: "actor must be an address" });
+        return;
+      }
+      const sinceDays = Number(req.query.days ?? 0);
+      const events = eventIndex.query({
+        actor,
+        name: typeof req.query.name === "string" ? req.query.name : undefined,
+        contract: typeof req.query.contract === "string" ? req.query.contract : undefined,
+        since: sinceDays > 0 ? Math.floor(Date.now() / 1000) - sinceDays * 86_400 : undefined,
+        limit: Number(req.query.limit ?? 100),
+      });
+      res.json({
+        ok: true,
+        indexedThroughBlock: eventIndex.lastBlock(),
+        total: eventIndex.count(),
+        tally: eventIndex.tally(),
+        events,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   app.get("/api/pool/health", async (_req, res) => {
     if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
     try {
