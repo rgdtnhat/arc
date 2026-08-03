@@ -3,10 +3,20 @@ pragma solidity ^0.8.24;
 
 import {ReentrancyGuard} from "./ReentrancyGuard.sol";
 
+interface IPolicyEscrow {
+    function open(address provider, uint256 amount, uint64 deadline, bytes32 quoteHash)
+        external
+        returns (uint256 paymentId);
+    function settle(uint256 paymentId) external;
+    function refund(uint256 paymentId) external;
+    function bondFor(uint256 amount) external view returns (uint256);
+}
+
 interface IERC20P {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
 }
 
 /**
@@ -146,6 +156,22 @@ contract TesseraSpendPolicy is ReentrancyGuard {
         if (p.expiresAt != 0 && block.timestamp > p.expiresAt) revert Expired();
         if (p.allowlistOnly && !allowed[to]) revert NotAllowed(to);
 
+        remaining = _charge(p, token, to, amount);
+
+        if (!IERC20P(token).transfer(to, amount)) revert TransferFailed();
+        emit Spent(token, to, amount, remaining);
+    }
+
+    /**
+     * @dev Book `amount` against both caps, or revert. Split out of `spend` so
+     *      the escrow path charges the identical accounting — two copies of a
+     *      cap check is two places for them to drift, and a limit that binds on
+     *      one payment route and not another is not a limit.
+     */
+    function _charge(Policy memory p, address token, address to, uint256 amount)
+        internal
+        returns (uint256 remaining)
+    {
         uint256 w = _window(p.periodSeconds);
 
         uint256 usedTotal = spentInWindow[token][w];
@@ -163,11 +189,132 @@ contract TesseraSpendPolicy is ReentrancyGuard {
             spentToInWindow[token][w][to] = usedTo + amount;
         }
         spentInWindow[token][w] = usedTotal + amount;
+        return p.periodCap - (usedTotal + amount);
+    }
 
-        if (!IERC20P(token).transfer(to, amount)) revert TransferFailed();
+    /// @dev Give budget back when money returns unspent. See `refundPayment`.
+    function _credit(address token, address to, uint256 amount, uint256 windowAt) internal {
+        uint256 used = spentInWindow[token][windowAt];
+        spentInWindow[token][windowAt] = used > amount ? used - amount : 0;
+        uint256 usedTo = spentToInWindow[token][windowAt][to];
+        spentToInWindow[token][windowAt][to] = usedTo > amount ? usedTo - amount : 0;
+    }
 
-        remaining = p.periodCap - (usedTotal + amount);
-        emit Spent(token, to, amount, remaining);
+    // --- paying through the escrow -------------------------------------------
+    //
+    // `spend` sends money to an address. The escrow does not work that way: it
+    // pulls from whoever calls `open`, and records that caller as the buyer who
+    // may later settle or refund. So for the cap to bind on the rail the agent
+    // actually uses, the policy has to *be* the buyer — which is what these do.
+    //
+    // Without them the policy was deployed, funded, and bypassed: the agent
+    // signed `escrow.open()` from its own key and the cap sat beside the
+    // spending rather than in front of it.
+
+    /// @notice The escrow payments are routed through. Guardian-set.
+    address public escrow;
+    /// @notice paymentId => what leaving the policy cost, so a refund can undo it.
+    mapping(uint256 => uint256) public committed;
+    /// @notice paymentId => the provider it was committed to.
+    mapping(uint256 => address) public committedTo;
+    /// @notice paymentId => the period it was charged against.
+    mapping(uint256 => uint256) public committedWindow;
+
+    event EscrowSet(address escrow);
+    event PaymentOpened(uint256 indexed paymentId, address indexed provider, uint256 total);
+    event PaymentClosed(uint256 indexed paymentId, bool refunded, uint256 credited);
+
+    error NoEscrow();
+    error UnknownPayment();
+
+    function setEscrow(address e) external onlyGuardian {
+        escrow = e;
+        emit EscrowSet(e);
+    }
+
+    /**
+     * @notice Open an escrow payment funded by the policy, charged to the caps.
+     * @dev The counterparty booked is the *provider*, not the escrow — charging
+     *      it to the escrow address would collapse every provider into one
+     *      counterparty and make `perCounterpartyCap` meaningless.
+     *
+     *      The bond the escrow pulls alongside the payment is counted too,
+     *      because it is money leaving the policy. It comes back on settle, and
+     *      `refundPayment` credits it back when it does.
+     */
+    function openPayment(
+        address token,
+        address provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash
+    ) external nonReentrant returns (uint256 paymentId) {
+        if (msg.sender != agent) revert NotAgent();
+        if (paused) revert IsPaused();
+        if (escrow == address(0)) revert NoEscrow();
+        if (amount == 0) revert ZeroAmount();
+
+        Policy memory p = policy;
+        if (p.expiresAt != 0 && block.timestamp > p.expiresAt) revert Expired();
+        if (p.allowlistOnly && !allowed[provider]) revert NotAllowed(provider);
+
+        uint256 total = amount + IPolicyEscrow(escrow).bondFor(amount);
+        _charge(p, token, provider, total);
+
+        IERC20P(token).approve(escrow, 0);
+        if (!IERC20P(token).approve(escrow, total)) revert TransferFailed();
+        paymentId = IPolicyEscrow(escrow).open(provider, amount, deadline, quoteHash);
+        IERC20P(token).approve(escrow, 0);
+
+        committed[paymentId] = total;
+        committedTo[paymentId] = provider;
+        committedWindow[paymentId] = _window(p.periodSeconds);
+        emit PaymentOpened(paymentId, provider, total);
+    }
+
+    /**
+     * @notice Release a payment to the provider.
+     * @dev Nothing is charged here — the budget was taken at `open`. The bond
+     *      returns to this contract, and the difference is credited back so the
+     *      agent is not billed for money it got back.
+     */
+    function settlePayment(address token, uint256 paymentId) external nonReentrant {
+        if (msg.sender != agent) revert NotAgent();
+        if (committed[paymentId] == 0) revert UnknownPayment();
+        uint256 before = IERC20P(token).balanceOf(address(this));
+        IPolicyEscrow(escrow).settle(paymentId);
+        uint256 returned = IERC20P(token).balanceOf(address(this)) - before;
+        _close(token, paymentId, returned, false);
+    }
+
+    /**
+     * @notice Reclaim a payment — the provider never delivered, or delivered
+     *         badly.
+     * @dev Whatever comes back is credited against the caps. A payment that was
+     *      refunded was not spent, and billing the agent's budget for it would
+     *      make a provider's failure cost the buyer twice.
+     *
+     *      Permissionless on purpose: reclaiming after a deadline is something
+     *      anyone may do for the policy's benefit, and requiring the agent key
+     *      would strand funds precisely when that key is the problem.
+     */
+    function refundPayment(address token, uint256 paymentId) external nonReentrant {
+        if (committed[paymentId] == 0) revert UnknownPayment();
+        uint256 before = IERC20P(token).balanceOf(address(this));
+        IPolicyEscrow(escrow).refund(paymentId);
+        uint256 returned = IERC20P(token).balanceOf(address(this)) - before;
+        _close(token, paymentId, returned, true);
+    }
+
+    function _close(address token, uint256 paymentId, uint256 returned, bool refunded) internal {
+        uint256 total = committed[paymentId];
+        address to = committedTo[paymentId];
+        uint256 w = committedWindow[paymentId];
+        committed[paymentId] = 0;
+
+        uint256 credit = returned > total ? total : returned;
+        if (credit > 0) _credit(token, to, credit, w);
+        emit PaymentClosed(paymentId, refunded, credit);
     }
 
     /**
