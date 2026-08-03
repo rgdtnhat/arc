@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
-import { verifyMessage, formatUnits, toFunctionSelector, keccak256, toHex } from "viem";
+import { verifyMessage, verifyTypedData, formatUnits, toFunctionSelector, keccak256, toHex } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID } from "node:crypto";
 import {
@@ -13,6 +13,8 @@ import {
   PaymentStatus,
   arcTestnet,
   receiptFromPayment,
+  tesseraStreamAbi,
+  tesseraSubscriptionAbi,
   ARC_USDC_ADDRESS,
   tesseraFeeCollectorAbi,
   tesseraEscrowAbi,
@@ -38,6 +40,7 @@ import {
   planLiquidation,
   planSweep,
   isLiquidatable,
+  healthFactor,
   DELEVERAGE_TRIGGER,
   DELEVERAGE_TARGET,
 } from "./keeper.js";
@@ -104,6 +107,15 @@ const DASHBOARD_HOST = process.env.HOST ?? "0.0.0.0";
 const KEEPER_BUFFER = 25_000_000n; // 25 USDC on hand
 const KEEPER_TOLERANCE = 5_000_000n; // 5 USDC either side
 const KEEPER_MIN_MOVE = 2_000_000n; // never pay gas to move less than 2 USDC
+
+/**
+ * Bounds on what the keeper may do unattended. These are ceilings, not targets:
+ * the point is that a pricing glitch, a bad read, or a compromised operator
+ * token cannot turn self-defence into a way to drain the wallet.
+ */
+const KEEPER_MAX_REPAY = 250_000_000n; // 250 USDC in any single action
+const KEEPER_MIN_INTERVAL_MS = 5 * 60_000; // and no more often than every 5 minutes
+const keeperState = { lastActionAt: 0, actions: 0 };
 const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
 
 // The Arc testnet deployment (contracts + wallets) recorded in deployments/arc.json.
@@ -1199,6 +1211,287 @@ async function main() {
    * Read-only on purpose. Acting on any of these already has an endpoint behind
    * `requireOperator`; what was missing was the judgement, not the buttons.
    */
+  /**
+   * The agent's streams and prepaid plans.
+   *
+   * Both contracts index each side, so this is two reads and a fan-out rather
+   * than a log scan — which is what makes it usable against an RPC that prunes.
+   */
+  /**
+   * Act on the keeper's own-position plan, within bounds it cannot exceed.
+   *
+   * `/api/keeper` works out what should happen and stops there, which leaves the
+   * agent unable to protect itself while nobody is watching — and being
+   * liquidated costs the liquidation bonus, so "wait for a human" is an
+   * expensive default.
+   *
+   * The bounds are the whole design, because this spends money without being
+   * asked to:
+   *
+   *   - repay only. It never borrows, never supplies, never posts collateral.
+   *     Every reachable action here reduces the agent's exposure.
+   *   - from the wallet balance only. It cannot pull from the vault, so it can
+   *     never drain the yield position to defend a bad borrow.
+   *   - a hard per-call ceiling, and a rate limit. A pricing glitch that makes
+   *     the agent look unhealthy every block cannot turn into a stream of
+   *     repayments.
+   *   - it does nothing at all unless health is under the trigger.
+   *
+   * Operator-gated because it moves funds. The bounds are not a substitute for
+   * that; they are what keeps a compromised caller from being able to do much.
+   */
+  app.post("/api/keeper/act", requireOperator, async (_req, res) => {
+    if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    const now = Date.now();
+    if (now - keeperState.lastActionAt < KEEPER_MIN_INTERVAL_MS) {
+      res.status(429).json({
+        ok: false,
+        error: "rate limited",
+        retryInSeconds: Math.ceil((KEEPER_MIN_INTERVAL_MS - (now - keeperState.lastActionAt)) / 1000),
+      });
+      return;
+    }
+
+    try {
+      const me = client.account.address;
+      const [limits, wallet] = await Promise.all([
+        poolClient.accountLimits(me),
+        client.usdcBalance().catch(() => 0n),
+      ]);
+      if (!limits) { res.status(503).json({ ok: false, error: "could not read the agent's position" }); return; }
+
+      const usdcReserve = (await poolClient.public
+        .readContract({
+          address: poolClient.pool, abi: tesseraPoolAbi, functionName: "reserves", args: [ARC_USDC_ADDRESS],
+        })
+        .catch(() => null)) as readonly unknown[] | null;
+      const dec = usdcReserve ? BigInt(usdcReserve[2] as number) : 6n;
+      const price = usdcReserve ? (usdcReserve[7] as bigint) : 0n;
+      if (price === 0n) { res.status(503).json({ ok: false, error: "no USDC price to size a repayment against" }); return; }
+
+      const plan = planDeleverage({
+        limits,
+        triggerHealth: DELEVERAGE_TRIGGER,
+        targetHealth: DELEVERAGE_TARGET,
+        debtLFactorBps: 9_500n,
+        repayableValue: (wallet * price) / 10n ** dec,
+      });
+
+      if (plan.action !== "repay" || plan.repayValue === 0n) {
+        res.json({ ok: true, acted: false, reason: plan.reason, healthNow: plan.healthNow.toString() });
+        return;
+      }
+
+      // Back into token units, then apply the ceiling. Both bounds are applied
+      // to the amount actually sent, not to the plan, so neither can be talked
+      // past by a plan that asked for more.
+      let amount = (plan.repayValue * 10n ** dec) / price;
+      if (amount > KEEPER_MAX_REPAY) amount = KEEPER_MAX_REPAY;
+      if (amount > wallet) amount = wallet;
+      if (amount === 0n) {
+        res.json({ ok: true, acted: false, reason: "nothing repayable within the bounds" });
+        return;
+      }
+
+      keeperState.lastActionAt = now;
+      const txHash = await poolClient.repay(ARC_USDC_ADDRESS, amount);
+      keeperState.actions += 1;
+
+      const after = await poolClient.accountLimits(me);
+      pushEvent({
+        source: "agent", ts: Date.now(), level: "settle",
+        message: `Keeper repaid ${formatUsdc(amount)} USDC to defend its own position`,
+        txHash,
+      } as UiEvent);
+
+      res.json({
+        ok: true,
+        acted: true,
+        repaidUsdc: formatUsdc(amount),
+        cappedByCeiling: (plan.repayValue * 10n ** dec) / price > KEEPER_MAX_REPAY,
+        healthBefore: plan.healthNow.toString(),
+        healthAfter: after ? healthFactor(after).toString() : null,
+        txHash,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Check a receipt somebody hands you.
+   *
+   * The dashboard shows a tick next to a settled call, but a tick is a claim
+   * about a check we ran on ourselves — which is worth nothing to the party who
+   * would need convincing. This takes a receipt as it comes out of
+   * `/api/receipt/:resource` and answers two separate questions:
+   *
+   *   1. Did the named provider actually sign this? (signature recovery)
+   *   2. Does what it says match the chain? (the escrow's own record)
+   *
+   * They are reported separately on purpose. A validly-signed receipt naming a
+   * response hash the escrow never recorded is not a broken signature — it is a
+   * provider contradicting itself, and collapsing the two into one boolean would
+   * hide which of those happened.
+   *
+   * Deliberately unauthenticated: a verifier only the operator can reach does
+   * not solve the problem it exists for.
+   */
+  app.post("/api/verify-receipt", async (req, res) => {
+    try {
+      const body = req.body ?? {};
+      const typed = body.typedData ?? body;
+      const signature = body.signature as Hex | undefined;
+      const msg = typed?.message;
+      if (!signature || !msg?.paymentId || !typed?.domain || !typed?.types) {
+        res.status(400).json({ ok: false, error: "need { signature, typedData } as returned by /api/receipt/:resource" });
+        return;
+      }
+
+      // Rebuild through the same helper both sides use, from the receipt's own
+      // claims. Trusting the pasted `types` block would let a forger choose the
+      // struct their signature happens to match.
+      const rebuilt = receiptFromPayment(
+        Number(typed.domain.chainId),
+        typed.domain.verifyingContract as Hex,
+        BigInt(msg.paymentId),
+        {
+          agent: msg.payer as Hex,
+          provider: msg.provider as Hex,
+          amount: BigInt(msg.amount),
+          responseHash: msg.responseHash as Hex,
+        },
+        String(msg.resource),
+        BigInt(msg.issuedAt),
+      );
+
+      // Deliberately not wrapped in its own try/catch. viem returns false for a
+      // signature that simply does not recover, and throws only when the input
+      // is malformed or this code is wrong — and swallowing the second case as
+      // "invalid signature" is how a broken verifier reports every genuine
+      // receipt as a forgery while looking like it works. Let it reach the outer
+      // handler and be reported as the error it is.
+      const signerOk = await verifyTypedData({ address: msg.provider as Hex, signature, ...rebuilt });
+
+      // Now the second, independent question: does the chain agree?
+      let onChain: Record<string, unknown> | null = null;
+      let matchesChain: boolean | null = null;
+      try {
+        const p = (await client.public.readContract({
+          address: typed.domain.verifyingContract as Hex,
+          abi: tesseraEscrowAbi,
+          functionName: "getPayment",
+          args: [BigInt(msg.paymentId)],
+        })) as readonly [Hex, Hex, bigint, bigint, Hex, Hex, number];
+        onChain = {
+          payer: p[0], provider: p[1],
+          amount: formatUsdc(p[2]),
+          responseHash: p[5],
+          status: PaymentStatus[p[6]] ?? String(p[6]),
+        };
+        matchesChain =
+          p[0].toLowerCase() === String(msg.payer).toLowerCase() &&
+          p[1].toLowerCase() === String(msg.provider).toLowerCase() &&
+          p[2] === BigInt(msg.amount) &&
+          p[5].toLowerCase() === String(msg.responseHash).toLowerCase();
+      } catch {
+        // The escrow named in the receipt may not be one this node can read.
+        onChain = null;
+        matchesChain = null;
+      }
+
+      res.json({
+        ok: true,
+        signatureValid: signerOk,
+        matchesChain,
+        verdict: !signerOk
+          ? "the named provider did not sign this"
+          : matchesChain === false
+            ? "signed, but it disagrees with the escrow's own record"
+            : matchesChain === null
+              ? "signature checks out; the escrow could not be read from here"
+              : "signed by the provider and consistent with the chain",
+        claimed: {
+          paymentId: String(msg.paymentId),
+          provider: msg.provider,
+          payer: msg.payer,
+          amount: formatUsdc(BigInt(msg.amount)),
+          resource: msg.resource,
+          responseHash: msg.responseHash,
+          issuedAt: Number(msg.issuedAt),
+        },
+        onChain,
+      });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.get("/api/payments/ongoing", async (_req, res) => {
+    const streamAddr = liveDeployment.tesseraStream as Hex | undefined;
+    const subAddr = liveDeployment.tesseraSubscription as Hex | undefined;
+    if (!streamAddr && !subAddr) {
+      res.status(404).json({ ok: false, error: "streams and subscriptions are not deployed yet" });
+      return;
+    }
+    const me = client.account.address;
+    const dec = (v: bigint) => formatUsdc(v);
+
+    try {
+      const streams: unknown[] = [];
+      if (streamAddr) {
+        const ids = [
+          ...((await client.public.readContract({
+            address: streamAddr, abi: tesseraStreamAbi, functionName: "streamsAsPayer", args: [me],
+          })) as bigint[]),
+          ...((await client.public.readContract({
+            address: streamAddr, abi: tesseraStreamAbi, functionName: "streamsAsRecipient", args: [me],
+          })) as bigint[]),
+        ];
+        for (const id of [...new Set(ids)]) {
+          const d = (await client.public.readContract({
+            address: streamAddr, abi: tesseraStreamAbi, functionName: "streamData", args: [id],
+          })) as readonly [Hex, Hex, Hex, bigint, bigint, bigint, bigint, bigint, bigint, boolean];
+          streams.push({
+            id: id.toString(),
+            role: d[0].toLowerCase() === me.toLowerCase() ? "payer" : "recipient",
+            payer: d[0], recipient: d[1], token: d[2],
+            deposit: dec(d[3]), earned: dec(d[4]), claimable: dec(d[5]), refundable: dec(d[6]),
+            startAt: Number(d[7]), stopAt: Number(d[8]), cancelled: d[9],
+          });
+        }
+      }
+
+      const plans: unknown[] = [];
+      if (subAddr) {
+        const ids = [
+          ...((await client.public.readContract({
+            address: subAddr, abi: tesseraSubscriptionAbi, functionName: "plansAsBuyer", args: [me],
+          })) as bigint[]),
+          ...((await client.public.readContract({
+            address: subAddr, abi: tesseraSubscriptionAbi, functionName: "plansAsProvider", args: [me],
+          })) as bigint[]),
+        ];
+        for (const id of [...new Set(ids)]) {
+          const d = (await client.public.readContract({
+            address: subAddr, abi: tesseraSubscriptionAbi, functionName: "planData", args: [id],
+          })) as readonly [Hex, Hex, Hex, bigint, bigint, bigint, bigint, bigint, bigint, boolean];
+          plans.push({
+            id: id.toString(),
+            role: d[0].toLowerCase() === me.toLowerCase() ? "buyer" : "provider",
+            buyer: d[0], provider: d[1], token: d[2],
+            balance: dec(d[3]), spent: dec(d[4]), periodCap: dec(d[5]), chargeable: dec(d[6]),
+            periodSeconds: Number(d[7]), startedAt: Number(d[8]), cancelled: d[9],
+          });
+        }
+      }
+
+      res.json({ ok: true, agent: me, streams, plans });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   app.get("/api/keeper", async (req, res) => {
     if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
     try {

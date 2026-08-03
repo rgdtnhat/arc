@@ -3,7 +3,7 @@
 // from the deployer's real balances, and open the agent's cirBTC-collateralised
 // position. Reads keys from .env (DEPLOYER_/AGENT_PRIVATE_KEY).
 import { readFileSync, writeFileSync } from "node:fs";
-import { createPublicClient, createWalletClient, maxUint256 } from "viem";
+import { createPublicClient, createWalletClient, maxUint256, toFunctionSelector } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   arcTestnet,
@@ -25,6 +25,12 @@ import {
   tesseraStreamBytecode,
   tesseraSubscriptionAbi,
   tesseraSubscriptionBytecode,
+  tesseraSpendPolicyAbi,
+  tesseraSpendPolicyBytecode,
+  tesseraLpTokenAbi,
+  tesseraLpTokenBytecode,
+  tesseraTimelockAbi,
+  tesseraTimelockBytecode,
   formatUsdc,
   pacedHttp,
 } from "@tessera/shared";
@@ -565,6 +571,108 @@ async function main() {
   }, { custodial: true });
   const subscription = subRes.address;
 
+  // 6h) TesseraSpendPolicy: the agent's spending limit, on chain.
+  //
+  //     The app enforced its cap in a Node process, which bounds a well-behaved
+  //     agent and nothing else — a holder of the agent key could ignore it
+  //     entirely. Here the funds sit in the policy and the agent calls `spend`,
+  //     so the limit is a property of the money rather than of the software
+  //     asking for it. The guardian must not be the agent, which the constructor
+  //     enforces: a limit you can raise yourself is not a limit.
+  const policyRes = await adopt("TesseraSpendPolicy", existing.tesseraSpendPolicy, FRESH, async () => {
+    console.log("→ deploying TesseraSpendPolicy (agent limit enforced on chain)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraSpendPolicyAbi,
+      bytecode: tesseraSpendPolicyBytecode,
+      args: [
+        deployer.address, // guardian
+        agent.address,
+        {
+          periodSeconds: 86400,
+          periodCap: 50n * 10n ** 6n, // 50 USDC/day
+          perCounterpartyCap: 10n * 10n ** 6n, // 10 USDC to any one provider
+          allowlistOnly: false,
+          expiresAt: 0n,
+        },
+      ],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   policy", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const spendPolicy = policyRes.address;
+
+  // 6i) TesseraLpToken: AMM pool 0's shares as an ordinary ERC-20.
+  //
+  //     Wrapping is what lets an LP position be listed as a pool reserve, and
+  //     what the vault's sleeve holds. Pool 0 because that is the one the fee
+  //     collectors cycle into, so it is the position with depth.
+  const lpRes = await adopt("TesseraLpToken", existing.tesseraLpToken, FRESH, async () => {
+    console.log("→ deploying TesseraLpToken (AMM pool 0 shares as ERC-20)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraLpTokenAbi,
+      bytecode: tesseraLpTokenBytecode,
+      args: [amm, 0n, "Tessera LP (pool 0)", "tLP0"],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   lpToken", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const lpToken = lpRes.address;
+
+  // 6j) TesseraTimelock, and the handover.
+  //
+  //     Every risk parameter moved the instant the deployer key signed. The
+  //     timelock puts a delay and a public announcement in front of that, with
+  //     freezing exempt so the emergency brake still works instantly.
+  //
+  //     The handover is LAST and deliberately so: everything above needs owner
+  //     calls, and doing it earlier would mean queueing and waiting for each of
+  //     them on a fresh deployment.
+  // Freezing is the only power that skips the delay — see TesseraTimelock for
+  // why. Derived from the signatures rather than pasted as hex so a change to
+  // either function cannot leave a stale selector silently unlisted.
+  const FREEZE_SEL = toFunctionSelector("function setFrozen(address,uint8)");
+  const FREEZE_MANY_SEL = toFunctionSelector("function setFrozenMany(address[],uint8)");
+  const timelockRes = await adopt("TesseraTimelock", existing.tesseraTimelock, FRESH, async () => {
+    console.log("→ deploying TesseraTimelock (24h on risk changes, instant freeze)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraTimelockAbi,
+      bytecode: tesseraTimelockBytecode,
+      args: [deployer.address, 86400n, [FREEZE_SEL, FREEZE_MANY_SEL]],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   timelock", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const timelock = timelockRes.address;
+
+  // Only hand the pool over once, and only when asked. An operator running this
+  // against a live pool mid-configuration would otherwise find every subsequent
+  // step queued behind a day.
+  if (process.argv.includes("--handover")) {
+    await optional("handing the pool to the timelock", async () => {
+      const current = await pub.readContract({ address: pool, abi: tesseraPoolAbi, functionName: "owner" });
+      if (String(current).toLowerCase() === timelock.toLowerCase()) {
+        console.log("   pool already owned by the timelock");
+        return;
+      }
+      await dSend(pool, tesseraPoolAbi, "transferOwnership", [timelock]);
+      console.log("   pool owner → timelock (risk changes now take 24h)");
+    });
+  } else {
+    console.log("   (skip pool handover — pass --handover to put the timelock in charge)");
+  }
+
   // 7) Persist. Merge into whatever record we adopted so escrow/tab and any
   //     other recorded addresses survive.
   const dep = { ...existing };
@@ -579,6 +687,9 @@ async function main() {
   dep.tesseraPriceGuard = priceGuard;
   dep.tesseraStream = stream;
   dep.tesseraSubscription = subscription;
+  dep.tesseraSpendPolicy = spendPolicy;
+  dep.tesseraLpToken = lpToken;
+  dep.tesseraTimelock = timelock;
   dep.poolAssets = LIVE_RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
   const body = JSON.stringify(dep, null, 2) + "\n";
@@ -597,6 +708,9 @@ async function main() {
   console.log("   guard    ", priceGuard);
   console.log("   stream   ", stream);
   console.log("   subs     ", subscription);
+  console.log("   policy   ", spendPolicy);
+  console.log("   lpToken  ", lpToken);
+  console.log("   timelock ", timelock);
   for (const r of LIVE_RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
   console.log("   explorer ", `https://testnet.arcscan.app/address/${pool}`);
 

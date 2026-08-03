@@ -498,3 +498,44 @@ test("a run against an existing record does not redeploy the new contracts", asy
   assert.equal(record.tesseraStream, "0x0000000000000000000000000000000000000b02");
   assert.equal(record.tesseraSubscription, "0x0000000000000000000000000000000000000b03");
 });
+
+test("deploys the spend policy, LP token and timelock too", async (t) => {
+  // These were compiled, exported, and never put on a chain — which is the same
+  // as not having them.
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
+
+  assert.match(stdout, /deploying TesseraSpendPolicy/);
+  assert.match(stdout, /deploying TesseraLpToken/);
+  assert.match(stdout, /deploying TesseraTimelock/);
+
+  const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
+  for (const key of ["tesseraSpendPolicy", "tesseraLpToken", "tesseraTimelock"]) {
+    assert.match(record[key], /^0x[0-9a-fA-F]{40}$/, `${key} recorded`);
+  }
+});
+
+test("does not hand the pool to the timelock unless asked", async (t) => {
+  // Handing over mid-configuration would put every later owner call behind a
+  // day. It has to be a decision, not a side effect of deploying.
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
+  assert.match(stdout, /skip pool handover/);
+  assert.ok(!node.sent.includes("transferOwnership"), "ownership left alone");
+});
+
+test("hands the pool over when --handover is passed", async (t) => {
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing", "--handover"]);
+  assert.doesNotMatch(stdout, /skip pool handover/);
+  assert.ok(node.sent.includes("transferOwnership"), "pool ownership moved");
+});
