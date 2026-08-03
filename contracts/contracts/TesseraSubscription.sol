@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {ReentrancyGuard} from "./ReentrancyGuard.sol";
+import {Guarded} from "./Guarded.sol";
 
 interface IERC20Sub {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -47,7 +48,7 @@ interface IERC20Sub {
  *
  * Unaudited testnet code. Requires an audit before mainnet or real funds.
  */
-contract TesseraSubscription is ReentrancyGuard {
+contract TesseraSubscription is ReentrancyGuard, Guarded {
     struct Plan {
         address buyer;
         address provider;
@@ -66,6 +67,9 @@ contract TesseraSubscription is ReentrancyGuard {
         uint64 startedAt;
         uint64 cancelledAt;
     }
+
+    /// @dev Guardian defaults to the deployer; hand it on with `setGuardian`.
+    constructor() Guarded(address(0)) {}
 
     uint256 public nextPlanId = 1;
     mapping(uint256 => Plan) public plans;
@@ -113,7 +117,7 @@ contract TesseraSubscription is ReentrancyGuard {
         uint256 deposit,
         uint256 periodCap,
         uint64 periodSeconds
-    ) external nonReentrant returns (uint256 planId) {
+    ) external nonReentrant whenLive returns (uint256 planId) {
         if (provider == address(0) || provider == msg.sender) revert NotProvider();
         if (deposit == 0 || periodCap == 0 || periodSeconds == 0) revert ZeroAmount();
         if (!IERC20Sub(token).transferFrom(msg.sender, address(this), deposit)) revert TransferFailed();
@@ -158,7 +162,7 @@ contract TesseraSubscription is ReentrancyGuard {
      *      up does not change the cap, so it never widens what the provider can
      *      take in a period.
      */
-    function topUp(uint256 planId, uint256 amount) external nonReentrant {
+    function topUp(uint256 planId, uint256 amount) external nonReentrant whenLive {
         Plan storage p = plans[planId];
         if (p.buyer == address(0)) revert NoPlan();
         if (p.cancelledAt != 0) revert PlanCancelled();
@@ -258,7 +262,7 @@ contract TesseraSubscription is ReentrancyGuard {
      * @dev Paid out immediately rather than accrued. A provider that has served
      *      the work should not also be carrying a claim on this contract.
      */
-    function charge(uint256 planId, uint256 amount, bytes32 memo) external nonReentrant {
+    function charge(uint256 planId, uint256 amount, bytes32 memo) external nonReentrant whenLive {
         Plan storage p = plans[planId];
         if (p.buyer == address(0)) revert NoPlan();
         if (msg.sender != p.provider) revert NotProvider();

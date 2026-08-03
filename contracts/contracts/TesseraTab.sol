@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {ReentrancyGuard} from "./ReentrancyGuard.sol";
+import {Guarded} from "./Guarded.sol";
 
 interface IERC20_ {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -26,7 +27,7 @@ interface IERC20_ {
  *   claim()/closeTab()  provider redeems best voucher, remainder -> agent
  *   reclaim()  agent recovers unclaimed funds after expiry
  */
-contract TesseraTab is ReentrancyGuard {
+contract TesseraTab is ReentrancyGuard, Guarded {
     struct Tab {
         address agent;
         address provider;
@@ -39,6 +40,15 @@ contract TesseraTab is ReentrancyGuard {
     IERC20_ public immutable usdc;
     uint256 public nextTabId = 1;
     mapping(uint256 => Tab) public tabs;
+
+    /**
+     * Who is party to which tab. Same reason as the stream and subscription
+     * indexes: a tab reachable only by an id somebody already knows is a tab the
+     * app cannot show, and rebuilding it from logs is not something a pruning
+     * RPC will answer. This was the oldest primitive and the last one without.
+     */
+    mapping(address => uint256[]) private _asAgent;
+    mapping(address => uint256[]) private _asProvider;
 
     event TabOpened(
         uint256 indexed tabId,
@@ -59,7 +69,7 @@ contract TesseraTab is ReentrancyGuard {
     error OverDeposit();
     error TransferFailed();
 
-    constructor(address usdc_) {
+    constructor(address usdc_) Guarded(address(0)) {
         require(usdc_ != address(0), "usdc=0");
         usdc = IERC20_(usdc_);
     }
@@ -68,6 +78,7 @@ contract TesseraTab is ReentrancyGuard {
     function openTab(address provider, uint256 deposit, uint64 duration)
         external
         nonReentrant
+        whenLive
         returns (uint256 tabId)
     {
         if (deposit == 0) revert ZeroDeposit();
@@ -82,7 +93,24 @@ contract TesseraTab is ReentrancyGuard {
             expiry: uint64(block.timestamp) + duration,
             closed: false
         });
+        _asAgent[msg.sender].push(tabId);
+        _asProvider[provider].push(tabId);
         emit TabOpened(tabId, msg.sender, provider, deposit, tabs[tabId].expiry);
+    }
+
+    /// @notice Tabs this address opened.
+    function tabsAsAgent(address who) external view returns (uint256[] memory) {
+        return _asAgent[who];
+    }
+
+    /// @notice Tabs this address can claim against.
+    function tabsAsProvider(address who) external view returns (uint256[] memory) {
+        return _asProvider[who];
+    }
+
+    /// @notice How many tabs this address is party to, on each side.
+    function tabCounts(address who) external view returns (uint256 asAgent, uint256 asProvider) {
+        return (_asAgent[who].length, _asProvider[who].length);
     }
 
     /** The message an agent signs per micro-call (cumulative, replay-safe). */

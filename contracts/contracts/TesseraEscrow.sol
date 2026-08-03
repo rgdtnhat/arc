@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {ReentrancyGuard} from "./ReentrancyGuard.sol";
+import {Guarded} from "./Guarded.sol";
 
 /// @notice Minimal ERC-20 surface used by the escrow (Arc USDC).
 interface IERC20 {
@@ -39,7 +40,7 @@ interface IEscrowRouter {
  * Reputation is updated on every terminal transition so agents can price the
  * risk of an unknown provider before spending.
  */
-contract TesseraEscrow is ReentrancyGuard {
+contract TesseraEscrow is ReentrancyGuard, Guarded {
     enum Status {
         None,
         Escrowed,
@@ -245,7 +246,7 @@ contract TesseraEscrow is ReentrancyGuard {
         _;
     }
 
-    constructor(address usdc_) {
+    constructor(address usdc_) Guarded(address(0)) {
         require(usdc_ != address(0), "usdc=0");
         usdc = IERC20(usdc_);
         owner = msg.sender;
@@ -320,7 +321,7 @@ contract TesseraEscrow is ReentrancyGuard {
         uint256 amount,
         uint64 deadline,
         bytes32 quoteHash
-    ) external nonReentrant returns (uint256 paymentId) {
+    ) external nonReentrant whenLive returns (uint256 paymentId) {
         if (amount == 0) revert ZeroAmount();
         if (deadline <= block.timestamp) revert DeadlinePassed();
 
@@ -396,7 +397,7 @@ contract TesseraEscrow is ReentrancyGuard {
         uint256 amount,
         uint64 deadline,
         bytes32 quoteHash
-    ) external nonReentrant returns (uint256 paymentId) {
+    ) external nonReentrant whenLive returns (uint256 paymentId) {
         if (amount == 0 || maxIn == 0) revert ZeroAmount();
         if (deadline <= block.timestamp) revert DeadlinePassed();
         if (router == address(0)) revert NoRouter();
@@ -665,7 +666,7 @@ contract TesseraEscrow is ReentrancyGuard {
      * @notice Provider bonds USDC as skin-in-the-game. A staked provider is a
      *         stronger trust signal for agents; stake is slashed on SLA breaches.
      */
-    function stake(uint256 amount) external nonReentrant {
+    function stake(uint256 amount) external nonReentrant whenLive {
         if (amount == 0) revert ZeroAmount();
         if (!usdc.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
         stakeOf[msg.sender] += amount;

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {ReentrancyGuard} from "./ReentrancyGuard.sol";
+import {Guarded} from "./Guarded.sol";
 
 interface IERC20S {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -40,7 +41,7 @@ interface IERC20S {
  *
  * Unaudited testnet code. Requires an audit before mainnet or real funds.
  */
-contract TesseraStream is ReentrancyGuard {
+contract TesseraStream is ReentrancyGuard, Guarded {
     struct Stream {
         address payer;
         address recipient;
@@ -56,6 +57,9 @@ contract TesseraStream is ReentrancyGuard {
         /// @notice Set when the payer cancels; earnings stop here.
         uint64 cancelledAt;
     }
+
+    /// @dev Guardian defaults to the deployer; hand it on with `setGuardian`.
+    constructor() Guarded(address(0)) {}
 
     uint256 public nextStreamId = 1;
     mapping(uint256 => Stream) public streams;
@@ -110,7 +114,7 @@ contract TesseraStream is ReentrancyGuard {
         address token,
         uint256 deposit,
         uint256 ratePerSecond
-    ) external nonReentrant returns (uint256 streamId) {
+    ) external nonReentrant whenLive returns (uint256 streamId) {
         if (recipient == address(0) || recipient == msg.sender) revert NotRecipient();
         if (deposit == 0 || ratePerSecond == 0) revert ZeroAmount();
         // A deposit smaller than one second of rate would open a stream that is
@@ -159,7 +163,7 @@ contract TesseraStream is ReentrancyGuard {
      * @dev The rate is unchanged; the end moves out. Anyone may top up — paying
      *      for somebody else's stream can only help them.
      */
-    function topUp(uint256 streamId, uint256 amount) external nonReentrant {
+    function topUp(uint256 streamId, uint256 amount) external nonReentrant whenLive {
         Stream storage s = streams[streamId];
         if (s.payer == address(0)) revert NoStream();
         if (s.cancelledAt != 0) revert AlreadyCancelled();
