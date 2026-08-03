@@ -44,6 +44,11 @@ export interface AgentConfig {
   treasury?: TesseraTreasury;
   /** Lending pool client, exposed as pool_supply / pool_borrow / etc. */
   pool?: TesseraPoolClient;
+  /**
+   * Assets the agent may fund a payment with when it is short of the escrow
+   * asset, in preference order. Empty means USDC or nothing.
+   */
+  fundingAssets?: { address: Hex; symbol: string }[];
   onEvent?: (e: AgentEvent) => void;
 }
 
@@ -359,18 +364,62 @@ export class TesseraAgent {
     const minDeadlineSeconds = Number(process.env.TESSERA_MIN_DEADLINE_SECONDS ?? 60);
     const deadlineSeconds = BigInt(Math.max(quote.deadlineSeconds, minDeadlineSeconds));
     const deadline = (chainNow > wallNow ? chainNow : wallNow) + deadlineSeconds;
-    const { paymentId, txHash: openTx } = await this.cfg.client.open(
-      quote.provider,
-      quote.price,
-      deadline,
-      quote.quoteHash
-    );
+
+    /*
+     * Pay in USDC when there is enough of it, and route from something else when
+     * there is not.
+     *
+     * The provider quoted in USDC and is paid in USDC either way — that is what
+     * makes a quote a quote. What changes is where the USDC comes from. An agent
+     * holding EURC and no USDC could previously not trade at all, which is an odd
+     * limitation on a chain that ships three Circle assets and a router
+     * connecting them, and an odder one for an agent that is meant to operate
+     * unattended: running dry in one asset while holding another should not stop
+     * it.
+     *
+     * USDC stays the default rather than always routing, because a swap costs
+     * fees and slippage that a direct payment does not.
+     */
+    const bond = await this.cfg.client.bondFor(quote.price);
+    const needed = quote.price + bond;
+    const usdcHeld = await this.cfg.client.usdcBalance().catch(() => needed);
+
+    let paymentId: bigint;
+    let openTx: Hex;
+    let fundedWith: { symbol: string; spent: bigint } | null = null;
+
+    if (usdcHeld >= needed) {
+      ({ paymentId, txHash: openTx } = await this.cfg.client.open(
+        quote.provider,
+        quote.price,
+        deadline,
+        quote.quoteHash
+      ));
+    } else {
+      const alt = await this.pickFundingAsset(needed);
+      if (!alt) {
+        entry.reason = `not enough USDC (${formatUsdc(usdcHeld)}) and no other asset can cover it`;
+        return entry;
+      }
+      ({ paymentId, txHash: openTx } = await this.cfg.client.openWith(
+        alt.token,
+        alt.maxIn,
+        quote.provider,
+        quote.price,
+        deadline,
+        quote.quoteHash
+      ));
+      fundedWith = { symbol: alt.symbol, spent: alt.maxIn };
+    }
+
     entry.paymentId = paymentId.toString();
     entry.txs.open = openTx;
     this.emit({
       level: "pay",
       resource: svc.resource,
-      message: `Escrowed ${formatUsdc(quote.price)} USDC (payment #${paymentId})`,
+      message: fundedWith
+        ? `Escrowed ${formatUsdc(quote.price)} USDC (payment #${paymentId}) — routed from ${fundedWith.symbol}`
+        : `Escrowed ${formatUsdc(quote.price)} USDC (payment #${paymentId})`,
       txHash: openTx,
     });
 
@@ -709,6 +758,52 @@ export class TesseraAgent {
       );
     }
     return lines;
+  }
+
+  /**
+   * Find an asset the agent holds that can cover `needed` of the escrow asset.
+   *
+   * Picks the first configured asset whose route clears the requirement with
+   * headroom, and returns a bound sized against the *quote* rather than the
+   * balance: sending the whole balance as `maxIn` would let a thin pool take all
+   * of it and return the surplus as change, which is a worse trade than not
+   * trading. `SLIPPAGE_BPS` over the amount the route says it needs is the most
+   * the agent is willing to be wrong by.
+   */
+  private async pickFundingAsset(
+    needed: bigint
+  ): Promise<{ token: Hex; symbol: string; maxIn: bigint } | null> {
+    const assets = this.cfg.fundingAssets ?? [];
+    const SLIPPAGE_BPS = 300n; // 3%
+
+    for (const a of assets) {
+      let held: bigint;
+      try {
+        held = await this.cfg.client.tokenBalance(a.address);
+      } catch {
+        continue;
+      }
+      if (held === 0n) continue;
+
+      // What the whole balance would fetch, to see whether this asset can cover
+      // the payment at all.
+      const { out } = await this.cfg.client.quoteOpenWith(a.address, held);
+      if (out < needed) continue;
+
+      // Then size the actual spend: scale the balance down to roughly what is
+      // required, plus slippage, and never above what is held.
+      let maxIn = (held * needed) / out;
+      maxIn = (maxIn * (10_000n + SLIPPAGE_BPS)) / 10_000n;
+      if (maxIn > held) maxIn = held;
+
+      // Re-check at the size actually being sent — a route that clears at full
+      // balance can still fall short at a fraction of it.
+      const { out: outAtSize } = await this.cfg.client.quoteOpenWith(a.address, maxIn);
+      if (outAtSize < needed) continue;
+
+      return { token: a.address, symbol: a.symbol, maxIn };
+    }
+    return null;
   }
 
   private async fetchQuote(svc: OfferedService, query = ""): Promise<Quote | null> {

@@ -356,6 +356,12 @@ async function main() {
     faucet,
     treasury,
     pool: poolClient,
+    // Anything the pool lists that is not the escrow asset is something the
+    // agent holds a price for and the router can reach. Ordered as configured,
+    // so the operator's reserve list is also the preference order.
+    fundingAssets: ((liveDeployment.poolAssets as { symbol: string; address: string }[] | undefined) ?? [])
+      .filter((a) => a.address.toLowerCase() !== ARC_USDC_ADDRESS.toLowerCase())
+      .map((a) => ({ address: a.address as Hex, symbol: a.symbol })),
     onEvent: (e) => pushEvent({ ...e, source: "agent" }),
   });
   console.log(`🛡  Guardian policy: ${describePolicy(policy)}${policy.autoApprove ? " (auto-approve mode)" : ""}`);

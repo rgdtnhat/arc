@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Verify a Tessera receipt</title>
+<link rel="icon" href="/favicon.svg" />
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #14181d; --line: #232a32;
+    --text: #e8edf3; --muted: #8b97a6;
+    --ok: #35d07f; --bad: #ff6b6b; --warn: #f5a524;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f8fa; --panel:#fff; --line:#e3e8ee; --text:#1a1f26; --muted:#5c6773; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 28px 20px 60px;
+  }
+  main { max-width: 780px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  p.lede { color: var(--muted); margin: 0 0 22px; max-width: 60ch; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  textarea {
+    width: 100%; min-height: 190px; resize: vertical;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  button {
+    margin-top: 12px; padding: 10px 18px; border-radius: 8px; border: 0;
+    background: #3b82f6; color: #fff; font-weight: 600; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  .verdict { margin-top: 20px; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--line); }
+  .verdict.ok   { border-color: var(--ok);   background: color-mix(in srgb, var(--ok) 10%, transparent); }
+  .verdict.bad  { border-color: var(--bad);  background: color-mix(in srgb, var(--bad) 10%, transparent); }
+  .verdict.warn { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+  .verdict b { display: block; font-size: 15px; margin-bottom: 4px; }
+  .checks { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 0 0; font-size: 13.5px; }
+  .checks span::before { content: "● "; }
+  .yes { color: var(--ok); } .no { color: var(--bad); } .unk { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; width: 34%; }
+  td { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .wrap { overflow-x: auto; }
+  footer { margin-top: 26px; color: var(--muted); font-size: 12.5px; }
+  code { background: var(--panel); padding: 1px 5px; border-radius: 4px; border: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Verify a Tessera receipt</h1>
+  <p class="lede">
+    A provider signs a receipt for what it served. Paste one here and this checks
+    two separate things: whether the named provider actually signed it, and
+    whether what it says matches the escrow's own record on Arc. Get a receipt
+    from <code>/api/receipt/&lt;resource&gt;</code>.
+  </p>
+
+  <div class="panel">
+    <label for="input">Receipt JSON — the <code>{ signature, typedData }</code> object</label>
+    <textarea id="input" spellcheck="false" placeholder='{ "signature": "0x…", "typedData": { "domain": { … }, "types": { … }, "message": { … } } }'></textarea>
+    <button id="go">Check it</button>
+    <div id="out"></div>
+  </div>
+
+  <footer>
+    Nothing is stored. The check runs against the escrow named in the receipt
+    itself — so a receipt pointing at a contract this node cannot read will
+    verify its signature and say so about the chain.
+  </footer>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+function mark(v) {
+  if (v === true) return '<span class="yes">yes</span>';
+  if (v === false) return '<span class="no">no</span>';
+  return '<span class="unk">could not check</span>';
+}
+
+$("go").addEventListener("click", async () => {
+  const btn = $("go"), out = $("out");
+  let payload;
+  try {
+    payload = JSON.parse($("input").value);
+  } catch (e) {
+    out.innerHTML = `<div class="verdict bad"><b>That is not valid JSON</b>${esc(e.message)}</div>`;
+    return;
+  }
+
+  btn.disabled = true;
+  out.innerHTML = `<div class="verdict"><b>Checking…</b></div>`;
+  try {
+    const res = await fetch("/api/verify-receipt", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const d = await res.json();
+    if (!d.ok) {
+      out.innerHTML = `<div class="verdict bad"><b>Could not check this</b>${esc(d.error ?? "unknown error")}</div>`;
+      return;
+    }
+
+    // Signed and consistent is the only good outcome. Signed-but-inconsistent
+    // gets its own colour because it is a different accusation: the signature
+    // is real and the provider is contradicting the chain.
+    const cls = d.signatureValid && d.matchesChain === true ? "ok"
+              : d.signatureValid ? "warn" : "bad";
+    const c = d.claimed ?? {}, o = d.onChain;
+
+    out.innerHTML = `
+      <div class="verdict ${cls}"><b>${esc(d.verdict)}</b>
+        <div class="checks">
+          <span>signed by the named provider: ${mark(d.signatureValid)}</span>
+          <span>agrees with the escrow: ${mark(d.matchesChain)}</span>
+        </div>
+      </div>
+      <div class="wrap"><table>
+        <tr><th>Payment</th><td>#${esc(c.paymentId)}</td></tr>
+        <tr><th>Provider</th><td>${esc(c.provider)}</td></tr>
+        <tr><th>Paid by</th><td>${esc(c.payer)}</td></tr>
+        <tr><th>Amount</th><td>${esc(c.amount)} USDC</td></tr>
+        <tr><th>Resource</th><td>${esc(c.resource)}</td></tr>
+        <tr><th>Response hash</th><td>${esc(c.responseHash)}</td></tr>
+        <tr><th>Issued</th><td>${c.issuedAt ? new Date(c.issuedAt * 1000).toISOString() : "—"}</td></tr>
+        ${o ? `
+        <tr><th>On chain — status</th><td>${esc(o.status)}</td></tr>
+        <tr><th>On chain — amount</th><td>${esc(o.amount)} USDC</td></tr>
+        <tr><th>On chain — response hash</th><td>${esc(o.responseHash)}</td></tr>` : `
+        <tr><th>On chain</th><td>not readable from this node</td></tr>`}
+      </table></div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="verdict bad"><b>Request failed</b>${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

@@ -84,6 +84,16 @@ export class TesseraClient {
     return block.timestamp;
   }
 
+  /** Balance of any ERC-20 the agent holds, not just the escrow asset. */
+  tokenBalance(token: Hex, who?: Hex): Promise<bigint> {
+    return this.public.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [who ?? this.account.address],
+    }) as Promise<bigint>;
+  }
+
   usdcBalance(who?: Hex): Promise<bigint> {
     return this.public.readContract({
       address: this.usdc,
@@ -193,6 +203,75 @@ export class TesseraClient {
     } catch {
       return 0n;
     }
+  }
+
+  /**
+   * What `maxIn` of `tokenIn` would buy in the escrow asset, and in how many
+   * hops. Zero means there is no route — asked, not assumed, so the agent can
+   * decide whether paying in this asset is even possible before it commits.
+   */
+  async quoteOpenWith(tokenIn: Hex, amountIn: bigint): Promise<{ out: bigint; hops: number }> {
+    try {
+      const r = (await this.public.readContract({
+        address: this.escrow,
+        abi: tesseraEscrowAbi,
+        functionName: "quoteOpenWith",
+        args: [tokenIn, amountIn],
+      })) as readonly [bigint, bigint];
+      return { out: r[0], hops: Number(r[1]) };
+    } catch {
+      return { out: 0n, hops: 0 };
+    }
+  }
+
+  /**
+   * Open a payment funded with an asset the agent actually holds.
+   *
+   * The provider is paid in the asset it quoted; the route happens inside the
+   * escrow, in the same transaction. `maxIn` is the agent's slippage bound and
+   * has to cover the bond as well as the price — `openWith` reverts rather than
+   * opening a payment for less than was agreed, so a bound set against the price
+   * alone simply fails instead of silently underfunding.
+   */
+  async openWith(
+    tokenIn: Hex,
+    maxIn: bigint,
+    provider: Hex,
+    amount: bigint,
+    deadline: bigint,
+    quoteHash: Hex
+  ): Promise<{ paymentId: bigint; txHash: Hex }> {
+    await this.ensureApprovalFor(tokenIn, maxIn);
+    const { request } = await this.public.simulateContract({
+      address: this.escrow,
+      abi: tesseraEscrowAbi,
+      functionName: "openWith",
+      args: [tokenIn, maxIn, provider, amount, deadline, quoteHash],
+      account: this.account,
+    });
+    const txHash = await this.wallet.writeContract(request);
+    const receipt = await this.public.waitForTransactionReceipt({ hash: txHash });
+    return { paymentId: this.paymentIdFromReceipt(receipt), txHash };
+  }
+
+  /** Approve an arbitrary token for the escrow, not just USDC. */
+  async ensureApprovalFor(token: Hex, min: bigint): Promise<void> {
+    const allowance = (await this.public.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [this.account.address, this.escrow],
+    })) as bigint;
+    if (allowance >= min) return;
+    const hash = await this.wallet.writeContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: "approve",
+      args: [this.escrow, maxUint256],
+      chain: this.chain,
+      account: this.account,
+    });
+    await this.public.waitForTransactionReceipt({ hash });
   }
 
   /**
