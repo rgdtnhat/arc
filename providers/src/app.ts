@@ -21,6 +21,7 @@ import {
   pacedHttp,
   type DefiOracle,
 } from "@tessera/shared";
+import { quotePrice, LoadMeter } from "./pricing.js";
 import { CATALOG, produceBody, type ServiceDef, type ServiceContext } from "./catalog.js";
 import { quoteHash, responseHash, randomNonce } from "./quote.js";
 
@@ -395,6 +396,30 @@ export function createProviderApp(config: ProviderConfig): Express {
     }
   });
 
+  /** Recent call rate per resource, for the surge component of a quote. */
+  const loadMeter = new LoadMeter();
+
+  /**
+   * A buyer's settle/dispute record from the escrow.
+   *
+   * Best effort: an escrow that cannot be read, or one deployed before buyer
+   * records existed, simply means no surcharge. A pricing input that can fail
+   * closed would make an RPC hiccup look like a price rise.
+   */
+  async function readBuyerRecord(buyer: Hex) {
+    try {
+      const r = (await publicClient.readContract({
+        address: config.escrowAddress,
+        abi: tesseraEscrowAbi,
+        functionName: "buyerRecord",
+        args: [buyer],
+      })) as readonly [bigint, bigint, bigint];
+      return { settled: Number(r[0]), disputed: Number(r[1]) };
+    } catch {
+      return null;
+    }
+  }
+
   async function handlePaid(svc: ServiceDef, req: Request, res: Response) {
     const provider = addressOf.get(svc.resource)!;
     const paymentId = req.header(HEADERS.payment);
@@ -402,11 +427,43 @@ export function createProviderApp(config: ProviderConfig): Express {
     // --- Unpaid: issue a 402 quote -------------------------------------------
     if (!paymentId) {
       const nonce = randomNonce();
-      const qh = quoteHash(provider, svc.price, svc.resource, nonce);
+
+      /*
+       * The price is computed, not read.
+       *
+       * A constant means the provider charges the same when saturated as when
+       * idle, and the same to a buyer that settles every time as to one that
+       * disputes half. Both are ways of making the honest buyers subsidise
+       * everybody else.
+       *
+       * The buyer is identified by the address it says it is paying from. That
+       * is unauthenticated, so a buyer with a bad record could quote itself a
+       * cheaper price by claiming a different one — which is why the surcharge
+       * only ever raises the price. Lying gets you the base price, the same as
+       * a newcomer, and never a discount.
+       */
+      loadMeter.record(svc.resource);
+      const claimedBuyer = req.header(HEADERS.provider) ?? req.query.buyer;
+      const buyerRecord =
+        typeof claimedBuyer === "string" && /^0x[0-9a-fA-F]{40}$/.test(claimedBuyer)
+          ? await readBuyerRecord(claimedBuyer as Hex)
+          : null;
+
+      const quoted = quotePrice({
+        basePrice: svc.price,
+        load: {
+          callsPerMinute: loadMeter.ratePerMinute(svc.resource),
+          comfortableRate: svc.comfortableRate ?? 60,
+        },
+        buyer: buyerRecord,
+      });
+      const price = quoted.price;
+
+      const qh = quoteHash(provider, price, svc.resource, nonce);
       const expiry = BigInt(Math.floor(Date.now() / 1000) + svc.slaSeconds + 60);
       issued.set(qh, {
         resource: svc.resource,
-        price: svc.price,
+        price,
         provider,
         expiresAt: Date.now() + svc.slaSeconds * 1000 + 60_000,
       });
@@ -414,18 +471,24 @@ export function createProviderApp(config: ProviderConfig): Express {
       const wallet = wallets.get(svc.resource)!;
       const typed = quoteTypedData(config.chain.id, config.escrowAddress, {
         provider,
-        price: svc.price,
+        price,
         resource: svc.resource,
         nonce,
         expiry,
       });
       const quoteSig = await wallet.signTypedData({ account: wallet.account!, ...typed });
-      emit({ kind: "quote", resource: svc.resource, detail: `quoted ${formatUsdc(svc.price)} USDC (signed)` });
+      emit({
+        kind: "quote",
+        resource: svc.resource,
+        detail: quoted.reasons.length
+          ? `quoted ${formatUsdc(price)} USDC (${quoted.multiplier}x — ${quoted.reasons.join("; ")})`
+          : `quoted ${formatUsdc(price)} USDC (signed)`,
+      });
       res
         .status(402)
         .set({
           [HEADERS.provider]: provider,
-          [HEADERS.price]: svc.price.toString(),
+          [HEADERS.price]: price.toString(),
           [HEADERS.quote]: qh,
           [HEADERS.deadline]: String(svc.slaSeconds),
           [HEADERS.resource]: svc.resource,
@@ -436,7 +499,7 @@ export function createProviderApp(config: ProviderConfig): Express {
         .json({
           error: "payment required",
           resource: svc.resource,
-          price: formatUsdc(svc.price),
+          price: formatUsdc(price),
           how: "escrow on Arc via TesseraEscrow.open(), then retry with x-tessera-payment: <paymentId>",
         });
       return;

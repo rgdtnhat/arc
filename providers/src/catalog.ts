@@ -21,6 +21,12 @@ export interface ServiceDef {
   price: bigint;
   /** SLA window in seconds the provider commits to. */
   slaSeconds: number;
+  /**
+   * Calls per minute this service is happy to serve at the catalog price.
+   * Past it, quotes rise — which is what shortens a queue rather than
+   * lengthening it. Defaults to 60 when unset.
+   */
+  comfortableRate?: number;
   /** "escrow" = one escrow per call (default); "tab" = nanopayments via TesseraTab vouchers. */
   billing?: "escrow" | "tab";
   /** If set, the provider publishes a payment request (invoice) for this service. */

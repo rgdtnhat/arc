@@ -6,7 +6,8 @@
   "main": "src/app.ts",
   "exports": {
     ".": "./src/app.ts",
-    "./catalog": "./src/catalog.ts"
+    "./catalog": "./src/catalog.ts",
+    "./pricing": "./src/pricing.ts"
   },
   "scripts": {
     "start": "NODE_USE_ENV_PROXY=1 tsx src/server.ts"
