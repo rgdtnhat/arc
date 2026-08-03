@@ -175,13 +175,41 @@ export class TesseraClient {
     }) as Promise<bigint>;
   }
 
-  /** Escrow `amount` for `provider`; returns the on-chain paymentId + tx hash. */
+  /**
+   * The dispute bond the escrow will pull alongside a payment of `amount`.
+   *
+   * Read from the contract rather than recomputed here. An escrow deployed
+   * before bonds existed has no `bondFor`, and answering 0 for it is correct —
+   * it will not pull one.
+   */
+  async bondFor(amount: bigint): Promise<bigint> {
+    try {
+      return (await this.public.readContract({
+        address: this.escrow,
+        abi: tesseraEscrowAbi,
+        functionName: "bondFor",
+        args: [amount],
+      })) as bigint;
+    } catch {
+      return 0n;
+    }
+  }
+
+  /**
+   * Escrow `amount` for `provider`; returns the on-chain paymentId + tx hash.
+   *
+   * @dev Approval is ensured here, for the payment *and* its bond. Leaving that
+   *      to callers meant three places each had to remember that `open` pulls
+   *      more than the price, and a caller that approved exactly the price would
+   *      revert at the door.
+   */
   async open(
     provider: Hex,
     amount: bigint,
     deadline: bigint,
     quoteHash: Hex
   ): Promise<{ paymentId: bigint; txHash: Hex }> {
+    await this.ensureApproval(amount + (await this.bondFor(amount)));
     const { request } = await this.public.simulateContract({
       address: this.escrow,
       abi: tesseraEscrowAbi,

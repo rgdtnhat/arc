@@ -54,8 +54,9 @@ describe("TesseraEscrow", () => {
     const deadline = await futureDeadline();
     await agentEscrow.write.open([provider.account.address, PRICE, deadline, quoteHash]);
 
-    // Escrow holds the funds.
-    expect(await usdc.read.balanceOf([escrow.address])).to.equal(PRICE);
+    // Escrow holds the payment and the buyer's dispute bond.
+    const BOND = await escrow.read.bondFor([PRICE]);
+    expect(await usdc.read.balanceOf([escrow.address])).to.equal(PRICE + BOND);
 
     await providerEscrow.write.fulfill([1n, responseHash]);
     await agentEscrow.write.settle([1n]);
@@ -98,7 +99,12 @@ describe("TesseraEscrow", () => {
     // Agent decides the SLA/quality was not met.
     await agentEscrow.write.refund([1n]);
 
-    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT);
+    // The payment comes back; the bond does not. Rejecting work that was
+    // actually delivered is the one outcome the buyer pays for — otherwise
+    // every purchase is an option to take the data and then decide.
+    const BOND = await escrow.read.bondFor([PRICE]);
+    expect(BOND > 0n).to.equal(true);
+    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT - BOND);
     expect(await usdc.read.balanceOf([provider.account.address])).to.equal(0n);
     const [, failed] = await escrow.read.reputation([provider.account.address]);
     expect(failed).to.equal(1n);
@@ -160,9 +166,14 @@ describe("TesseraEscrow", () => {
     await providerEscrow.write.fulfill([1n, responseHash]);
     await agentEscrow.write.refund([1n]);
 
-    // Agent got the refund PLUS 20% of the payment slashed from the stake.
+    // Agent got the refund PLUS 20% of the payment slashed from the stake,
+    // MINUS the bond it forfeited by rejecting delivered work. The slash is
+    // deliberately the larger of the two, so a staked provider still comes out
+    // behind on a breach and cannot profit by inducing rejections.
     const slash = (PRICE * 2000n) / 10000n;
-    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT + slash);
+    const BOND = await escrow.read.bondFor([PRICE]);
+    expect(slash > BOND).to.equal(true);
+    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT + slash - BOND);
     expect(await escrow.read.stakeOf([provider.account.address])).to.equal(STAKE - slash);
   });
 
@@ -181,13 +192,15 @@ describe("TesseraEscrow", () => {
   });
 
   it("refunds without slash when the provider has no stake", async () => {
-    const { agent, provider, usdc, agentEscrow, providerEscrow } =
+    const { agent, provider, usdc, escrow, agentEscrow, providerEscrow } =
       await loadFixture(deployFixture);
     const deadline = await futureDeadline();
     await agentEscrow.write.open([provider.account.address, PRICE, deadline, quoteHash]);
     await providerEscrow.write.fulfill([1n, responseHash]);
     await agentEscrow.write.refund([1n]);
-    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT);
+    // No stake to slash, so the buyer is simply out its bond.
+    const BOND = await escrow.read.bondFor([PRICE]);
+    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT - BOND);
   });
 
   it("lets the provider claim a delivered payment after the dispute window", async () => {
@@ -239,7 +252,9 @@ describe("TesseraEscrow", () => {
     // Half the window passes, then the agent rejects — refund still works.
     await time.increase(Number(await escrow.read.DISPUTE_WINDOW()) / 2);
     await agentEscrow.write.refund([1n]);
-    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(MINT);
+    expect(await usdc.read.balanceOf([agent.account.address])).to.equal(
+      MINT - (await escrow.read.bondFor([PRICE])),
+    );
     // And the provider can no longer claim a refunded payment.
     await time.increase(Number(await escrow.read.DISPUTE_WINDOW()));
     await expect(providerEscrow.write.providerClaim([1n])).to.be.rejected;
@@ -263,8 +278,23 @@ describe("TesseraEscrow", () => {
   // use this contract for their own trade. These pin the fee that turns that
   // into revenue, and the limits on it.
 
-  /** open -> fulfill, returning the payment id. */
+  /**
+   * open -> fulfill, returning the payment id.
+   *
+   * Tops the buyer up by exactly the dispute bond first. These cases are about
+   * the protocol fee, and the bond is a separate mechanism that returns to the
+   * buyer on every path here except an outright rejection — funding it exactly
+   * keeps it out of the deltas being measured instead of leaving each case to
+   * subtract it back out.
+   */
   async function opened(fx: any, amount: bigint, buyer: any, seller: any) {
+    const bond = await fx.escrow.read.bondFor([amount]);
+    await fx.usdc.write.mint([buyer.account.address, bond]);
+    const buyerUsdc = await hre.viem.getContractAt("MockUSDC", fx.usdc.address, {
+      client: { wallet: buyer },
+    });
+    await buyerUsdc.write.approve([fx.escrow.address, amount + bond]);
+
     const deadline = await futureDeadline(3600);
     await (await fx.asEscrow(buyer)).write.open([seller.account.address, amount, deadline, quoteHash]);
     const id = (await fx.escrow.read.nextPaymentId()) - 1n;
@@ -303,11 +333,18 @@ describe("TesseraEscrow", () => {
 
     const before = await usdc.read.balanceOf([agent.account.address]);
     const tBefore = await usdc.read.balanceOf([treasury.account.address]);
+    const bond = await escrow.read.bondFor([1_000_000n]);
     const id = await opened(fx, 1_000_000n, agent, provider);
     await (await fx.asEscrow(agent)).write.refund([id]);
 
+    // The buyer is whole on the payment and out its bond, which `opened` had
+    // topped it up by — so its balance lands exactly where it started.
     expect(await usdc.read.balanceOf([agent.account.address])).to.equal(before);
-    expect(await usdc.read.balanceOf([treasury.account.address])).to.equal(tBefore);
+    // The treasury receives the forfeited bond and *no fee*. The distinction is
+    // the point of this case: a rejected payment is not revenue, and the only
+    // thing that reaches the treasury here is the buyer's own stake in its
+    // dispute.
+    expect((await usdc.read.balanceOf([treasury.account.address])) - tBefore).to.equal(bond);
   });
 
   it("takes the fee on a provider claim too, so the liveness path isn't a bypass", async () => {
@@ -382,6 +419,14 @@ describe("TesseraEscrow (the fee is fixed when the escrow is funded)", () => {
 
   /** open -> fulfill at whatever fee is currently set, returning the id. */
   async function openAndFulfil(fx: any, amount: bigint) {
+    // Cover the dispute bond, which is orthogonal to the fee under test.
+    const bond = await fx.escrow.read.bondFor([amount]);
+    await fx.usdc.write.mint([fx.agent.account.address, bond]);
+    const agentUsdc = await hre.viem.getContractAt("MockUSDC", fx.usdc.address, {
+      client: { wallet: fx.agent },
+    });
+    await agentUsdc.write.approve([fx.escrow.address, amount + bond]);
+
     const deadline = await futureDeadline(3600);
     await (await fx.asEscrow(fx.agent)).write.open([
       fx.provider.account.address, amount, deadline, quoteHash,
@@ -446,6 +491,15 @@ describe("TesseraEscrow (the fee is fixed when the escrow is funded)", () => {
     const { escrow, usdc, agent, treasury } = fx;
     await escrow.write.setProtocolFee([100, treasury.account.address]);
 
+    // Cover the bond, which this path returns in full: the provider never
+    // delivered, so there is nothing for the buyer to have rejected.
+    const bond = await escrow.read.bondFor([MINT]);
+    await usdc.write.mint([agent.account.address, bond]);
+    const agentUsdc = await hre.viem.getContractAt("MockUSDC", usdc.address, {
+      client: { wallet: agent },
+    });
+    await agentUsdc.write.approve([escrow.address, MINT + bond]);
+
     const deadline = await futureDeadline(3600);
     await (await fx.asEscrow(agent)).write.open([
       fx.provider.account.address, MINT, deadline, quoteHash,
@@ -457,7 +511,9 @@ describe("TesseraEscrow (the fee is fixed when the escrow is funded)", () => {
     await time.increaseTo(Number(deadline) + 1);
     await (await fx.asEscrow(agent)).write.refund([id]);
 
-    expect((await usdc.read.balanceOf([agent.account.address])) - before).to.equal(MINT);
+    // Payment and bond both come back: a provider that never delivered is not
+    // something the buyer disputed, so there is nothing to forfeit.
+    expect((await usdc.read.balanceOf([agent.account.address])) - before).to.equal(MINT + bond);
     expect((await usdc.read.balanceOf([treasury.account.address])) - tBefore).to.equal(0n);
   });
 });

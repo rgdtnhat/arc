@@ -77,3 +77,104 @@ test("quality gate rejects junk and passes good payloads", () => {
   assert.equal(passesQuality("fx:quote", { rate: 1.1 }).ok, true);
   assert.equal(passesQuality("alpha:report", { stance: "bullish", drivers: [] }).ok, true);
 });
+
+// --- reputation that costs something to build --------------------------------
+//
+// `fulfilled` and `failed` are cheap to manufacture: fund a second address, buy
+// from yourself, settle, repeat. This function decides what the agent's money
+// buys, so it has to treat a manufactured record as weaker than a real one.
+
+const NOW = 1_800_000_000; // fixed, so decay is deterministic
+const RECENT = NOW - 86_400; // a day ago
+
+test("a spread, recent record scores as well as it always did", () => {
+  const spread = trustScore(
+    { fulfilled: 20, failed: 0, distinctBuyers: 12, lastSettledAt: RECENT },
+    "0",
+    NOW,
+  );
+  const naive = trustScore({ fulfilled: 20, failed: 0 }, "0", NOW);
+  // Honest providers must not be penalised by the new signals — the point is
+  // to catch a fake history, not to make real ones unbuyable.
+  assert.ok(Math.abs(spread - naive) < 0.02, `${spread} vs ${naive}`);
+});
+
+test("a record from a single counterparty is discounted toward neutral", () => {
+  const farmed = trustScore(
+    { fulfilled: 40, failed: 0, distinctBuyers: 1, lastSettledAt: RECENT },
+    "0",
+    NOW,
+  );
+  const real = trustScore(
+    { fulfilled: 40, failed: 0, distinctBuyers: 20, lastSettledAt: RECENT },
+    "0",
+    NOW,
+  );
+  // Identical counts, very different claims.
+  assert.ok(farmed < real, `${farmed} should be below ${real}`);
+  assert.ok(farmed < 0.75, `${farmed} should be well short of a clean record`);
+  assert.ok(farmed > 0.5, "still better than unknown, just not by much");
+});
+
+test("concentration cannot push a good provider below neutral", () => {
+  // The discount pulls toward 0.5, never through it. A provider with a clean
+  // record and one counterparty is unproven, not bad.
+  const s = trustScore(
+    { fulfilled: 50, failed: 0, distinctBuyers: 1, lastSettledAt: RECENT },
+    "0",
+    NOW,
+  );
+  assert.ok(s >= 0.5, `${s}`);
+});
+
+test("a record that stopped moving decays toward neutral", () => {
+  const fresh = trustScore(
+    { fulfilled: 30, failed: 0, distinctBuyers: 15, lastSettledAt: RECENT },
+    "0",
+    NOW,
+  );
+  const stale = trustScore(
+    { fulfilled: 30, failed: 0, distinctBuyers: 15, lastSettledAt: NOW - 86_400 * 240 },
+    "0",
+    NOW,
+  );
+  assert.ok(stale < fresh, `${stale} should be below ${fresh}`);
+  // Four half-lives out, almost all of the signal is gone.
+  assert.ok(stale < 0.55, `${stale}`);
+});
+
+test("an unseen provider stays neutral rather than being punished twice", () => {
+  const s = trustScore({ fulfilled: 0, failed: 0, distinctBuyers: 0, lastSettledAt: 0 }, "0", NOW);
+  assert.equal(s, 0.5);
+});
+
+test("a caller that has not read the new fields gets the old behaviour", () => {
+  // Reading an escrow deployed before these fields returns a shorter tuple. That
+  // must degrade to the previous score, not to "zero counterparties".
+  const s = trustScore({ fulfilled: 20, failed: 0 }, "0", NOW);
+  assert.ok(s > 0.9, `${s}`);
+});
+
+test("a bad record is still bad however well spread it is", () => {
+  const s = trustScore(
+    { fulfilled: 2, failed: 20, distinctBuyers: 20, lastSettledAt: RECENT },
+    "0",
+    NOW,
+  );
+  assert.ok(s < 0.3, `${s}`);
+});
+
+test("stake still helps, and concentration still applies on top", () => {
+  const staked = trustScore(
+    { fulfilled: 10, failed: 0, distinctBuyers: 8, lastSettledAt: RECENT },
+    "5.0",
+    NOW,
+  );
+  const unstaked = trustScore(
+    { fulfilled: 10, failed: 0, distinctBuyers: 8, lastSettledAt: RECENT },
+    "0",
+    NOW,
+  );
+  assert.ok(staked >= unstaked, `${staked} vs ${unstaked}`);
+  assert.ok(staked <= 1);
+});

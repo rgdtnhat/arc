@@ -104,8 +104,20 @@ export interface ReputationAnswer {
   /** Settled / total, 0..1. `null` when there is no history to judge. */
   successRate: number | null;
   stakeUsdc: string;
+  /**
+   * Unique counterparties behind `settled`. The number that separates a real
+   * track record from one address settling with itself repeatedly.
+   */
+  distinctBuyers: number;
+  /**
+   * Settlements per distinct buyer, in bps. 10000 is a different buyer every
+   * time; 100 is a hundred settlements from one.
+   */
+  concentrationBps: number;
+  /** Unix seconds of the most recent settlement, 0 if never. */
+  lastSettledAt: number;
   /** Our reading of it, stated as a rule so a buyer can disagree. */
-  verdict: "unknown" | "unproven" | "poor" | "mixed" | "good";
+  verdict: "unknown" | "unproven" | "poor" | "mixed" | "good" | "concentrated";
   asOf: string;
 }
 
@@ -326,7 +338,18 @@ export class DefiOracle {
         { address: this.cfg.escrow, abi: tesseraEscrowAbi, functionName: "stakeOf", args: [provider] },
       ] as never,
     })) as [readonly bigint[], bigint];
-    return reputationFrom(provider, Number(rep[0] ?? 0n), Number(rep[1] ?? 0n), fmt(stake, 6));
+    // rep = [fulfilled, failed, earned, distinctBuyers, lastSettledAt]. The last
+    // two are appended fields; an escrow deployed before them simply returns a
+    // shorter tuple, and the defaults make that read as "unknown" rather than
+    // as a provider with no counterparties.
+    return reputationFrom(
+      provider,
+      Number(rep[0] ?? 0n),
+      Number(rep[1] ?? 0n),
+      fmt(stake, 6),
+      rep[3] === undefined ? 0 : Number(rep[3]),
+      rep[4] === undefined ? 0 : Number(rep[4]),
+    );
   }
 }
 
@@ -416,9 +439,19 @@ export function reputationFrom(
   settled: number,
   failed: number,
   stakeUsdc: string,
+  distinctBuyers = 0,
+  lastSettledAt = 0,
 ): ReputationAnswer {
   const total = settled + failed;
   const successRate = total === 0 ? null : round(settled / total, 4);
+  const concentrationBps = settled === 0 ? 0 : Math.round((distinctBuyers * 10_000) / settled);
+
+  // A record that is long but came from almost nobody is reported as its own
+  // verdict rather than folded into "good". The counts look excellent in that
+  // case — that is exactly what makes it worth saying out loud, because a buyer
+  // reading "good" would have no reason to go and divide the two numbers.
+  const concentrated = settled >= 5 && distinctBuyers > 0 && concentrationBps < 2_500;
+
   const verdict: ReputationAnswer["verdict"] =
     total === 0
       ? "unknown"
@@ -426,8 +459,23 @@ export function reputationFrom(
         ? "unproven"
         : successRate! < 0.7
           ? "poor"
-          : successRate! < 0.95
-            ? "mixed"
-            : "good";
-  return { provider, settled, failed, total, successRate, stakeUsdc, verdict, asOf: new Date().toISOString() };
+          : concentrated
+            ? "concentrated"
+            : successRate! < 0.95
+              ? "mixed"
+              : "good";
+
+  return {
+    provider,
+    settled,
+    failed,
+    total,
+    successRate,
+    stakeUsdc,
+    distinctBuyers,
+    concentrationBps,
+    lastSettledAt,
+    verdict,
+    asOf: new Date().toISOString(),
+  };
 }

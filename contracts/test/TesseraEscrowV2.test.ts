@@ -181,7 +181,12 @@ describe("TesseraEscrow — batching", () => {
     await time.increase(120);
     const before = await f.usdc.read.balanceOf([f.agent.account.address]);
     await a.write.refundMany([ids]);
-    expect(await f.usdc.read.balanceOf([f.agent.account.address])).to.equal(before + U("12"));
+    // Four timed-out payments of 3, each returning its bond as well: nobody
+    // delivered anything, so no bond was forfeited.
+    const bond = await f.escrow.read.bondFor([U("3")]);
+    expect(await f.usdc.read.balanceOf([f.agent.account.address])).to.equal(
+      before + U("12") + bond * 4n,
+    );
   });
 });
 
@@ -220,13 +225,15 @@ describe("TesseraEscrow — paying in an asset the buyer holds", () => {
     const a = await f.as(f.agent);
     const eurcBefore = await f.eurc.read.balanceOf([f.agent.account.address]);
 
-    // Provider quoted 100 USDC; the buyer holds only EURC.
-    await a.write.openWith([f.eurc.address, U("110"), f.provider.account.address, U("100"), await soon(), H("q")]);
+    // Provider quoted 100 USDC; the buyer holds only EURC. The route has to
+    // cover the 10% bond as well as the price, so the buyer's bound is set
+    // against 110 USDC of need rather than 100.
+    await a.write.openWith([f.eurc.address, U("125"), f.provider.account.address, U("100"), await soon(), H("q")]);
     const id = (await f.escrow.read.nextPaymentId()) - 1n;
 
     const p = await f.escrow.read.getPayment([id]);
     expect(p[2]).to.equal(U("100")); // escrowed in the quoted asset, exactly
-    expect(await f.eurc.read.balanceOf([f.agent.account.address])).to.equal(eurcBefore - U("110"));
+    expect(await f.eurc.read.balanceOf([f.agent.account.address])).to.equal(eurcBefore - U("125"));
 
     await (await f.as(f.provider)).write.fulfill([id, H("r")]);
     const provBefore = await f.usdc.read.balanceOf([f.provider.account.address]);
@@ -239,7 +246,7 @@ describe("TesseraEscrow — paying in an asset the buyer holds", () => {
     const usdcBefore = await f.usdc.read.balanceOf([f.agent.account.address]);
     await (await f.as(f.agent)).write.openWith([
       f.eurc.address,
-      U("110"),
+      U("125"),
       f.provider.account.address,
       U("100"),
       await soon(),
@@ -248,8 +255,10 @@ describe("TesseraEscrow — paying in an asset the buyer holds", () => {
     // Whatever the route did not need comes straight back.
     const back = (await f.usdc.read.balanceOf([f.agent.account.address])) - usdcBefore;
     expect(back > 0n).to.equal(true);
-    // And the escrow holds exactly what it owes, not a wei more.
-    expect(await f.usdc.read.balanceOf([f.escrow.address])).to.equal(U("100"));
+    // And the escrow holds exactly what it owes plus the bond, not a wei more.
+    expect(await f.usdc.read.balanceOf([f.escrow.address])).to.equal(
+      U("100") + (await f.escrow.read.bondFor([U("100")])),
+    );
   });
 
   it("reverts rather than opening a payment the route could not cover", async () => {
@@ -273,13 +282,15 @@ describe("TesseraEscrow — paying in an asset the buyer holds", () => {
     const f = await loadFixture(routedFixture);
     await (await f.as(f.agent)).write.openWith([
       f.usdc.address,
-      U("40"),
+      U("44"), // the quote plus its 10% bond
       f.provider.account.address,
       U("40"),
       await soon(),
       H("q"),
     ]);
-    expect(await f.usdc.read.balanceOf([f.escrow.address])).to.equal(U("40"));
+    expect(await f.usdc.read.balanceOf([f.escrow.address])).to.equal(
+      U("40") + (await f.escrow.read.bondFor([U("40")])),
+    );
   });
 
   it("refuses to route when no router is wired", async () => {

@@ -48,20 +48,73 @@ export interface Decision {
   matchedNeed?: Need;
 }
 
+/** How stale a record has to get before it stops counting for much. */
+const REPUTATION_HALF_LIFE_DAYS = 60;
+
 /**
  * Trust score: neutral 0.5 for an unseen provider, rising with a clean record.
  * A provider that has bonded stake gets a bonus — it loses real money on an
  * SLA breach, so an unknown-but-staked provider is safer than an unknown one.
+ *
+ * ## Why the counts alone are not enough
+ * `fulfilled` and `failed` are cheap to manufacture. A provider funds a second
+ * address, buys from itself, settles, and repeats — a spotless record for the
+ * price of gas. This function decides what the agent's money buys, so treating
+ * those two numbers as evidence is treating an advertisement as a reference.
+ *
+ * Two corrections, both reading fields the escrow now records:
+ *
+ * `distinctBuyers` says how many different addresses that record came from. One
+ * counterparty across fifty settlements is a single relationship, not fifty
+ * endorsements, and the score treats it as roughly the former. Faking it means
+ * funding a new address per point, which is the cost that was missing.
+ *
+ * `lastSettledAt` discounts a record that stopped moving. A perfect history from
+ * eight months ago describes a provider that may no longer be running.
+ *
+ * Both only ever *reduce* the score. A provider with a genuine, spread, recent
+ * record is unaffected — which is the point: this is meant to catch a
+ * manufactured history, not to make honest newcomers unbuyable.
  */
 export function trustScore(
-  rep: { fulfilled: number; failed: number },
-  stakeUsdc?: string
+  rep: {
+    fulfilled: number;
+    failed: number;
+    /** Unique counterparties. Absent for a caller that has not read it. */
+    distinctBuyers?: number;
+    /** Unix seconds of the last settlement. Absent, or 0, means unknown. */
+    lastSettledAt?: number;
+  },
+  stakeUsdc?: string,
+  nowSeconds: number = Math.floor(Date.now() / 1000)
 ): number {
   const total = rep.fulfilled + rep.failed;
   // Laplace-smoothed success rate; 0.5 when unseen.
   const record = total === 0 ? 0.5 : (rep.fulfilled + 1) / (total + 2);
   const stakeBonus = Number(stakeUsdc ?? 0) > 0 ? 0.1 : 0;
-  return Math.min(1, record + stakeBonus);
+  const raw = Math.min(1, record + stakeBonus);
+
+  // An unseen provider is neutral, not suspicious — there is no concentration
+  // to measure and nothing to go stale.
+  if (total === 0) return raw;
+
+  // Pull the score toward neutral in proportion to how concentrated the record
+  // is. Four or more distinct buyers is treated as spread enough to stand on
+  // its own; one buyer keeps only a quarter of the distance above neutral.
+  let score = raw;
+  if (rep.distinctBuyers !== undefined && rep.fulfilled > 0) {
+    const spread = Math.min(1, rep.distinctBuyers / 4);
+    score = 0.5 + (score - 0.5) * spread;
+  }
+
+  // Then decay what is left toward neutral with age.
+  if (rep.lastSettledAt) {
+    const ageDays = Math.max(0, (nowSeconds - rep.lastSettledAt) / 86_400);
+    const freshness = Math.pow(0.5, ageDays / REPUTATION_HALF_LIFE_DAYS);
+    score = 0.5 + (score - 0.5) * freshness;
+  }
+
+  return Math.max(0, Math.min(1, score));
 }
 
 /**

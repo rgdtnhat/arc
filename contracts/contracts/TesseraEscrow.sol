@@ -57,6 +57,10 @@ contract TesseraEscrow is ReentrancyGuard {
         bytes32 quoteHash; // binds the off-chain price quote
         bytes32 responseHash; // set on fulfill; commitment to the delivered payload
         Status status;
+        // Posted by the buyer at `open`, alongside the payment. Returned in every
+        // outcome except one: rejecting work that was actually delivered. See
+        // DISPUTE_BOND_BPS.
+        uint256 bond;
         // The protocol fee in force when this escrow was funded.
         //
         // Snapshotted rather than read at payout, because the two are not the
@@ -68,11 +72,35 @@ contract TesseraEscrow is ReentrancyGuard {
         uint16 feeBps;
     }
 
+    /**
+     * A provider's track record.
+     *
+     * `fulfilled` and `failed` on their own are farmable, and cheaply: a provider
+     * funds a second address, opens escrows to itself, fulfills and settles them,
+     * and mints a flawless record for the price of gas. Since the agent's
+     * `trustScore` reads exactly these two numbers to decide what to buy, that is
+     * not a cosmetic problem — it is a way to talk a buyer into a purchase.
+     *
+     * `distinctBuyers` is what makes it visible. A hundred settlements across one
+     * counterparty and a hundred across sixty are the same two numbers and very
+     * different claims, and only the second is expensive to fake: every extra
+     * distinct buyer is another funded address. It does not make farming
+     * impossible, it makes it cost something and show up in the record.
+     *
+     * `lastSettledAt` lets a reader discount a record that stopped moving. A
+     * perfect history from eight months ago says little about a provider today.
+     */
     struct Reputation {
         uint128 fulfilled; // settled deliveries
         uint128 failed; // refunds charged against the provider
         uint256 earned; // total USDC released to the provider
+        uint64 distinctBuyers; // unique addresses that have settled with them
+        uint64 lastSettledAt; // unix seconds of the most recent settlement
     }
+
+    /// @dev provider => buyer => have they ever settled together. Backs
+    ///      `Reputation.distinctBuyers`, which cannot be derived without it.
+    mapping(address => mapping(address => bool)) public hasSettledWith;
 
     /**
      * The buyer's side of the record.
@@ -108,6 +136,42 @@ contract TesseraEscrow is ReentrancyGuard {
     ///         griefing agent can never lock a delivered payment forever.
     uint64 public constant DISPUTE_WINDOW = 1 hours;
 
+    /**
+     * The buyer's stake in its own dispute, as a share of the payment.
+     *
+     * `BuyerRecord` made the free option visible. This is what prices it.
+     *
+     * Before this, a buyer could take delivery and then call `refund` inside the
+     * dispute window: full payment back, `failed += 1` against the provider, the
+     * provider's stake slashed, and nothing at all paid by the buyer. Every
+     * purchase was really an option — receive the work, then decide whether to
+     * pay for it. The agent in this repo does not exploit that, because
+     * `passesQuality` gates it honestly, but nothing in the contract required
+     * that of anyone else.
+     *
+     * So the buyer now posts a bond with the payment. It comes back on settle,
+     * on a provider that never showed up, and on a provider claim. It is
+     * forfeited in exactly one case: the buyer rejecting work that *was*
+     * delivered. Disputing is still available and still cheap — it simply is no
+     * longer free.
+     *
+     * ## Where the bond goes, and why not to the provider
+     * To the treasury. Paying it to the provider would have created a worse
+     * problem than the one being fixed: a provider with no stake could deliver
+     * deliberate garbage, bank the forfeited bond, and lose nothing, because
+     * `slashAmount` is capped at what they have staked. The bond is a cost of
+     * disputing, not a transfer to the counterparty, and that distinction is what
+     * keeps it from becoming an attack in the other direction.
+     *
+     * ## The honest cost
+     * A buyer who genuinely receives garbage pays this to reject it. That is the
+     * price of settling disputes with no arbiter: the chain cannot tell a bad
+     * response from a buyer who changed their mind, so it charges for the claim
+     * rather than pretending to judge it. Sized well below `SLASH_BPS` so that
+     * inducing a rejection stays firmly negative for a staked provider.
+     */
+    uint256 public constant DISPUTE_BOND_BPS = 1_000; // 10% of the payment
+
     uint256 public nextPaymentId = 1;
     mapping(uint256 => Payment) public payments;
     mapping(address => Reputation) public reputationOf;
@@ -132,6 +196,7 @@ contract TesseraEscrow is ReentrancyGuard {
     event Unstaked(address indexed provider, uint256 amount, uint256 total);
     event Slashed(address indexed provider, uint256 indexed paymentId, uint256 amount, address indexed to);
     event PaymentDisputed(uint256 indexed paymentId, address indexed agent, address indexed provider);
+    event BondReleased(uint256 indexed paymentId, address indexed to, uint256 amount);
     event RouterSet(address router);
     event PaymentRouted(uint256 indexed paymentId, address indexed tokenIn, uint256 amountIn, uint256 amountOut);
 
@@ -259,9 +324,25 @@ contract TesseraEscrow is ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
         if (deadline <= block.timestamp) revert DeadlinePassed();
 
-        if (!usdc.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
+        // Payment and bond move together, so a buyer can never end up holding a
+        // funded escrow it has not staked anything against.
+        uint256 bond = bondFor(amount);
+        if (!usdc.transferFrom(msg.sender, address(this), amount + bond)) revert TransferFailed();
 
-        paymentId = _record(msg.sender, provider, amount, deadline, quoteHash);
+        paymentId = _record(msg.sender, provider, amount, deadline, quoteHash, bond);
+    }
+
+    /// @notice What a buyer must post alongside a payment of `amount`.
+    function bondFor(uint256 amount) public pure returns (uint256) {
+        return (amount * DISPUTE_BOND_BPS) / 10_000;
+    }
+
+    /// @notice The bond held against a payment, and whether it is still at risk.
+    function bondOf(uint256 paymentId) external view returns (uint256 bond, bool atRisk) {
+        Payment storage p = payments[paymentId];
+        // Only a live payment can still lose its bond; once settled or refunded
+        // the outcome is decided and the bond has already gone where it goes.
+        return (p.bond, p.status == Status.Escrowed || p.status == Status.Fulfilled);
     }
 
     /// @dev The one place a payment comes into existence, so the direct and the
@@ -271,7 +352,8 @@ contract TesseraEscrow is ReentrancyGuard {
         address provider,
         uint256 amount,
         uint64 deadline,
-        bytes32 quoteHash
+        bytes32 quoteHash,
+        uint256 bond
     ) internal returns (uint256 paymentId) {
         paymentId = nextPaymentId++;
         payments[paymentId] = Payment({
@@ -283,6 +365,7 @@ contract TesseraEscrow is ReentrancyGuard {
             quoteHash: quoteHash,
             responseHash: bytes32(0),
             status: Status.Escrowed,
+            bond: bond,
             feeBps: protocolFeeBps
         });
         emit PaymentOpened(paymentId, agent, provider, amount, deadline, quoteHash);
@@ -320,6 +403,13 @@ contract TesseraEscrow is ReentrancyGuard {
 
         if (!IERC20(tokenIn).transferFrom(msg.sender, address(this), maxIn)) revert TransferFailed();
 
+        // The route has to cover the bond as well as the price. Funding one
+        // without the other would let the cross-currency path open a payment the
+        // buyer has staked nothing against — the same free option, reachable by
+        // a different door.
+        uint256 bond = bondFor(amount);
+        uint256 needed = amount + bond;
+
         uint256 received;
         if (tokenIn == address(usdc)) {
             // Nothing to route. Accepting this rather than rejecting it lets a
@@ -329,22 +419,22 @@ contract TesseraEscrow is ReentrancyGuard {
             uint256 heldBefore = usdc.balanceOf(address(this));
             IERC20(tokenIn).approve(router, 0);
             if (!IERC20(tokenIn).approve(router, maxIn)) revert TransferFailed();
-            // `amount` as the floor: the route delivers the full quoted price or
-            // the whole call reverts. A partial fill would open a payment for
-            // less than the provider agreed to.
-            IEscrowRouter(router).swap(tokenIn, address(usdc), maxIn, amount, block.timestamp);
+            // `needed` as the floor: the route delivers the full quoted price
+            // plus bond or the whole call reverts. A partial fill would open a
+            // payment for less than the provider agreed to.
+            IEscrowRouter(router).swap(tokenIn, address(usdc), maxIn, needed, block.timestamp);
             IERC20(tokenIn).approve(router, 0);
             // Measured, not taken from the return value: the balance is what
             // this contract can actually pay out, and it stays true even if the
             // router ever behaves differently from its ABI.
             received = usdc.balanceOf(address(this)) - heldBefore;
         }
-        if (received < amount) revert RouteShortfall(received, amount);
+        if (received < needed) revert RouteShortfall(received, needed);
 
-        paymentId = _record(msg.sender, provider, amount, deadline, quoteHash);
+        paymentId = _record(msg.sender, provider, amount, deadline, quoteHash, bond);
         emit PaymentRouted(paymentId, tokenIn, maxIn, received);
 
-        uint256 change = received - amount;
+        uint256 change = received - needed;
         if (change > 0 && !usdc.transfer(msg.sender, change)) revert TransferFailed();
     }
 
@@ -435,16 +525,13 @@ contract TesseraEscrow is ReentrancyGuard {
 
         uint256 net = _payProvider(paymentId, p);
 
-        Reputation storage r = reputationOf[p.provider];
-        r.fulfilled += 1;
-        // What the provider actually received, not the gross — `earned` is read
-        // as a track record of income, and gross would overstate it.
-        r.earned += net;
+        _creditProvider(p.provider, p.agent, net);
 
         BuyerRecord storage b = buyerRecordOf[p.agent];
         b.settled += 1;
         b.spent += p.amount;
 
+        _releaseBond(paymentId, p, p.agent);
         emit PaymentSettled(paymentId, p.provider, net);
     }
 
@@ -466,9 +553,7 @@ contract TesseraEscrow is ReentrancyGuard {
 
         uint256 net = _payProvider(paymentId, p);
 
-        Reputation storage r = reputationOf[p.provider];
-        r.fulfilled += 1;
-        r.earned += net;
+        _creditProvider(p.provider, p.agent, net);
 
         // The buyer went quiet rather than settling, but the payment did land
         // with the provider — counting it keeps `settled + disputed` equal to
@@ -477,7 +562,40 @@ contract TesseraEscrow is ReentrancyGuard {
         b.settled += 1;
         b.spent += p.amount;
 
+        // The buyer went quiet, which is not the same as disputing. Going quiet
+        // already costs them the payment; taking the bond too would punish an
+        // outage twice.
+        _releaseBond(paymentId, p, p.agent);
         emit PaymentClaimed(paymentId, p.provider, net);
+    }
+
+    /**
+     * @dev The one place a settlement is written into a provider's record, so
+     *      the fast path and the claim path cannot count it differently.
+     * @param net What the provider actually received, not the gross — `earned`
+     *        is read as a track record of income, and gross would overstate it.
+     */
+    function _creditProvider(address provider, address buyer, uint256 net) internal {
+        Reputation storage r = reputationOf[provider];
+        r.fulfilled += 1;
+        r.earned += net;
+        r.lastSettledAt = uint64(block.timestamp);
+        if (!hasSettledWith[provider][buyer]) {
+            hasSettledWith[provider][buyer] = true;
+            r.distinctBuyers += 1;
+        }
+    }
+
+    /**
+     * @dev Send a payment's bond wherever this outcome sends it, once.
+     *      Zeroed before the transfer so no path can pay the same bond twice.
+     */
+    function _releaseBond(uint256 paymentId, Payment storage p, address to) internal {
+        uint256 bond = p.bond;
+        if (bond == 0) return;
+        p.bond = 0;
+        if (!usdc.transfer(to, bond)) revert TransferFailed();
+        emit BondReleased(paymentId, to, bond);
     }
 
     /**
@@ -524,6 +642,12 @@ contract TesseraEscrow is ReentrancyGuard {
             emit PaymentDisputed(paymentId, p.agent, p.provider);
         }
 
+        // The one outcome the bond is for. Rejecting delivered work forfeits it;
+        // every other way out of an escrow returns it. To the treasury rather
+        // than to the provider — see DISPUTE_BOND_BPS for why paying the
+        // counterparty would open a worse hole than it closes.
+        _releaseBond(paymentId, p, agentReject ? treasury : p.agent);
+
         // SLA breach: compensate the agent from the provider's stake (if any).
         uint256 slashAmount = (p.amount * SLASH_BPS) / 10_000;
         uint256 staked = stakeOf[p.provider];
@@ -561,10 +685,31 @@ contract TesseraEscrow is ReentrancyGuard {
     function reputation(address provider)
         external
         view
-        returns (uint128 fulfilled, uint128 failed, uint256 earned)
+        returns (
+            uint128 fulfilled,
+            uint128 failed,
+            uint256 earned,
+            uint64 distinctBuyers,
+            uint64 lastSettledAt
+        )
     {
         Reputation storage r = reputationOf[provider];
-        return (r.fulfilled, r.failed, r.earned);
+        return (r.fulfilled, r.failed, r.earned, r.distinctBuyers, r.lastSettledAt);
+    }
+
+    /**
+     * @notice How concentrated a provider's record is, in bps of settlements per
+     *         distinct buyer.
+     * @dev 10000 means every settlement came from a different address; 100 means
+     *      a hundred settlements from one. A reader does not need this — it is
+     *      `distinctBuyers / fulfilled` — but putting the ratio next to the counts
+     *      is what makes a farmed record obvious at a glance rather than only to
+     *      someone who thought to divide.
+     */
+    function concentrationBps(address provider) external view returns (uint256) {
+        Reputation storage r = reputationOf[provider];
+        if (r.fulfilled == 0) return 0;
+        return (uint256(r.distinctBuyers) * 10_000) / uint256(r.fulfilled);
     }
 
     /**
