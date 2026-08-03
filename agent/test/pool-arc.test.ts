@@ -37,6 +37,7 @@ import {
   tesseraRouterAbi,
   tesseraFeeCollectorAbi,
   tesseraAmmAbi,
+  tesseraOracleAbi,
 } from "@tessera/shared";
 
 const run = promisify(execFile);
@@ -67,6 +68,7 @@ const ABIS: Abi[] = [
   tesseraRouterAbi as Abi,
   tesseraFeeCollectorAbi as Abi,
   tesseraAmmAbi as Abi,
+  tesseraOracleAbi as Abi,
 ];
 
 /** Which function is this calldata, under whichever ABI understands it? */
@@ -538,4 +540,32 @@ test("hands the pool over when --handover is passed", async (t) => {
   const { stdout } = await runScript(node, dir, ["--deploy-missing", "--handover"]);
   assert.doesNotMatch(stdout, /skip pool handover/);
   assert.ok(node.sent.includes("transferOwnership"), "pool ownership moved");
+});
+
+test("deploys the risk oracle and configures every reserve, but does not arm it", async (t) => {
+  // Arming on a fresh deployment would refuse borrowing immediately: the guard
+  // stops the pool whenever sources disagree, and a TWAP with no history cannot
+  // agree with anything yet.
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
+
+  assert.match(stdout, /deploying TesseraOracle/);
+  assert.match(stdout, /skip arming the risk oracle/);
+  const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
+  assert.match(record.tesseraOracle, /^0x[0-9a-fA-F]{40}$/);
+  assert.ok(node.sent.includes("configureAsset"), "reserves configured in the oracle");
+  assert.ok(!node.sent.includes("setRiskOracle"), "pool left unarmed");
+});
+
+test("arms the risk oracle when --arm-oracle is passed", async (t) => {
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing", "--arm-oracle"]);
+  assert.doesNotMatch(stdout, /skip arming the risk oracle/);
+  assert.ok(node.sent.includes("setRiskOracle"), "pool pointed at the oracle");
 });

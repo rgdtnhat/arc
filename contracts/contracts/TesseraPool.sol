@@ -26,6 +26,16 @@ interface IAggregatorV3 {
 }
 
 /// @notice Optional sanity band on manually-set prices. See TesseraPriceGuard.
+/**
+ * The pool's risk pricing. See TesseraOracle for why a price has a direction:
+ * collateral is marked at the lowest usable source and debt at the highest, so
+ * moving one feed cannot move the answer in an attacker's favour.
+ */
+interface IRiskOracle {
+    function riskPrice(address asset, bool forDebt) external view returns (uint256);
+    function anyUnreliable(address[] calldata assets) external view returns (address bad, uint256 spreadBps);
+}
+
 interface IPriceGuard {
     function check(address asset, uint256 usdPrice)
         external
@@ -311,6 +321,11 @@ contract TesseraPool is ReentrancyGuard {
 
     /// @notice Optional TesseraPriceGuard. Zero leaves manual prices unchecked.
     address public priceGuard;
+    /**
+     * Directional risk pricing, optional. Unset, the pool keeps its old
+     * behaviour: one price per asset, used for both collateral and debt.
+     */
+    address public riskOracle;
 
     /// @notice Flash-loan fee, in bps of the principal. Paid to suppliers.
     uint16 public flashFeeBps = 9; // 0.09%, the Aave-v2 number
@@ -389,6 +404,7 @@ contract TesseraPool is ReentrancyGuard {
 
     event ReserveFrozen(address indexed asset, uint8 mask);
     event CapsSet(address indexed asset, uint256 supplyCap, uint256 borrowCap);
+    event RiskOracleSet(address oracle);
     event OwnerSet(address indexed owner);
     event ReserveRenamed(address indexed asset, string name);
     event ReserveVisibility(address indexed asset, bool hidden);
@@ -437,6 +453,8 @@ contract TesseraPool is ReentrancyGuard {
     error FlashLoanNotRepaid(uint256 owed, uint256 got);
     error UnknownCategory();
     error PriceOutOfBand(uint256 given, uint256 referencePrice, uint256 deviationBps);
+    /// @dev Sources for `asset` disagree by `spreadBps` — see TesseraOracle.
+    error PriceUnreliable(address asset, uint256 spreadBps);
     error SupplyCapReached(uint256 cap, uint256 would);
     error BorrowCapReached(uint256 cap, uint256 would);
 
@@ -668,6 +686,17 @@ contract TesseraPool is ReentrancyGuard {
     function setPriceGuard(address guard) external onlyOwner {
         priceGuard = guard;
         emit PriceGuardSet(guard);
+    }
+
+    /**
+     * @notice Point risk pricing at a TesseraOracle, or clear it with address(0).
+     * @dev Clearable deliberately. An oracle that could not be removed would be
+     *      a way to freeze the pool permanently by configuring one asset badly —
+     *      the guard causing the outage it exists to prevent.
+     */
+    function setRiskOracle(address o) external onlyOwner {
+        riskOracle = o;
+        emit RiskOracleSet(o);
     }
 
     function setTreasury(address t) external onlyOwner {
@@ -904,6 +933,7 @@ contract TesseraPool is ReentrancyGuard {
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
         _requireNotFrozen(asset, FREEZE_WITHDRAW);
+        _requireReliablePrices();
         _accrueAll();
         uint256 bal = supplyBalance(asset, msg.sender);
         if (amount == 0 || amount > bal) revert ZeroAmount();
@@ -923,6 +953,7 @@ contract TesseraPool is ReentrancyGuard {
         if (!r.enabled) revert UnknownReserve();
         if (!r.borrowable) revert NotBorrowable();
         _requireNotFrozen(asset, FREEZE_BORROW);
+        _requireReliablePrices();
         _accrueAll();
         if (amount > _available(r)) revert InsufficientLiquidity();
         uint256 bCap = borrowCap[asset];
@@ -1115,6 +1146,11 @@ contract TesseraPool is ReentrancyGuard {
         uint16 percentBps
     ) external nonReentrant {
         _accrueAll();
+        // The deflation attack cashes out here: mark a price down, declare
+        // somebody liquidatable, buy their collateral at the discount. Seizing
+        // on evidence the pool does not believe is exactly what the divergence
+        // check exists to stop.
+        _requireReliablePrices();
         if (auctions[user].startedAt != 0) revert AuctionExists();
         if (!_liquidatable(user)) revert Healthy();
         if (percentBps == 0 || percentBps > BPS) revert BadFillPercent();
@@ -1580,8 +1616,52 @@ contract TesseraPool is ReentrancyGuard {
         return (borrowShares[asset][user] * r.totalBorrowAssets) / r.totalBorrowShares;
     }
 
+    /**
+     * @dev The price to use, given what the number is about to justify.
+     *
+     * `forDebt` is not decoration. Collateral marked high and debt marked low
+     * both hand an attacker borrowing power they never paid for, so the two
+     * uses want opposite caution: the oracle answers with the lowest usable
+     * source for collateral and the highest for debt, which means moving one
+     * feed cannot move the answer in the attacker's favour. With no oracle
+     * configured the pool keeps its previous single-price behaviour.
+     */
+    function _priceFor(address asset, bool forDebt) internal view returns (uint256) {
+        address o = riskOracle;
+        if (o == address(0)) return price(asset);
+        return IRiskOracle(o).riskPrice(asset, forDebt);
+    }
+
+    function _value(address asset, uint256 amount, bool forDebt) internal view returns (uint256) {
+        return (amount * _priceFor(asset, forDebt)) / (10 ** reserves[asset].decimals);
+    }
+
+    /// @dev Neutral valuation, for paths where no borrowing power is at stake.
     function _value(address asset, uint256 amount) internal view returns (uint256) {
         return (amount * price(asset)) / (10 ** reserves[asset].decimals);
+    }
+
+    /**
+     * @dev Refuse to take on new risk while any priced reserve's sources
+     *      disagree.
+     *
+     * Conservative pricing on its own defends the pool and exposes borrowers:
+     * marking collateral at the lowest source means one deflated feed hands
+     * every borrower to a liquidator. So divergence is treated as its own
+     * signal — when the contract cannot tell which source is lying it stops
+     * rather than guessing, and that stop covers borrowing *and* liquidation.
+     *
+     * Checked across all reserves rather than only the caller's, because the
+     * risk maths is cross-asset: a mark this pool does not believe makes every
+     * account's health suspect, not just the accounts holding that asset.
+     * Positions keep accruing and can always be repaid, so this freezes new
+     * risk without trapping anybody.
+     */
+    function _requireReliablePrices() internal view {
+        address o = riskOracle;
+        if (o == address(0)) return;
+        (address bad, uint256 spreadBps) = IRiskOracle(o).anyUnreliable(reserveList);
+        if (bad != address(0)) revert PriceUnreliable(bad, spreadBps);
     }
 
     function _amountForValue(address asset, uint256 value) internal view returns (uint256) {
@@ -1670,7 +1750,7 @@ contract TesseraPool is ReentrancyGuard {
             (uint16 cF, uint16 liqF, uint16 lF) = _factors(asset, cat);
             uint256 sup = supplyBalance(asset, user);
             if (sup > 0) {
-                uint256 v = _value(asset, sup);
+                uint256 v = _value(asset, sup, false);
                 supplyValue += v;
                 borrowLimit += (v * cF) / BPS;
                 liqLimit += (v * liqF) / BPS;
@@ -1680,7 +1760,7 @@ contract TesseraPool is ReentrancyGuard {
             // more than its face value, which is what lets one pool hold assets
             // of genuinely different quality.
             if (b > 0) {
-                uint256 bv = _value(asset, b);
+                uint256 bv = _value(asset, b, true);
                 borrowValue += bv;
                 liability += (bv * BPS) / lF;
             }

@@ -31,6 +31,8 @@ import {
   tesseraLpTokenBytecode,
   tesseraTimelockAbi,
   tesseraTimelockBytecode,
+  tesseraOracleAbi,
+  tesseraOracleBytecode,
   formatUsdc,
   pacedHttp,
 } from "@tessera/shared";
@@ -501,6 +503,60 @@ async function main() {
   }, { custodial: true });
   const priceGuard = guardRes.address;
 
+  // 6e-bis) TesseraOracle: risk pricing that a single moved feed cannot bend.
+  //
+  //     The pool used one number per asset for both collateral and debt, which
+  //     is what makes a manipulated price profitable in either direction —
+  //     inflate a collateral mark and over-borrow against it, or deflate one and
+  //     liquidate somebody at a price nobody traded at. The oracle quotes
+  //     collateral at the lowest usable source and debt at the highest, and
+  //     stops the pool entirely when its sources disagree.
+  const oracleRes = await adopt("TesseraOracle", existing.tesseraOracle, FRESH, async () => {
+    console.log("→ deploying TesseraOracle (directional risk pricing)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraOracleAbi,
+      bytecode: tesseraOracleBytecode,
+      args: [deployer.address, priceGuard],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   oracle", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const riskOracle = oracleRes.address;
+
+  // Seed each reserve. 10% per update and a 30-minute floor between them make
+  // walking a price somewhere useful slow and visible; 5% divergence is the
+  // point at which the sources are treated as disagreeing rather than merely
+  // differing.
+  for (const r of LIVE_RESERVES) {
+    await optional(`configuring the oracle for ${r.symbol}`, () =>
+      dSend(riskOracle, tesseraOracleAbi, "configureAsset", [
+        r.address,
+        r.price,
+        "0x0000000000000000000000000000000000000000", // no Chainlink feed on Arc testnet yet
+        3600,
+        1000,  // maxMoveBps: 10% per update
+        1800,  // minUpdateInterval: 30 minutes
+        500,   // maxDivergenceBps: 5%
+        7 * 24 * 3600, // maxAge: a week
+      ]),
+    );
+  }
+
+  // Arming is opt-in for the same reason the timelock handover is: the guard
+  // refuses new borrowing whenever its sources disagree, and on a fresh
+  // deployment the TWAP has no history to agree with yet.
+  if (process.argv.includes("--arm-oracle")) {
+    await optional("arming the pool's risk oracle", () =>
+      dSend(pool, tesseraPoolAbi, "setRiskOracle", [riskOracle]),
+    );
+  } else {
+    console.log("   (skip arming the risk oracle — pass --arm-oracle once the TWAP has history)");
+  }
+
   // Point each non-USDC reserve at the AMM pool that prices it. A reserve with
   // no feed is simply unguarded — the guard answers "ok" rather than blocking,
   // so a missing feed can never be the reason an asset's price freezes.
@@ -685,6 +741,7 @@ async function main() {
   dep.tesseraAmm = amm;
   dep.tesseraAmmFeeCollector = ammFeeCollector;
   dep.tesseraPriceGuard = priceGuard;
+  dep.tesseraOracle = riskOracle;
   dep.tesseraStream = stream;
   dep.tesseraSubscription = subscription;
   dep.tesseraSpendPolicy = spendPolicy;
@@ -706,6 +763,7 @@ async function main() {
   console.log("   amm      ", amm);
   console.log("   amm fees ", ammFeeCollector);
   console.log("   guard    ", priceGuard);
+  console.log("   oracle   ", riskOracle);
   console.log("   stream   ", stream);
   console.log("   subs     ", subscription);
   console.log("   policy   ", spendPolicy);
