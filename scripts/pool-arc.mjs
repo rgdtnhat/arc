@@ -31,8 +31,17 @@ import {
   tesseraLpTokenBytecode,
   tesseraTimelockAbi,
   tesseraTimelockBytecode,
+  tesseraEscrowAbi,
   tesseraOracleAbi,
   tesseraOracleBytecode,
+  tesseraRegistryAbi,
+  tesseraRegistryBytecode,
+  tesseraRateLimiterAbi,
+  tesseraRateLimiterBytecode,
+  tesseraArbiterAbi,
+  tesseraArbiterBytecode,
+  tesseraReceiptAnchorAbi,
+  tesseraReceiptAnchorBytecode,
   formatUsdc,
   pacedHttp,
 } from "@tessera/shared";
@@ -70,9 +79,9 @@ const EURC_ADDRESS = process.env.EURC_ADDRESS ?? "0x89B50855Aa3bE2F677cD6303Cec0
 // Reserve set: USDC + EURC (stablecoins) + cirBTC — all borrowable. Prices are
 // static USD (1e8); adjust later with setPrice or wire an oracle for mainnet.
 const RESERVES = [
-  { symbol: "USDC", address: ARC_USDC_ADDRESS, decimals: 6, cFactor: 9000, lFactor: 9500, rf: 1000, price: 1n * USD, seed: 5_000_000n },
-  { symbol: "EURC", address: EURC_ADDRESS, decimals: 6, cFactor: 8500, lFactor: 9000, rf: 1000, price: 108_000_000n, seed: 5_000_000n },
-  { symbol: "cirBTC", address: CIRBTC_ADDRESS, decimals: 8, cFactor: 7000, lFactor: 8000, rf: 1000, price: 95_000n * USD, seed: 20_000n },
+  { symbol: "USDC", address: ARC_USDC_ADDRESS, decimals: 6, cFactor: 9000, lFactor: 9500, rf: 1000, price: 1n * USD, seed: 5_000_000n, outflowPerHour: 250_000_000n },
+  { symbol: "EURC", address: EURC_ADDRESS, decimals: 6, cFactor: 8500, lFactor: 9000, rf: 1000, price: 108_000_000n, seed: 5_000_000n, outflowPerHour: 250_000_000n },
+  { symbol: "cirBTC", address: CIRBTC_ADDRESS, decimals: 8, cFactor: 7000, lFactor: 8000, rf: 1000, price: 95_000n * USD, seed: 20_000n, outflowPerHour: 500_000n },
 ];
 
 /** Read the current deployment record, preferring the gitignored local override. */
@@ -698,6 +707,129 @@ async function main() {
   }, { custodial: true });
   const lpToken = lpRes.address;
 
+  // 6i-bis) TesseraRegistry: where a provider says it exists.
+  //
+  //     Until this, the seller list was a hardcoded array on the buyer's side,
+  //     so the set of providers an agent could reach was decided by whoever
+  //     deployed the agent. A provider now stakes and lists itself.
+  const registryRes = await adopt("TesseraRegistry", existing.tesseraRegistry, FRESH, async () => {
+    console.log("→ deploying TesseraRegistry (permissionless provider discovery)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraRegistryAbi,
+      bytecode: tesseraRegistryBytecode,
+      // 1 USDC to list. High enough that a thousand spam listings cost a
+      // thousand dollars of working capital, low enough that an independent
+      // provider is not priced out — and it is returned on unlisting, so an
+      // honest lister pays only the time value.
+      args: [ARC_USDC_ADDRESS, 1_000_000n],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   registry", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const registry = registryRes.address;
+
+  // The registry keeps no reputation of its own — it points at the escrow's,
+  // which is a byproduct of real settlements and cannot be written directly.
+  if (existing.tesseraEscrow) {
+    await optional("pointing the registry at the escrow's reputation", () =>
+      dSend(registry, tesseraRegistryAbi, "setEscrow", [existing.tesseraEscrow]),
+    );
+  } else {
+    console.log("   (skip wiring the registry — no escrow in the deployment record yet)");
+  }
+
+  // 6i-ter) TesseraRateLimiter: a ceiling on how fast value leaves.
+  const limiterRes = await adopt("TesseraRateLimiter", existing.tesseraRateLimiter, FRESH, async () => {
+    console.log("→ deploying TesseraRateLimiter (outflow metering)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraRateLimiterAbi,
+      bytecode: tesseraRateLimiterBytecode,
+      args: [pool],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   limiter", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const rateLimiter = limiterRes.address;
+
+  // A bucket per reserve, sized so ordinary use never touches it and a drain
+  // takes hours. Deliberately generous: a limit that bites in normal operation
+  // is an outage, and the first thing an operator does with one is remove it.
+  for (const r of LIVE_RESERVES) {
+    await optional(`metering outflow for ${r.symbol}`, () =>
+      dSend(rateLimiter, tesseraRateLimiterAbi, "setLimit", [r.address, r.outflowPerHour, 3600n]),
+    );
+  }
+
+  // Arming is opt-in, like the oracle: this is the one control here that can
+  // block an honest withdrawal, so switching it on is a decision rather than a
+  // side effect of running the deploy script.
+  if (process.argv.includes("--arm-limiter")) {
+    await optional("arming the pool's outflow limiter", () =>
+      dSend(pool, tesseraPoolAbi, "setRateLimiter", [rateLimiter]),
+    );
+  } else {
+    console.log("   (skip arming the outflow limiter — pass --arm-limiter to meter withdrawals)");
+  }
+
+  // 6i-quater) TesseraArbiter: somebody to decide when 'it hashed' is disputed.
+  //
+  //     Skipped entirely without an escrow: the arbiter's address is baked in at
+  //     construction, so deploying one pointed at nothing would have to be
+  //     replaced rather than rewired.
+  const arbiterRes = !existing.tesseraEscrow ? { address: null } : await adopt("TesseraArbiter", existing.tesseraArbiter, FRESH, async () => {
+    console.log("→ deploying TesseraArbiter (dispute resolution)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraArbiterAbi,
+      bytecode: tesseraArbiterBytecode,
+      args: [ARC_USDC_ADDRESS, existing.tesseraEscrow, 100_000_000n], // 100 USDC to sit on the panel
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   arbiter", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const arbiter = arbiterRes.address;
+
+  if (!arbiter) {
+    console.log("   (skip the arbiter — no escrow in the deployment record yet)");
+  } else if (process.argv.includes("--arm-arbiter")) {
+    // Opt-in: with no registered arbitrators, escalation would freeze a payment
+    // until the escrow's own 24h timeout released it to the provider. Correct,
+    // but a worse experience than not offering escalation at all.
+    await optional("pointing the escrow at the arbiter", () =>
+      dSend(existing.tesseraEscrow, tesseraEscrowAbi, "setArbiter", [arbiter]),
+    );
+  } else {
+    console.log("   (skip arming the arbiter — pass --arm-arbiter once a panel is registered)");
+  }
+
+  // 6i-quinquies) TesseraReceiptAnchor: an agent's spending, provable to an outsider.
+  const anchorRes = await adopt("TesseraReceiptAnchor", existing.tesseraReceiptAnchor, FRESH, async () => {
+    console.log("→ deploying TesseraReceiptAnchor (auditable spend statements)…");
+    const h = await dWallet.deployContract({
+      abi: tesseraReceiptAnchorAbi,
+      bytecode: tesseraReceiptAnchorBytecode,
+      args: [],
+      account: deployer,
+      chain: arcTestnet,
+    });
+    const addr = (await pub.waitForTransactionReceipt({ hash: h })).contractAddress;
+    console.log("   anchor", addr);
+    await pace();
+    return addr;
+  }, { custodial: true });
+  const receiptAnchor = anchorRes.address;
+
   // 6j) TesseraTimelock, and the handover.
   //
   //     Every risk parameter moved the instant the deployer key signed. The
@@ -763,6 +895,10 @@ async function main() {
   dep.tesseraSpendPolicy = spendPolicy;
   dep.tesseraLpToken = lpToken;
   dep.tesseraTimelock = timelock;
+  dep.tesseraRegistry = registry;
+  dep.tesseraRateLimiter = rateLimiter;
+  if (arbiter) dep.tesseraArbiter = arbiter;
+  dep.tesseraReceiptAnchor = receiptAnchor;
   dep.poolAssets = LIVE_RESERVES.map((r) => ({ symbol: r.symbol, address: r.address, decimals: r.decimals, borrowable: true }));
   delete dep.poolCollateral; // no more mock collateral
   const body = JSON.stringify(dep, null, 2) + "\n";
@@ -785,6 +921,10 @@ async function main() {
   console.log("   policy   ", spendPolicy);
   console.log("   lpToken  ", lpToken);
   console.log("   timelock ", timelock);
+  console.log("   registry ", registry);
+  console.log("   limiter  ", rateLimiter);
+  if (arbiter) console.log("   arbiter  ", arbiter);
+  console.log("   anchor   ", receiptAnchor);
   for (const r of LIVE_RESERVES) console.log(`   ${r.symbol.padEnd(7)} ${r.address}`);
   console.log("   explorer ", `https://testnet.arcscan.app/address/${pool}`);
 

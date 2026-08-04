@@ -16,6 +16,8 @@ import {
   tesseraStreamAbi,
   tesseraSubscriptionAbi,
   tesseraOracleAbi,
+  tesseraRegistryAbi,
+  tesseraRateLimiterAbi,
   tesseraTabAbi,
   ARC_USDC_ADDRESS,
   tesseraFeeCollectorAbi,
@@ -47,6 +49,9 @@ import {
   DELEVERAGE_TARGET,
 } from "./keeper.js";
 import { EventIndex, indexOnce } from "./indexer.js";
+import { rankListings, decodeFindResult, endpointAllowed, type Listing } from "./discovery.js";
+import { rankOpportunities, actionable, badDebt, type LiquidatablePosition } from "./liquidatable.js";
+import { evaluate as evaluateAlerts, type Observation } from "./watchtower.js";
 import { TrustMemory } from "./memory.js";
 import { describePolicy } from "./policy.js";
 import { AGENT_TASK, AGENT_POLICY } from "./scenario.js";
@@ -1705,6 +1710,313 @@ async function main() {
         oracleArmed: oracleLive,
         alerts,
         reserves,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * The market, as the registry sees it.
+   *
+   * Ranked here rather than in the browser so every consumer — the app, the
+   * agent, a third party — sorts by the same rule. An endpoint that returned
+   * raw rows would invite each caller to invent its own idea of trustworthy,
+   * and the cheapest-first one is the invention that loses money.
+   */
+  app.get("/api/registry", async (req, res) => {
+    const registryAddr = liveDeployment?.tesseraRegistry as Hex | undefined;
+    if (!registryAddr) { res.status(404).json({ ok: false, error: "registry not deployed" }); return; }
+    const resource = String(req.query.resource ?? "").slice(0, 64);
+    if (!resource) { res.status(400).json({ ok: false, error: "resource is required" }); return; }
+
+    try {
+      const page = (await client.public.readContract({
+        address: registryAddr,
+        abi: tesseraRegistryAbi,
+        functionName: "findByResource",
+        args: [resource, 0n, 50n],
+      })) as Parameters<typeof decodeFindResult>[0];
+      const { listings } = decodeFindResult(page);
+
+      // The endpoint URI needs a read per provider, and it is the field the app
+      // actually needs, so fetch them together rather than one round trip each.
+      const withEndpoints: Listing[] = await Promise.all(
+        listings.map(async (l) => {
+          try {
+            const row = (await client.public.readContract({
+              address: registryAddr,
+              abi: tesseraRegistryAbi,
+              functionName: "listingOf",
+              args: [l.provider],
+            })) as readonly [boolean, string, readonly string[], bigint, bigint, bigint, bigint];
+            return { ...l, endpoint: row[0] ? row[1] : undefined };
+          } catch {
+            return l;
+          }
+        }),
+      );
+
+      const ranked = rankListings(withEndpoints);
+      res.json({
+        ok: true,
+        resource,
+        registry: registryAddr,
+        providers: ranked.map((l) => ({
+          provider: l.provider,
+          endpoint: l.endpoint ?? null,
+          // Surfaced rather than filtered out: an operator should be able to see
+          // that somebody listed a loopback address, not just that a row vanished.
+          endpointUsable: endpointAllowed(l.endpoint),
+          priceUsdc: formatUsdc(l.price),
+          stakeUsdc: formatUsdc(l.stake),
+          fulfilled: Number(l.fulfilled),
+          failed: Number(l.failed),
+          distinctBuyers: Number(l.distinctBuyers),
+          score: Number(l.score.toFixed(4)),
+          reasons: l.reasons,
+        })),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Everything a third-party keeper needs to decide whether to act.
+   *
+   * Deliberately unauthenticated. Liquidations currently happen because we run a
+   * bot, which quietly makes the pool's solvency a function of our uptime; the
+   * point of publishing is that somebody else can do it when we are not there.
+   * An access-controlled keeper feed would keep the dependency and add a login.
+   */
+  app.get("/api/liquidatable", async (_req, res) => {
+    if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    try {
+      /*
+       * Who has ever borrowed, from the event index.
+       *
+       * There is no on-chain enumeration of borrowers — the pool stores shares
+       * per address and nothing walks them — so the candidate set has to come
+       * from history. Anyone who ever emitted `Borrow` is a candidate; the
+       * liquidity read below is what decides whether they still owe anything,
+       * so a repaid borrower costs one read and drops out.
+       *
+       * Without the indexer this endpoint can still answer for the agent
+       * itself, which is the position we know about without any history at all.
+       */
+      /**
+       * An asset amount in the pool's own USD scale (1e8).
+       *
+       * The auction stores amounts in each asset's base units, and cirBTC's are
+       * not USDC's — comparing them directly is the 100x class of bug this
+       * codebase has already been bitten by once.
+       */
+      const usdValueOf = async (asset: Hex, amount: bigint): Promise<bigint> => {
+        const known = (liveDeployment.poolAssets as { address: string; decimals?: number }[] | undefined) ?? [];
+        const dp = BigInt(known.find((k) => k.address.toLowerCase() === asset.toLowerCase())?.decimals ?? 6);
+        const px = (await poolClient!.public.readContract({
+          address: poolClient!.pool,
+          abi: tesseraPoolAbi,
+          functionName: "price",
+          args: [asset],
+        })) as bigint;
+        return (amount * px) / 10n ** dp;
+      };
+
+      const candidates = new Set<string>();
+      if (eventIndex) {
+        for (const ev of eventIndex.query({ name: "Borrow", limit: 5_000 })) {
+          for (const a of ev.actors) candidates.add(a.toLowerCase());
+        }
+      }
+      candidates.add(client.account.address.toLowerCase());
+
+      const now = await chainSeconds();
+      const positions: LiquidatablePosition[] = [];
+
+      await Promise.all(
+        [...candidates].slice(0, 200).map(async (addr) => {
+          const user = addr as Hex;
+          try {
+            const [limits, data, auction] = await Promise.all([
+              poolClient!.accountLimits(user),
+              poolClient!.accountData(user),
+              poolClient!.auctionOf(user).catch(() => null),
+            ]);
+            if (!limits || limits.liability === 0n) return;
+
+            /*
+             * Quote against the auction, not against the account.
+             *
+             * `startLiquidationAuction` takes a percentage: an auction may cover
+             * half a position, or a fifth. Pricing a fill from the borrower's
+             * *total* debt and collateral therefore overstates the lot by
+             * whatever fraction was left out — the first version of this endpoint
+             * reported a 234 USD profit on an auction whose real lot was half
+             * that, which is exactly the kind of number a keeper acts on and then
+             * finds is not there.
+             *
+             * When an auction exists its own amounts are the truth; the account
+             * totals are only a fallback for showing a position that has none.
+             */
+            const open = !!auction?.open;
+            const [debtValue, collValue] = open
+              ? await Promise.all([
+                  usdValueOf(auction!.debtAsset, auction!.debtAmount),
+                  usdValueOf(auction!.collateralAsset, auction!.collateralAmount),
+                ])
+              : [limits.liability, data.supplyValue];
+
+            positions.push({
+              user,
+              healthWad: healthFactor(limits),
+              debtUsd: debtValue,
+              collateralUsd: collValue,
+              auctionElapsed: open ? Math.max(0, now - auction!.startedAt!) : null,
+              filledBps: open ? auction!.filledBps ?? 0 : 0,
+            });
+          } catch { /* one unreadable position must not blank the feed */ }
+        }),
+      );
+
+      const opps = rankOpportunities(positions);
+      res.json({
+        ok: true,
+        pool: poolClient.pool,
+        scanned: candidates.size,
+        // The raw on-chain edge. Each keeper applies its own margin for gas and
+        // slippage — a default here would be wrong for everyone who trusted it.
+        opportunities: opps.map((o) => ({
+          user: o.user,
+          health: (Number(o.healthWad) / 1e18).toFixed(4),
+          debtUsd: (Number(o.debtUsd) / 1e8).toFixed(2),
+          collateralUsd: (Number(o.collateralUsd) / 1e8).toFixed(2),
+          auctionOpen: o.auctionOpen,
+          lotBps: o.terms?.lotBps ?? null,
+          bidBps: o.terms?.bidBps ?? null,
+          repayUsd: (Number(o.repayUsd) / 1e8).toFixed(2),
+          seizeUsd: (Number(o.seizeUsd) / 1e8).toFixed(2),
+          profitUsd: (Number(o.profitUsd) / 1e8).toFixed(2),
+          profitBps: o.profitBps,
+          secondsToFloor: o.secondsToFloor,
+          note: o.note,
+        })),
+        actionableCount: actionable(opps).length,
+        badDebtCount: badDebt(opps).length,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * What the watchtower would tell an operator right now.
+   *
+   * Reuses /api/pool/health's reads rather than duplicating them, so the two can
+   * never disagree about the same chain state.
+   */
+  app.get("/api/alerts", async (_req, res) => {
+    try {
+      const obs: Observation = { now: await chainSeconds() };
+
+      if (poolClient) {
+        const oracleAddr = liveDeployment?.tesseraOracle as Hex | undefined;
+        const limiterAddr = liveDeployment?.tesseraRateLimiter as Hex | undefined;
+        const assets = (liveDeployment.poolAssets as { symbol: string; address: string }[] | undefined) ?? [];
+
+        obs.reserves = [];
+        obs.outflow = [];
+        await Promise.all(
+          assets.map(async (a) => {
+            const addr = a.address as Hex;
+            const [stats, capacity, oracleStatus, budget] = await Promise.all([
+              poolClient!.reserveData(addr).catch(() => null),
+              poolClient!.public
+                .readContract({ address: poolClient!.pool, abi: tesseraPoolAbi, functionName: "capacityOf", args: [addr] })
+                .catch(() => [0n, 0n] as const),
+              oracleAddr
+                ? poolClient!.public
+                    .readContract({ address: oracleAddr, abi: tesseraOracleAbi, functionName: "status", args: [addr] })
+                    .catch(() => null)
+                : Promise.resolve(null),
+              limiterAddr
+                ? poolClient!.public
+                    .readContract({ address: limiterAddr, abi: tesseraRateLimiterAbi, functionName: "limitOf", args: [addr] })
+                    .catch(() => null)
+                : Promise.resolve(null),
+            ]);
+            if (!stats) return;
+
+            const st = oracleStatus as readonly [boolean, boolean, bigint, bigint, bigint, bigint, bigint, bigint] | null;
+            const [supplyRoom, borrowRoom] = capacity as readonly [bigint, bigint];
+            const UNCAPPED = (1n << 256n) - 1n;
+
+            obs.reserves!.push({
+              symbol: a.symbol,
+              utilisationPct: Number(stats.utilizationWad) / 1e16,
+              supplyRoom: supplyRoom === UNCAPPED ? null : supplyRoom,
+              borrowRoom,
+              supplyCap: supplyRoom === UNCAPPED ? null : supplyRoom + stats.cash + stats.totalBorrows,
+              borrowCap: borrowRoom + stats.totalBorrows,
+              oracle: st && st[0]
+                ? { ok: st[1], spreadBps: Number(st[4]), sources: Number(st[5]), updatedAt: Number(st[7]) }
+                : null,
+            });
+
+            const lim = budget as readonly [bigint, bigint, bigint, bigint] | null;
+            if (lim && lim[0] > 0n) {
+              const available = await poolClient!.public
+                .readContract({ address: limiterAddr!, abi: tesseraRateLimiterAbi, functionName: "available", args: [addr] })
+                .catch(() => null);
+              if (available !== null) {
+                obs.outflow!.push({
+                  symbol: a.symbol,
+                  availableFraction: Number(available as bigint) / Number(lim[0]),
+                });
+              }
+            }
+          }),
+        );
+
+        const me = client.account.address;
+        const limits = await poolClient.accountLimits(me).catch(() => null);
+        if (limits && limits.liability > 0n) {
+          obs.positions = [{ label: "agent", healthWad: healthFactor(limits) }];
+        }
+      }
+
+      // Pause state across the contracts that have a stop switch.
+      const guarded: [string, Hex | undefined][] = [
+        ["escrow", liveDeployment?.tesseraEscrow as Hex | undefined],
+        ["tab", liveDeployment?.tesseraTab as Hex | undefined],
+        ["stream", liveDeployment?.tesseraStream as Hex | undefined],
+        ["subscription", liveDeployment?.tesseraSubscription as Hex | undefined],
+      ];
+      obs.paused = (
+        await Promise.all(
+          guarded.map(async ([name, addr]) => {
+            if (!addr) return null;
+            try {
+              const paused = (await client.public.readContract({
+                address: addr,
+                abi: tesseraEscrowAbi,
+                functionName: "paused",
+              })) as boolean;
+              return { name, paused };
+            } catch {
+              return null;
+            }
+          }),
+        )
+      ).filter((x): x is { name: string; paused: boolean } => x !== null);
+
+      const alerts = evaluateAlerts(obs);
+      res.json({
+        ok: true,
+        quiet: alerts.length === 0,
+        critical: alerts.filter((a) => a.severity === "critical").length,
+        alerts,
       });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
