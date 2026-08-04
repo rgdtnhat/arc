@@ -10,6 +10,10 @@ interface IPolicyEscrow {
     function settle(uint256 paymentId) external;
     function refund(uint256 paymentId) external;
     function bondFor(uint256 amount) external view returns (uint256);
+    function getPayment(uint256 paymentId)
+        external
+        view
+        returns (address, address, uint256, uint64, bytes32, bytes32, uint8);
 }
 
 interface IERC20P {
@@ -294,12 +298,27 @@ contract TesseraSpendPolicy is ReentrancyGuard {
      *      refunded was not spent, and billing the agent's budget for it would
      *      make a provider's failure cost the buyer twice.
      *
-     *      Permissionless on purpose: reclaiming after a deadline is something
-     *      anyone may do for the policy's benefit, and requiring the agent key
-     *      would strand funds precisely when that key is the problem.
+     *      Permissionless only for a payment that genuinely timed out.
+     *
+     *      The distinction matters more here than it looks. This policy is the
+     *      buyer of record, so when it calls `escrow.refund` the escrow sees its
+     *      own buyer rejecting the delivery. Leaving that open to anybody would
+     *      hand a stranger the ability to destroy a purchase the agent wanted,
+     *      burn the bond to the treasury, and slash an innocent provider's stake
+     *      — repeatable for the price of gas.
+     *
+     *      So: rejecting *delivered* work is a judgement about quality and only
+     *      the agent may make it. Reclaiming a payment nobody delivered is not a
+     *      judgement at all, and staying open there is what stops funds being
+     *      stranded when the agent key is itself the problem.
      */
     function refundPayment(address token, uint256 paymentId) external nonReentrant {
         if (committed[paymentId] == 0) revert UnknownPayment();
+
+        (, , , uint64 deadline, , , uint8 status) = IPolicyEscrow(escrow).getPayment(paymentId);
+        // Status 1 is Escrowed: funded, nothing delivered.
+        bool timedOut = status == 1 && block.timestamp > deadline;
+        if (!timedOut && msg.sender != agent) revert NotAgent();
         uint256 before = IERC20P(token).balanceOf(address(this));
         IPolicyEscrow(escrow).refund(paymentId);
         uint256 returned = IERC20P(token).balanceOf(address(this)) - before;

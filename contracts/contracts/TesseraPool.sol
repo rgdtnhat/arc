@@ -933,7 +933,12 @@ contract TesseraPool is ReentrancyGuard {
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
         _requireNotFrozen(asset, FREEZE_WITHDRAW);
-        _requireReliablePrices();
+        // Only when the caller is actually leveraged. A price nobody can agree
+        // on has no bearing on a depositor who never borrowed, and blocking
+        // their exit would be trapping funds during exactly the incident that
+        // makes people want them back. A borrower pulling collateral out is a
+        // different matter — that raises leverage as surely as borrowing does.
+        if (_hasDebt(msg.sender)) _requireReliablePrices();
         _accrueAll();
         uint256 bal = supplyBalance(asset, msg.sender);
         if (amount == 0 || amount > bal) revert ZeroAmount();
@@ -1657,6 +1662,16 @@ contract TesseraPool is ReentrancyGuard {
      * Positions keep accruing and can always be repaid, so this freezes new
      * risk without trapping anybody.
      */
+    /// @dev Does this account owe anything at all? Cheap enough to ask before
+    ///      deciding whether a price dispute has any bearing on them.
+    function _hasDebt(address user) internal view returns (bool) {
+        uint256 n = reserveList.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (borrowShares[reserveList[i]][user] != 0) return true;
+        }
+        return false;
+    }
+
     function _requireReliablePrices() internal view {
         address o = riskOracle;
         if (o == address(0)) return;
