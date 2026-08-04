@@ -38,6 +38,7 @@ import {
   tesseraFeeCollectorAbi,
   tesseraAmmAbi,
   tesseraOracleAbi,
+  tesseraSpendPolicyAbi,
 } from "@tessera/shared";
 
 const run = promisify(execFile);
@@ -69,6 +70,7 @@ const ABIS: Abi[] = [
   tesseraFeeCollectorAbi as Abi,
   tesseraAmmAbi as Abi,
   tesseraOracleAbi as Abi,
+  tesseraSpendPolicyAbi as Abi,
 ];
 
 /** Which function is this calldata, under whichever ABI understands it? */
@@ -568,4 +570,27 @@ test("arms the risk oracle when --arm-oracle is passed", async (t) => {
   const { stdout } = await runScript(node, dir, ["--deploy-missing", "--arm-oracle"]);
   assert.doesNotMatch(stdout, /skip arming the risk oracle/);
   assert.ok(node.sent.includes("setRiskOracle"), "pool pointed at the oracle");
+});
+
+test("points the spend policy at the escrow, so it is not deployed unreachable", async (t) => {
+  // A policy with no escrow reverts every openPayment with NoEscrow, and the
+  // agent quietly falls back to paying from its own key — the exact
+  // deployed-but-bypassed state the policy exists to end.
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD, tesseraEscrow: "0x0000000000000000000000000000000000000e11" });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  await runScript(node, dir, ["--deploy-missing"]);
+  assert.ok(node.sent.includes("setEscrow"), "policy wired to the escrow");
+});
+
+test("says so rather than inventing an escrow when the record has none", async (t) => {
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const { tesseraEscrow, ...noEscrow } = { ...BASE_RECORD } as Record<string, unknown>;
+  const dir = scratchTree(noEscrow);
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing"]);
+  assert.match(stdout, /skip wiring the spend policy/);
+  void tesseraEscrow;
 });

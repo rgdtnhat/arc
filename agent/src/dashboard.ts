@@ -1601,15 +1601,43 @@ async function main() {
         .catch(() => null)) as Hex | null;
       const oracleLive = !!armed && armed !== "0x0000000000000000000000000000000000000000";
 
-      for (const a of assets) {
-        const addr = a.address as Hex;
-        const stats = await poolClient.reserveData(addr).catch(() => null);
+      /*
+       * Every read for every asset, fired at once.
+       *
+       * Awaiting them one at a time inside the loop took 38 seconds against a
+       * paced RPC with three reserves — each round-trip serialised behind the
+       * last. The client batches concurrent reads into a single multicall, so
+       * issuing them together turns a dashboard endpoint that times out into
+       * one round-trip.
+       */
+      const perAsset = await Promise.all(
+        assets.map(async (a) => {
+          const addr = a.address as Hex;
+          const [stats, capacity, oracleStatus] = await Promise.all([
+            poolClient.reserveData(addr).catch(() => null),
+            poolClient.public
+              .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "capacityOf", args: [addr] })
+              .catch(() => [0n, 0n] as const),
+            oracleAddr
+              ? poolClient.public
+                  .readContract({ address: oracleAddr, abi: tesseraOracleAbi, functionName: "status", args: [addr] })
+                  .catch(() => null)
+              : Promise.resolve(null),
+          ]);
+          return { a, addr, stats, capacity, oracleStatus };
+        }),
+      );
+
+      for (const { a, addr, stats, capacity, oracleStatus } of perAsset) {
         if (!stats) continue;
+        // Amounts come back in the asset's own units, so the asset's own
+        // decimals are what format them. Using USDC's six for everything
+        // reported cirBTC a hundred times larger than it is.
+        const dp = Number(a.decimals ?? 6);
+        const fmtAmt = (v: bigint) => fmtUnits(v, dp);
 
         const utilPct = Number(stats.utilizationWad) / 1e16;
-        const [supplyRoom, borrowRoom] = ((await poolClient.public
-          .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "capacityOf", args: [addr] })
-          .catch(() => [0n, 0n])) as readonly [bigint, bigint]);
+        const [supplyRoom, borrowRoom] = capacity as readonly [bigint, bigint];
 
         // Utilization is the one that strands depositors: at 100% the cash is
         // gone and a withdrawal reverts for reasons the withdrawer did not cause.
@@ -1623,10 +1651,10 @@ async function main() {
         }
 
         let oracle: Record<string, unknown> | null = null;
-        if (oracleAddr) {
-          const st = (await poolClient.public
-            .readContract({ address: oracleAddr, abi: tesseraOracleAbi, functionName: "status", args: [addr] })
-            .catch(() => null)) as readonly [boolean, boolean, bigint, bigint, bigint, bigint, bigint, bigint] | null;
+        {
+          const st = oracleStatus as
+            | readonly [boolean, boolean, bigint, bigint, bigint, bigint, bigint, bigint]
+            | null;
           if (st && st[0]) {
             const [, ok, low, high, spreadBps, sources, , updatedAt] = st;
             oracle = {
@@ -1652,13 +1680,16 @@ async function main() {
         reserves.push({
           symbol: a.symbol,
           address: addr,
+          decimals: dp,
           utilisationPct: Number(utilPct.toFixed(2)),
-          cashUsdc: formatUsdc(stats.cash),
-          borrowedUsdc: formatUsdc(stats.totalBorrows),
+          // Named for the asset, not for USDC — these are cirBTC when the row
+          // is cirBTC.
+          cash: fmtAmt(stats.cash),
+          borrowed: fmtAmt(stats.totalBorrows),
           borrowAprPct: Number((Number(stats.borrowAprWad) / 1e16).toFixed(2)),
           supplyAprPct: Number((Number(stats.supplyAprWad) / 1e16).toFixed(2)),
-          supplyRoom: supplyRoom === (1n << 256n) - 1n ? null : formatUsdc(supplyRoom),
-          borrowRoom: formatUsdc(borrowRoom),
+          supplyRoom: supplyRoom === (1n << 256n) - 1n ? null : fmtAmt(supplyRoom),
+          borrowRoom: fmtAmt(borrowRoom),
           oracle,
         });
       }

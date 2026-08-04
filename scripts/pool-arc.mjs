@@ -661,6 +661,22 @@ async function main() {
   }, { custodial: true });
   const spendPolicy = policyRes.address;
 
+  // Point the policy at the escrow, or it is deployed and unreachable: every
+  // `openPayment` reverts with NoEscrow and the agent silently falls back to
+  // paying from its own key — which is the exact "deployed but bypassed" state
+  // the policy was written to end.
+  //
+  // Read from the record rather than deployed here: the escrow is created by
+  // the bootstrap, and a pool run that has not seen one yet should say so
+  // rather than invent an address.
+  if (existing.tesseraEscrow) {
+    await optional("pointing the spend policy at the escrow", () =>
+      dSend(spendPolicy, tesseraSpendPolicyAbi, "setEscrow", [existing.tesseraEscrow]),
+    );
+  } else {
+    console.log("   (skip wiring the spend policy — no escrow in the deployment record yet)");
+  }
+
   // 6i) TesseraLpToken: AMM pool 0's shares as an ordinary ERC-20.
   //
   //     Wrapping is what lets an LP position be listed as a pool reserve, and
