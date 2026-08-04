@@ -31,6 +31,11 @@ interface IAggregatorV3 {
  * collateral is marked at the lowest usable source and debt at the highest, so
  * moving one feed cannot move the answer in an attacker's favour.
  */
+/// @notice The outflow meter's consume surface. See TesseraRateLimiter.
+interface IRateLimiter {
+    function consume(address asset, uint256 amount) external;
+}
+
 interface IRiskOracle {
     function riskPrice(address asset, bool forDebt) external view returns (uint256);
     function anyUnreliable(address[] calldata assets) external view returns (address bad, uint256 spreadBps);
@@ -327,6 +332,16 @@ contract TesseraPool is ReentrancyGuard {
      */
     address public riskOracle;
 
+    /**
+     * @notice Optional TesseraRateLimiter metering how fast value may leave.
+     *
+     * Caps bound how large a position can get and the freeze switch stops
+     * everything, but nothing bounded the *rate* of outflow — so between a
+     * compromise and a human noticing, the reserve left as fast as blocks would
+     * carry it. Zero disables metering entirely.
+     */
+    address public rateLimiter;
+
     /// @notice Flash-loan fee, in bps of the principal. Paid to suppliers.
     uint16 public flashFeeBps = 9; // 0.09%, the Aave-v2 number
     uint16 public constant MAX_FLASH_FEE = 100; // 1%, hard ceiling
@@ -405,6 +420,7 @@ contract TesseraPool is ReentrancyGuard {
     event ReserveFrozen(address indexed asset, uint8 mask);
     event CapsSet(address indexed asset, uint256 supplyCap, uint256 borrowCap);
     event RiskOracleSet(address oracle);
+    event RateLimiterSet(address limiter);
     event OwnerSet(address indexed owner);
     event ReserveRenamed(address indexed asset, string name);
     event ReserveVisibility(address indexed asset, bool hidden);
@@ -458,6 +474,29 @@ contract TesseraPool is ReentrancyGuard {
     error SupplyCapReached(uint256 cap, uint256 would);
     error BorrowCapReached(uint256 cap, uint256 would);
 
+    /*
+     * The admin paths speak in custom errors rather than `require` strings.
+     *
+     * This contract sits at the EVM's 24576-byte ceiling, and a revert string is
+     * bytecode: the literal itself, plus the encoding of `Error(string)`, at
+     * every site. Sixteen of them across the configuration setters cost more
+     * than the outflow-metering hook this change adds — so the strings paid for
+     * the feature.
+     *
+     * Nothing is lost that a caller could use. These fire only on owner-only
+     * setters given out-of-range parameters, where the caller is an operator
+     * reading a decoded 4-byte selector out of a failed simulation, not an agent
+     * parsing prose. The names carry the same meaning the strings did.
+     */
+    error ReserveExists();
+    error BadIrConfig();
+    error BadLabel();
+    error BadTakeRate();
+    error BadRiskParams();
+    error BadMask();
+    error BadFlashFee();
+    error TransferFailed();
+
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
         _;
@@ -480,7 +519,7 @@ contract TesseraPool is ReentrancyGuard {
         uint8 decimals_,
         uint256 usdPrice
     ) external onlyOwner {
-        require(!reserves[asset].enabled, "exists");
+        if (reserves[asset].enabled) revert ReserveExists();
         _requireFactors(cFactor, liqFactor, lFactor, reserveFactor);
         reserves[asset] = Reserve({
             enabled: true,
@@ -538,8 +577,8 @@ contract TesseraPool is ReentrancyGuard {
         uint64 reactivity_
     ) external onlyOwner {
         if (!reserves[asset].enabled) revert UnknownReserve();
-        require(targetUtil > 0 && (uint256(targetUtil) * WAD) / BPS < MAX_UTIL, "targetUtil");
-        require(reactivity_ <= MAX_REACTIVITY, "reactivity");
+        if (targetUtil == 0 || (uint256(targetUtil) * WAD) / BPS >= MAX_UTIL) revert BadIrConfig();
+        if (reactivity_ > MAX_REACTIVITY) revert BadIrConfig();
         _accrue(asset); // settle at the old curve before the new one applies
         IrConfig storage c = irConfig[asset];
         c.rBase = rBase;
@@ -578,7 +617,7 @@ contract TesseraPool is ReentrancyGuard {
     ) external onlyOwner {
         if (category == 0) revert UnknownCategory();
         _requireFactors(cFactor, liqFactor, lFactor, 0);
-        require(bytes(label).length <= 32, "label");
+        if (bytes(label).length > 32) revert BadLabel();
         emodeParams[category] =
             EmodeParams({enabled: true, cFactor: cFactor, liqFactor: liqFactor, lFactor: lFactor, label: label});
         emit EmodeCategorySet(category, cFactor, liqFactor, lFactor, label);
@@ -613,7 +652,7 @@ contract TesseraPool is ReentrancyGuard {
      *      which inverts the arrangement it exists to create.
      */
     function setBackstopTakeRate(uint16 takeRate) external onlyOwner {
-        require(takeRate <= 5_000, "take rate");
+        if (takeRate > 5_000) revert BadTakeRate();
         backstopTakeRate = takeRate;
         emit BackstopTakeRateSet(takeRate);
     }
@@ -629,10 +668,10 @@ contract TesseraPool is ReentrancyGuard {
         internal
         pure
     {
-        require(liqFactor <= BPS, "liqFactor > 100%");
-        require(cFactor < liqFactor, "cFactor must be below liqFactor");
-        require(lFactor > 0 && lFactor <= BPS, "lFactor");
-        require(reserveFactor < BPS, "reserveFactor");
+        if (liqFactor > BPS) revert BadRiskParams();
+        if (cFactor >= liqFactor) revert BadRiskParams();
+        if (lFactor == 0 || lFactor > BPS) revert BadRiskParams();
+        if (reserveFactor >= BPS) revert BadRiskParams();
     }
 
     /**
@@ -651,7 +690,7 @@ contract TesseraPool is ReentrancyGuard {
         onlyOwner
     {
         Reserve storage r = reserves[asset];
-        require(r.enabled, "unknown reserve");
+        if (!r.enabled) revert UnknownReserve();
         _requireFactors(cFactor, liqFactor, lFactor, r.reserveFactor);
         r.cFactor = cFactor;
         r.liqFactor = liqFactor;
@@ -697,6 +736,18 @@ contract TesseraPool is ReentrancyGuard {
     function setRiskOracle(address o) external onlyOwner {
         riskOracle = o;
         emit RiskOracleSet(o);
+    }
+
+    /**
+     * @notice Point outflow metering at a TesseraRateLimiter, or clear it.
+     * @dev Same escape hatch as the oracle, and needed more: this is the one
+     *      control here that can legitimately block an honest withdrawal, so the
+     *      ability to remove it in a single transaction is what keeps a
+     *      misconfigured limit from becoming an outage nobody can end.
+     */
+    function setRateLimiter(address l) external onlyOwner {
+        rateLimiter = l;
+        emit RateLimiterSet(l);
     }
 
     function setTreasury(address t) external onlyOwner {
@@ -774,14 +825,14 @@ contract TesseraPool is ReentrancyGuard {
      */
     function setFrozen(address asset, uint8 mask) external onlyOwner {
         if (!reserves[asset].enabled) revert UnknownReserve();
-        require(mask <= FREEZE_ALL, "mask");
+        if (mask > FREEZE_ALL) revert BadMask();
         frozenActions[asset] = mask;
         emit ReserveFrozen(asset, mask);
     }
 
     /// @notice Apply the same freeze mask to several reserves in one call.
     function setFrozenMany(address[] calldata assets, uint8 mask) external onlyOwner {
-        require(mask <= FREEZE_ALL, "mask");
+        if (mask > FREEZE_ALL) revert BadMask();
         for (uint256 i = 0; i < assets.length; i++) {
             if (!reserves[assets[i]].enabled) revert UnknownReserve();
             frozenActions[assets[i]] = mask;
@@ -792,7 +843,7 @@ contract TesseraPool is ReentrancyGuard {
     /// @notice Display name for a reserve. Cosmetic only — never affects accounting.
     function renameReserve(address asset, string calldata name) external onlyOwner {
         if (!reserves[asset].enabled) revert UnknownReserve();
-        require(bytes(name).length <= 40, "name");
+        if (bytes(name).length > 40) revert BadLabel();
         reserveName[asset] = name;
         emit ReserveRenamed(asset, name);
     }
@@ -948,6 +999,7 @@ contract TesseraPool is ReentrancyGuard {
         r.totalSupplyShares -= shares;
         r.totalSupplyAssets -= amount;
         if (!_healthy(msg.sender)) revert Unhealthy();
+        _meter(asset, amount);
         _push(asset, msg.sender, amount);
         emit Withdraw(asset, msg.sender, amount, shares);
     }
@@ -970,6 +1022,7 @@ contract TesseraPool is ReentrancyGuard {
         r.totalBorrowShares += shares;
         r.totalBorrowAssets += amount;
         if (!_healthy(msg.sender)) revert Unhealthy();
+        _meter(asset, amount);
         _push(asset, msg.sender, amount);
         emit Borrow(asset, msg.sender, amount, shares);
     }
@@ -1103,7 +1156,7 @@ contract TesseraPool is ReentrancyGuard {
      *      claim on anyone who used this.
      */
     function setFlashFee(uint16 bps) external onlyOwner {
-        require(bps <= MAX_FLASH_FEE, "flash fee");
+        if (bps > MAX_FLASH_FEE) revert BadFlashFee();
         flashFeeBps = bps;
     }
 
@@ -1664,6 +1717,19 @@ contract TesseraPool is ReentrancyGuard {
      */
     /// @dev Does this account owe anything at all? Cheap enough to ask before
     ///      deciding whether a price dispute has any bearing on them.
+    /**
+     * @dev Spend outflow budget, if a limiter is wired. Called on the two paths
+     *      that actually move assets out of the pool — withdraw and borrow —
+     *      and on neither repay nor supply, which move value the other way.
+     *
+     *      Placed after the health check so a transaction that was going to fail
+     *      anyway does not consume budget an honest user could have used.
+     */
+    function _meter(address asset, uint256 amount) internal {
+        address l = rateLimiter;
+        if (l != address(0)) IRateLimiter(l).consume(asset, amount);
+    }
+
     function _hasDebt(address user) internal view returns (bool) {
         uint256 n = reserveList.length;
         for (uint256 i = 0; i < n; i++) {
@@ -1852,10 +1918,10 @@ contract TesseraPool is ReentrancyGuard {
     // --- token helpers --------------------------------------------------------
 
     function _pull(address asset, address from, uint256 amount) internal {
-        require(IERC20(asset).transferFrom(from, address(this), amount), "transferFrom");
+        if (!IERC20(asset).transferFrom(from, address(this), amount)) revert TransferFailed();
     }
 
     function _push(address asset, address to, uint256 amount) internal {
-        require(IERC20(asset).transfer(to, amount), "transfer");
+        if (!IERC20(asset).transfer(to, amount)) revert TransferFailed();
     }
 }

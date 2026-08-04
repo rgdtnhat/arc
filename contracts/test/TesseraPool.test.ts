@@ -247,11 +247,11 @@ describe("TesseraPool (borrowing stops before liquidation starts)", () => {
     // cFactor == liqFactor collapses the two lines back into one.
     await expect(
       pool.write.addReserve([other.address, 8000, 8000, 9000, 1000, true, 6, PRICE]),
-    ).to.be.rejectedWith("cFactor must be below liqFactor");
+    ).to.be.rejectedWith("BadRiskParams");
     // ...and above it is worse still.
     await expect(
       pool.write.addReserve([other.address, 9000, 8000, 9000, 1000, true, 6, PRICE]),
-    ).to.be.rejectedWith("cFactor must be below liqFactor");
+    ).to.be.rejectedWith("BadRiskParams");
   });
 
   it("lets an operator retune risk without redeploying the pool", async () => {

@@ -46,7 +46,11 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
         Escrowed,
         Fulfilled,
         Settled,
-        Refunded
+        Refunded,
+        // Appended, never inserted. `Status` is mirrored by off-chain readers
+        // (shared/src/protocol.ts) and written into indexed history; renumbering
+        // the existing four would silently reinterpret every record ever stored.
+        Disputed
     }
 
     struct Payment {
@@ -62,6 +66,9 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
         // outcome except one: rejecting work that was actually delivered. See
         // DISPUTE_BOND_BPS.
         uint256 bond;
+        // Unix seconds the buyer escalated to arbitration; zero if it never did.
+        // Starts the arbitrator's clock — see ARBITRATION_TIMEOUT.
+        uint64 disputedAt;
         // The protocol fee in force when this escrow was funded.
         //
         // Snapshotted rather than read at payout, because the two are not the
@@ -211,6 +218,13 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
     error TransferFailed();
     error NoRouter();
     error RouteShortfall(uint256 got, uint256 wanted);
+    error NoArbiter();
+    error NotArbiter();
+    error DisputeWindowClosed();
+    error ArbitrationPending();
+    error BadSignature();
+    error AuthExpired();
+    error FeeAboveAuthorized(uint256 asked, uint256 max);
 
     /**
      * @notice Escrow-as-a-service: a protocol fee on settled payments.
@@ -237,6 +251,40 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
     address public treasury;
     /// @notice Optional TesseraRouter, enabling `openWith`. Zero disables it.
     address public router;
+
+    /**
+     * @notice Optional TesseraArbiter. Zero disables escalation entirely.
+     *
+     * Without one, a rejected delivery is decided by the buyer alone: it calls
+     * `refund`, forfeits its bond, and the provider eats the loss whether or not
+     * the data was actually bad. The bond makes that expensive, not wrong. An
+     * arbiter is what lets a provider that *did* deliver correctly be paid over
+     * the buyer's objection.
+     */
+    address public arbiter;
+
+    /**
+     * How long the arbitrator has, once a case is opened.
+     *
+     * This is the liveness guard on the whole mechanism. Escalation freezes both
+     * settle and refund, so without a timeout a buyer could park a provider's
+     * money indefinitely simply by escalating into an arbiter that never rules —
+     * a strictly cheaper griefing attack than the one the bond was added to
+     * price, since the buyer's bond comes back if it just waits.
+     *
+     * After this elapses with no ruling, the provider may claim as if the
+     * dispute had never been raised.
+     */
+    uint64 public constant ARBITRATION_TIMEOUT = 24 hours;
+
+    /// @notice The arbitrator's cut of the bond, on either outcome.
+    /// @dev Paid whoever wins. An arbitrator paid only by the winner has a side
+    ///      to prefer, which is the one property a judge must not have.
+    uint16 public constant ARBITER_FEE_BPS = 2_000; // 20% of the bond
+
+    event ArbiterSet(address arbiter);
+    event PaymentEscalated(uint256 indexed paymentId, address indexed agent, address indexed provider);
+    event DisputeResolved(uint256 indexed paymentId, bool forBuyer, address indexed arbitrator, uint256 fee);
 
     event ProtocolFeeSet(uint16 bps, address treasury);
     event ProtocolFeeTaken(uint256 indexed paymentId, uint256 amount);
@@ -271,6 +319,15 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
     function setRouter(address router_) external onlyOwner {
         router = router_;
         emit RouterSet(router_);
+    }
+
+    /// @notice Point escalation at an arbiter, or clear it with the zero address.
+    /// @dev Clearing is the escape hatch: an arbiter contract that has gone bad
+    ///      can be unhooked without migrating the escrow. Cases already open
+    ///      still resolve — through ARBITRATION_TIMEOUT rather than a ruling.
+    function setArbiter(address arbiter_) external onlyOwner {
+        arbiter = arbiter_;
+        emit ArbiterSet(arbiter_);
     }
 
     /**
@@ -308,6 +365,29 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
             emit ProtocolFeeTaken(paymentId, fee);
         }
         if (!usdc.transfer(p.provider, net)) revert TransferFailed();
+    }
+
+    /**
+     * @dev `_payProvider` with a slice diverted to a relayer that fronted the
+     *      gas. Returns what the provider actually received, so the caller
+     *      credits reputation with income rather than gross.
+     */
+    function _payProviderSplit(uint256 paymentId, Payment storage p, address relayer, uint256 relayFee)
+        internal
+        returns (uint256 toProvider)
+    {
+        uint256 fee;
+        (toProvider, fee) = quotePayoutAt(p.amount, p.feeBps);
+        if (fee > 0) {
+            if (!usdc.transfer(treasury, fee)) revert TransferFailed();
+            emit ProtocolFeeTaken(paymentId, fee);
+        }
+        if (relayFee > 0) {
+            if (relayFee > toProvider) revert FeeAboveAuthorized(relayFee, toProvider);
+            toProvider -= relayFee;
+            if (!usdc.transfer(relayer, relayFee)) revert TransferFailed();
+        }
+        if (!usdc.transfer(p.provider, toProvider)) revert TransferFailed();
     }
 
     /**
@@ -366,6 +446,7 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
             quoteHash: quoteHash,
             responseHash: bytes32(0),
             status: Status.Escrowed,
+            disputedAt: 0,
             bond: bond,
             feeBps: protocolFeeBps
         });
@@ -536,6 +617,263 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
         emit PaymentSettled(paymentId, p.provider, net);
     }
 
+    // --- Sponsored provider actions -----------------------------------------
+    //
+    // Arc charges gas in USDC. That is elegant right up until you notice what it
+    // means for a provider on its first sale: to be paid it must call `fulfill`
+    // and then `providerClaim`, both of which cost USDC, and it has none —
+    // because being paid is the thing it is trying to do. A seller cannot earn
+    // its first dollar without already holding one, which quietly makes this a
+    // market only funded participants can enter.
+    //
+    // So the provider signs its intent and anybody may carry it. The relayer
+    // pays the gas and takes a fee out of the payout, capped by a number the
+    // provider itself signed — it can never be charged more than it agreed to,
+    // and if no relayer finds the fee worth taking, the provider is exactly
+    // where it was and can still call the ordinary functions itself.
+
+    /// @dev EIP-712 domain, matching the one the off-chain code signs quotes and
+    ///      receipts under (shared/src/protocol.ts): name "Tessera", version "1".
+    bytes32 private constant EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 public constant FULFILL_TYPEHASH =
+        keccak256("FulfillAuth(uint256 paymentId,bytes32 responseHash,uint256 nonce,uint64 deadline)");
+    bytes32 public constant CLAIM_TYPEHASH =
+        keccak256("ClaimAuth(uint256 paymentId,uint256 maxRelayFee,uint256 nonce,uint64 deadline)");
+
+    /// @notice Per-signer nonce. One counter across both authorization types, so
+    ///         a signature can never be replayed as the other kind either.
+    mapping(address => uint256) public authNonce;
+
+    event Sponsored(uint256 indexed paymentId, address indexed provider, address indexed relayer, uint256 fee);
+
+    function domainSeparator() public view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                EIP712_DOMAIN_TYPEHASH, keccak256("Tessera"), keccak256("1"), block.chainid, address(this)
+            )
+        );
+    }
+
+    function _recover(bytes32 structHash, bytes calldata signature) internal view returns (address) {
+        if (signature.length != 65) revert BadSignature();
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 32))
+            v := byte(0, calldataload(add(signature.offset, 64)))
+        }
+        // Reject the upper half of the curve order. Without this, every
+        // signature has a twin that recovers to the same address, which would
+        // let a relayer burn a nonce twice or replay past a consumed one.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) revert BadSignature();
+        if (v < 27) v += 27;
+        address signer = ecrecover(digest, v, r, s);
+        if (signer == address(0)) revert BadSignature();
+        return signer;
+    }
+
+    /// @notice What a provider signs to let anyone mark a delivery for it.
+    function fulfillAuthHash(uint256 paymentId, bytes32 responseHash, uint256 nonce, uint64 deadline)
+        external
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(FULFILL_TYPEHASH, paymentId, responseHash, nonce, deadline));
+    }
+
+    /// @notice What a provider signs to let anyone claim a payout for it.
+    function claimAuthHash(uint256 paymentId, uint256 maxRelayFee, uint256 nonce, uint64 deadline)
+        external
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(CLAIM_TYPEHASH, paymentId, maxRelayFee, nonce, deadline));
+    }
+
+    /**
+     * @notice Mark a delivery on the provider's behalf, against its signature.
+     * @dev No fee. Fulfilment moves no money, so there is nothing to take a cut
+     *      of; a relayer sponsors this because it intends to relay the claim
+     *      that follows, where it is paid.
+     */
+    function fulfillFor(uint256 paymentId, bytes32 responseHash, uint64 deadline, bytes calldata signature)
+        external
+    {
+        if (block.timestamp > deadline) revert AuthExpired();
+        Payment storage p = payments[paymentId];
+        if (p.status != Status.Escrowed) revert BadState(p.status, Status.Escrowed);
+
+        uint256 n = authNonce[p.provider];
+        address signer = _recover(
+            keccak256(abi.encode(FULFILL_TYPEHASH, paymentId, responseHash, n, deadline)), signature
+        );
+        if (signer != p.provider) revert BadSignature();
+        authNonce[p.provider] = n + 1;
+
+        p.responseHash = responseHash;
+        p.fulfilledAt = uint64(block.timestamp);
+        p.status = Status.Fulfilled;
+        emit PaymentFulfilled(paymentId, responseHash);
+    }
+
+    /**
+     * @notice Claim a matured payout on the provider's behalf, paying the
+     *         relayer `relayFee` out of it.
+     *
+     * @param relayFee what the relayer takes. Bounded by the `maxRelayFee` the
+     *        provider signed — a relayer setting its own price would make the
+     *        authorization a blank cheque.
+     *
+     * @dev Same maturity rules as `providerClaim`: this is a gas sponsorship,
+     *      not a shortcut past the dispute window.
+     */
+    function claimFor(
+        uint256 paymentId,
+        uint256 maxRelayFee,
+        uint256 relayFee,
+        uint64 deadline,
+        bytes calldata signature
+    ) external nonReentrant {
+        if (block.timestamp > deadline) revert AuthExpired();
+        if (relayFee > maxRelayFee) revert FeeAboveAuthorized(relayFee, maxRelayFee);
+
+        Payment storage p = payments[paymentId];
+
+        if (p.status == Status.Disputed) {
+            if (block.timestamp <= uint256(p.disputedAt) + ARBITRATION_TIMEOUT) revert ArbitrationPending();
+        } else {
+            if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+            if (block.timestamp <= uint256(p.fulfilledAt) + DISPUTE_WINDOW) revert DisputeWindowOpen();
+        }
+
+        uint256 n = authNonce[p.provider];
+        address signer =
+            _recover(keccak256(abi.encode(CLAIM_TYPEHASH, paymentId, maxRelayFee, n, deadline)), signature);
+        if (signer != p.provider) revert BadSignature();
+        authNonce[p.provider] = n + 1;
+
+        p.status = Status.Settled;
+
+        // Split at payout, never after it. Paying the provider in full and then
+        // pulling the relayer's fee back would need an ERC-20 approval from the
+        // provider — a transaction, costing gas, which is the exact thing it
+        // cannot afford and the reason this function exists.
+        uint256 net = _payProviderSplit(paymentId, p, msg.sender, relayFee);
+
+        // Reputation counts what the delivery was worth to the provider, so the
+        // relay fee comes off: `earned` stays a record of income received.
+        _creditProvider(p.provider, p.agent, net);
+
+        BuyerRecord storage b = buyerRecordOf[p.agent];
+        b.settled += 1;
+        b.spent += p.amount;
+
+        _releaseBond(paymentId, p, p.agent);
+        emit PaymentClaimed(paymentId, p.provider, net);
+        emit Sponsored(paymentId, p.provider, msg.sender, relayFee);
+    }
+
+    /**
+     * @notice Buyer escalates a delivered response to arbitration instead of
+     *         rejecting it unilaterally.
+     *
+     * `refund` is the buyer's own verdict on its own dispute: it forfeits the
+     * bond and the provider is marked failed, whether or not the data was
+     * actually wrong. That is deliberately cheap to do and deliberately costly
+     * to abuse, but it is not adjudication — a provider that delivered exactly
+     * what was quoted has no way to say so.
+     *
+     * Escalating freezes the payment and hands the decision to a third party.
+     * The buyer still risks its bond; what it gives up is the certainty of
+     * winning. That asymmetry is the point: a buyer with a real complaint loses
+     * nothing by being judged, and a buyer inventing one now can.
+     *
+     * @dev Same window as `refund`, and for the same reason — a provider must
+     *      not be exposed to a dispute raised days after delivery.
+     */
+    function escalate(uint256 paymentId) external nonReentrant {
+        Payment storage p = payments[paymentId];
+        if (arbiter == address(0)) revert NoArbiter();
+        if (msg.sender != p.agent) revert NotAgent();
+        if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+        if (block.timestamp > uint256(p.fulfilledAt) + DISPUTE_WINDOW) revert DisputeWindowClosed();
+
+        p.status = Status.Disputed;
+        p.disputedAt = uint64(block.timestamp);
+        emit PaymentEscalated(paymentId, p.agent, p.provider);
+    }
+
+    /**
+     * @notice The arbiter's ruling. Pays out exactly as the corresponding
+     *         uncontested path would, minus the arbitrator's fee.
+     *
+     * @param forBuyer true if the complaint was upheld (money back to the
+     *        buyer, provider marked failed); false if the delivery stands.
+     * @param arbitrator who to pay the fee to — the individual who ruled, not
+     *        the arbiter contract, so a contract holding no funds can still
+     *        compensate its members.
+     *
+     * @dev Callable only by the arbiter contract. The fee comes out of the bond
+     *      the buyer already posted, so arbitration costs the protocol nothing
+     *      and costs an honest provider nothing.
+     */
+    function resolveDispute(uint256 paymentId, bool forBuyer, address arbitrator) external nonReentrant {
+        if (msg.sender != arbiter) revert NotArbiter();
+        Payment storage p = payments[paymentId];
+        if (p.status != Status.Disputed) revert BadState(p.status, Status.Disputed);
+
+        // Take the arbitrator's cut off the bond before either branch spends it,
+        // so both outcomes pay the judge identically.
+        uint256 fee = (p.bond * ARBITER_FEE_BPS) / 10_000;
+        if (fee > 0) {
+            p.bond -= fee;
+            if (!usdc.transfer(arbitrator, fee)) revert TransferFailed();
+        }
+
+        if (forBuyer) {
+            // Same consequences as a rejected delivery: the provider failed, the
+            // buyer is made whole, and the buyer's bond is forfeit — it lost the
+            // remainder of the bond to the treasury only when *it* was the one
+            // who got it wrong, so here the bond comes back.
+            p.status = Status.Refunded;
+            reputationOf[p.provider].failed += 1;
+            buyerRecordOf[p.agent].disputed += 1;
+
+            uint256 slashAmount = (p.amount * SLASH_BPS) / 10_000;
+            uint256 staked = stakeOf[p.provider];
+            if (slashAmount > staked) slashAmount = staked;
+            if (slashAmount > 0) {
+                stakeOf[p.provider] = staked - slashAmount;
+                emit Slashed(p.provider, paymentId, slashAmount, p.agent);
+            }
+
+            _releaseBond(paymentId, p, p.agent);
+            if (!usdc.transfer(p.agent, p.amount + slashAmount)) revert TransferFailed();
+            emit PaymentRefunded(paymentId, p.agent, p.amount, true);
+        } else {
+            // The delivery stands. Pay the provider exactly as `settle` would,
+            // and the buyer forfeits what is left of its bond — it took a
+            // provider to arbitration and was wrong.
+            p.status = Status.Settled;
+            uint256 net = _payProvider(paymentId, p);
+            _creditProvider(p.provider, p.agent, net);
+
+            BuyerRecord storage b = buyerRecordOf[p.agent];
+            b.settled += 1;
+            b.spent += p.amount;
+            b.disputed += 1;
+
+            _releaseBond(paymentId, p, treasury);
+            emit PaymentSettled(paymentId, p.provider, net);
+        }
+
+        emit DisputeResolved(paymentId, forBuyer, arbitrator, fee);
+    }
+
     /**
      * @notice Provider claims a delivered-but-unsettled payment once the
      *         agent's dispute window has elapsed. This is the liveness guard:
@@ -547,8 +885,17 @@ contract TesseraEscrow is ReentrancyGuard, Guarded {
     function providerClaim(uint256 paymentId) external nonReentrant {
         Payment storage p = payments[paymentId];
         if (msg.sender != p.provider) revert NotProvider();
-        if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
-        if (block.timestamp <= uint256(p.fulfilledAt) + DISPUTE_WINDOW) revert DisputeWindowOpen();
+
+        if (p.status == Status.Disputed) {
+            // An arbitration that never happened must not become a freeze. Once
+            // the arbitrator's clock runs out the payment reverts to what it
+            // was before escalation — a delivery nobody ruled against — and the
+            // ordinary claim applies.
+            if (block.timestamp <= uint256(p.disputedAt) + ARBITRATION_TIMEOUT) revert ArbitrationPending();
+        } else {
+            if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+            if (block.timestamp <= uint256(p.fulfilledAt) + DISPUTE_WINDOW) revert DisputeWindowOpen();
+        }
 
         p.status = Status.Settled;
 

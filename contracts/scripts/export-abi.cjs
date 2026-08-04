@@ -33,6 +33,10 @@ const stream = readArtifact("TesseraStream");
 const subscription = readArtifact("TesseraSubscription");
 const timelock = readArtifact("TesseraTimelock");
 const riskOracle = readArtifact("TesseraOracle");
+const registry = readArtifact("TesseraRegistry");
+const rateLimiter = readArtifact("TesseraRateLimiter");
+const arbiter = readArtifact("TesseraArbiter");
+const receiptAnchor = readArtifact("TesseraReceiptAnchor");
 
 const outDir = path.resolve(root, "..", "shared", "src");
 fs.mkdirSync(outDir, { recursive: true });
@@ -54,7 +58,11 @@ const abiTs =
   `export const tesseraStreamAbi = ${JSON.stringify(stream.abi)} as const;\n\n` +
   `export const tesseraSubscriptionAbi = ${JSON.stringify(subscription.abi)} as const;\n\n` +
   `export const tesseraTimelockAbi = ${JSON.stringify(timelock.abi)} as const;\n\n` +
-  `export const tesseraOracleAbi = ${JSON.stringify(riskOracle.abi)} as const;\n`;
+  `export const tesseraOracleAbi = ${JSON.stringify(riskOracle.abi)} as const;\n\n` +
+  `export const tesseraRegistryAbi = ${JSON.stringify(registry.abi)} as const;\n\n` +
+  `export const tesseraRateLimiterAbi = ${JSON.stringify(rateLimiter.abi)} as const;\n\n` +
+  `export const tesseraArbiterAbi = ${JSON.stringify(arbiter.abi)} as const;\n\n` +
+  `export const tesseraReceiptAnchorAbi = ${JSON.stringify(receiptAnchor.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 
 // Bytecode is only needed to deploy the mock locally from a plain viem script.
@@ -75,7 +83,11 @@ const bytecodeTs =
   `export const tesseraStreamBytecode = "${stream.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const tesseraSubscriptionBytecode = "${subscription.bytecode}" as \`0x\${string}\`;\n\n` +
   `export const tesseraTimelockBytecode = "${timelock.bytecode}" as \`0x\${string}\`;\n\n` +
-  `export const tesseraOracleBytecode = "${riskOracle.bytecode}" as \`0x\${string}\`;\n`;
+  `export const tesseraOracleBytecode = "${riskOracle.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraRegistryBytecode = "${registry.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraRateLimiterBytecode = "${rateLimiter.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraArbiterBytecode = "${arbiter.bytecode}" as \`0x\${string}\`;\n\n` +
+  `export const tesseraReceiptAnchorBytecode = "${receiptAnchor.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);
 
 console.log("[export-abi] wrote shared/src/abi.ts and shared/src/bytecode.ts");
