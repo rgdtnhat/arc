@@ -9,7 +9,12 @@
 //    offline. Cache-first would pin index.html/app.js forever, so shipped UI
 //    changes would never reach a returning visitor.
 //  - CACHE is versioned; bump it whenever the shell changes.
-const CACHE = "tessera-v17";
+//
+//    v18: the frosted-glass bars became opaque and the lending panel learned to
+//    show an unreadable reserve instead of dropping it. Both are shell changes
+//    and the version was not bumped with them, so a returning phone could keep
+//    painting the old CSS from cache and read as "the fix did nothing".
+const CACHE = "tessera-v18";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {
