@@ -49,6 +49,7 @@ import {
   DELEVERAGE_TARGET,
 } from "./keeper.js";
 import { EventIndex, indexOnce } from "./indexer.js";
+import { proposePrice, actionable as actionablePrices, roundsToTarget } from "./price-push.js";
 import { rankListings, decodeFindResult, endpointAllowed, type Listing } from "./discovery.js";
 import { rankOpportunities, actionable, badDebt, type LiquidatablePosition } from "./liquidatable.js";
 import { evaluate as evaluateAlerts, type Observation } from "./watchtower.js";
@@ -384,7 +385,8 @@ async function main() {
   let streamSummary: { ticks: number; spentUsdc: string } | null = null;
   // Cache of on-chain reads for /api/state (see readChainState). Invalidated
   // after a run or a faucet drip so balances refresh promptly.
-  let chainCache: { at: number; providers: any[]; agentBalance: bigint } | null = null;
+  // `agentBalance` is nullable on purpose: null means "not read", never "zero".
+  let chainCache: { at: number; providers: any[]; agentBalance: bigint | null } | null = null;
 
   /**
    * The local event index, and the loop that fills it.
@@ -732,7 +734,22 @@ async function main() {
         },
       };
     });
-    const agentBalance = await client.usdcBalance();
+    /*
+     * The balance is read on its own, and a failure keeps the last known value.
+     *
+     * It used to be one `await` in the middle of this function, so *any* read in
+     * here throwing — a provider's reputation, the LP token — took the whole
+     * refresh down with it. `chainCache` then stayed null and the fallback below
+     * reported a balance of zero, which is how an agent holding hundreds of USDC
+     * came to be displayed as empty. A wallet that cannot be read is not a wallet
+     * with nothing in it, and the two must never render the same.
+     */
+    let agentBalance: bigint | null = chainCache?.agentBalance ?? null;
+    try {
+      agentBalance = await client.usdcBalance();
+    } catch (e) {
+      console.error("[dashboard] agent balance read failed:", e);
+    }
     chainCache = { at: Date.now(), providers, agentBalance };
   }
 
@@ -746,7 +763,9 @@ async function main() {
         .catch((err) => console.error(`[dashboard] chain refresh failed: ${String(err).slice(0, 120)}`))
         .finally(() => (refreshing = false));
     }
-    return chainCache ?? { at: 0, providers: [] as any[], agentBalance: 0n };
+    // null, not 0n — inventing a zero here is what displayed a funded wallet
+    // as empty for as long as one unrelated read kept failing.
+    return chainCache ?? { at: 0, providers: [] as any[], agentBalance: null as bigint | null };
   }
 
   // Prime the cache once at startup (best-effort) so the first paint has data.
@@ -4062,7 +4081,7 @@ async function main() {
         return;
       }
       const assets = poolDeployment.assets;
-      const [onChain, market] = await Promise.all([
+      const [onChain, market, fxFeed] = await Promise.all([
         client.public.multicall({
           contracts: assets.map(
             (a) => ({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [a.address] }) as const,
@@ -4070,14 +4089,32 @@ async function main() {
           allowFailure: true,
         }),
         feeds.crypto().catch(() => ({ ok: false, data: [] as { symbol: string; price: number }[] })),
+        // EURC is a euro claim, so its dollar price is EUR/USD. Reading the FX
+        // feed here is what stopped the row showing "—" forever: it was never a
+        // missing price, only a missing lookup.
+        feeds.fx().catch(() => ({ ok: false, data: { rates: [] as { pair?: string; base?: string; quote?: string; rate?: number }[] } })),
       ]);
+
+      const eurUsd = (() => {
+        const rows = (fxFeed as { data?: { rates?: any[] } }).data?.rates ?? [];
+        for (const r of rows) {
+          const base = String(r.base ?? "").toUpperCase();
+          const quote = String(r.quote ?? "").toUpperCase();
+          const pair = String(r.pair ?? "").toUpperCase().replace(/[^A-Z]/g, "");
+          if ((base === "EUR" && quote === "USD") || pair === "EURUSD") {
+            const v = Number(r.rate ?? r.price);
+            if (Number.isFinite(v) && v > 0) return v;
+          }
+        }
+        return null;
+      })();
 
       // Map a reserve symbol to the feed's. Stablecoins are pegged, so their
       // market price is 1 by definition rather than by lookup.
       const marketFor = (symbol: string): number | null => {
         const s = symbol.toUpperCase();
         if (s === "USDC" || s === "USDT" || s === "DAI") return 1;
-        if (s === "EURC") return null; // an FX rate, not a crypto quote
+        if (s === "EURC") return eurUsd; // an FX rate — see the fx() read above
         const wanted = s.replace(/^CIR/, "").replace(/^W/, ""); // cirBTC -> BTC
         const rows = (market as { data?: { symbol: string; price: number }[] }).data ?? [];
         const hit = rows.find((r) => String(r.symbol).toUpperCase() === wanted);
@@ -4143,6 +4180,116 @@ async function main() {
     } catch (e) {
       logTx(req, { category: "defi", action: "set-price", status: "failed", detail: friendlyError(e) });
       res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Track the market: propose (or send) a bounded step toward the live feed.
+   *
+   * GET is a dry run and needs no operator session — seeing that a mark has
+   * drifted is not a privileged fact. POST sends, and is operator-only.
+   *
+   * Every step is clamped, because the feed is an HTTP endpoint that can be
+   * wrong, stale, or attacked, and this number sets every borrow limit and every
+   * liquidation threshold. A genuinely large move is tracked over several rounds
+   * rather than in one jump; `roundsToTarget` says how many, so a clamped update
+   * reads as "tracking" rather than "stuck".
+   */
+  async function priceProposals() {
+    if (!poolDeployment) return null;
+    const assets = poolDeployment.assets;
+    const [onChain, market, fxFeed] = await Promise.all([
+      client.public.multicall({
+        contracts: assets.map(
+          (a) => ({ address: poolDeployment!.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [a.address] }) as const,
+        ) as never,
+        allowFailure: true,
+      }),
+      feeds.crypto().catch(() => ({ data: [] as { symbol: string; price: number }[] })),
+      feeds.fx().catch(() => ({ data: { rates: [] as any[] } })),
+    ]);
+
+    const eurUsd = (() => {
+      const rows = (fxFeed as { data?: { rates?: any[] } }).data?.rates ?? [];
+      for (const r of rows) {
+        const base = String(r.base ?? "").toUpperCase();
+        const quote = String(r.quote ?? "").toUpperCase();
+        const pair = String(r.pair ?? "").toUpperCase().replace(/[^A-Z]/g, "");
+        if ((base === "EUR" && quote === "USD") || pair === "EURUSD") {
+          const v = Number(r.rate ?? r.price);
+          if (Number.isFinite(v) && v > 0) return v;
+        }
+      }
+      return null;
+    })();
+
+    const rows = (market as { data?: { symbol: string; price: number }[] }).data ?? [];
+    const marketFor = (symbol: string): number | null => {
+      const sym = symbol.toUpperCase();
+      if (sym === "USDC" || sym === "USDT" || sym === "DAI") return 1;
+      if (sym === "EURC") return eurUsd;
+      const wanted = sym.replace(/^CIR/, "").replace(/^W/, "");
+      const hit = rows.find((r) => String(r.symbol).toUpperCase() === wanted);
+      return hit && Number.isFinite(hit.price) ? hit.price : null;
+    };
+
+    return assets.map((a, i) => {
+      const row = onChain[i];
+      const current = row?.status === "success" ? (row.result as bigint) : 0n;
+      const p = proposePrice({ asset: a.address as Hex, symbol: a.symbol, current, marketUsd: marketFor(a.symbol) });
+      return { ...p, roundsToTarget: roundsToTarget(p) };
+    });
+  }
+
+  const fmtPrice = (v: bigint) => (Number(v) / 1e8).toFixed(v >= 100n * 100_000_000n ? 0 : 4);
+
+  app.get("/api/lending/price-track", async (_req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    try {
+      const all = (await priceProposals()) ?? [];
+      res.json({
+        ok: true,
+        canSend: Boolean(owner) && (await poolSupportsPrices()).write,
+        proposals: all.map((p) => ({
+          symbol: p.symbol, asset: p.asset,
+          currentUsd: fmtPrice(p.current), targetUsd: fmtPrice(p.target), nextUsd: fmtPrice(p.next),
+          moveBps: p.moveBps, clamped: p.clamped, roundsToTarget: p.roundsToTarget, skip: p.skip ?? null,
+        })),
+        pending: actionablePrices(all).length,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/lending/price-track", requireOperator, async (req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    if (!(await poolSupportsPrices()).write) {
+      res.status(409).json({ ok: false, error: "This pool was deployed before setPrice existed — migrate first." });
+      return;
+    }
+    try {
+      const todo = actionablePrices((await priceProposals()) ?? []);
+      const sent: { symbol: string; usd: string; txHash: string }[] = [];
+      const failedRows: { symbol: string; error: string }[] = [];
+      for (const p of todo) {
+        try {
+          const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setPrice", [p.asset, p.next]);
+          sent.push({ symbol: p.symbol, usd: fmtPrice(p.next), txHash });
+          logTx(req, {
+            category: "defi", action: "track-price", status: "success", txHash,
+            detail: `${p.symbol} ${fmtPrice(p.current)} -> ${fmtPrice(p.next)}${p.clamped ? " (clamped step)" : ""}`,
+          });
+        } catch (e) {
+          // One asset failing must not abandon the others; the run is repeatable.
+          failedRows.push({ symbol: p.symbol, error: friendlyError(e) });
+        }
+      }
+      if (sent.length) await refreshAll();
+      res.json({ ok: failedRows.length === 0, sent, failed: failedRows });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
 
@@ -4511,15 +4658,23 @@ async function main() {
     const refunded = ledgerRef.filter((e) => e.status === "refunded");
     // Derive the treasury snapshot from the balance we already read (no extra RPC call).
     const lowWater = usdc("0.02");
+    // `null` means the read failed. Everything downstream that needs a number
+    // falls back to zero for its own arithmetic, but the *reported* balance
+    // stays null so the UI can say "unavailable" instead of "0.0000" — the two
+    // mean opposite things to somebody deciding whether to fund the agent.
+    const walletKnown = agentBalance !== null;
+    const bal = agentBalance ?? 0n;
     const treasurySnapshot = {
       address: agentAccount.address,
-      balance: agentBalance.toString(),
-      balanceUsdc: formatUsdc(agentBalance),
+      balance: walletKnown ? bal.toString() : null,
+      balanceUsdc: walletKnown ? formatUsdc(bal) : null,
+      unavailable: !walletKnown,
       lowWaterUsdc: formatUsdc(lowWater),
-      healthy: agentBalance >= lowWater,
-      runwayCalls: Number(agentBalance / usdc("0.004")),
+      // An unknown balance is not a healthy one, and not an unhealthy one either.
+      healthy: walletKnown ? bal >= lowWater : null,
+      runwayCalls: walletKnown ? Number(bal / usdc("0.004")) : null,
     };
-    const settlement = TesseraTreasury.settlement(ledgerRef, startBalance, agentBalance);
+    const settlement = TesseraTreasury.settlement(ledgerRef, startBalance, bal);
     res.json({
       meta: {
         brain,
@@ -4537,7 +4692,8 @@ async function main() {
       task: { goal: AGENT_TASK.goal, budgetUsdc: formatUsdc(AGENT_TASK.budget) },
       agent: {
         address: agentAccount.address,
-        balanceUsdc: formatUsdc(agentBalance),
+        balanceUsdc: walletKnown ? formatUsdc(bal) : null,
+        balanceUnavailable: !walletKnown,
         startBalanceUsdc: formatUsdc(startBalance),
       },
       providers,

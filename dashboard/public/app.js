@@ -431,11 +431,20 @@ const $ = (id) => document.getElementById(id);
         $("summary").textContent =
           `${s.summary.settled} settled · ${s.summary.refunded} refunded · ${s.summary.skipped} skipped`;
 
-        $("agentBal").innerHTML = (+s.agent.balanceUsdc).toFixed(4) + '<span class="u">USDC</span>';
+        // A balance the server could not read is not a balance of zero. Showing
+        // "0.0000" for a funded wallet is worse than showing nothing, because it
+        // reads as a fact and invites someone to go top the agent up.
+        if (s.agent.balanceUnavailable || s.agent.balanceUsdc == null) {
+          $("agentBal").innerHTML = '<span class="muted">unavailable</span>';
+        } else {
+          $("agentBal").innerHTML = (+s.agent.balanceUsdc).toFixed(4) + '<span class="u">USDC</span>';
+        }
         $("agentAddr").textContent = s.agent.address;
         const start = +s.agent.startBalanceUsdc || 1;
-        $("balBar").style.width = Math.max(0, Math.min(100, (100 * +s.agent.balanceUsdc) / start)) + "%";
-        const delta = +s.agent.balanceUsdc - start;
+        const balNum = s.agent.balanceUsdc == null ? null : +s.agent.balanceUsdc;
+        $("balBar").style.width =
+          balNum == null ? "0%" : Math.max(0, Math.min(100, (100 * balNum) / start)) + "%";
+        const delta = balNum == null ? 0 : balNum - start;
         $("balDelta").textContent = (delta >= 0 ? "+" : "") + delta.toFixed(4) + " vs start";
         $("balDelta").style.color = delta < 0 ? "var(--muted)" : "var(--good)";
 
@@ -585,7 +594,8 @@ const $ = (id) => document.getElementById(id);
         // Treasury & faucet workflow.
         const tr = s.treasury;
         if (tr) {
-          $("trBal").textContent = (+tr.balanceUsdc).toFixed(4) + " USDC";
+          $("trBal").textContent =
+            tr.balanceUsdc == null ? "unavailable" : (+tr.balanceUsdc).toFixed(4) + " USDC";
           $("trRunway").textContent = tr.runwayCalls != null ? tr.runwayCalls + " calls" : "—";
           $("trLow").textContent = tr.lowWaterUsdc + " USDC";
           const net = tr.settlement ? +tr.settlement.netUsdc : 0;
@@ -699,7 +709,7 @@ const $ = (id) => document.getElementById(id);
         setPanelReady("vault", vtReady, ["vAction", "vAmount", "vMax", "vExecute"], vt && vt.deployed);
         if (vtReady) {
           window.__vault = vt;
-          window.__agentUsdc = vt.walletUsdc || (s.agent ? s.agent.balanceUsdc : "0");
+          window.__agentUsdc = vt.walletUsdc || (s.agent && s.agent.balanceUsdc != null ? s.agent.balanceUsdc : "0");
           setUnlessMine("vWallet", (vt.walletUsdc || "0") + " USDC");
           // These come straight from the contract each refresh, so an admin
           // change to the ratio or fee shows up here as soon as it lands.
