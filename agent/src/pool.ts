@@ -28,6 +28,40 @@ export interface PoolAccount {
   healthFactor: bigint; // WAD; maxUint256 when no debt
 }
 
+/**
+ * `TesseraPool.reserves(asset)` as it actually comes back.
+ *
+ * Written out in full because reading it by hand-counted index is how this went
+ * wrong: the struct carries **four** uint16 risk parameters — cFactor,
+ * liqFactor, lFactor, reserveFactor — and two readers here counted three, so
+ * they took index 6 and got `reserveFactor` (1000) where they meant `price`.
+ *
+ * That is not a display bug. `priceE8` sizes the borrow limit, so a price of
+ * 1000 base units instead of, say, 1e8 inflates the maximum borrow by five
+ * orders of magnitude and quotes it to the user as a number they can act on.
+ *
+ * Named constants below, so the next field added to the struct moves one line
+ * rather than silently repointing every reader at its neighbour.
+ */
+export type ReserveTuple = readonly [
+  boolean, // 0 enabled
+  boolean, // 1 borrowable
+  number,  // 2 decimals
+  number,  // 3 cFactor
+  number,  // 4 liqFactor
+  number,  // 5 lFactor
+  number,  // 6 reserveFactor
+  bigint,  // 7 price (PRICE_SCALE, 1e8)
+  bigint,  // 8 totalSupplyShares
+  bigint,  // 9 totalSupplyAssets
+  bigint,  // 10 totalBorrowShares
+  bigint,  // 11 totalBorrowAssets
+  bigint,  // 12 lastAccrual
+];
+
+/** Index of `price` in `ReserveTuple`. Seven, not six. */
+export const PRICE_IX = 7;
+
 export interface ReserveStats {
   cash: bigint;
   totalBorrows: bigint;
@@ -276,8 +310,8 @@ export class TesseraPoolClient {
       abi: tesseraPoolAbi,
       functionName: "reserves",
       args: [asset],
-    })) as readonly [boolean, boolean, number, number, number, number, bigint, bigint, bigint, bigint, bigint, bigint];
-    return { enabled: r[0], borrowable: r[1], decimals: Number(r[2]), priceE8: r[6] };
+    })) as ReserveTuple;
+    return { enabled: r[0], borrowable: r[1], decimals: Number(r[2]), priceE8: r[PRICE_IX] };
   }
 
   /**
@@ -328,8 +362,8 @@ export class TesseraPoolClient {
         : { frozen: 0, hidden: false, name: "" };
       const priceOk = okR?.status === "success" ? Boolean(okR.result) : true;
       if (cfgR.status !== "success") return { asset, ok: false as const };
-      const c = cfgR.result as readonly [boolean, boolean, number, number, number, number, bigint, bigint, bigint, bigint, bigint, bigint];
-      const cfg = { enabled: c[0], borrowable: c[1], decimals: Number(c[2]), priceE8: c[6] };
+      const c = cfgR.result as ReserveTuple;
+      const cfg = { enabled: c[0], borrowable: c[1], decimals: Number(c[2]), priceE8: c[PRICE_IX] };
       if (!cfg.enabled) return { asset, ok: true as const, cfg, meta, priceOk, reserve: null, supplied: 0n, borrowed: 0n, wallet: 0n };
       if (dataR.status !== "success") return { asset, ok: false as const };
       const d = dataR.result as readonly [bigint, bigint, bigint, bigint, bigint];
