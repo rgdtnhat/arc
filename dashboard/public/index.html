@@ -80,12 +80,28 @@
          so on a short viewport it could scroll away before its containing block
          ended. Fixed pins it for good, and `body` gets matching top padding so
          nothing hides underneath. */
+      /*
+       * The blur lives on a pseudo-element, not on the bar itself.
+       *
+       * `backdrop-filter` promotes its element to a composited layer, and every
+       * rounded child inside that layer gets its anti-aliased corners rasterised
+       * against the layer's own tile grid. On desktop Chromium that is invisible;
+       * on several mobile GPUs it takes a visible bite out of one corner of every
+       * button, tile and pill inside the bar. All three blurred bars here contain
+       * exactly that — icon buttons, nav tiles, tab pills — so all three showed it.
+       *
+       * Painting the blur into a square `::before` behind the content leaves the
+       * children outside the filtered layer entirely. Same look, nothing to clip.
+       */
       .topbar {
         position: fixed; top: 0; left: 0; right: 0; z-index: 90;
+        border-bottom: 1px solid var(--line);
+      }
+      .topbar::before {
+        content: ""; position: absolute; inset: 0; z-index: -1;
         backdrop-filter: saturate(160%) blur(16px);
         -webkit-backdrop-filter: saturate(160%) blur(16px);
         background: color-mix(in srgb, var(--bg) 84%, transparent);
-        border-bottom: 1px solid var(--line);
       }
       body { padding-top: var(--headerH, 56px); }
       /* Anything scrolled to — a deep link from a landing card, an in-page
@@ -346,11 +362,15 @@
       }
 
       /* ---- app shell / tabs ---------------------------------------------- */
+      /* Blur on a square backdrop layer — see .topbar::before for why. */
       .tabsBar {
         position: sticky; top: 57px; z-index: 60; padding: 12px 0 10px;
+        border-bottom: 1px solid var(--line);
+      }
+      .tabsBar::before {
+        content: ""; position: absolute; inset: 0; z-index: -1;
         backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
         background: color-mix(in srgb, var(--bg) 82%, transparent);
-        border-bottom: 1px solid var(--line);
       }
       .tabs { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
       .tabs::-webkit-scrollbar { display: none; }
@@ -667,6 +687,10 @@
          so it slides under rather than over it. */
       .tabDock {
         position: sticky; top: var(--headerH, 56px); z-index: 55;
+      }
+      /* Blur on a square backdrop layer — see .topbar::before for why. */
+      .tabDock::before {
+        content: ""; position: absolute; inset: 0; z-index: -1;
         backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
         background: color-mix(in srgb, var(--bg) 88%, transparent);
       }
