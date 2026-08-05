@@ -32,10 +32,15 @@
  * re-running tops up the difference and never doubles a position.
  *
  * ## Usage
- *   node scripts/migrate-pool.mjs                    # dry run: plan, cost, blockers
- *   node scripts/migrate-pool.mjs --to 0xNEW         # dry run against a specific pool
- *   node scripts/migrate-pool.mjs --to 0xNEW --execute
- *   node scripts/migrate-pool.mjs --to 0xNEW --execute --verify-only
+ *
+ * Through npm, always — this file imports TypeScript modules, so bare `node`
+ * cannot load it and fails with ERR_UNKNOWN_FILE_EXTENSION. The script entry
+ * supplies `--import tsx` and the env file, exactly as `pool:arc` does.
+ *
+ *   npm run migrate:pool                                  # survey: plan, cost, blockers
+ *   npm run migrate:pool -- --to 0xNEW                    # dry run against a destination
+ *   npm run migrate:pool -- --to 0xNEW --execute
+ *   npm run migrate:pool -- --to 0xNEW --execute --verify-only
  */
 import { readFileSync } from "node:fs";
 import { createPublicClient, createWalletClient } from "viem";

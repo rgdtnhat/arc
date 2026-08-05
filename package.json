@@ -19,6 +19,7 @@
     "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs",
     "pool:arc": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/pool-arc.mjs",
     "pool:arc:init": "npm run pool:arc -- --deploy-missing",
+    "migrate:pool": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/migrate-pool.mjs",
     "audit": "npm audit --omit=dev && npm audit --audit-level=moderate",
     "deck": "node scripts/make-deck.mjs && node scripts/check-deck.mjs",
     "deck:check": "node scripts/check-deck.mjs",
