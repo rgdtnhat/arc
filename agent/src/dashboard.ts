@@ -852,12 +852,19 @@ async function main() {
       poolDeployment.assets.map(async (a) => {
         try {
         const row = byAsset.get(a.address.toLowerCase());
-        if (!row || !row.ok) throw new Error("reserve read failed");
-        const cfg = row.cfg;
-        // An unregistered reserve is reported as clearly disabled rather than
-        // throwing, so it stays visible in the picker with an explanation.
-        if (!cfg.enabled || !row.reserve) {
-          const dec0 = cfg.decimals || 6;
+        /*
+         * A row that cannot be read is still a row.
+         *
+         * This used to throw, and the catch below turned that into `null`,
+         * which the filter then dropped. With a cold cache and a pool whose
+         * `reserves` the current ABI cannot decode, *every* asset returned null
+         * — so the asset picker came back empty and the panel sat on "reading
+         * current values from the network…" forever, with nothing on screen
+         * saying why. An empty dropdown is indistinguishable from a slow one.
+         *
+         * A placeholder keeps the asset visible and carries the reason.
+         */
+        const placeholder = (dec0: number, note: string) => {
           const zero = fmtUnits(0n, dec0);
           return {
             symbol: a.symbol,
@@ -865,6 +872,8 @@ async function main() {
             decimals: dec0,
             enabled: false,
             borrowable: false,
+            unavailable: true,
+            note,
             priceUsd: "0.00",
             reserve: { cash: zero, borrows: zero, utilizationPct: "0.0", borrowApr: "0.00", supplyApr: "0.00" },
             position: { supplied: zero, borrowed: zero, wallet: zero },
@@ -873,6 +882,20 @@ async function main() {
               supplyRaw: "0", withdrawRaw: "0", borrowRaw: "0", repayRaw: "0",
             },
           };
+        };
+
+        if (!row || !row.ok) {
+          return placeholder(
+            a.decimals ?? 6,
+            "This reserve could not be read from the pool. The most likely cause is a " +
+              "deployed pool older than the app's ABI — check /api/lending/prices, and migrate if so.",
+          );
+        }
+        const cfg = row.cfg;
+        // An unregistered reserve is reported as clearly disabled rather than
+        // throwing, so it stays visible in the picker with an explanation.
+        if (!cfg.enabled || !row.reserve) {
+          return { ...placeholder(cfg.decimals || 6, "This asset is not a registered reserve on the pool."), unavailable: false };
         }
         const r = row.reserve;
         const { supplied, borrowed, wallet } = row;
@@ -926,9 +949,16 @@ async function main() {
           },
         };
         } catch (e) {
-          console.error(`[lending] ${a.symbol} read failed: ${String(e).slice(0, 90)}`);
-          // Reuse the last good values for this asset rather than dropping it.
-          return assetCache.get(a.address.toLowerCase()) ?? null;
+          // Full message, not 90 characters of it. A truncated decode error
+          // ("TypeError: Can…") names neither the field nor the contract, which
+          // is exactly what you need when the ABI and the deployment disagree.
+          console.error(`[lending] ${a.symbol} read failed:`, e);
+          // Last good values if we have them; otherwise a visible placeholder,
+          // never null — dropping the asset is what emptied the picker.
+          return (
+            assetCache.get(a.address.toLowerCase()) ??
+            placeholder(a.decimals ?? 6, `Read failed: ${String((e as Error)?.message ?? e).slice(0, 160)}`)
+          );
         }
       }),
     );

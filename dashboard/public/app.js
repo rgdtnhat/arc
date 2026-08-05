@@ -1085,7 +1085,14 @@ const $ = (id) => document.getElementById(id);
         // An asset listed in the deployment but never registered on-chain can't
         // be used — say so plainly instead of showing zeros with no explanation.
         if (a.enabled === false) {
-          $("lnMaxHint").textContent = a.symbol + " isn't registered as a reserve in this pool — redeploy with pool:arc to add it.";
+          // Two different situations wearing the same disabled state. An asset
+          // that was never registered is a configuration gap; one the server
+          // could not read is a fault, and the server now says which.
+          $("lnMaxHint").textContent = a.unavailable
+            ? (a.note || (a.symbol + " could not be read from the pool."))
+            : a.symbol + " isn't registered as a reserve in this pool — redeploy with pool:arc to add it.";
+          $("lnExecute").disabled = true;
+          $("lnExecute").style.opacity = "0.5";
           return;
         }
         // A frozen action or a dead oracle feed both make the transaction

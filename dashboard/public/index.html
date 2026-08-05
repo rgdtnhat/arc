@@ -81,17 +81,27 @@
          ended. Fixed pins it for good, and `body` gets matching top padding so
          nothing hides underneath. */
       /*
-       * The blur lives on a pseudo-element, not on the bar itself.
+       * These three bars are opaque. They used to be frosted glass, and the
+       * frosting cost more than it was worth.
        *
-       * `backdrop-filter` promotes its element to a composited layer, and every
-       * rounded child inside that layer gets its anti-aliased corners rasterised
-       * against the layer's own tile grid. On desktop Chromium that is invisible;
-       * on several mobile GPUs it takes a visible bite out of one corner of every
-       * button, tile and pill inside the bar. All three blurred bars here contain
-       * exactly that — icon buttons, nav tiles, tab pills — so all three showed it.
+       * `backdrop-filter` promotes its element to a composited layer. Every
+       * rounded child inside that layer — icon button, nav tile, tab pill — then
+       * has its anti-aliased corners rasterised against the layer's own tile
+       * grid, and on several mobile GPUs that takes a visible bite out of one
+       * corner. Exactly the three bars carrying the blur were the three showing
+       * the artifact, and nothing else in the app showed it.
        *
-       * Painting the blur into a square `::before` behind the content leaves the
-       * children outside the filtered layer entirely. Same look, nothing to clip.
+       * The first attempt moved the blur onto a square `::before` so the filtered
+       * layer held no rounded children. It kept the look and it did not fix the
+       * problem, which says the layer itself is the trouble and not what is
+       * nested inside it. So the layer is gone: a plain opaque background cannot
+       * be composited wrongly because there is nothing to composite.
+       *
+       * Not reproducible on desktop Chromium at any viewport, colour scheme, or
+       * device pixel ratio tried (integer and fractional). Reproducing it needs
+       * the affected hardware, so the fix removes the cause rather than chasing
+       * the symptom. Do not reintroduce `backdrop-filter` on a container that
+       * holds rounded children.
        */
       .topbar {
         position: fixed; top: 0; left: 0; right: 0; z-index: 90;
@@ -99,9 +109,9 @@
       }
       .topbar::before {
         content: ""; position: absolute; inset: 0; z-index: -1;
-        backdrop-filter: saturate(160%) blur(16px);
-        -webkit-backdrop-filter: saturate(160%) blur(16px);
-        background: color-mix(in srgb, var(--bg) 84%, transparent);
+        /* Opaque. No filter, no compositing layer, nothing to rasterise
+           children against. See the note above for why the blur is gone. */
+        background: var(--bg);
       }
       body { padding-top: var(--headerH, 56px); }
       /* Anything scrolled to — a deep link from a landing card, an in-page
@@ -362,15 +372,11 @@
       }
 
       /* ---- app shell / tabs ---------------------------------------------- */
-      /* Blur on a square backdrop layer — see .topbar::before for why. */
+      /* Opaque, not blurred — see .topbar::before. */
       .tabsBar {
         position: sticky; top: 57px; z-index: 60; padding: 12px 0 10px;
         border-bottom: 1px solid var(--line);
-      }
-      .tabsBar::before {
-        content: ""; position: absolute; inset: 0; z-index: -1;
-        backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-        background: color-mix(in srgb, var(--bg) 82%, transparent);
+        background: var(--bg);
       }
       .tabs { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
       .tabs::-webkit-scrollbar { display: none; }
@@ -481,7 +487,10 @@
         width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
         border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
         font-size: 16px; display: grid; place-items: center; box-shadow: var(--shadow);
-        backdrop-filter: blur(10px); transition: transform .15s ease, border-color .15s ease;
+        /* No backdrop-filter: these are circles, and a filter on a rounded
+           element is the case that clips its own corners. `--panel` above is
+           opaque, so the blur was buying nothing. */
+        transition: transform .15s ease, border-color .15s ease;
       }
       .scrollDock button:hover { transform: translateY(-2px); border-color: var(--accent); color: var(--accent); }
       .scrollDock button[hidden] { display: none; }
@@ -581,7 +590,7 @@
       /* ---- modal ---------------------------------------------------------- */
       .modalWrap {
         position: fixed; inset: 0; z-index: 120; display: grid; place-items: center;
-        background: rgba(4, 7, 14, .62); backdrop-filter: blur(6px); padding: 20px;
+        background: rgba(4, 7, 14, .78); padding: 20px;
       }
       .modalWrap[hidden] { display: none; }
       .modalCard {
@@ -614,8 +623,7 @@
          clear of a notch and the iOS home indicator. */
       .sheetWrap {
         position: fixed; inset: 0; z-index: 140; display: flex; align-items: center; justify-content: center;
-        background: rgba(4, 7, 14, .66);
-        backdrop-filter: blur(7px); -webkit-backdrop-filter: blur(7px);
+        background: rgba(4, 7, 14, .8);
         padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right))
                  max(14px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
         animation: fade .18s ease both;
@@ -687,13 +695,9 @@
          so it slides under rather than over it. */
       .tabDock {
         position: sticky; top: var(--headerH, 56px); z-index: 55;
+        background: var(--bg);
       }
-      /* Blur on a square backdrop layer — see .topbar::before for why. */
-      .tabDock::before {
-        content: ""; position: absolute; inset: 0; z-index: -1;
-        backdrop-filter: blur(14px) saturate(150%); -webkit-backdrop-filter: blur(14px) saturate(150%);
-        background: color-mix(in srgb, var(--bg) 88%, transparent);
-      }
+      /* Opaque, not blurred — see .topbar::before. */
       .sheetBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px 18px 24px; }
       .sheetFilters {
         display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -747,7 +751,7 @@
          group you are in and what the columns mean. */
       table.data tbody tr.grp td {
         position: sticky; top: var(--thH, 34px); z-index: 2;
-        background: var(--panel-2); backdrop-filter: blur(8px);
+        background: var(--panel-2);
         font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase;
         color: var(--muted); font-weight: 700; padding: 5px 10px;
       }
