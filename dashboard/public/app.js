@@ -622,7 +622,10 @@ const $ = (id) => document.getElementById(id);
         // Kept for the account-status sheet, which renders from the same state
         // rather than issuing its own reads.
         window.__lastState = s;
-        window.__explorer = (s.live && s.live.explorer) || "";
+        // Never store "" here: every consumer wrote `explorer || ""`, so an
+        // empty value produced a *relative* href — "/tx/0x…" on tesra.xyz,
+        // which is a 404 rather than a block explorer. Fall back to Arcscan.
+        window.__explorer = (s.live && s.live.explorer) || "https://testnet.arcscan.app";
 
         // ---- Dashboard tab + landing stat strip -------------------------------
         // Same numbers in both places, so the landing page shows real live state.
@@ -1208,6 +1211,19 @@ const $ = (id) => document.getElementById(id);
       })();
 
       async function connectWallet() {
+        /*
+         * Already connected? Open the profile instead of asking again.
+         *
+         * The button ran the whole sign-in every tap: request accounts, fetch a
+         * nonce, personal_sign. So touching it after connecting produced another
+         * signature prompt for no reason — which trains people to approve
+         * signature requests without reading them, the precise habit that gets
+         * wallets drained.
+         */
+        if (window.__myAddress && localStorage.getItem("tessera_token")) {
+          $("profileBtn").click();
+          return;
+        }
         // Pick when there is a choice, or when there is nothing yet — the
         // picker is also what offers the deep links on a phone.
         if (!eth() || discovered.size > 1) {
@@ -3209,7 +3225,7 @@ const $ = (id) => document.getElementById(id);
           const safeHash = /^0x[0-9a-fA-F]{64}$/.test(String(hash)) ? String(hash) : "";
           msg.innerHTML = safeHash
             ? `${esc(label)} sent from your wallet ✓ — ` +
-              `<a href="${esc(cfg.explorer)}/tx/${esc(safeHash)}" target="_blank" rel="noopener">` +
+              `<a href="${esc(explorerBase())}/tx/${esc(safeHash)}" target="_blank" rel="noopener">` +
               `${esc(safeHash.slice(0, 12))}…</a>`
             : `${esc(label)} sent from your wallet ✓`;
         } catch (e) {
@@ -3350,10 +3366,15 @@ const $ = (id) => document.getElementById(id);
        * The hash is validated rather than trusted: it goes into markup, and a
        * value that is not a 32-byte hash has no business being there.
        */
+      /** The block explorer, always absolute. See window.__explorer. */
+      function explorerBase() {
+        const e = String(window.__explorer || "").trim();
+        return /^https?:\/\//.test(e) ? e.replace(/\/+$/, "") : "https://testnet.arcscan.app";
+      }
       function txLink(hash, label) {
         const h = String(hash || "");
         if (!/^0x[0-9a-fA-F]{64}$/.test(h)) return esc(h.slice(0, 12));
-        const base = window.__explorer || "https://testnet.arcscan.app";
+        const base = explorerBase();
         return `<a href="${esc(base)}/tx/${esc(h)}" target="_blank" rel="noopener" style="text-decoration:underline">${label || esc(h.slice(0, 10)) + "…"}</a>`;
       }
       function setMine(id, text) {
@@ -4951,7 +4972,7 @@ const $ = (id) => document.getElementById(id);
           rows.innerHTML = (r.rows || [])
             .map((x) => {
               const link = x.txHash
-                ? `<a href="${esc(window.__explorer || "")}/tx/${esc(x.txHash)}" target="_blank" rel="noopener">${esc(x.txHash.slice(0, 10))}…</a>`
+                ? `<a href="${esc(explorerBase())}/tx/${esc(x.txHash)}" target="_blank" rel="noopener">${esc(x.txHash.slice(0, 10))}…</a>`
                 : "—";
               return (
                 `<tr><td>${esc(fmtWhenShort(x.at))}</td>` +
@@ -5160,7 +5181,7 @@ const $ = (id) => document.getElementById(id);
           const c = (k, addr) =>
             addr
               ? `<div class="cfgRow" style="padding:8px 0"><span>${esc(k)}</span>` +
-                `<span class="mono" style="font-size:12px"><a href="${esc(live.explorer || "")}/address/${esc(addr)}" target="_blank" rel="noopener">${esc(short(addr))}</a></span></div>`
+                `<span class="mono" style="font-size:12px"><a href="${esc(explorerBase())}/address/${esc(addr)}" target="_blank" rel="noopener">${esc(short(addr))}</a></span></div>`
               : row(k, "not deployed");
           host.innerHTML =
             section("Network", [

@@ -19,7 +19,8 @@
 //    v21: AMM Max stops falling back to a pool share; dashboard shows your balance.
 //    v22: wallet caps survive a re-render; the summary row follows the signer.
 //    v23: holder USD values use the pool scale; receipts link to Arcscan.
-const CACHE = "tessera-v23";
+//    v24: absolute explorer links, no repeat sign-in, header order, wallet box.
+const CACHE = "tessera-v24";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

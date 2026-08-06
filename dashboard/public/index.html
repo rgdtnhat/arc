@@ -187,7 +187,11 @@
         color: var(--text); transition: border-color .16s ease;
       }
       .themeWrap:hover, .themeWrap:focus-within { border-color: var(--accent); }
-      .themeWrap svg { width: 18px; height: 18px; }
+      /* The select inside is absolutely positioned and invisible, but its line
+         box still nudged the icon off centre on some engines. Zero the line
+         height and let flex do the centring on its own. */
+      .themeWrap { line-height: 0; font-size: 0; }
+      .themeWrap svg { width: 18px; height: 18px; display: block; }
       .themesel {
         position: absolute; inset: 0; width: 100%; height: 100%;
         opacity: 0; border: 0; padding: 0; margin: 0; cursor: pointer;
@@ -905,12 +909,6 @@
           </svg><span class="lbl">Connect</span>
         </button>
 
-        <button class="iconBtn" id="adminBtn" title="Operator sign-in" aria-label="Operator sign-in">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 3l7 3v5.5c0 4.3-2.9 7.6-7 9.5-4.1-1.9-7-5.2-7-9.5V6l7-3z"/><path d="M9.4 12.2l1.9 1.9 3.4-3.6"/>
-          </svg><span class="lbl">Admin</span>
-        </button>
-
         <span class="menuWrap" id="profileWrap" style="display:none">
           <button class="iconBtn" id="profileBtn" title="Your profile" aria-label="Your profile" aria-haspopup="true" aria-expanded="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -937,6 +935,13 @@
             <button class="menuItem" data-prof="signout" role="menuitem" style="color:var(--bad)">&#8617; Sign out</button>
           </div>
         </span>
+
+        <button class="iconBtn" id="adminBtn" title="Operator sign-in" aria-label="Operator sign-in">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3l7 3v5.5c0 4.3-2.9 7.6-7 9.5-4.1-1.9-7-5.2-7-9.5V6l7-3z"/><path d="M9.4 12.2l1.9 1.9 3.4-3.6"/>
+          </svg><span class="lbl">Admin</span>
+        </button>
+
 
         <span class="menuWrap" id="cfgWrap" style="display:none">
           <button class="iconBtn" id="cfgBtn" title="App Config (operator only)" aria-label="App Config" aria-haspopup="dialog" aria-expanded="false">
@@ -1153,8 +1158,12 @@
               <!-- The signed-in user's own balance, beside the agent's. Two
                    different pots of money that were easy to confuse when only
                    one of them was on screen. -->
-              <div id="myWalletRow" style="display:none;margin-top:6px;font-size:12.5px" class="muted">
-                your wallet: <span id="myWalletBal" class="mono">—</span>
+              <!-- Its own bordered block, not a line of small print under the
+                   agent's figure. They are two different pots of money and the
+                   layout should say so before the labels have to. -->
+              <div id="myWalletRow" style="display:none;margin-top:14px;padding:12px;border:1px solid var(--line-strong);border-radius:12px;background:var(--panel-2)">
+                <div class="muted" style="font-size:10.5px;letter-spacing:.07em;text-transform:uppercase">Your wallet</div>
+                <div class="balance" id="myWalletBal" style="margin-top:2px">—</div>
               </div>
               <div class="bar"><span id="balBar" style="width:100%"></span></div>
               <div class="kv"><span class="mono" id="agentAddr">—</span><span id="balDelta"></span></div>
