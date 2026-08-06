@@ -215,7 +215,7 @@ describe("TesseraPool — TWAP sanity band on manual prices", () => {
     ]);
 
     const guard = await hre.viem.deployContract("TesseraPriceGuard", [amm.address, f.pool.address]);
-    await guard.write.setFeed([f.eurc.address, 0n, f.usdc.address, 500, 600]); // ±5%, 10-min window
+    await guard.write.setFeed([f.eurc.address, 0n, f.usdc.address, 500, 600, 0n]); // ±5%, 10-min window, no depth floor
     await f.pool.write.setPriceGuard([guard.address]);
     return { ...f, amm, guard, lp };
   }

@@ -7,6 +7,8 @@ interface IGuardAmm {
         view
         returns (uint256 cumulative, uint64 at, uint256 spot);
     function PRICE_UNIT() external view returns (uint256);
+    /// @notice How much of `token` the pool actually holds. See `minQuoteLiquidity`.
+    function reserves(uint256 poolId, address token) external view returns (uint256);
 }
 
 interface IGuardPool {
@@ -58,6 +60,29 @@ contract TesseraPriceGuard {
         uint16 maxDeviationBps;
         /// @notice Shortest window whose average is trusted, in seconds.
         uint32 minWindow;
+        /**
+         * @notice Least quote-side depth this feed will read a price from, in
+         *         the quote token's own units. Zero means unchecked.
+         *
+         * A TWAP is only as honest as the pool under it. Averaging over time
+         * raises the *cost* of holding a false price but does not change who can
+         * afford it: against a thin pool an attacker can hold a skewed quote
+         * across the whole window for a fraction of what they stand to borrow,
+         * and the oracle reports the average of a lie.
+         *
+         * This is the defence YieldBlox did not have. In February 2026 its
+         * Stellar lending pool lost $10.2m when a trader moved a thinly-traded
+         * asset's price with one large order, the oracle reported the inflated
+         * number, and the attacker borrowed against it and drained the pool.
+         * The post-mortem named liquidity checks on single-source feeds as the
+         * missing safeguard.
+         *
+         * Below this floor the feed reports "no usable price" rather than a
+         * cheap one. That is deliberately the safe direction: an unusable window
+         * already answers `ok` in `check`, so a thin pool stops *guarding* the
+         * manual price rather than starting to *dictate* it.
+         */
+        uint256 minQuoteLiquidity;
         /// @notice The last snapshot `sync` took.
         uint256 snapCumulative;
         uint64 snapAt;
@@ -70,6 +95,7 @@ contract TesseraPriceGuard {
     mapping(address => Feed) public feeds;
 
     event FeedSet(address indexed asset, uint256 poolId, address quote, uint16 maxDeviationBps, uint32 minWindow);
+    event MinLiquiditySet(address indexed asset, uint256 minQuoteLiquidity);
     event FeedCleared(address indexed asset);
     event Synced(address indexed asset, uint256 cumulative, uint64 at);
     event SourcesSet(address amm, address lendingPool);
@@ -108,7 +134,8 @@ contract TesseraPriceGuard {
         uint256 poolId,
         address quote,
         uint16 maxDeviationBps,
-        uint32 minWindow
+        uint32 minWindow,
+        uint256 minQuoteLiquidity
     ) external onlyOwner {
         require(maxDeviationBps > 0 && maxDeviationBps <= 5_000, "deviation");
         require(minWindow >= 60, "window too short to mean anything");
@@ -119,10 +146,27 @@ contract TesseraPriceGuard {
             quote: quote,
             maxDeviationBps: maxDeviationBps,
             minWindow: minWindow,
+            minQuoteLiquidity: minQuoteLiquidity,
             snapCumulative: cum,
             snapAt: uint64(block.timestamp)
         });
         emit FeedSet(asset, poolId, quote, maxDeviationBps, minWindow);
+    }
+
+    /// @notice Raise or lower the depth floor without resetting the window.
+    function setMinLiquidity(address asset, uint256 minQuoteLiquidity) external onlyOwner {
+        require(feeds[asset].enabled, "no feed");
+        feeds[asset].minQuoteLiquidity = minQuoteLiquidity;
+        emit MinLiquiditySet(asset, minQuoteLiquidity);
+    }
+
+    /// @notice Quote-side depth behind this feed right now, and whether it passes.
+    function feedLiquidity(address asset) external view returns (uint256 held, uint256 required, bool ok) {
+        Feed storage f = feeds[asset];
+        if (!f.enabled) return (0, 0, false);
+        held = amm.reserves(f.poolId, f.quote);
+        required = f.minQuoteLiquidity;
+        ok = required == 0 || held >= required;
     }
 
     /// @notice Stop guarding an asset. Its manual price becomes unchecked again.
@@ -162,6 +206,12 @@ contract TesseraPriceGuard {
         if (block.timestamp <= f.snapAt) return (0, 0);
         window = block.timestamp - f.snapAt;
         if (window < f.minWindow) return (0, window);
+
+        // Depth first. Averaging a price nobody had to spend much to set does
+        // not make it true — see Feed.minQuoteLiquidity.
+        if (f.minQuoteLiquidity != 0 && amm.reserves(f.poolId, f.quote) < f.minQuoteLiquidity) {
+            return (0, window);
+        }
 
         (uint256 cum, , ) = amm.observe(f.poolId, asset);
         if (cum <= f.snapCumulative) return (0, window);

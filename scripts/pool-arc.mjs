@@ -577,7 +577,13 @@ async function main() {
         // 25% band over a 30-minute window: wide enough that ordinary
         // volatility does not block an honest re-mark, tight enough to catch a
         // decimal slip.
-        dSend(priceGuard, tesseraPriceGuardAbi, "setFeed", [r.address, id, ARC_USDC_ADDRESS, 2500, 1800]),
+        //
+        // Plus 1,000 USDC of quote-side depth before the average is trusted at
+        // all. A TWAP over a thin pool is not a safer price, only a slower one
+        // to forge — which is how YieldBlox lost $10.2m in February 2026. Below
+        // the floor the feed reports no price, so a thin pool stops guarding
+        // the manual mark rather than starting to dictate it.
+        dSend(priceGuard, tesseraPriceGuardAbi, "setFeed", [r.address, id, ARC_USDC_ADDRESS, 2500, 1800, 1_000_000_000n]),
       );
     }
   }

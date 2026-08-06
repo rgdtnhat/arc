@@ -1380,11 +1380,25 @@ async function main() {
 
     try {
       const me = client.account.address;
+      /*
+       * A failed balance read stops the plan; it does not become a zero.
+       *
+       * This figure is what the keeper can repay with. Defaulting it to zero
+       * makes an unreadable wallet look like an empty one, so the plan says
+       * "cannot deleverage" and the agent stands still — during precisely the
+       * incident it exists for, since a throttled RPC and a moving market are
+       * the same afternoon. Refusing to plan is the honest failure: the caller
+       * retries, rather than acting on a number nobody read.
+       */
       const [limits, wallet] = await Promise.all([
         poolClient.accountLimits(me),
-        client.usdcBalance().catch(() => 0n),
+        client.usdcBalance().then((v) => v as bigint | null).catch(() => null),
       ]);
       if (!limits) { res.status(503).json({ ok: false, error: "could not read the agent's position" }); return; }
+      if (wallet === null) {
+        res.status(503).json({ ok: false, error: "could not read the agent's wallet balance — not planning against an unknown figure" });
+        return;
+      }
 
       const usdcReserve = (await poolClient.public
         .readContract({
@@ -2107,13 +2121,18 @@ async function main() {
       const target = String(req.query.user ?? me);
       const watched = /^0x[0-9a-fA-F]{40}$/.test(target) ? (target as Hex) : me;
 
+      // Same rule as /api/keeper/act: an unreadable balance is not a zero one.
       const [mine, theirs, walletBal] = await Promise.all([
         poolClient.accountLimits(me),
         watched.toLowerCase() === me.toLowerCase()
           ? Promise.resolve(null)
           : poolClient.accountLimits(watched),
-        client.usdcBalance().catch(() => 0n),
+        client.usdcBalance().then((v) => v as bigint | null).catch(() => null),
       ]);
+      if (walletBal === null) {
+        res.status(503).json({ ok: false, error: "could not read the agent's wallet balance — the keeper view would understate what it can repay" });
+        return;
+      }
 
       // The pool speaks in USD, the wallet in USDC base units. Everything the
       // keeper compares against a limit has to be converted first — passing a
