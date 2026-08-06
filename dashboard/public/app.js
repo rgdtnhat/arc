@@ -374,6 +374,9 @@ const $ = (id) => document.getElementById(id);
          */
         window.__myPos = {};
         window.__myBal = {};
+        // The account totals move with every one of these actions too — a
+        // borrow eats headroom, a supply creates it.
+        window.__myAccount = null;
         tick({ fresh: true });
         refreshMyPositions().catch(() => {});
         // A deposit or withdrawal changes the leaderboard and may have moved
@@ -1367,15 +1370,13 @@ const $ = (id) => document.getElementById(id);
             a.max.repay = fmtUnitsStr(rep, dec);
             a.max.repayRaw = rep.toString();
           }
+          // Free liquidity in the reserve, which caps both withdrawing and
+          // borrowing no matter whose account is asking.
+          const cash = BigInt((a.reserve && a.reserve.cashRaw) || "0");
           if (pos) {
             // Withdraw is bounded by your own supply, then by the pool's cash.
             const mineSup = BigInt(pos.supplied || "0");
-            const cashRaw = BigInt(a.max.withdrawRaw || "0");
-            // The server's withdraw cap already folded in liquidity for the
-            // agent; take the tighter of that and the signer's own supply only
-            // when the agent's number is the binding one, otherwise the signer's.
-            const cap = mineSup;
-            const wd = cashRaw > 0n && cashRaw < cap ? cashRaw : cap;
+            const wd = cash > 0n && cash < mineSup ? cash : mineSup;
             a.max.withdraw = fmtUnitsStr(wd, dec);
             a.max.withdrawRaw = wd.toString();
             a.position = {
@@ -1383,6 +1384,33 @@ const $ = (id) => document.getElementById(id);
               supplied: fmtUnitsStr(mineSup, dec),
               borrowed: fmtUnitsStr(BigInt(pos.borrowed || "0"), dec),
             };
+          }
+          /*
+           * Borrow is bounded by *your* headroom, not the agent's.
+           *
+           * This was the last cap still coming from the server, and it read
+           * zero for the same reason "max withdraw" did: the agent has no
+           * collateral, so the agent has no headroom, so a user who had just
+           * supplied 5 USDC was told they could borrow nothing.
+           *
+           * Headroom is (borrowLimit - borrowValue) in the pool's 1e8 USD
+           * scale — the pool has already applied each collateral's factor when
+           * it computed the limit — converted at this asset's mark and then
+           * capped by what the reserve actually holds.
+           */
+          const acct = window.__myAccount;
+          const priceE8 = BigInt(a.priceE8 || "0");
+          if (acct && priceE8 > 0n) {
+            let cap = 0n;
+            if (a.borrowable) {
+              const limit = BigInt(acct.borrowLimit || "0");
+              const used = BigInt(acct.borrowValue || "0");
+              const headroom = limit > used ? limit - used : 0n;
+              cap = (headroom * 10n ** BigInt(dec)) / priceE8;
+              if (cash < cap) cap = cash;
+            }
+            a.max.borrow = fmtUnitsStr(cap, dec);
+            a.max.borrowRaw = cap.toString();
           }
         }
         const action = $("lnAction").value;
@@ -1420,8 +1448,33 @@ const $ = (id) => document.getElementById(id);
             " by the operator. Unfrozen actions still work.";
           return;
         }
+        /*
+         * Say *why* a cap is zero. "max borrow: 0" against a panel that shows
+         * 5 USDC supplied reads as a bug, and the three reasons it can happen
+         * are entirely different problems: nothing deposited, a reserve that
+         * cannot be borrowed, or a pool with no free cash.
+         */
+        let why = "";
+        if (String(max) === "0" || Number(String(max).replace(/,/g, "")) === 0) {
+          const cash = BigInt((a.reserve && a.reserve.cashRaw) || "0");
+          if (action === "borrow") {
+            why = !a.borrowable
+              ? " — this reserve is not borrowable"
+              : cash === 0n
+                ? " — the reserve has no free liquidity to lend right now"
+                : " — supply collateral first, or repay to free up headroom";
+          } else if (action === "withdraw") {
+            why = cash === 0n
+              ? " — the reserve has no free liquidity; borrowers must repay first"
+              : " — you have not supplied any " + a.symbol;
+          } else if (action === "repay") {
+            why = " — you have no " + a.symbol + " debt to repay";
+          } else if (action === "supply") {
+            why = " — your wallet holds no " + a.symbol;
+          }
+        }
         $("lnMaxHint").textContent = "max " + action + ": " + max + " " + a.symbol +
-          (action === "borrow" && !a.borrowable ? " (not borrowable)" : "");
+          (action === "borrow" && !a.borrowable ? " (not borrowable)" : "") + why;
       };
       /**
        * The connected wallet's balance of a token, straight from the chain.
@@ -1441,6 +1494,12 @@ const $ = (id) => document.getElementById(id);
       window.__myBal = window.__myBal || {};
       // asset -> { supplied, borrowed } for the *signer*, raw strings.
       window.__myPos = window.__myPos || {};
+      // The signer's account totals in the pool's 1e8 USD scale, as raw
+      // strings: { supplyValue, borrowValue, borrowLimit }. This is what a
+      // borrow cap is actually made of, and it belongs to whoever is signing —
+      // the server's `max.borrow` is the *agent's* headroom, which is why
+      // somebody with 5 USDC of collateral was offered a maximum borrow of 0.
+      window.__myAccount = window.__myAccount || null;
 
       async function myTokenBalance(token) {
         try {
@@ -1493,9 +1552,18 @@ const $ = (id) => document.getElementById(id);
         const btn = $("lnMax");
         btn.disabled = true;
         try {
-          // Refresh the cache, then let the normal render apply it — one path
-          // for the number, so Max and the hint cannot disagree.
+          /*
+           * Refresh the whole cache, then let the normal render apply it — one
+           * path for the number, so Max and the hint cannot disagree.
+           *
+           * All four caps now come from the signer, and three of them are not
+           * made of the wallet balance: withdraw needs the supply, repay needs
+           * the debt, borrow needs the account's headroom. Refreshing only the
+           * balance left those three reading whatever the last poll happened
+           * to leave behind.
+           */
           if (selfMode() && a.address) {
+            await refreshMyPositions().catch(() => {});
             const bal = await myTokenBalance(a.address);
             if (bal !== null) window.__myBal[String(a.address).toLowerCase()] = bal.toString();
           }
@@ -1567,6 +1635,23 @@ const $ = (id) => document.getElementById(id);
                 : `You supplied ${fmtUnitsStr(mine, dec)} ${a.symbol}. Lower the amount, or tap Max.`;
               return;
             }
+          }
+        }
+        /*
+         * Borrowing past your limit reverts with `Unhealthy`, which tells the
+         * user nothing about how much they could have taken. The cap is
+         * already on screen — check against it and quote the number.
+         */
+        if (selfMode() && action === "borrow") {
+          const cap = BigInt(a.max.borrowRaw || "0");
+          const want = BigInt($("lnAmount").dataset.raw || parsed.raw);
+          if (want > cap) {
+            const dec = Number(a.decimals ?? 6);
+            msg.style.display = "block"; msg.style.color = "var(--warn)";
+            msg.textContent = cap === 0n
+              ? `You cannot borrow ${a.symbol} yet — supply collateral first, or check the reserve has free liquidity.`
+              : `Your borrow limit allows ${fmtUnitsStr(cap, dec)} ${a.symbol}. Lower the amount, or tap Max.`;
+            return;
           }
         }
         // Use the exact raw when the field is an untouched Max; else the parse.
@@ -3460,16 +3545,14 @@ const $ = (id) => document.getElementById(id);
         while (Date.now() < until) {
           try {
             const r = await eth().request({ method: "eth_getTransactionReceipt", params: [hash] });
-            if (r && r.blockNumber) {
-              if (r.status && BigInt(r.status) === 0n) throw new Error("The approval transaction failed.");
-              return r;
-            }
-          } catch (e) {
-            if (e && /approval transaction failed/.test(String(e.message || ""))) throw e;
-          }
+            // Return the receipt whatever it says. A revert *is* a receipt, and
+            // callers need to see it — swallowing it here is how a failed
+            // transaction became a green tick in the first place.
+            if (r && r.blockNumber) return r;
+          } catch { /* a transient RPC hiccup is not an answer; keep polling */ }
           await new Promise((r) => setTimeout(r, 1500));
         }
-        return null;
+        return null; // still pending — unknown, which is neither pass nor fail
       }
 
       /**
@@ -3487,35 +3570,81 @@ const $ = (id) => document.getElementById(id);
         const cur = await ethCall(token, callData(cfg.selectors.allowance, encAddr(from), encAddr(spender)));
         if (BigInt(cur || "0x0") >= BigInt(amount)) return null;
         const hash = await sendTx(from, token, cfg.selectors.approve + encAddr(spender) + encUint(amount));
-        await waitForTx(hash);
+        const receipt = await waitForTx(hash);
+        // A failed approval must stop the action rather than let it go out and
+        // revert for a reason nobody would connect back to this step.
+        if (receipt && !receiptOkHex(receipt.status)) {
+          throw new Error("The approval transaction failed on chain, so nothing was sent.");
+        }
         return hash;
       }
 
-      /** Run a self-custody action, reporting progress into `msgEl`. */
+      /**
+       * Run a self-custody action, reporting progress into `msgEl`.
+       *
+       * A transaction hash is not an outcome. `eth_sendTransaction` resolves
+       * the moment the wallet broadcasts, and this printed a green tick right
+       * there — so a transaction that reverted in the very next block showed
+       * "supply 1 USDC ✓" in the app and "Fail" on Arcscan, from the same
+       * hash. The tick now waits for the receipt and reads its status, and
+       * says so plainly when the chain rejected it.
+       */
       async function selfCustody(msgEl, label, fn) {
         const msg = $(msgEl);
-        msg.style.display = "block";
-        msg.style.color = "var(--muted)";
-        msg.textContent = "Confirm in your wallet…";
+        const show = (text, colour, html) => {
+          msg.style.display = "block";
+          msg.style.color = colour;
+          if (html) msg.innerHTML = text; else msg.textContent = text;
+        };
+        show("Confirm in your wallet…", "var(--muted)");
+        let safeHash = "";
+        const link = () =>
+          safeHash
+            ? ` — <a href="${esc(explorerBase())}/tx/${esc(safeHash)}" target="_blank" rel="noopener">` +
+              `${esc(safeHash.slice(0, 12))}…</a>`
+            : "";
         try {
           const from = await selfAccount();
           const hash = await fn(from, await loadDefiConfig());
-          const cfg = await loadDefiConfig();
-          msg.style.color = "var(--good)";
           // `hash` comes from the wallet provider, so treat it as untrusted:
           // accept only a 0x-hex tx hash, and escape everything interpolated.
-          const safeHash = /^0x[0-9a-fA-F]{64}$/.test(String(hash)) ? String(hash) : "";
-          msg.innerHTML = safeHash
-            ? `${esc(label)} sent from your wallet ✓ — ` +
-              `<a href="${esc(explorerBase())}/tx/${esc(safeHash)}" target="_blank" rel="noopener">` +
-              `${esc(safeHash.slice(0, 12))}…</a>`
-            : `${esc(label)} sent from your wallet ✓`;
+          safeHash = /^0x[0-9a-fA-F]{64}$/.test(String(hash)) ? String(hash) : "";
+          if (!safeHash) {
+            // No hash means the wallet never told us what it sent. That is not
+            // a success, and claiming one would be the exact bug above.
+            show(`${esc(label)}: your wallet did not return a transaction hash, so the result is unknown. ` +
+                 `Check your wallet's activity before retrying.`, "var(--warn)", true);
+            return;
+          }
+          show(`${esc(label)} sent — waiting for the chain to confirm it…${link()}`, "var(--muted)", true);
+          const receipt = await waitForTx(safeHash, 120000);
+          if (!receipt) {
+            // Still pending. Not a success and not a failure; say which.
+            show(`${esc(label)} is still pending after two minutes. It may yet land — ` +
+                 `check the explorer rather than sending it again.${link()}`, "var(--warn)", true);
+            return;
+          }
+          if (!receiptOkHex(receipt.status)) {
+            show(`${esc(label)} <b>failed on chain</b> — it was mined but reverted, so nothing moved. ` +
+                 `Your funds are untouched.${link()}`, "var(--warn)", true);
+            return;
+          }
+          show(`${esc(label)} confirmed ✓${link()}`, "var(--good)", true);
         } catch (e) {
-          msg.style.color = "var(--warn)";
-          msg.textContent = walletError(e);
+          show(walletError(e) + (safeHash ? ` (${safeHash.slice(0, 12)}…)` : ""), "var(--warn)");
         } finally {
           afterTx();
         }
+      }
+      /**
+       * Did this receipt status mean success? Raw RPC gives 0x1/0x0; be strict
+       * and treat anything else as a failure — an unrecognised status is
+       * precisely where a false green tick does the most harm.
+       */
+      function receiptOkHex(status) {
+        if (status === undefined || status === null) return false;
+        const s = String(status).toLowerCase();
+        return s === "0x1" || s === "1" || s === "success";
       }
       // Plain-language wallet/chain errors (mirrors the server's friendlyError).
       function walletError(e) {
@@ -3573,6 +3702,14 @@ const $ = (id) => document.getElementById(id);
               setMine("lnSupplied", usd(word(0)));
               setMine("lnBorrowed", usd(word(1)));
               setMine("lnLimit", usd(word(2)));
+              // Keep the raw words: the borrow cap is (limit - borrowed) in USD
+              // converted at the asset's mark, and doing that from the "$5.00"
+              // above would round the headroom to the nearest cent.
+              window.__myAccount = {
+                supplyValue: word(0).toString(),
+                borrowValue: word(1).toString(),
+                borrowLimit: word(2).toString(),
+              };
             }
           } catch {}
         }
@@ -3691,6 +3828,12 @@ const $ = (id) => document.getElementById(id);
       function clearMine() {
         document.querySelectorAll("[data-mine]").forEach((el) => { delete el.dataset.mine; el.title = ""; });
         window.__myTokenIn = null;
+        // Leaving these behind would keep deriving the caps of a signer who is
+        // no longer connected — or is on the wrong chain, which is one of the
+        // ways clearMine gets called.
+        window.__myAccount = null;
+        window.__myPos = {};
+        window.__myBal = {};
       }
 
       // Toggle: "My wallet" (self-custody) vs "Agent wallet" (operator).

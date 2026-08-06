@@ -17,6 +17,7 @@ import {
   PaymentStatus,
   pacedHttp,
 } from "@tessera/shared";
+import { confirm } from "./confirm.js";
 import { encodePacked, keccak256 } from "viem";
 
 export interface TesseraClientConfig {
@@ -119,7 +120,7 @@ export class TesseraClient {
       chain: this.chain,
       account: this.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
   }
 
   // --- Nanopayments (TesseraTab) ---------------------------------------------
@@ -140,7 +141,7 @@ export class TesseraClient {
       account: this.account,
     });
     const txHash = await this.wallet.writeContract(request);
-    const receipt = await this.public.waitForTransactionReceipt({ hash: txHash });
+    const receipt = await confirm(this.public, txHash);
     // Read the real tabId from the emitted TabOpened event — the simulated
     // return value is speculative and collides under concurrent opens.
     const logs = parseEventLogs({ abi: tesseraTabAbi, eventName: "TabOpened", logs: receipt.logs });
@@ -172,7 +173,7 @@ export class TesseraClient {
       chain: this.chain,
       account: this.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
     return hash;
   }
 
@@ -250,7 +251,7 @@ export class TesseraClient {
       account: this.account,
     });
     const txHash = await this.wallet.writeContract(request);
-    const receipt = await this.public.waitForTransactionReceipt({ hash: txHash });
+    const receipt = await confirm(this.public, txHash);
     return { paymentId: this.paymentIdFromReceipt(receipt), txHash };
   }
 
@@ -271,7 +272,7 @@ export class TesseraClient {
       chain: this.chain,
       account: this.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
   }
 
   /**
@@ -297,7 +298,7 @@ export class TesseraClient {
       account: this.account,
     });
     const txHash = await this.wallet.writeContract(request);
-    const receipt = await this.public.waitForTransactionReceipt({ hash: txHash });
+    const receipt = await confirm(this.public, txHash);
     // Read the REAL paymentId from the emitted PaymentOpened event. The simulated
     // return value is speculative: under concurrent opens (e.g. a fleet), two
     // agents would both predict the same next id but get different ids on-chain.
@@ -325,7 +326,7 @@ export class TesseraClient {
       chain: this.chain,
       account: this.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
     return hash;
   }
 
@@ -338,7 +339,7 @@ export class TesseraClient {
       chain: this.chain,
       account: this.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
     return hash;
   }
 

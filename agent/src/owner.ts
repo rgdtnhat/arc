@@ -7,6 +7,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { tesseraVaultAbi, tesseraFeeCollectorAbi, pacedHttp } from "@tessera/shared";
+import { confirm } from "./confirm.js";
 
 /**
  * Signs the **owner-gated** contract calls — the ones the deploying key owns, not
@@ -48,7 +49,7 @@ export class OwnerClient {
       account: this.account,
     });
     const hash = await this.wallet.writeContract(request as never);
-    await this.pub.waitForTransactionReceipt({ hash });
+    await confirm(this.pub, hash);
     return hash;
   }
 
@@ -75,7 +76,7 @@ export class OwnerClient {
       account: this.account,
       chain: this.chain,
     } as never);
-    const receipt = await this.pub.waitForTransactionReceipt({ hash });
+    const receipt = await confirm(this.pub, hash);
     if (receipt.status !== "success" || !receipt.contractAddress) {
       throw new Error("Deployment reverted — nothing was created.");
     }

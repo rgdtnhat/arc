@@ -22,7 +22,8 @@
 //    v24: absolute explorer links, no repeat sign-in, header order, wallet box.
 //    v25: withdraw cap and position come from the signer, and refresh after a tx.
 //    v26: reads refuse to run off Arc, one amount parser, exact approvals.
-const CACHE = "tessera-v26";
+//    v27: the tick waits for the receipt; borrow/repay caps follow the signer.
+const CACHE = "tessera-v27";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

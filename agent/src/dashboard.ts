@@ -923,7 +923,8 @@ async function main() {
             unavailable: true,
             note,
             priceUsd: "0.00",
-            reserve: { cash: zero, borrows: zero, utilizationPct: "0.0", borrowApr: "0.00", supplyApr: "0.00" },
+            priceE8: "0",
+            reserve: { cash: zero, cashRaw: "0", borrows: zero, utilizationPct: "0.0", borrowApr: "0.00", supplyApr: "0.00" },
             position: { supplied: zero, borrowed: zero, wallet: zero },
             max: {
               supply: zero, withdraw: zero, borrow: zero, repay: zero,
@@ -972,8 +973,15 @@ async function main() {
           // actions will revert, so the UI must say so rather than quote on.
           priceOk: row.priceOk !== false,
           priceUsd: (Number(cfg.priceE8) / 1e8).toFixed(2),
+          // The exact mark, in the pool's 1e8 USD scale. A connected wallet has
+          // to work out its *own* borrow headroom — every `max` below is
+          // computed for the agent — and it cannot do that from a two-decimal
+          // display string without being wrong by up to half a cent per unit.
+          priceE8: cfg.priceE8.toString(),
           reserve: {
             cash: fmtUnits(r.cash, dec),
+            // Free liquidity as an integer, for the same reason.
+            cashRaw: r.cash.toString(),
             borrows: fmtUnits(r.totalBorrows, dec),
             utilizationPct: ((Number(r.utilizationWad) / 1e18) * 100).toFixed(1),
             borrowApr: fmtApr(r.borrowAprWad),

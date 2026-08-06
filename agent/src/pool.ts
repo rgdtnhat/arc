@@ -9,6 +9,7 @@ import {
   type WalletClient,
 } from "viem";
 import { tesseraPoolAbi, erc20Abi, pacedHttp } from "@tessera/shared";
+import { confirm } from "./confirm.js";
 
 /**
  * Thin, typed wrapper over TesseraPool for an agent: supply idle USDC to earn
@@ -111,7 +112,7 @@ export class TesseraPoolClient {
       chain: this.chain,
       account: this.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
   }
 
   private async write(functionName: string, args: unknown[]): Promise<Hex> {
@@ -123,7 +124,7 @@ export class TesseraPoolClient {
       account: this.account,
     });
     const hash = await this.wallet.writeContract(request);
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
     return hash;
   }
 

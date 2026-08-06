@@ -16,6 +16,7 @@ import {
   erc20Abi,
   pacedHttp,
 } from "@tessera/shared";
+import { confirm } from "./confirm.js";
 
 interface Cfg {
   chain: Chain;
@@ -52,7 +53,7 @@ export class VaultClient {
       chain: this.cfg.chain,
       account: this.cfg.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
   }
 
   private async write(functionName: string, args: unknown[]): Promise<Hex> {
@@ -64,7 +65,7 @@ export class VaultClient {
       account: this.cfg.account,
     });
     const hash = await this.wallet.writeContract(request);
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
     return hash;
   }
 
@@ -177,7 +178,7 @@ export class RouterClient {
       chain: this.cfg.chain,
       account: this.cfg.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
   }
 
   /**
@@ -204,7 +205,7 @@ export class RouterClient {
       account: this.cfg.account,
     });
     const hash = await this.wallet.writeContract(request);
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
     return hash;
   }
 
@@ -227,7 +228,7 @@ export class RouterClient {
       account: this.cfg.account,
     });
     const hash = await this.wallet.writeContract(request);
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
     return hash;
   }
 
@@ -354,7 +355,7 @@ export class AmmClient {
       chain: this.cfg.chain,
       account: this.cfg.account,
     });
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
   }
 
   private async write(functionName: string, args: unknown[]): Promise<Hex> {
@@ -366,7 +367,7 @@ export class AmmClient {
       account: this.cfg.account,
     });
     const hash = await this.wallet.writeContract(request);
-    await this.public.waitForTransactionReceipt({ hash });
+    await confirm(this.public, hash);
     return hash;
   }
 
