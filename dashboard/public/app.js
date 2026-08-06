@@ -1019,22 +1019,159 @@ const $ = (id) => document.getElementById(id);
           btn.style.color = "";
         }
       }
+      /* ---- wallet discovery ---------------------------------------------
+       *
+       * Three things had to change for a phone to work at all.
+       *
+       * **EIP-6963.** `window.ethereum` is a single slot that every installed
+       * wallet fights over, so with two installed you get whichever won the
+       * race. 6963 has each wallet announce itself instead, which is how you
+       * pick rather than guess.
+       *
+       * **No injected provider on mobile.** Safari and Chrome on a phone have
+       * no extensions, so `window.ethereum` is simply undefined there — and the
+       * old code answered that by telling the user to install an extension,
+       * which is not a thing that exists on their device. What does work is
+       * opening this page *inside* the wallet's own browser, where the wallet
+       * injects a provider. The deep links below do exactly that.
+       *
+       * **No SDK.** WalletConnect would let someone stay in their browser and
+       * approve in the app, which is nicer, but it needs a bundled SDK, a
+       * project id, and a relay connection — none of which fit a static page
+       * under a strict CSP. Deep links need nothing and work today; the hook
+       * below is where WalletConnect would slot in later.
+       */
+      const discovered = new Map(); // uuid -> { info, provider }
+      let chosenProvider = null;
+
+      window.addEventListener("eip6963:announceProvider", (e) => {
+        const d = e.detail;
+        if (d && d.info && d.provider) discovered.set(d.info.uuid, d);
+      });
+      // Wallets answer this synchronously on receipt; fired once at load and
+      // again when the picker opens, in case one was unlocked in between.
+      const askWallets = () => window.dispatchEvent(new Event("eip6963:requestProvider"));
+      askWallets();
+
+      /** The provider every call in this file goes through. */
+      function eth() {
+        if (chosenProvider) return chosenProvider;
+        if (discovered.size === 1) return [...discovered.values()][0].provider;
+        return window.ethereum || null;
+      }
+      window.__tesseraEth = eth; // for the console, and for anything loaded later
+
+      const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+      /**
+       * Reopen this exact page inside a wallet's in-app browser.
+       *
+       * Each wallet has its own scheme and none of them agree; the shapes below
+       * are the documented ones. The full path is carried through so somebody
+       * deep in the DeFi tab lands back where they were rather than at the top.
+       */
+      const MOBILE_WALLETS = [
+        { name: "MetaMask", link: () => `https://metamask.app.link/dapp/${location.host}${location.pathname}${location.hash}` },
+        { name: "Trust Wallet", link: () => `https://link.trustwallet.com/open_url?coin_id=60&url=${encodeURIComponent(location.href)}` },
+        { name: "Coinbase Wallet", link: () => `https://go.cb-w.com/dapp?cb_url=${encodeURIComponent(location.href)}` },
+        { name: "Rainbow", link: () => `https://rnbwapp.com/dapp?url=${encodeURIComponent(location.href)}` },
+      ];
+
+      function closeWalletPicker() {
+        const el = $("walletPicker");
+        if (el) el.remove();
+      }
+
+      /**
+       * Ask which wallet, and return its provider — or null if the user is being
+       * sent to an app instead.
+       */
+      function pickWallet() {
+        askWallets();
+        closeWalletPicker();
+        return new Promise((resolve) => {
+          const found = [...discovered.values()];
+          const wrap = document.createElement("div");
+          wrap.id = "walletPicker";
+          wrap.className = "modalWrap";
+          const rows = found.length
+            ? found
+                .map(
+                  (d, i) =>
+                    `<button class="btn" data-i="${i}" style="display:flex;width:100%;justify-content:flex-start;gap:10px;margin-bottom:8px">` +
+                    (d.info.icon ? `<img src="${d.info.icon}" alt="" width="20" height="20" style="border-radius:5px">` : "") +
+                    `${esc(d.info.name)}</button>`,
+                )
+                .join("")
+            : "";
+          // Deep links only where they can work. On a desktop with no wallet the
+          // honest answer is "install one", not a link that opens nothing.
+          const links = !found.length && isMobile()
+            ? `<p class="muted" style="margin:0 0 10px;font-size:13px">No wallet is available to this browser. Open Tessera inside your wallet's own browser:</p>` +
+              MOBILE_WALLETS.map(
+                (w) => `<a class="btn" href="${w.link()}" style="display:flex;width:100%;justify-content:flex-start;margin-bottom:8px" rel="noopener">${w.name}</a>`,
+              ).join("")
+            : "";
+          const none = !found.length && !isMobile()
+            ? `<p class="muted" style="margin:0;font-size:13px">No wallet extension detected. Install MetaMask, Rabby or another EIP-1193 wallet, then try again.</p>`
+            : "";
+
+          wrap.innerHTML =
+            `<div class="modalCard" style="padding:18px">` +
+            `<h3 style="margin:0 0 12px;font-size:15px">Connect a wallet</h3>` +
+            rows + links + none +
+            `<button class="btn" id="walletPickerCancel" style="display:flex;width:100%;justify-content:center;margin-top:6px">Cancel</button>` +
+            `</div>`;
+          document.body.appendChild(wrap);
+
+          wrap.addEventListener("click", (ev) => {
+            if (ev.target === wrap) { closeWalletPicker(); resolve(null); }
+          });
+          $("walletPickerCancel").addEventListener("click", () => { closeWalletPicker(); resolve(null); });
+          wrap.querySelectorAll("button[data-i]").forEach((b) => {
+            b.addEventListener("click", () => {
+              const d = found[Number(b.dataset.i)];
+              chosenProvider = d.provider;
+              try { localStorage.setItem("tessera_wallet_rdns", d.info.rdns || ""); } catch {}
+              closeWalletPicker();
+              resolve(d.provider);
+            });
+          });
+          // Following a deep link leaves the page; nothing to resolve.
+        });
+      }
+
+      // Reconnect to the same wallet on a return visit, so the choice sticks.
+      (() => {
+        let saved = null;
+        try { saved = localStorage.getItem("tessera_wallet_rdns"); } catch {}
+        if (!saved) return;
+        setTimeout(() => {
+          for (const d of discovered.values()) {
+            if (d.info.rdns === saved) { chosenProvider = d.provider; break; }
+          }
+        }, 300);
+      })();
+
       async function connectWallet() {
-        if (!window.ethereum) {
-          alert("No browser wallet detected. Please install or enable a Web3 wallet, then try Connect Wallet again.");
-          return;
+        // Pick when there is a choice, or when there is nothing yet — the
+        // picker is also what offers the deep links on a phone.
+        if (!eth() || discovered.size > 1) {
+          const picked = await pickWallet();
+          if (!picked) return; // cancelled, or being sent to a wallet app
         }
+        if (!eth()) return;
         const btn = $("walletBtn");
         btn.disabled = true;
         try {
-          const [address] = await window.ethereum.request({ method: "eth_requestAccounts" });
+          const [address] = await eth().request({ method: "eth_requestAccounts" });
           const { nonce } = await (await fetch("/api/auth/nonce")).json();
-          const chainIdHex = await window.ethereum.request({ method: "eth_chainId" });
+          const chainIdHex = await eth().request({ method: "eth_chainId" });
           const message =
             `${location.host} wants you to sign in with your Ethereum account:\n${address}\n\n` +
             `Sign in to Tessera.\n\nURI: ${location.origin}\nVersion: 1\n` +
             `Chain ID: ${parseInt(chainIdHex, 16)}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`;
-          const signature = await window.ethereum.request({ method: "personal_sign", params: [message, address] });
+          const signature = await eth().request({ method: "personal_sign", params: [message, address] });
           const r = await (
             await fetch("/api/auth/verify", {
               method: "POST",
@@ -1345,9 +1482,9 @@ const $ = (id) => document.getElementById(id);
         // `eth_accounts` rather than `eth_requestAccounts`: a quote must not
         // pop a connection prompt.
         let from = "";
-        if (selfMode() && window.ethereum) {
+        if (selfMode() && eth()) {
           try {
-            const [a] = await window.ethereum.request({ method: "eth_accounts" });
+            const [a] = await eth().request({ method: "eth_accounts" });
             if (a) from = a;
           } catch { /* not connected — the server falls back to the agent wallet */ }
         }
@@ -2687,10 +2824,10 @@ const $ = (id) => document.getElementById(id);
 
         /** The connected wallet's balance of each pool asset (self-custody only). */
         async function amWalletBalances(p) {
-          if (!selfMode() || !window.ethereum) return null;
+          if (!selfMode() || !eth()) return null;
           try {
             const cfg = await loadDefiConfig();
-            const [from] = await window.ethereum.request({ method: "eth_accounts" });
+            const [from] = await eth().request({ method: "eth_accounts" });
             if (!from) return null;
             return Promise.all(
               p.assets.map(async (a) =>
@@ -2805,18 +2942,18 @@ const $ = (id) => document.getElementById(id);
       const encArray = (values) => encUint(values.length) + values.map(encUint).join("");
 
       async function selfAccount() {
-        if (!window.ethereum) throw new Error("No browser wallet detected.");
-        const [a] = await window.ethereum.request({ method: "eth_requestAccounts" });
+        if (!eth()) throw new Error("No browser wallet detected.");
+        const [a] = await eth().request({ method: "eth_requestAccounts" });
         const cfg = await loadDefiConfig();
         // Make sure the wallet is on Arc, offering to add the network if unknown.
         const want = "0x" + Number(cfg.chainId).toString(16);
-        const have = await window.ethereum.request({ method: "eth_chainId" });
+        const have = await eth().request({ method: "eth_chainId" });
         if (have !== want) {
           try {
-            await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: want }] });
+            await eth().request({ method: "wallet_switchEthereumChain", params: [{ chainId: want }] });
           } catch (e) {
             if (e && (e.code === 4902 || String(e.message || "").includes("Unrecognized"))) {
-              await window.ethereum.request({
+              await eth().request({
                 method: "wallet_addEthereumChain",
                 params: [{
                   chainId: want,
@@ -2833,10 +2970,10 @@ const $ = (id) => document.getElementById(id);
       }
 
       async function ethCall(to, data) {
-        return window.ethereum.request({ method: "eth_call", params: [{ to, data }, "latest"] });
+        return eth().request({ method: "eth_call", params: [{ to, data }, "latest"] });
       }
       async function sendTx(from, to, data) {
-        return window.ethereum.request({ method: "eth_sendTransaction", params: [{ from, to, data }] });
+        return eth().request({ method: "eth_sendTransaction", params: [{ from, to, data }] });
       }
       // Ensure `spender` may move `amount` of `token` on the user's behalf.
       async function ensureAllowance(from, token, spender, amount) {
@@ -2897,10 +3034,10 @@ const $ = (id) => document.getElementById(id);
        */
       const decStr = (raw, dec) => fmtUnitsJs(BigInt(raw || "0x0").toString(), dec);
       async function refreshMyPositions() {
-        if (!selfMode() || !window.ethereum) { clearMine(); return; }
+        if (!selfMode() || !eth()) { clearMine(); return; }
         let from;
         try {
-          const accts = await window.ethereum.request({ method: "eth_accounts" });
+          const accts = await eth().request({ method: "eth_accounts" });
           from = accts && accts[0];
         } catch { return; }
         if (!from) { clearMine(); return; }
@@ -2973,7 +3110,7 @@ const $ = (id) => document.getElementById(id);
       // on mobile) leaving it on would make every action fail with "no wallet
       // detected", so we turn it off, lock it, and explain — actions then route
       // through the operator path, which is what a signed-in admin expects.
-      const hasInjectedWallet = () => !!window.ethereum;
+      const hasInjectedWallet = () => !!eth();
       const selfMode = () => {
         const t = $("selfCustodyToggle");
         return !!(t && t.checked && hasInjectedWallet());
@@ -4963,9 +5100,9 @@ const $ = (id) => document.getElementById(id);
       setInterval(() => { refreshMyPositions().catch(() => {}); }, 12000);
       window.addEventListener("focus", () => tick());
       window.addEventListener("online", () => tick());
-      if (window.ethereum && window.ethereum.on) {
-        window.ethereum.on("accountsChanged", () => tick());
-        window.ethereum.on("chainChanged", () => tick());
+      if (eth() && eth().on) {
+        eth().on("accountsChanged", () => tick());
+        eth().on("chainChanged", () => tick());
       }
 
       // Poll interval is driven by the server (slower in live mode to spare the

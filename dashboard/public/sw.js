@@ -14,7 +14,8 @@
 //    show an unreadable reserve instead of dropping it. Both are shell changes
 //    and the version was not bumped with them, so a returning phone could keep
 //    painting the old CSS from cache and read as "the fix did nothing".
-const CACHE = "tessera-v18";
+//    v19: wallet discovery (EIP-6963) and the mobile deep-link picker.
+const CACHE = "tessera-v19";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {
