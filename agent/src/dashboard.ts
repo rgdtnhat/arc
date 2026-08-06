@@ -702,54 +702,82 @@ async function main() {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   let refreshing = false;
 
+  /**
+   * Refresh the chain-derived cache. Never throws, and always writes.
+   *
+   * The agent's balance used to be read *last*, after a sequential loop over
+   * every provider on a rate-limited public RPC. One throttled call anywhere in
+   * that loop threw, so `chainCache` was never assigned at all and the wallet
+   * card fell back to a figure the agent did not have — which is how a wallet
+   * holding 520 USDC came to read as empty, and then as unavailable.
+   *
+   * `byAddr.get(...)!` made it worse by asserting a hit that a failed read had
+   * never put there, turning one bad response into a TypeError.
+   *
+   * So: the number the dashboard leads with is read first and alone, every
+   * provider is guarded on its own, and the cache is written whatever happened.
+   * A partial refresh is worth strictly more than none, and whatever failed
+   * keeps its previous value rather than being replaced by a zero.
+   */
   async function refreshChain() {
-    // Services often share one on-chain wallet (all of them in live mode), so
-    // read each unique address once, sequentially, with a pace between calls.
-    const uniqueAddrs = [...new Set(Object.values(providerAddrs))] as Hex[];
-    const byAddr = new Map<string, { balance: bigint; rep: any; stake: bigint }>();
-    for (const addr of uniqueAddrs) {
-      const balance = await client.usdcBalance(addr);
-      if (READ_PACE) await sleep(READ_PACE);
-      const rep = await client.reputation(addr);
-      if (READ_PACE) await sleep(READ_PACE);
-      const stake = await client.stakeOf(addr);
-      if (READ_PACE) await sleep(READ_PACE);
-      byAddr.set(addr.toLowerCase(), { balance, rep, stake });
-    }
-    const providers = CATALOG.map((s) => {
-      const address = providerAddrs[s.resource] as Hex;
-      const { balance, rep, stake } = byAddr.get(address.toLowerCase())!;
-      return {
-        resource: s.resource,
-        name: s.name,
-        address,
-        behavior: s.behavior,
-        billing: s.billing ?? "escrow",
-        balanceUsdc: formatUsdc(balance),
-        stakeUsdc: formatUsdc(stake),
-        reputation: {
-          fulfilled: Number(rep.fulfilled),
-          failed: Number(rep.failed),
-          earnedUsdc: formatUsdc(rep.earned),
-        },
-      };
-    });
-    /*
-     * The balance is read on its own, and a failure keeps the last known value.
-     *
-     * It used to be one `await` in the middle of this function, so *any* read in
-     * here throwing — a provider's reputation, the LP token — took the whole
-     * refresh down with it. `chainCache` then stayed null and the fallback below
-     * reported a balance of zero, which is how an agent holding hundreds of USDC
-     * came to be displayed as empty. A wallet that cannot be read is not a wallet
-     * with nothing in it, and the two must never render the same.
-     */
+    // First, and alone — not hostage to N provider reads on a throttled RPC.
     let agentBalance: bigint | null = chainCache?.agentBalance ?? null;
     try {
       agentBalance = await client.usdcBalance();
     } catch (e) {
       console.error("[dashboard] agent balance read failed:", e);
     }
+    if (READ_PACE) await sleep(READ_PACE);
+
+    // Services often share one on-chain wallet (all of them in live mode), so
+    // read each unique address once, sequentially, with a pace between calls.
+    const uniqueAddrs = [...new Set(Object.values(providerAddrs))] as Hex[];
+    const byAddr = new Map<string, { balance: bigint; rep: any; stake: bigint }>();
+    for (const addr of uniqueAddrs) {
+      try {
+        const balance = await client.usdcBalance(addr);
+        if (READ_PACE) await sleep(READ_PACE);
+        const rep = await client.reputation(addr);
+        if (READ_PACE) await sleep(READ_PACE);
+        const stake = await client.stakeOf(addr);
+        if (READ_PACE) await sleep(READ_PACE);
+        byAddr.set(addr.toLowerCase(), { balance, rep, stake });
+      } catch (e) {
+        console.error(`[dashboard] provider read failed for ${addr}:`, e);
+      }
+    }
+
+    const prior = new Map((chainCache?.providers ?? []).map((p: any) => [String(p.resource), p]));
+    const providers = CATALOG.map((s) => {
+      const address = providerAddrs[s.resource] as Hex | undefined;
+      const row = address ? byAddr.get(address.toLowerCase()) : undefined;
+      // Nothing fresh: keep what was shown last rather than inventing zeros for
+      // a provider we simply did not manage to ask about this round.
+      if (!row) {
+        return (
+          prior.get(s.resource) ?? {
+            resource: s.resource, name: s.name, address: address ?? null,
+            behavior: s.behavior, billing: s.billing ?? "escrow",
+            balanceUsdc: null, stakeUsdc: null, unavailable: true,
+            reputation: { fulfilled: null, failed: null, earnedUsdc: null },
+          }
+        );
+      }
+      return {
+        resource: s.resource,
+        name: s.name,
+        address,
+        behavior: s.behavior,
+        billing: s.billing ?? "escrow",
+        balanceUsdc: formatUsdc(row.balance),
+        stakeUsdc: formatUsdc(row.stake),
+        reputation: {
+          fulfilled: Number(row.rep.fulfilled),
+          failed: Number(row.rep.failed),
+          earnedUsdc: formatUsdc(row.rep.earned),
+        },
+      };
+    });
     chainCache = { at: Date.now(), providers, agentBalance };
   }
 
