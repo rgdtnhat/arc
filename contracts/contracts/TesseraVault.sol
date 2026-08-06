@@ -279,6 +279,30 @@ contract TesseraVault {
             // Shares priced on TVL *before* this deposit landed in the buffer.
             uint256 taBefore = totalAssets() - assets;
             shares = taBefore == 0 ? assets : (assets * totalShares) / taBefore;
+
+            /*
+             * Bound what rounding can take from a depositor.
+             *
+             * `totalAssets()` includes this contract's raw token balance, so
+             * anybody can inflate it by transferring in — no deposit call, no
+             * shares minted. Dead shares (MINIMUM_LIQUIDITY) stop the classic
+             * first-depositor theft, and `shares > 0` below stops the total
+             * loss, but neither bounds the *partial* one: once a donation has
+             * made a single share expensive, a deposit that does not divide
+             * evenly silently forfeits up to one share's worth to everyone else.
+             *
+             * That is the residual of the attack that took $6.04m from Lazy
+             * Summer's USDC vaults in July 2026 and $240k from sDOLA in March —
+             * both donation-driven share-price manipulation, both against
+             * vaults whose NAV read a balance.
+             *
+             * So the depositor is told. Their minted shares must be worth at
+             * least 99.5% of what they paid, and a deposit too small for the
+             * current share price reverts with something actionable instead of
+             * quietly costing them the difference.
+             */
+            uint256 credited = totalShares == 0 ? assets : (shares * taBefore) / totalShares;
+            require(credited * 10_000 >= assets * 9_950, "deposit too small at this share price");
         }
         require(shares > 0, "no shares");
         sharesOf[user] += shares;

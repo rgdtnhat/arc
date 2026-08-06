@@ -104,6 +104,13 @@ contract TesseraArbiter is ReentrancyGuard {
         uint64 openedAt;
         bool decided;
         bool forBuyer;
+        /// @dev How many times this case has been passed on. Drives the rotation
+        ///      in `reassign`, so the walk is a function of the case rather than
+        ///      of anything a block proposer can choose.
+        uint32 rotations;
+        /// @dev Snapshotted at open, so reassignment does not have to re-read
+        ///      the escrow — and cannot be steered by anything that happened since.
+        bytes32 responseHash;
     }
 
     mapping(uint256 => Case) public caseOf;
@@ -264,7 +271,14 @@ contract TesseraArbiter is ReentrancyGuard {
         assigned = selectorFor(paymentId, responseHash);
         if (assigned == address(0)) revert NoPanel();
 
-        caseOf[paymentId] = Case({assigned: assigned, openedAt: uint64(block.timestamp), decided: false, forBuyer: false});
+        caseOf[paymentId] = Case({
+            assigned: assigned,
+            openedAt: uint64(block.timestamp),
+            decided: false,
+            forBuyer: false,
+            rotations: 0,
+            responseHash: responseHash
+        });
         emit CaseOpened(paymentId, assigned);
     }
 
@@ -282,11 +296,26 @@ contract TesseraArbiter is ReentrancyGuard {
         address previous = c.assigned;
         arbitratorOf[previous].missed += 1;
 
-        // Draw again, salted by the current timestamp so a lapsed case does not
-        // land back on the same address it just lapsed on.
+        /*
+         * Rotate, do not re-draw.
+         *
+         * The first version salted a fresh draw with `block.timestamp`, which is
+         * a value the block's proposer chooses inside its allowed drift. A
+         * proposer sitting on the panel could therefore grind the timestamp
+         * until a lapsed case landed on itself — and a lapsed case is precisely
+         * the one nobody else is watching. Cheap for them, and it defeats the
+         * whole reason selection is deterministic in the first place.
+         *
+         * Stepping one place along the panel from the original draw has none of
+         * that. It is fixed by values decided at delivery, it cannot land back
+         * on the address that just let the window lapse, and it needs no
+         * randomness — which is the right amount of randomness to want on chain.
+         */
         uint256 n = panel.length;
         if (n == 0) revert NoPanel();
-        assigned = panel[uint256(keccak256(abi.encode(paymentId, previous, block.timestamp, n))) % n];
+        c.rotations += 1;
+        uint256 base = uint256(keccak256(abi.encode(paymentId, c.responseHash, n)));
+        assigned = panel[(base + c.rotations) % n];
 
         c.assigned = assigned;
         c.openedAt = uint64(block.timestamp);
