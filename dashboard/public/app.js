@@ -1007,18 +1007,56 @@ const $ = (id) => document.getElementById(id);
       })();
 
       // --- Web3 wallet login (Sign-In-With-Ethereum) ---
+      /**
+       * Reflect the connected wallet, without wrecking the button.
+       *
+       * This used to do `btn.textContent = "0x4d31…4205 ✓"`, which replaces the
+       * button's children — so the SVG icon was deleted and a string of address
+       * was left loose in a 38px square, spilling across its neighbours. The
+       * header is icons precisely because there is no room for text there.
+       *
+       * So the button only changes colour, and the address goes where there is
+       * space to read it: the profile panel, in full, with a copy button. An
+       * address you cannot read is one you cannot check against your wallet.
+       */
       function setWallet(addr) {
         const btn = $("walletBtn");
-        if (addr) {
-          btn.textContent = addr.slice(0, 6) + "…" + addr.slice(-4) + " ✓";
-          btn.style.borderColor = "var(--good)";
-          btn.style.color = "var(--good)";
-        } else {
-          btn.textContent = "Connect Wallet";
-          btn.style.borderColor = "";
-          btn.style.color = "";
+        btn.classList.toggle("on", !!addr);
+        btn.title = addr ? `Connected: ${addr}` : "Connect wallet";
+        btn.setAttribute("aria-label", addr ? `Wallet connected: ${addr}` : "Connect wallet");
+        window.__myAddress = addr || null;
+
+        const row = $("profileAddrRow");
+        const sep = $("profileAddrSep");
+        if (row && sep) {
+          row.style.display = addr ? "block" : "none";
+          sep.style.display = addr ? "" : "none";
+          if (addr) $("profileAddr").textContent = addr;
         }
       }
+
+      (() => {
+        const copy = $("profileCopy");
+        if (!copy) return;
+        copy.addEventListener("click", async () => {
+          const addr = window.__myAddress;
+          if (!addr) return;
+          try {
+            await navigator.clipboard.writeText(addr);
+          } catch {
+            // Clipboard access is refused in plenty of mobile contexts. Select
+            // the text instead, so there is still a way to get it out.
+            const r = document.createRange();
+            r.selectNodeContents($("profileAddr"));
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(r);
+          }
+          const was = copy.textContent;
+          copy.textContent = "Copied";
+          setTimeout(() => { copy.textContent = was; }, 1400);
+        });
+      })();
       /* ---- wallet discovery ---------------------------------------------
        *
        * Three things had to change for a phone to work at all.
@@ -1265,12 +1303,79 @@ const $ = (id) => document.getElementById(id);
         $("lnMaxHint").textContent = "max " + action + ": " + max + " " + a.symbol +
           (action === "borrow" && !a.borrowable ? " (not borrowable)" : "");
       };
-      function fillMax() {
+      /**
+       * The connected wallet's balance of a token, straight from the chain.
+       *
+       * `/api/lending` computes positions and limits for the *agent* — that is
+       * its job, and it is right for the agent's own panels. But when a user has
+       * connected their own wallet, every "max" derived from it belongs to
+       * somebody else's account. It offered a max supply of 520 USDC to a wallet
+       * holding 78, and Execute then sent a transaction that could only revert,
+       * which the UI reported as success.
+       *
+       * A wrong max is not a cosmetic problem: it is the number people press Max
+       * and then Execute against.
+       */
+      async function myTokenBalance(token) {
+        try {
+          if (!selfMode() || !eth()) return null;
+          const [from] = await eth().request({ method: "eth_accounts" });
+          if (!from) return null;
+          const cfg = await loadDefiConfig();
+          const hex = await ethCall(token, callData(cfg.selectors.balanceOf, encAddr(from)));
+          return BigInt(hex || "0x0");
+        } catch {
+          // Unknown, never zero — the same rule the rest of this app now follows.
+          return null;
+        }
+      }
+
+      const fmtUnitsStr = (raw, dec) => {
+        const s = raw.toString().padStart(dec + 1, "0");
+        const whole = s.slice(0, s.length - dec);
+        const frac = dec ? s.slice(s.length - dec).replace(/0+$/, "") : "";
+        return frac ? `${whole}.${frac}` : whole;
+      };
+
+      /**
+       * Replace the agent-derived caps with the connected wallet's own.
+       *
+       * Only the two that are bounded by what you hold. `withdraw` and `borrow`
+       * are bounded by the position and the pool, which the server already
+       * computes correctly for whoever is asking.
+       */
+      async function applyMyCaps(a) {
+        if (!selfMode() || !a || !a.address) return a;
+        const bal = await myTokenBalance(a.address);
+        if (bal === null) return a;
+        const dec = Number(a.decimals ?? 6);
+        const human = fmtUnitsStr(bal, dec);
+        a.max = { ...a.max, supply: human, supplyRaw: bal.toString() };
+        // Repaying is capped by the debt as well as by the wallet.
+        const debtRaw = BigInt(a.max.repayRaw || "0");
+        const repay = debtRaw < bal ? debtRaw : bal;
+        a.max.repay = fmtUnitsStr(repay, dec);
+        a.max.repayRaw = repay.toString();
+        a.__mine = true;
+        return a;
+      }
+
+      async function fillMax() {
         const a = selectedLendingAsset();
         if (!a) return;
-        const action = $("lnAction").value;
-        $("lnAmount").value = a.max[action];
-        $("lnAmount").dataset.raw = a.max[action + "Raw"]; // exact raw for a true MAX
+        const btn = $("lnMax");
+        btn.disabled = true;
+        try {
+          // Read the wallet first. Filling from a stale agent figure is exactly
+          // the bug this replaced.
+          await applyMyCaps(a);
+          const action = $("lnAction").value;
+          $("lnAmount").value = a.max[action] || "0";
+          $("lnAmount").dataset.raw = a.max[action + "Raw"] || "";
+          renderLendingAsset();
+        } finally {
+          btn.disabled = false;
+        }
       }
       $("lnAsset").addEventListener("change", () => { renderLendingAsset(); refreshMyPositions().catch(() => {}); });
       $("lnAction").addEventListener("change", renderLendingAsset);
@@ -1287,6 +1392,33 @@ const $ = (id) => document.getElementById(id);
           msg.style.display = "block"; msg.style.color = "var(--warn)";
           msg.textContent = "Enter an amount (or tap Max).";
           return;
+        }
+        /*
+         * Refuse what the wallet cannot pay for, here, rather than sending it.
+         *
+         * Supplying more than you hold reverts on chain — but the UI reported
+         * success anyway, because it was reporting that the request had been
+         * made rather than that it had landed. Checking the balance first turns
+         * an unexplained failure into a sentence, and costs one read.
+         */
+        if (selfMode() && (action === "supply" || action === "repay")) {
+          const bal = await myTokenBalance(a.address);
+          if (bal !== null) {
+            const dec = Number(a.decimals ?? 6);
+            const want = $("lnAmount").dataset.raw
+              ? BigInt($("lnAmount").dataset.raw)
+              : (() => {
+                  const [w, f = ""] = human.replace(/,/g, "").split(".");
+                  return BigInt(w + (f + "0".repeat(dec)).slice(0, dec));
+                })();
+            if (want > bal) {
+              msg.style.display = "block"; msg.style.color = "var(--warn)";
+              msg.textContent =
+                `Your wallet holds ${fmtUnitsStr(bal, dec)} ${a.symbol}. ` +
+                `Lower the amount, or tap Max to use all of it.`;
+              return;
+            }
+          }
         }
         // Use the exact raw when the field is an untouched Max; else parse the input.
         const raw = $("lnAmount").dataset.raw || toRaw(human, a.decimals);
@@ -1330,10 +1462,18 @@ const $ = (id) => document.getElementById(id);
       });
 
       // --- Vault: deposit / withdraw USDC ------------------------------------
-      $("vMax").addEventListener("click", () => {
+      $("vMax").addEventListener("click", async () => {
         const vt = window.__vault;
         if (!vt) return;
-        $("vAmount").value = $("vAction").value === "deposit" ? (window.__agentUsdc || "0") : vt.maxWithdraw;
+        // Deposit is capped by the connected wallet, not by the agent's balance.
+        // `window.__agentUsdc` prefilled 520 into a wallet holding 78.
+        if ($("vAction").value === "deposit") {
+          const cfg0 = await loadDefiConfig().catch(() => null);
+          const mine = cfg0 ? await myTokenBalance(cfg0.usdc || cfg0.vaultAsset) : null;
+          $("vAmount").value = mine !== null ? fmtUnitsStr(mine, 6) : (vt.walletUsdc || window.__agentUsdc || "0");
+        } else {
+          $("vAmount").value = vt.maxWithdraw;
+        }
       });
       $("vExecute").addEventListener("click", async () => {
         const vt = window.__vault;

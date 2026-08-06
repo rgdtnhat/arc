@@ -15,7 +15,8 @@
 //    and the version was not bumped with them, so a returning phone could keep
 //    painting the old CSS from cache and read as "the fix did nothing".
 //    v19: wallet discovery (EIP-6963) and the mobile deep-link picker.
-const CACHE = "tessera-v19";
+//    v20: Max reads the connected wallet, and the address moved to the profile.
+const CACHE = "tessera-v20";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

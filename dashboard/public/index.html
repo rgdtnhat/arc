@@ -919,6 +919,16 @@
           </button>
           <div class="menuPanel" id="profileMenu" role="menu">
             <div class="menuHead" id="profileWho">Signed in</div>
+            <!-- The connected address belongs here, not squeezed into the top
+                 bar where it overlapped the buttons on a phone. Full value, not
+                 an abbreviation: an address you cannot read is one you cannot
+                 check against your wallet. -->
+            <div id="profileAddrRow" style="display:none;padding:8px 12px 10px">
+              <div class="muted" style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Wallet</div>
+              <div class="mono" id="profileAddr" style="font-size:11.5px;word-break:break-all;line-height:1.5"></div>
+              <button class="btn" id="profileCopy" style="display:flex;width:100%;justify-content:center;margin-top:8px;font-size:12.5px">Copy address</button>
+            </div>
+            <div class="menuSep" id="profileAddrSep" style="display:none"></div>
             <button class="menuItem" data-prof="edit" role="menuitem">&#9998; Edit profile (set name)</button>
             <button class="menuItem" data-prof="password" role="menuitem" id="profPassword">&#128273; Change password</button>
             <button class="menuItem" data-prof="status" role="menuitem">&#128202; Account status</button>
