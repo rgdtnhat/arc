@@ -20,7 +20,8 @@
 //    v22: wallet caps survive a re-render; the summary row follows the signer.
 //    v23: holder USD values use the pool scale; receipts link to Arcscan.
 //    v24: absolute explorer links, no repeat sign-in, header order, wallet box.
-const CACHE = "tessera-v24";
+//    v25: withdraw cap and position come from the signer, and refresh after a tx.
+const CACHE = "tessera-v25";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

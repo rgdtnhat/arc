@@ -359,6 +359,21 @@ const $ = (id) => document.getElementById(id);
        * after, because a state change can land a moment after the receipt.
        */
       function afterTx() {
+        /*
+         * Drop the signer's cached position before re-reading it.
+         *
+         * The panel kept showing the pre-transaction numbers after a withdraw:
+         * `refreshMyPositions` did run, but the render it triggers reads
+         * `window.__myPos`, and the stale entry was still there for the whole
+         * round trip — so the first paint after the transaction was the old
+         * value, and nothing forced a second one once the read landed.
+         *
+         * Clearing first means the panel briefly falls back to the server's
+         * figures rather than confidently showing a number that is no longer
+         * true.
+         */
+        window.__myPos = {};
+        window.__myBal = {};
         tick({ fresh: true });
         refreshMyPositions().catch(() => {});
         // A deposit or withdrawal changes the leaderboard and may have moved
@@ -1308,15 +1323,35 @@ const $ = (id) => document.getElementById(id);
          * the wallet cache each time the panel draws.
          */
         if (selfMode() && a.address) {
-          const raw = window.__myBal[String(a.address).toLowerCase()];
+          const key = String(a.address).toLowerCase();
+          const raw = window.__myBal[key];
+          const pos = window.__myPos[key];
+          const dec = Number(a.decimals ?? 6);
           if (raw !== undefined && raw !== null) {
-            const dec = Number(a.decimals ?? 6);
             const bal = BigInt(raw);
             a.max = { ...a.max, supply: fmtUnitsStr(bal, dec), supplyRaw: bal.toString() };
-            const debt = BigInt(a.max.repayRaw || "0");
+            // Repaying is bounded by the wallet *and* by what you owe.
+            const debt = pos ? BigInt(pos.borrowed || "0") : BigInt(a.max.repayRaw || "0");
             const rep = debt < bal ? debt : bal;
             a.max.repay = fmtUnitsStr(rep, dec);
             a.max.repayRaw = rep.toString();
+          }
+          if (pos) {
+            // Withdraw is bounded by your own supply, then by the pool's cash.
+            const mineSup = BigInt(pos.supplied || "0");
+            const cashRaw = BigInt(a.max.withdrawRaw || "0");
+            // The server's withdraw cap already folded in liquidity for the
+            // agent; take the tighter of that and the signer's own supply only
+            // when the agent's number is the binding one, otherwise the signer's.
+            const cap = mineSup;
+            const wd = cashRaw > 0n && cashRaw < cap ? cashRaw : cap;
+            a.max.withdraw = fmtUnitsStr(wd, dec);
+            a.max.withdrawRaw = wd.toString();
+            a.position = {
+              ...a.position,
+              supplied: fmtUnitsStr(mineSup, dec),
+              borrowed: fmtUnitsStr(BigInt(pos.borrowed || "0"), dec),
+            };
           }
         }
         const action = $("lnAction").value;
@@ -1373,6 +1408,8 @@ const $ = (id) => document.getElementById(id);
       // Asset address (lowercase) -> the connected wallet's raw balance.
       // Filled by refreshMyPositions, read synchronously by renderLendingAsset.
       window.__myBal = window.__myBal || {};
+      // asset -> { supplied, borrowed } for the *signer*, raw strings.
+      window.__myPos = window.__myPos || {};
 
       async function myTokenBalance(token) {
         try {
@@ -3293,15 +3330,35 @@ const $ = (id) => document.getElementById(id);
           } catch {}
         }
 
-        // Per-asset wallet balances, cached so a re-render keeps the right max.
+        /*
+         * The signer's wallet balance *and* their position, per asset.
+         *
+         * The position half is what "max withdraw: 0" was missing. Supply and
+         * repay are bounded by the wallet, so those were fixed first — but
+         * withdraw is bounded by what *you* supplied, and that number was still
+         * coming from the server, which computes it for the agent. Somebody who
+         * had supplied 4 USDC was offered a maximum withdrawal of zero, because
+         * the agent had supplied nothing.
+         *
+         * Every cap on this panel is now derived from the signer.
+         */
         try {
-          // From the config, which lists the reserves independently of the
-          // agent-shaped /api/state payload.
           const assets = (cfg.assets || []).filter((a) => a && a.address);
           await Promise.all(
             assets.map(async (a) => {
-              const hex = await ethCall(a.address, callData(sel.balanceOf, encAddr(from)));
-              window.__myBal[String(a.address).toLowerCase()] = BigInt(hex || "0x0").toString();
+              const key = String(a.address).toLowerCase();
+              const [wal, sup, bor] = await Promise.all([
+                ethCall(a.address, callData(sel.balanceOf, encAddr(from))),
+                cfg.pool ? ethCall(cfg.pool, callData(sel.supplyBalance, encAddr(a.address), encAddr(from))) : null,
+                cfg.pool && sel.borrowBalance
+                  ? ethCall(cfg.pool, callData(sel.borrowBalance, encAddr(a.address), encAddr(from)))
+                  : null,
+              ]);
+              window.__myBal[key] = BigInt(wal || "0x0").toString();
+              window.__myPos[key] = {
+                supplied: BigInt(sup || "0x0").toString(),
+                borrowed: BigInt(bor || "0x0").toString(),
+              };
             }),
           );
           if (typeof renderLendingAsset === "function") renderLendingAsset();
