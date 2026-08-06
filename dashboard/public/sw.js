@@ -17,7 +17,8 @@
 //    v19: wallet discovery (EIP-6963) and the mobile deep-link picker.
 //    v20: Max reads the connected wallet, and the address moved to the profile.
 //    v21: AMM Max stops falling back to a pool share; dashboard shows your balance.
-const CACHE = "tessera-v21";
+//    v22: wallet caps survive a re-render; the summary row follows the signer.
+const CACHE = "tessera-v22";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

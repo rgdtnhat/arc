@@ -664,9 +664,13 @@ const $ = (id) => document.getElementById(id);
         // (chain read hasn't landed), and ready.
         setPanelReady("lending", lnReady, ["lnAsset", "lnAction", "lnAmount", "lnMax", "lnExecute"], ln && ln.deployed);
         if (lnReady) {
-          $("lnSupplied").textContent = "$" + ln.account.suppliedUsd;
-          $("lnBorrowed").textContent = "$" + ln.account.borrowedUsd;
-          $("lnLimit").textContent = "$" + ln.account.borrowLimitUsd;
+          // `ln.account` is the *agent's* account. With a wallet connected these
+          // three lines belong to the signer, and refreshMyPositions marks them
+          // as theirs — so the poll must not paint over them, which is exactly
+          // what "Supplied $0.00" next to "your position: 1 USDC" was.
+          setUnlessMine("lnSupplied", "$" + ln.account.suppliedUsd);
+          setUnlessMine("lnBorrowed", "$" + ln.account.borrowedUsd);
+          setUnlessMine("lnLimit", "$" + ln.account.borrowLimitUsd);
           // Only shown when the pool exposes it. An older pool returns null and
           // the field says so rather than repeating the borrow limit as if the
           // two lines were the same.
@@ -1277,6 +1281,28 @@ const $ = (id) => document.getElementById(id);
         setUnlessMine("lnAssetSupplied", a.position.supplied + " " + a.symbol);
         setUnlessMine("lnAssetBorrowed", a.position.borrowed + " " + a.symbol);
         setUnlessMine("lnWallet", a.position.wallet + " " + a.symbol);
+        /*
+         * Re-apply the connected wallet's caps on every render.
+         *
+         * `fillMax` used to patch the asset object it was handed, which worked
+         * exactly until the next `/api/state` poll replaced that object with a
+         * fresh one carrying the agent's numbers again — so the field showed the
+         * right balance for a second and then jumped back to 520. Patching the
+         * object was never going to hold; the caps have to be re-derived from
+         * the wallet cache each time the panel draws.
+         */
+        if (selfMode() && a.address) {
+          const raw = window.__myBal[String(a.address).toLowerCase()];
+          if (raw !== undefined && raw !== null) {
+            const dec = Number(a.decimals ?? 6);
+            const bal = BigInt(raw);
+            a.max = { ...a.max, supply: fmtUnitsStr(bal, dec), supplyRaw: bal.toString() };
+            const debt = BigInt(a.max.repayRaw || "0");
+            const rep = debt < bal ? debt : bal;
+            a.max.repay = fmtUnitsStr(rep, dec);
+            a.max.repayRaw = rep.toString();
+          }
+        }
         const action = $("lnAction").value;
         const max = a.max[action];
         // An asset listed in the deployment but never registered on-chain can't
@@ -1328,6 +1354,10 @@ const $ = (id) => document.getElementById(id);
        * A wrong max is not a cosmetic problem: it is the number people press Max
        * and then Execute against.
        */
+      // Asset address (lowercase) -> the connected wallet's raw balance.
+      // Filled by refreshMyPositions, read synchronously by renderLendingAsset.
+      window.__myBal = window.__myBal || {};
+
       async function myTokenBalance(token) {
         try {
           if (!selfMode() || !eth()) return null;
@@ -1378,13 +1408,17 @@ const $ = (id) => document.getElementById(id);
         const btn = $("lnMax");
         btn.disabled = true;
         try {
-          // Read the wallet first. Filling from a stale agent figure is exactly
-          // the bug this replaced.
-          await applyMyCaps(a);
-          const action = $("lnAction").value;
-          $("lnAmount").value = a.max[action] || "0";
-          $("lnAmount").dataset.raw = a.max[action + "Raw"] || "";
+          // Refresh the cache, then let the normal render apply it — one path
+          // for the number, so Max and the hint cannot disagree.
+          if (selfMode() && a.address) {
+            const bal = await myTokenBalance(a.address);
+            if (bal !== null) window.__myBal[String(a.address).toLowerCase()] = bal.toString();
+          }
           renderLendingAsset();
+          const fresh = selectedLendingAsset() || a;
+          const action = $("lnAction").value;
+          $("lnAmount").value = fresh.max[action] || "0";
+          $("lnAmount").dataset.raw = fresh.max[action + "Raw"] || "";
         } finally {
           btn.disabled = false;
         }
@@ -3212,6 +3246,43 @@ const $ = (id) => document.getElementById(id);
         let cfg;
         try { cfg = await loadDefiConfig(); } catch { return; }
         const sel = cfg.selectors;
+
+        /*
+         * The signer's own account totals, and their per-asset wallet balance.
+         *
+         * Without this the summary row showed the agent's account — "$0.00
+         * supplied" directly above "your position in this asset: 1 USDC", which
+         * is two true numbers about two different people stacked into one panel.
+         */
+        if (cfg.pool && sel.accountData) {
+          try {
+            const hex = await ethCall(cfg.pool, callData(sel.accountData, encAddr(from)));
+            const body = String(hex || "").replace(/^0x/, "");
+            if (body.length >= 256) {
+              const word = (i) => BigInt("0x" + body.slice(i * 64, i * 64 + 64));
+              // accountData returns (supplyValue, borrowValue, borrowLimit, healthFactor)
+              // in the pool's 1e8 USD scale.
+              const usd = (v) => "$" + (Number(v) / 1e8).toFixed(2);
+              setMine("lnSupplied", usd(word(0)));
+              setMine("lnBorrowed", usd(word(1)));
+              setMine("lnLimit", usd(word(2)));
+            }
+          } catch {}
+        }
+
+        // Per-asset wallet balances, cached so a re-render keeps the right max.
+        try {
+          // From the config, which lists the reserves independently of the
+          // agent-shaped /api/state payload.
+          const assets = (cfg.assets || []).filter((a) => a && a.address);
+          await Promise.all(
+            assets.map(async (a) => {
+              const hex = await ethCall(a.address, callData(sel.balanceOf, encAddr(from)));
+              window.__myBal[String(a.address).toLowerCase()] = BigInt(hex || "0x0").toString();
+            }),
+          );
+          if (typeof renderLendingAsset === "function") renderLendingAsset();
+        } catch {}
 
         // Vault: my redeemable balance + my wallet's USDC.
         if (cfg.vault) {
