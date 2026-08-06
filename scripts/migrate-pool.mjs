@@ -127,6 +127,44 @@ async function main() {
   if (!oldPool) throw new Error("No source pool: pass --from, or record tesseraPool in deployments/arc.json");
   if (!assets.length) throw new Error("No poolAssets in the deployment record — nothing to migrate");
 
+  /*
+   * Check the addresses before doing anything, not at the twentieth transaction.
+   *
+   * `--to 0xNEW` is the placeholder from the instructions, and it used to sail
+   * straight through: the header printed "Destination 0xnew", the plan was
+   * computed, the cost was quoted, and the failure only arrived per-position
+   * once viem tried to build a transaction. Nothing was lost, because nothing
+   * could be sent — but the operator watched a migration appear to run and then
+   * report every position as not landed, which is a frightening way to learn you
+   * mistyped an argument.
+   *
+   * Shape first, then code. An address that is well-formed but holds nothing is
+   * the worse mistake of the two: a plan against it is valid, affordable, and
+   * migrates everybody into a contract that does not exist.
+   */
+  const looksLikeAddress = (a) => /^0x[0-9a-f]{40}$/.test(String(a ?? "").toLowerCase());
+  for (const [flag, value] of [["--from", oldPool], ["--to", newPool]]) {
+    if (value === undefined) continue;
+    if (!looksLikeAddress(value)) {
+      throw new Error(
+        `${flag} ${value} is not an address.\n` +
+        `  It needs 0x followed by 40 hex characters. "0xNEW" in the instructions is a\n` +
+        `  placeholder — substitute the address that \`npm run pool:arc -- --fresh\` printed.`,
+      );
+    }
+  }
+  for (const [label, addr] of [["source pool", oldPool], ["destination pool", newPool]]) {
+    if (!addr) continue;
+    const code = await pub.getCode({ address: addr }).catch(() => null);
+    if (code === null) throw new Error(`Could not check whether the ${label} exists — the RPC failed. Not guessing.`);
+    if (code === "0x") {
+      throw new Error(
+        `The ${label} ${addr} holds no contract code.\n` +
+        `  A migration into an address with nothing at it would report success and strand everyone.`,
+      );
+    }
+  }
+
   console.log(`\nSource pool  ${oldPool}`);
   console.log(`Destination  ${newPool ?? "(none — pass --to 0x… ; deploy one with `npm run pool:arc -- --fresh` first)"}`);
   console.log(`Assets       ${assets.map((a) => a.symbol).join(", ")}`);
