@@ -439,6 +439,18 @@ const $ = (id) => document.getElementById(id);
         } else {
           $("agentBal").innerHTML = (+s.agent.balanceUsdc).toFixed(4) + '<span class="u">USDC</span>';
         }
+        // And the connected wallet beside it. The agent's balance is the app's
+        // money; a signed-in user looking at this card wants to know their own,
+        // and had no way to see it without opening a wallet.
+        (async () => {
+          const row = $("myWalletRow");
+          if (!row) return;
+          if (!selfMode() || !window.__myAddress) { row.style.display = "none"; return; }
+          const cfg = await loadDefiConfig().catch(() => null);
+          const bal = cfg ? await myTokenBalance(cfg.usdc || cfg.vaultAsset) : null;
+          row.style.display = "";
+          $("myWalletBal").textContent = bal === null ? "unavailable" : fmtUnitsStr(bal, 6) + " USDC";
+        })();
         $("agentAddr").textContent = s.agent.address;
         const start = +s.agent.startBalanceUsdc || 1;
         const balNum = s.agent.balanceUsdc == null ? null : +s.agent.balanceUsdc;
@@ -2873,6 +2885,22 @@ const $ = (id) => document.getElementById(id);
             // the signer doesn't have.
             const wallet = await amWalletBalances(p).catch(() => null);
             const idx = p.assets.findIndex((a) => a.address === tokenIn);
+            /*
+             * In self-custody the fallback is not a fallback.
+             *
+             * `myBalance` is a share of the pool, not a wallet balance, so using
+             * it when the wallet read failed offers to trade money the signer
+             * does not have — and Max then fills a number the swap can only
+             * revert on, which reads to the user as a button that does nothing.
+             * If we are signing from a wallet, the wallet's balance is the only
+             * honest ceiling; not having read it is a thing to say, not to paper
+             * over.
+             */
+            if (selfMode() && !wallet) {
+              $("amSwapQuote").textContent =
+                "Could not read your wallet balance. Reconnect the wallet and try Max again.";
+              return;
+            }
             const bal = wallet && idx >= 0 ? wallet[idx] : ai && ai.myBalance;
             if (bal == null || !(parseFloat(bal) > 0)) {
               $("amSwapQuote").textContent = `No ${ai ? ai.symbol : "input"} balance to trade.`;
