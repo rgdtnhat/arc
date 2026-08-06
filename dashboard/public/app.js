@@ -1492,9 +1492,10 @@ const $ = (id) => document.getElementById(id);
             await postAuthed(`/api/lending/${action}?asset=${a.address}&amount=${raw}`)
           ).json();
           msg.style.display = "block";
-          msg.textContent = r.ok
-            ? `${action} ${human} ${a.symbol} ✓ — tx ${String(r.txHash).slice(0, 12)}…`
-            : `failed: ${r.error}`;
+          // innerHTML, because the receipt now carries a link. `txLink` refuses
+          // anything that is not a 32-byte hash, and the rest is escaped.
+          if (r.ok) msg.innerHTML = `${esc(action)} ${esc(human)} ${esc(a.symbol)} ✓ — view on Arcscan: ${txLink(r.txHash)}`;
+          else msg.textContent = `failed: ${r.error}`;
           msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
           if (r.ok) { $("lnAmount").value = ""; delete $("lnAmount").dataset.raw; }
         } catch {
@@ -1571,7 +1572,8 @@ const $ = (id) => document.getElementById(id);
         try {
           const r = await (await postAuthed(query)).json();
           msg.style.display = "block";
-          msg.textContent = r.ok ? `${action} ${human} USDC ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;
+          if (r.ok) msg.innerHTML = `${esc(action)} ${esc(human)} USDC ✓ — view on Arcscan: ${txLink(r.txHash)}`;
+          else msg.textContent = `failed: ${r.error}`;
           msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
           if (r.ok) $("vAmount").value = "";
         } catch {
@@ -1802,7 +1804,8 @@ const $ = (id) => document.getElementById(id);
         try {
           const r = await (await postAuthed(`/api/swap?tokenIn=${q.tokenIn}&tokenOut=${q.tokenOut}&amountIn=${q.amountIn}&minOut=${minOut}`)).json();
           msg.style.display = "block";
-          msg.textContent = r.ok ? `swapped ${q.symIn} → ${q.symOut} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;
+          if (r.ok) msg.innerHTML = `swapped ${esc(q.symIn)} → ${esc(q.symOut)} ✓ — view on Arcscan: ${txLink(r.txHash)}`;
+          else msg.textContent = `failed: ${r.error}`;
           msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
         } catch {
           msg.style.display = "block"; msg.textContent = "request failed"; msg.style.color = "var(--warn)";
@@ -2053,7 +2056,11 @@ const $ = (id) => document.getElementById(id);
         body.innerHTML = slice
           .map((h, i) => {
             const rank = isUsd
-              ? `$${(Number(h.rank) / 1e6).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+              // 1e8, not 1e6. `rank` is the pool's own USD valuation — the same
+              // PRICE_SCALE it lends and liquidates against — and dividing by
+              // USDC's six decimals instead reported every position at a hundred
+              // times its size: 1 USDC supplied showed as $100.
+              ? `$${(Number(h.rank) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
               : Number(h.rank) / 1e18 >= 0.0001
                 ? (Number(h.rank) / 1e18).toLocaleString(undefined, { maximumFractionDigits: 6 })
                 : h.rank;
@@ -3332,6 +3339,23 @@ const $ = (id) => document.getElementById(id);
         }
       }
       // Mark a field as "yours" so the agent-state render doesn't overwrite it.
+      /**
+       * A transaction hash, as a link somebody can actually check.
+       *
+       * Every success message printed the first twelve characters of a hash as
+       * plain text — enough to look reassuring and not enough to do anything
+       * with. The whole point of an on-chain action is that it is verifiable by
+       * a third party, so the receipt should be one click from the explorer.
+       *
+       * The hash is validated rather than trusted: it goes into markup, and a
+       * value that is not a 32-byte hash has no business being there.
+       */
+      function txLink(hash, label) {
+        const h = String(hash || "");
+        if (!/^0x[0-9a-fA-F]{64}$/.test(h)) return esc(h.slice(0, 12));
+        const base = window.__explorer || "https://testnet.arcscan.app";
+        return `<a href="${esc(base)}/tx/${esc(h)}" target="_blank" rel="noopener" style="text-decoration:underline">${label || esc(h.slice(0, 10)) + "…"}</a>`;
+      }
       function setMine(id, text) {
         const el = $(id);
         if (!el) return;
