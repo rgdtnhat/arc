@@ -4381,6 +4381,54 @@ async function main() {
     }
   });
 
+  /*
+   * Walk the pool's marks toward the market on a timer.
+   *
+   * Everything needed to do this already existed — the proposer, the clamp,
+   * the cross-check, the operator endpoint — and nothing ever called it. So
+   * cirBTC sat at the $95,000 it was seeded with while the market moved,
+   * which is not a stale price so much as a fixed one: collateral valued at a
+   * number that stopped tracking anything is how a lending pool ends up
+   * solvent on paper and empty in practice.
+   *
+   * The guardrails are all in `proposeFromSources`: a per-round cap, a floor
+   * below which it is not worth a transaction, sanity bounds, a staleness
+   * limit, and a refusal to move at all when the two independent sources
+   * disagree by more than 2%. This loop only supplies the clock. It runs only
+   * when the deployment has an owner key and the pool understands `setPrice`,
+   * and TESSERA_PRICE_TRACK=off turns it off entirely.
+   */
+  const PRICE_TRACK_MS = Math.max(60_000, Number(process.env.TESSERA_PRICE_TRACK_MS ?? 10 * 60_000));
+  let priceTrackBusy = false;
+  setInterval(async () => {
+    if (process.env.TESSERA_PRICE_TRACK === "off") return;
+    if (priceTrackBusy || !owner || !poolDeployment) return;
+    priceTrackBusy = true;
+    try {
+      if (!(await poolSupportsPrices()).write) return;
+      const todo = actionablePrices((await priceProposals()) ?? []);
+      for (const p of todo) {
+        try {
+          const txHash = await owner.write(
+            poolDeployment.poolAddress, tesseraPoolAbi, "setPrice", [p.asset, p.next],
+          );
+          console.log(
+            `[price] ${p.symbol} ${fmtPrice(p.current)} -> ${fmtPrice(p.next)}` +
+            `${p.clamped ? " (clamped step)" : ""} ${txHash}`,
+          );
+        } catch (e) {
+          // One asset failing must not abandon the others; the loop repeats.
+          console.error(`[price] ${p.symbol} failed: ${String(e).slice(0, 140)}`);
+        }
+      }
+      if (todo.length) await refreshAll();
+    } catch (e) {
+      console.error(`[price] tracking round failed: ${String(e).slice(0, 140)}`);
+    } finally {
+      priceTrackBusy = false;
+    }
+  }, PRICE_TRACK_MS).unref?.();
+
   /** Wire (or clear) a Chainlink-compatible price feed for a reserve. */
   app.post("/api/lending/admin/oracle", requireOperator, async (req, res) => {
     if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }

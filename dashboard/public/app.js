@@ -1294,11 +1294,42 @@ const $ = (id) => document.getElementById(id);
         if (!ln) return null;
         return ln.assets.find((a) => a.symbol === $("lnAsset").value) || ln.assets[0];
       }
-      // Convert a human amount string to the asset's raw integer (string), no floats.
+      /**
+       * Parse a typed amount into the asset's raw integer — or say why not.
+       *
+       * The old version fed whatever was in the box straight to `BigInt`, and
+       * the guard in front of it was `Number(v) <= 0`. `Number("abc")` is NaN
+       * and `NaN <= 0` is false, so "abc" sailed through and `BigInt("abc")`
+       * threw inside an async click handler: no message, no failed state, the
+       * button simply did nothing. "-1" was worse — it parsed, and produced a
+       * negative that `encUint` padded into malformed calldata which the wallet
+       * was then asked to sign.
+       *
+       * Returns `{ raw }` or `{ error }`; never throws, never returns both.
+       */
+      function parseAmount(human, decimals) {
+        const s = String(human == null ? "" : human).trim().replace(/,/g, "");
+        if (!s) return { error: "Enter an amount." };
+        if (!/^\d*(\.\d*)?$/.test(s) || s === ".") {
+          return { error: `"${s}" is not an amount. Use digits, like 12.5.` };
+        }
+        const dec = Number(decimals) || 0;
+        const [i, f = ""] = s.split(".");
+        if (f.length > dec) {
+          return { error: `This asset has ${dec} decimal places — round to ${dec}.` };
+        }
+        const frac = (f + "0".repeat(dec)).slice(0, dec);
+        const raw = BigInt(i || "0") * 10n ** BigInt(dec) + BigInt(frac || "0");
+        if (raw <= 0n) return { error: "Enter an amount greater than zero." };
+        return { raw: raw.toString() };
+      }
+      // Convert a human amount string to the asset's raw integer (string), no
+      // floats. Throws on anything `parseAmount` rejects — call sites that can
+      // show a message should use `parseAmount` directly.
       function toRaw(human, decimals) {
-        const [i, f = ""] = String(human).trim().replace(/,/g, "").split(".");
-        const frac = (f + "0".repeat(decimals)).slice(0, decimals);
-        return (BigInt(i || "0") * 10n ** BigInt(decimals) + BigInt(frac || "0")).toString();
+        const r = parseAmount(human, decimals);
+        if (r.error) throw new Error(r.error);
+        return r.raw;
       }
       // Render the reserve + position + max hint for the currently selected asset.
       window.renderLendingAsset = function renderLendingAsset() {
@@ -1416,6 +1447,7 @@ const $ = (id) => document.getElementById(id);
           if (!selfMode() || !eth()) return null;
           const [from] = await eth().request({ method: "eth_accounts" });
           if (!from) return null;
+          if (!(await onArc())) return null; // unknown, not zero
           const cfg = await loadDefiConfig();
           const hex = await ethCall(token, callData(cfg.selectors.balanceOf, encAddr(from)));
           return BigInt(hex || "0x0");
@@ -1487,9 +1519,10 @@ const $ = (id) => document.getElementById(id);
         const action = $("lnAction").value;
         const human = $("lnAmount").value.trim();
         const msg = $("lendingMsg");
-        if (!human || Number(human.replace(/,/g, "")) <= 0) {
+        const parsed = parseAmount(human, a.decimals);
+        if (parsed.error) {
           msg.style.display = "block"; msg.style.color = "var(--warn)";
-          msg.textContent = "Enter an amount (or tap Max).";
+          msg.textContent = parsed.error + " (Or tap Max.)";
           return;
         }
         /*
@@ -1504,12 +1537,9 @@ const $ = (id) => document.getElementById(id);
           const bal = await myTokenBalance(a.address);
           if (bal !== null) {
             const dec = Number(a.decimals ?? 6);
-            const want = $("lnAmount").dataset.raw
-              ? BigInt($("lnAmount").dataset.raw)
-              : (() => {
-                  const [w, f = ""] = human.replace(/,/g, "").split(".");
-                  return BigInt(w + (f + "0".repeat(dec)).slice(0, dec));
-                })();
+            // One parser for the whole page: the second copy that used to live
+            // here disagreed with `toRaw` on leading dots and on negatives.
+            const want = BigInt($("lnAmount").dataset.raw || parsed.raw);
             if (want > bal) {
               msg.style.display = "block"; msg.style.color = "var(--warn)";
               msg.textContent =
@@ -1519,8 +1549,28 @@ const $ = (id) => document.getElementById(id);
             }
           }
         }
-        // Use the exact raw when the field is an untouched Max; else parse the input.
-        const raw = $("lnAmount").dataset.raw || toRaw(human, a.decimals);
+        /*
+         * Withdrawing more than you supplied is the same failure the other way
+         * round, and it has the same cure: the position is already cached, so
+         * saying so costs nothing and beats an opaque revert.
+         */
+        if (selfMode() && action === "withdraw") {
+          const pos = window.__myPos[String(a.address).toLowerCase()];
+          if (pos) {
+            const dec = Number(a.decimals ?? 6);
+            const mine = BigInt(pos.supplied || "0");
+            const want = BigInt($("lnAmount").dataset.raw || parsed.raw);
+            if (want > mine) {
+              msg.style.display = "block"; msg.style.color = "var(--warn)";
+              msg.textContent = mine === 0n
+                ? `You have not supplied any ${a.symbol} to withdraw.`
+                : `You supplied ${fmtUnitsStr(mine, dec)} ${a.symbol}. Lower the amount, or tap Max.`;
+              return;
+            }
+          }
+        }
+        // Use the exact raw when the field is an untouched Max; else the parse.
+        const raw = $("lnAmount").dataset.raw || parsed.raw;
         const btn = $("lnExecute");
         // Self-custody: sign with the user's wallet against their own balance.
         if (selfMode()) {
@@ -1571,6 +1621,31 @@ const $ = (id) => document.getElementById(id);
           const cfg0 = await loadDefiConfig().catch(() => null);
           const mine = cfg0 ? await myTokenBalance(cfg0.usdc || cfg0.vaultAsset) : null;
           $("vAmount").value = mine !== null ? fmtUnitsStr(mine, 6) : (vt.walletUsdc || window.__agentUsdc || "0");
+        } else if (selfMode()) {
+          /*
+           * `vt.maxWithdraw` is the *agent's* redeemable balance. Offering it
+           * to a connected user is the same mistake the lending panel made:
+           * two true numbers about two different people. Read the signer's own
+           * claim on the vault instead, and only fall back when it can't be
+           * read — a stale agent figure is worse than none.
+           */
+          const cfg0 = await loadDefiConfig().catch(() => null);
+          let mine = null;
+          if (cfg0 && cfg0.vault && (await onArc())) {
+            try {
+              const [from] = await eth().request({ method: "eth_accounts" });
+              if (from) {
+                const hex = await ethCall(cfg0.vault, callData(cfg0.selectors.balanceOfAssets, encAddr(from)));
+                mine = BigInt(hex || "0x0");
+              }
+            } catch { mine = null; }
+          }
+          $("vAmount").value = mine !== null ? fmtUnitsStr(mine, 6) : "";
+          if (mine === null) {
+            const m = $("vaultMsg");
+            m.style.display = "block"; m.style.color = "var(--warn)";
+            m.textContent = "Could not read your vault balance — check your wallet is connected to Arc.";
+          }
         } else {
           $("vAmount").value = vt.maxWithdraw;
         }
@@ -1581,11 +1656,27 @@ const $ = (id) => document.getElementById(id);
         const action = $("vAction").value;
         const human = $("vAmount").value.trim();
         const msg = $("vaultMsg");
-        if (!human || Number(human.replace(/,/g, "")) <= 0) {
+        const parsed = parseAmount(human, vt.decimals);
+        if (parsed.error) {
           msg.style.display = "block"; msg.style.color = "var(--warn)";
-          msg.textContent = "Enter a USDC amount (or tap Max)."; return;
+          msg.textContent = parsed.error + " (Or tap Max.)"; return;
         }
-        const raw = toRaw(human, vt.decimals);
+        const raw = parsed.raw;
+        /*
+         * The same pre-flight the lending panel got, which the vault never did.
+         * Depositing more USDC than you hold reverts, and the UI reported
+         * success because it was reporting that a request had been sent.
+         */
+        if (selfMode() && action === "deposit") {
+          const cfg0 = await loadDefiConfig().catch(() => null);
+          const bal = cfg0 ? await myTokenBalance(cfg0.vaultAsset || cfg0.usdc) : null;
+          if (bal !== null && BigInt(raw) > bal) {
+            msg.style.display = "block"; msg.style.color = "var(--warn)";
+            msg.textContent =
+              `Your wallet holds ${fmtUnitsStr(bal, 6)} USDC. Lower the amount, or tap Max to use all of it.`;
+            return;
+          }
+        }
         // Self-custody: deposit/redeem the user's own USDC via their wallet.
         if (selfMode()) {
           const b = $("vExecute"); b.disabled = true;
@@ -1713,10 +1804,16 @@ const $ = (id) => document.getElementById(id);
       async function swapQuote() {
         const s = swapSelected(); if (!s) return null;
         const human = $("swAmount").value.trim();
-        if (!human || Number(human) <= 0) return null;
+        const parsed = parseAmount(human, s.decIn);
+        if (parsed.error) {
+          // Only complain about text that is actually wrong; an empty box is
+          // just somebody who hasn't typed yet.
+          $("swQuoteOut").textContent = human ? parsed.error : "";
+          return null;
+        }
         // The same-asset hint already appears under the pickers; don't repeat it.
         if (s.tokenIn === s.tokenOut) { $("swQuoteOut").textContent = ""; return null; }
-        const amountIn = toRaw(human, s.decIn);
+        const amountIn = parsed.raw;
         // Tell the server whose wallet will actually pay. In self-custody mode
         // that is the connected wallet, not the agent's — otherwise the
         // preflight reports a balance the signer has nothing to do with.
@@ -1817,12 +1914,29 @@ const $ = (id) => document.getElementById(id);
         // Pre-flight the two things that actually make a swap revert, so the user
         // gets a plain reason instead of a bare "RPC request failed".
         const ai = swAsset(q.tokenIn), ao = swAsset(q.tokenOut);
-        const held = window.__myTokenIn != null ? window.__myTokenIn : ai && ai.wallet;
         const human = $("swAmount").value.trim();
-        if (held != null && Number(held) < Number(human)) {
-          msg.style.display = "block"; msg.style.color = "var(--warn)";
-          msg.textContent = `You only have ${held} ${q.symIn} — reduce the amount.`;
-          return;
+        /*
+         * In self-custody the balance is read fresh from the signer's wallet
+         * and compared in raw integers. `window.__myTokenIn` is a display
+         * string that a poll may have written seconds ago, and comparing it as
+         * a float made "spend exactly what I hold" a coin toss on the last
+         * decimal place.
+         */
+        const mineRaw = selfMode() ? await myTokenBalance(q.tokenIn) : null;
+        if (mineRaw !== null) {
+          if (BigInt(q.amountIn) > mineRaw) {
+            msg.style.display = "block"; msg.style.color = "var(--warn)";
+            msg.textContent =
+              `You only have ${fmtUnitsStr(mineRaw, q.decIn ?? (ai && ai.decimals) ?? 6)} ${q.symIn} — reduce the amount.`;
+            return;
+          }
+        } else {
+          const held = window.__myTokenIn != null ? window.__myTokenIn : ai && ai.wallet;
+          if (held != null && Number(held) < Number(human)) {
+            msg.style.display = "block"; msg.style.color = "var(--warn)";
+            msg.textContent = `You only have ${held} ${q.symIn} — reduce the amount.`;
+            return;
+          }
         }
         if (!q.out || BigInt(q.out) === 0n) {
           msg.style.display = "block"; msg.style.color = "var(--warn)";
@@ -2447,12 +2561,16 @@ const $ = (id) => document.getElementById(id);
             const a = pick();
             if (!a) return bsShow("Pick an asset.", "var(--warn)");
             const human = $("bsAmount").value.trim();
-            if (!human || !(parseFloat(human) > 0)) return bsShow("Enter an amount above zero.", "var(--warn)");
             // Queueing an exit is denominated in *shares*, not assets: a share
             // is a claim on a pot whose value moves, so asking for "50 USDC out"
             // would be a number that stops meaning anything the moment interest
-            // accrues or a loss lands.
-            const raw = sharesNotAssets ? String(BigInt(Math.floor(Number(human)))) : toRaw(human, a.decimals);
+            // accrues or a loss lands. Shares are whole, so parse at 0 decimals.
+            //
+            // `parseFloat("1abc")` is 1 and `Number("1abc")` is NaN, so the old
+            // guard passed input that then threw inside BigInt with no message.
+            const parsed = parseAmount(human, sharesNotAssets ? 0 : a.decimals);
+            if (parsed.error) return bsShow(parsed.error, "var(--warn)");
+            const raw = parsed.raw;
             post(`/api/lending/backstop/${action}`, `asset=${a.address}&amount=${raw}`, label);
           });
         };
@@ -2910,9 +3028,11 @@ const $ = (id) => document.getElementById(id);
           const tokenIn = $("amSwapIn").value, tokenOut = $("amSwapOut").value;
           const ai = amAsset(p, tokenIn), ao = amAsset(p, tokenOut);
           const human = $("amSwapAmount").value.trim();
-          if (!ai || !ao || !human || Number(human) <= 0) return null;
+          if (!ai || !ao) return null;
+          const parsed = parseAmount(human, ai.decimals);
+          if (parsed.error) { $("amSwapQuote").textContent = human ? parsed.error : ""; return null; }
           if (tokenIn === tokenOut) { $("amSwapQuote").textContent = "Pick two different assets."; return null; }
-          const amountIn = toRaw(human, ai.decimals);
+          const amountIn = parsed.raw;
           const r = await (
             await fetch(`/api/amm/quote?poolId=${p.id}&tokenIn=${tokenIn}&tokenOut=${tokenOut}&amountIn=${amountIn}`)
           ).json();
@@ -3013,6 +3133,17 @@ const $ = (id) => document.getElementById(id);
             msg.textContent = "Enter an amount and pick two different assets first.";
             return;
           }
+          // The same pre-flight as the swap desk: don't sign what the wallet
+          // cannot pay for, and say the real number rather than reverting.
+          if (selfMode()) {
+            const mineRaw = await myTokenBalance(q.ai.address);
+            if (mineRaw !== null && BigInt(q.amountIn) > mineRaw) {
+              msg.style.display = "block"; msg.style.color = "var(--warn)";
+              msg.textContent =
+                `Your wallet holds ${fmtUnitsStr(mineRaw, q.ai.decimals)} ${q.ai.symbol} — reduce the amount.`;
+              return;
+            }
+          }
           // Refuse a trade the pool is too shallow to fill sensibly. This is the
           // "I swapped and received nothing" case: constant-product working
           // exactly as designed against reserves far smaller than the order.
@@ -3091,6 +3222,7 @@ const $ = (id) => document.getElementById(id);
             const cfg = await loadDefiConfig();
             const [from] = await eth().request({ method: "eth_accounts" });
             if (!from) return null;
+            if (!(await onArc())) return null;
             return Promise.all(
               p.assets.map(async (a) =>
                 decStr(await ethCall(a.address, callData(cfg.selectors.balanceOf, encAddr(from))), a.decimals),
@@ -3110,13 +3242,16 @@ const $ = (id) => document.getElementById(id);
           let amounts = [], shares = "0";
           if (adding) {
             const boxes = [...document.querySelectorAll(".amLpAmt")];
+            let bad = null;
             amounts = p.assets.map((a, i) => {
               const v = (boxes[i] && boxes[i].value.trim()) || "";
-              return v && Number(v) > 0 ? toRaw(v, a.decimals) : "0";
+              const parsed = parseAmount(v, a.decimals);
+              if (parsed.error) { if (v && !bad) bad = `${a.symbol}: ${parsed.error}`; return "0"; }
+              return parsed.raw;
             });
-            if (amounts.some((v) => v === "0")) {
+            if (bad || amounts.some((v) => v === "0")) {
               msg.style.display = "block"; msg.style.color = "var(--warn)";
-              msg.textContent = "Enter an amount for every asset in the pool.";
+              msg.textContent = bad || "Enter an amount for every asset in the pool.";
               return;
             }
           } else {
@@ -3130,6 +3265,25 @@ const $ = (id) => document.getElementById(id);
               msg.style.display = "block"; msg.style.color = "var(--warn)";
               msg.textContent = `You hold ${p.myShares} shares — enter that or less.`;
               return;
+            }
+          }
+
+          /*
+           * Adding liquidity moves every asset in the pool at once, so it
+           * reverts on the first one you are short of — after the wallet has
+           * already collected an approval for it. Check all the legs up front
+           * and name the one that is short.
+           */
+          if (adding && selfMode()) {
+            for (let i = 0; i < p.assets.length; i++) {
+              const a = p.assets[i];
+              const bal = await myTokenBalance(a.address);
+              if (bal !== null && BigInt(amounts[i]) > bal) {
+                msg.style.display = "block"; msg.style.color = "var(--warn)";
+                msg.textContent =
+                  `Your wallet holds ${fmtUnitsStr(bal, a.decimals)} ${a.symbol} — reduce that leg.`;
+                return;
+              }
             }
           }
 
@@ -3231,19 +3385,110 @@ const $ = (id) => document.getElementById(id);
         return a;
       }
 
+      /**
+       * Is the connected wallet actually on Arc?
+       *
+       * Every read on this page — balances, positions, LP shares — is an
+       * `eth_call` through the injected provider, which sends it to whatever
+       * chain the wallet happens to be sitting on. Point it at any other
+       * network and those calls land on addresses that hold no code: the
+       * provider answers `0x`, `BigInt("0x0")` is zero, and the panel fills
+       * with confident zeros. "Max withdraw: 0" for somebody who supplied four
+       * USDC is indistinguishable from "your wallet is on Ethereum".
+       *
+       * So reads refuse to run off-chain rather than inventing a number, and
+       * say which network to switch to. Writes may prompt a switch
+       * (`selfAccount`); a background read must never pop a dialog.
+       */
+      let chainOk = null; // null = not yet checked
+      async function onArc() {
+        if (!eth()) { chainOk = null; wrongChainNote(false); return false; }
+        try {
+          const cfg = await loadDefiConfig();
+          const have = await eth().request({ method: "eth_chainId" });
+          chainOk = BigInt(have) === BigInt(cfg.chainId);
+        } catch {
+          chainOk = false;
+        }
+        wrongChainNote(chainOk === false);
+        return chainOk === true;
+      }
+      /** One line under the custody toggle, shown only while off Arc. */
+      function wrongChainNote(on) {
+        let el = $("wrongChain");
+        if (!on) { if (el) el.remove(); return; }
+        if (!el) {
+          const host = $("custodyNote");
+          if (!host || !host.parentNode) return;
+          el = document.createElement("div");
+          el.id = "wrongChain";
+          el.style.cssText = "margin-top:6px;color:var(--warn);font-size:13px";
+          host.parentNode.insertBefore(el, host.nextSibling);
+        }
+        el.textContent =
+          "Your wallet is on a different network, so your balances cannot be read. " +
+          "Switch it to Arc testnet — starting any action here will offer to switch for you.";
+      }
+      if (eth() && eth().on) {
+        eth().on("chainChanged", () => {
+          chainOk = null;
+          refreshMyPositions().catch(() => {});
+        });
+      }
+
       async function ethCall(to, data) {
         return eth().request({ method: "eth_call", params: [{ to, data }, "latest"] });
       }
       async function sendTx(from, to, data) {
         return eth().request({ method: "eth_sendTransaction", params: [{ from, to, data }] });
       }
-      // Ensure `spender` may move `amount` of `token` on the user's behalf.
+      /**
+       * Wait for a transaction to be mined, so the next one is simulated
+       * against the state it actually depends on.
+       *
+       * Without this the approval and the action went out back to back, and
+       * the wallet simulated the action against pre-approval state: MetaMask
+       * paints "this transaction is likely to fail" over a perfectly good
+       * supply. People read that as a bug in the app, and often cancel.
+       *
+       * Bounded, and non-fatal on timeout — the nonce ordering still holds, so
+       * giving up on waiting is worse UX, not a broken transaction.
+       */
+      async function waitForTx(hash, ms = 45000) {
+        if (!/^0x[0-9a-fA-F]{64}$/.test(String(hash || ""))) return null;
+        const until = Date.now() + ms;
+        while (Date.now() < until) {
+          try {
+            const r = await eth().request({ method: "eth_getTransactionReceipt", params: [hash] });
+            if (r && r.blockNumber) {
+              if (r.status && BigInt(r.status) === 0n) throw new Error("The approval transaction failed.");
+              return r;
+            }
+          } catch (e) {
+            if (e && /approval transaction failed/.test(String(e.message || ""))) throw e;
+          }
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+        return null;
+      }
+
+      /**
+       * Ensure `spender` may move `amount` of `token` on the user's behalf.
+       *
+       * Exactly `amount`, not `type(uint256).max`. An unlimited approval is a
+       * standing permission to drain that wallet of that token for as long as
+       * it exists, and it survives long after the transaction it was granted
+       * for — it is the single most common way a compromised or upgraded
+       * spender turns into a loss. The cost of being exact is one extra
+       * approval per action, which is the right trade on a lending pool.
+       */
       async function ensureAllowance(from, token, spender, amount) {
         const cfg = await loadDefiConfig();
         const cur = await ethCall(token, callData(cfg.selectors.allowance, encAddr(from), encAddr(spender)));
         if (BigInt(cur || "0x0") >= BigInt(amount)) return null;
-        const max = "f".repeat(64);
-        return sendTx(from, token, cfg.selectors.approve + encAddr(spender) + max);
+        const hash = await sendTx(from, token, cfg.selectors.approve + encAddr(spender) + encUint(amount));
+        await waitForTx(hash);
+        return hash;
       }
 
       /** Run a self-custody action, reporting progress into `msgEl`. */
@@ -3303,6 +3548,8 @@ const $ = (id) => document.getElementById(id);
           from = accts && accts[0];
         } catch { return; }
         if (!from) { clearMine(); return; }
+        // Off Arc, every call below would answer zero. Leave the panel alone.
+        if (!(await onArc())) { clearMine(); return; }
         let cfg;
         try { cfg = await loadDefiConfig(); } catch { return; }
         const sel = cfg.selectors;
