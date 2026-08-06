@@ -72,6 +72,123 @@ export function toPoolPrice(usd: number): bigint | null {
 }
 
 /**
+ * One source's opinion of a price, and how old it is.
+ *
+ * Named, because when two sources disagree the operator needs to know *which*
+ * two — "the feeds disagree" is not something anybody can act on.
+ */
+export interface Quote {
+  source: string;
+  usd: number | null;
+  ageMs?: number;
+}
+
+/** How far two independent sources may sit apart before neither is trusted. */
+export const MAX_SOURCE_SPREAD_BPS = 200; // 2%
+
+export interface CrossCheck {
+  /** The agreed price, or null when there is no usable agreement. */
+  usd: number | null;
+  /** Which sources actually answered. */
+  used: string[];
+  spreadBps: number;
+  /** Set when the answer is null, saying why in terms an operator can act on. */
+  reason?: string;
+}
+
+/**
+ * Agree a price across independent sources, or refuse.
+ *
+ * ## Why one feed is not enough
+ * A clamp bounds how fast a wrong price moves; it does not stop it moving. A
+ * single compromised or malfunctioning feed still walks the mark 10% a round,
+ * every round, and every round is a fresh chance to borrow against it. That is
+ * the shape of the KelpDAO compromise in April 2026: not a contract bug, but a
+ * single verifier fed by infrastructure an attacker could reach, and $292m
+ * behind it.
+ *
+ * ## What agreement means here
+ * The **median** of the sources that answered, and only if the extremes sit
+ * within `MAX_SOURCE_SPREAD_BPS` of each other. Median rather than mean so one
+ * source cannot drag the result by being wrong by a lot — with three sources it
+ * takes two compromised feeds to move the answer at all, and with two it takes
+ * agreement between them.
+ *
+ * Disagreement returns null rather than picking a winner. There is no rule for
+ * choosing between two sources that contradict each other which is not really a
+ * guess, and a guess is exactly what should not be setting a borrow limit. A
+ * refused update leaves the previous mark standing, which is the safe direction:
+ * stale is a known quantity, wrong is not.
+ */
+export function crossCheck(quotes: Quote[], maxSpreadBps = MAX_SOURCE_SPREAD_BPS): CrossCheck {
+  const usable = quotes.filter(
+    (q) => q.usd !== null && Number.isFinite(q.usd) && q.usd > 0 && (q.ageMs ?? 0) <= MAX_QUOTE_AGE_MS,
+  );
+  const used = usable.map((q) => q.source);
+
+  if (usable.length === 0) return { usd: null, used, spreadBps: 0, reason: "no source answered" };
+  if (usable.length === 1) {
+    // Deliberately allowed, and deliberately named. A second source is better,
+    // but refusing to price anything the moment one feed is down would hand an
+    // attacker a denial-of-service: knock out one endpoint and the marks freeze.
+    // The clamp is still doing its job underneath.
+    return { usd: usable[0]!.usd, used, spreadBps: 0, reason: `only ${used[0]} answered — uncorroborated` };
+  }
+
+  const sorted = [...usable].map((q) => q.usd as number).sort((a, b) => a - b);
+  const low = sorted[0]!;
+  const high = sorted[sorted.length - 1]!;
+  const spreadBps = Math.round(((high - low) / low) * 10_000);
+  if (spreadBps > maxSpreadBps) {
+    return {
+      usd: null,
+      used,
+      spreadBps,
+      reason: `sources disagree by ${(spreadBps / 100).toFixed(2)}% (${used.join(" vs ")}) — not repricing on a guess`,
+    };
+  }
+
+  const mid = sorted.length % 2
+    ? sorted[(sorted.length - 1) / 2]!
+    : (sorted[sorted.length / 2 - 1]! + sorted[sorted.length / 2]!) / 2;
+  return { usd: mid, used, spreadBps };
+}
+
+/**
+ * `proposePrice`, fed by several sources instead of one.
+ *
+ * The clamp, the sanity band and the staleness rule all still apply — this only
+ * changes where the target number comes from. Two independent defences in
+ * series: agreement decides *whether* to move, the clamp decides *how far*.
+ */
+export function proposeFromSources(args: {
+  asset: `0x${string}`;
+  symbol: string;
+  current: bigint;
+  quotes: Quote[];
+  maxSpreadBps?: number;
+  maxMoveBps?: number;
+  minMoveBps?: number;
+}): PriceProposal & { sources: string[]; spreadBps: number } {
+  const agreed = crossCheck(args.quotes, args.maxSpreadBps);
+  const p = proposePrice({
+    asset: args.asset,
+    symbol: args.symbol,
+    current: args.current,
+    marketUsd: agreed.usd,
+    maxMoveBps: args.maxMoveBps,
+    minMoveBps: args.minMoveBps,
+  });
+  return {
+    ...p,
+    // A refusal to agree is the more useful thing to report, so it wins.
+    skip: agreed.usd === null ? agreed.reason : p.skip,
+    sources: agreed.used,
+    spreadBps: agreed.spreadBps,
+  };
+}
+
+/**
  * Decide what, if anything, to send for one asset.
  *
  * @param quoteAgeMs how old the feed's answer is. A stale quote is refused

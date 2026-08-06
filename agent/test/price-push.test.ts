@@ -120,3 +120,108 @@ test("the scale matches the pool's", () => {
   assert.equal(PRICE_SCALE, 100_000_000n);
   assert.equal(toPoolPrice(1), PRICE_SCALE);
 });
+
+// --- cross-checking independent sources -------------------------------------
+
+import { crossCheck, proposeFromSources, MAX_SOURCE_SPREAD_BPS } from "../src/price-push.ts";
+
+test("agrees when independent sources agree", () => {
+  const r = crossCheck([
+    { source: "coingecko", usd: 95_000 },
+    { source: "amm-twap", usd: 95_400 },
+  ]);
+  assert.equal(r.usd, 95_200);
+  assert.deepEqual(r.used, ["coingecko", "amm-twap"]);
+});
+
+test("refuses rather than picking a winner when they contradict each other", () => {
+  // A clamp bounds how fast a wrong price moves; it does not stop it moving.
+  // There is no rule for choosing between two contradicting sources that is not
+  // really a guess, and a guess should not be setting a borrow limit.
+  const r = crossCheck([
+    { source: "coingecko", usd: 95_000 },
+    { source: "amm-twap", usd: 130_000 },
+  ]);
+  assert.equal(r.usd, null);
+  assert.match(r.reason!, /disagree/);
+  assert.ok(r.spreadBps > MAX_SOURCE_SPREAD_BPS);
+});
+
+test("takes the median, so one wrong source cannot drag the answer", () => {
+  const r = crossCheck(
+    [
+      { source: "a", usd: 95_000 },
+      { source: "b", usd: 95_100 },
+      { source: "c", usd: 95_050 },
+    ],
+    500,
+  );
+  assert.equal(r.usd, 95_050, "the middle, not the mean");
+});
+
+test("still prices from one source, and says it is uncorroborated", () => {
+  // Refusing the moment one feed is down would hand an attacker a
+  // denial-of-service: knock out an endpoint and every mark freezes.
+  const r = crossCheck([{ source: "coingecko", usd: 95_000 }, { source: "amm-twap", usd: null }]);
+  assert.equal(r.usd, 95_000);
+  assert.match(r.reason!, /uncorroborated/);
+});
+
+test("ignores a stale source rather than averaging it in", () => {
+  const r = crossCheck([
+    { source: "fresh", usd: 95_000 },
+    { source: "frozen", usd: 40_000, ageMs: 60 * 60_000 },
+  ]);
+  assert.equal(r.usd, 95_000);
+  assert.deepEqual(r.used, ["fresh"]);
+});
+
+test("says so when nothing answered", () => {
+  const r = crossCheck([{ source: "a", usd: null }, { source: "b", usd: null }]);
+  assert.equal(r.usd, null);
+  assert.match(r.reason!, /no source/);
+});
+
+test("ignores a source quoting zero or nonsense", () => {
+  const r = crossCheck([
+    { source: "good", usd: 95_000 },
+    { source: "broken", usd: 0 },
+    { source: "worse", usd: Number.NaN },
+  ]);
+  assert.equal(r.usd, 95_000);
+});
+
+test("agreement and the clamp are two defences in series", () => {
+  // Agreement decides whether to move; the clamp decides how far.
+  const p = proposeFromSources({
+    asset: A,
+    symbol: "cirBTC",
+    current: P(95_000),
+    quotes: [{ source: "a", usd: 60_000 }, { source: "b", usd: 60_100 }],
+  });
+  assert.equal(p.skip, undefined, "the sources agree, so a move is allowed");
+  assert.equal(p.clamped, true, "but only one step of it");
+  assert.equal(p.next, P(95_000) - (P(95_000) * 1000n) / 10_000n);
+});
+
+test("a compromised source cannot move the mark while an honest one disagrees", () => {
+  const p = proposeFromSources({
+    asset: A,
+    symbol: "cirBTC",
+    current: P(95_000),
+    quotes: [{ source: "honest", usd: 95_000 }, { source: "compromised", usd: 1 }],
+  });
+  assert.ok(p.skip, "no move at all");
+  assert.equal(p.next, p.current);
+});
+
+test("reports which sources were used, so a disagreement is actionable", () => {
+  const p = proposeFromSources({
+    asset: A,
+    symbol: "cirBTC",
+    current: P(95_000),
+    quotes: [{ source: "coingecko", usd: 95_000 }, { source: "amm-twap", usd: 200_000 }],
+  });
+  assert.deepEqual(p.sources, ["coingecko", "amm-twap"]);
+  assert.match(p.skip!, /coingecko vs amm-twap|amm-twap vs coingecko/);
+});

@@ -774,15 +774,29 @@ async function main() {
     );
   }
 
-  // Arming is opt-in, like the oracle: this is the one control here that can
-  // block an honest withdrawal, so switching it on is a decision rather than a
-  // side effect of running the deploy script.
-  if (process.argv.includes("--arm-limiter")) {
+  /*
+   * Armed by default. Opting *out* is the decision now, not opting in.
+   *
+   * This was opt-in on the reasoning that it is the one control here that can
+   * block an honest withdrawal. That reasoning had the risk backwards. The
+   * limiter starts full, refills on a clock nobody controls, and the pool can
+   * unhook it in a single transaction — so the worst it does is delay somebody
+   * by minutes. Unarmed, a compromised deployer key empties the reserve as fast
+   * as blocks will carry it, which is how Drift lost $285m in April 2026 to
+   * credentials rather than to a contract bug.
+   *
+   * A protection that has to be remembered is a protection that is off.
+   */
+  if (process.argv.includes("--no-arm-limiter")) {
+    console.log("   (outflow limiter deployed but NOT armed — --no-arm-limiter was passed)");
+    skipped.push({
+      step: "arming the outflow limiter",
+      why: "--no-arm-limiter was passed; the pool will not meter withdrawals",
+    });
+  } else {
     await optional("arming the pool's outflow limiter", () =>
       dSend(pool, tesseraPoolAbi, "setRateLimiter", [rateLimiter]),
     );
-  } else {
-    console.log("   (skip arming the outflow limiter — pass --arm-limiter to meter withdrawals)");
   }
 
   // 6i-quater) TesseraArbiter: somebody to decide when 'it hashed' is disputed.

@@ -594,3 +594,27 @@ test("says so rather than inventing an escrow when the record has none", async (
   assert.match(stdout, /skip wiring the spend policy/);
   void tesseraEscrow;
 });
+
+test("arms the outflow limiter without being asked", async (t) => {
+  // A protection that has to be remembered is a protection that is off. The
+  // limiter starts full, refills on a clock nobody controls, and the pool can
+  // unhook it in one transaction — so the worst it does is delay somebody by
+  // minutes, while unarmed it does nothing at all against a stolen key.
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  await runScript(node, dir, ["--deploy-missing"]);
+  assert.ok(node.sent.includes("setRateLimiter"), "pool metered by default");
+});
+
+test("lets an operator decline the limiter, loudly", async (t) => {
+  const node = await startNode({ swapOwner: COLLECTOR });
+  const dir = scratchTree({ ...BASE_RECORD });
+  t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
+
+  const { stdout } = await runScript(node, dir, ["--deploy-missing", "--no-arm-limiter"]);
+  assert.ok(!node.sent.includes("setRateLimiter"), "not armed when declined");
+  // Declining must appear in the skipped block, not vanish into the scroll.
+  assert.match(stdout, /--no-arm-limiter was passed/);
+});

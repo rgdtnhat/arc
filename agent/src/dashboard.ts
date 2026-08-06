@@ -16,6 +16,7 @@ import {
   tesseraStreamAbi,
   tesseraSubscriptionAbi,
   tesseraOracleAbi,
+  tesseraPriceGuardAbi,
   tesseraRegistryAbi,
   tesseraRateLimiterAbi,
   tesseraTabAbi,
@@ -49,7 +50,7 @@ import {
   DELEVERAGE_TARGET,
 } from "./keeper.js";
 import { EventIndex, indexOnce } from "./indexer.js";
-import { proposePrice, actionable as actionablePrices, roundsToTarget } from "./price-push.js";
+import { proposeFromSources, actionable as actionablePrices, roundsToTarget } from "./price-push.js";
 import { rankListings, decodeFindResult, endpointAllowed, type Listing } from "./discovery.js";
 import { rankOpportunities, actionable, badDebt, type LiquidatablePosition } from "./liquidatable.js";
 import { evaluate as evaluateAlerts, type Observation } from "./watchtower.js";
@@ -4280,10 +4281,47 @@ async function main() {
       return hit && Number.isFinite(hit.price) ? hit.price : null;
     };
 
+    /*
+     * The AMM's own TWAP, as a second opinion.
+     *
+     * One feed plus a clamp bounds how fast a wrong price moves but not that it
+     * moves: a compromised source walks the mark its full step every round, and
+     * every round is a fresh chance to borrow against it. That is the shape of
+     * the KelpDAO compromise — a single verifier, reachable infrastructure,
+     * $292m behind it.
+     *
+     * The price guard already computes a depth-floored TWAP for exactly these
+     * assets, and it is independent of the HTTP feed in the way that matters:
+     * different data, different failure mode, different attacker. Where both
+     * answer they must agree, or nothing moves.
+     */
+    const guardAddr = liveDeployment?.tesseraPriceGuard as Hex | undefined;
+    const twapUsd = await Promise.all(
+      assets.map(async (a) => {
+        if (!guardAddr) return null;
+        try {
+          const [usd] = (await client.public.readContract({
+            address: guardAddr, abi: tesseraPriceGuardAbi, functionName: "twapUsd", args: [a.address as Hex],
+          })) as readonly [bigint, bigint];
+          return usd > 0n ? Number(usd) / 1e8 : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+
     return assets.map((a, i) => {
       const row = onChain[i];
       const current = row?.status === "success" ? (row.result as bigint) : 0n;
-      const p = proposePrice({ asset: a.address as Hex, symbol: a.symbol, current, marketUsd: marketFor(a.symbol) });
+      const p = proposeFromSources({
+        asset: a.address as Hex,
+        symbol: a.symbol,
+        current,
+        quotes: [
+          { source: "market-feed", usd: marketFor(a.symbol) },
+          { source: "amm-twap", usd: twapUsd[i] ?? null },
+        ],
+      });
       return { ...p, roundsToTarget: roundsToTarget(p) };
     });
   }
@@ -4301,6 +4339,9 @@ async function main() {
           symbol: p.symbol, asset: p.asset,
           currentUsd: fmtPrice(p.current), targetUsd: fmtPrice(p.target), nextUsd: fmtPrice(p.next),
           moveBps: p.moveBps, clamped: p.clamped, roundsToTarget: p.roundsToTarget, skip: p.skip ?? null,
+          // Which sources answered and how far apart they sat. "The feeds
+          // disagree" is not something anybody can act on; naming them is.
+          sources: p.sources, sourceSpreadBps: p.spreadBps,
         })),
         pending: actionablePrices(all).length,
       });
