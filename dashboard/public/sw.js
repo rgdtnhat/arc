@@ -30,7 +30,8 @@
 //    v32: your wallet is its own dashboard card, with its address.
 //    v33: stop re-asking wallet permission; batch revoke-all.
 //    v34: provider rows show symbols and short addresses, not fragments.
-const CACHE = "tessera-v34";
+//    v35: every reserve in one table, and claimable pool emissions.
+const CACHE = "tessera-v35";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

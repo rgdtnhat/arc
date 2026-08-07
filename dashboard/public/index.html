@@ -1281,6 +1281,45 @@
               </div>
               <div class="metric"><div class="k">Health</div><div class="v" id="lnHealth" style="color:var(--good)">—</div></div>
             </div>
+            <!-- Every reserve at once, the way a lending market is normally
+                 read. The dropdown below still drives the action panel — this
+                 is the index into it, not a replacement: a market you have to
+                 open a select box to survey hides the one number most people
+                 came for, which is what each asset pays. -->
+            <div id="lnMarket" style="margin:4px 0 16px">
+              <div class="row-actions" style="gap:0;margin-bottom:10px">
+                <button class="btn" id="lnTabSupply" style="flex:1;border-radius:12px 0 0 12px">Supply</button>
+                <button class="btn" id="lnTabBorrow" style="flex:1;border-radius:0 12px 12px 0">Borrow</button>
+              </div>
+              <div class="row-actions" style="justify-content:space-between;margin-bottom:6px">
+                <b id="lnMarketTitle" style="font-size:13px">Assets to supply</b>
+                <span class="kv">Market size: <b id="lnMarketSize">—</b></span>
+              </div>
+              <div class="tblWrap auto"><table class="data" style="min-width:0">
+                <thead><tr>
+                  <th>Asset</th>
+                  <th class="num" id="lnMarketCol">Wallet balance</th>
+                  <th class="num">APY</th>
+                  <th></th>
+                </tr></thead>
+                <tbody id="lnMarketRows"></tbody>
+              </table></div>
+            </div>
+
+            <!-- Rewards the operator funds, on top of pool interest. Hidden
+                 until an emissions contract exists and has a reward asset. -->
+            <div id="lnEmissions" style="display:none;margin-bottom:16px;padding:12px;border:1px solid var(--line-strong);border-radius:12px">
+              <div class="row-actions" style="justify-content:space-between">
+                <div>
+                  <div class="muted" style="font-size:10.5px;letter-spacing:.07em;text-transform:uppercase">Claim pool emissions</div>
+                  <div style="font-size:18px;font-weight:700;margin-top:2px"><span id="lnEmAmount">0</span> <span id="lnEmSymbol"></span></div>
+                </div>
+                <button class="btn primary" id="lnEmClaim">Claim</button>
+              </div>
+              <div class="kv" id="lnEmNote" style="margin-top:8px"></div>
+              <div class="msg" id="lnEmMsg" style="display:none"></div>
+            </div>
+
             <div class="row-actions" style="margin-bottom:14px">
               <label style="font-size:12px;color:var(--muted)">Asset</label>
               <select id="lnAsset" class="field"></select>

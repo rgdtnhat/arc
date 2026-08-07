@@ -1356,6 +1356,192 @@ const $ = (id) => document.getElementById(id);
         } catch {}
       })();
 
+      /* ---- Market table: every reserve at once ----------------------------
+       *
+       * The panel below acts on one asset at a time, chosen from a select box.
+       * That is fine for acting and useless for deciding — you cannot compare
+       * what three reserves pay without opening the box three times. This table
+       * is the index: it lists every reserve with the number people actually
+       * came for, and a tap on a row points the action panel at it.
+       */
+      let lnMarketSide = "supply"; // which of the two tabs is showing
+      window.__emissions = null;
+
+      function setMarketSide(side) {
+        lnMarketSide = side === "borrow" ? "borrow" : "supply";
+        const sup = $("lnTabSupply"), bor = $("lnTabBorrow");
+        if (sup && bor) {
+          sup.classList.toggle("primary", lnMarketSide === "supply");
+          bor.classList.toggle("primary", lnMarketSide === "borrow");
+        }
+        const t = $("lnMarketTitle");
+        if (t) t.textContent = lnMarketSide === "supply" ? "Assets to supply" : "Assets to borrow";
+        const c = $("lnMarketCol");
+        if (c) c.textContent = lnMarketSide === "supply" ? "Wallet balance" : "Available";
+        // Point the action panel at the same side, so the two agree.
+        const act = $("lnAction");
+        if (act) {
+          act.value = lnMarketSide === "supply" ? "supply" : "borrow";
+          act.dispatchEvent(new Event("change"));
+        }
+        renderMarket();
+      }
+      if ($("lnTabSupply")) $("lnTabSupply").addEventListener("click", () => setMarketSide("supply"));
+      if ($("lnTabBorrow")) $("lnTabBorrow").addEventListener("click", () => setMarketSide("borrow"));
+
+      /** Emission APR for one asset and side, or null when it cannot be valued. */
+      function emissionApr(address, side) {
+        const em = window.__emissions;
+        if (!em || !em.configured) return null;
+        const row = (em.assets || []).find(
+          (r) => String(r.address).toLowerCase() === String(address).toLowerCase(),
+        );
+        if (!row) return null;
+        const apr = side === "supply" ? row.supplyApr : row.borrowApr;
+        const rate = side === "supply" ? row.supplyRatePerSecond : row.borrowRatePerSecond;
+        if (BigInt(rate || "0") === 0n) return null;
+        // A rate with no APR is a reward nobody can price — say that rather
+        // than printing a percentage derived from a guess.
+        return { apr, unpriced: apr === null };
+      }
+
+      window.renderMarket = function renderMarket() {
+        const body = $("lnMarketRows");
+        if (!body) return;
+        const ln = window.__lending;
+        if (!ln || !ln.assets || !ln.assets.length) {
+          body.innerHTML = emptyRow(4, "No reserves yet.");
+          return;
+        }
+        const side = lnMarketSide;
+        let totalUsd = 0;
+
+        body.innerHTML = ln.assets
+          .map((a) => {
+            const dec = Number(a.decimals ?? 6);
+            const priceE8 = Number(a.priceE8 || 0) / 1e8;
+            const cash = BigInt((a.reserve && a.reserve.cashRaw) || "0");
+            const supplied = a.reserve ? Number(a.reserve.cash) + Number(a.reserve.borrows) : 0;
+            totalUsd += supplied * priceE8;
+
+            // Supply side shows what you could put in; borrow side what the
+            // reserve can actually lend. Those are different questions.
+            const key = String(a.address || "").toLowerCase();
+            const mine = window.__myBal[key];
+            const amount = side === "supply"
+              ? (mine !== undefined && mine !== null ? fmtUnitsStr(BigInt(mine), dec) : (a.position && a.position.wallet) || "—")
+              : fmtUnitsStr(cash, dec);
+
+            const rate = side === "supply" ? a.reserve && a.reserve.supplyApr : a.reserve && a.reserve.borrowApr;
+            const em = emissionApr(a.address, side);
+            const badge = em
+              ? em.unpriced
+                ? `<div><span class="tag ok" style="font-size:10px">+ rewards</span></div>`
+                : `<div><span class="tag ok" style="font-size:10px">+${esc(Number(em.apr).toFixed(2))}% 🔥</span></div>`
+              : "";
+            const disabled = side === "borrow" && !a.borrowable;
+            return (
+              `<tr data-market="${esc(a.symbol)}" style="cursor:pointer${disabled ? ";opacity:.55" : ""}">` +
+              `<td><b>${esc(a.symbol)}</b>${a.enabled === false ? ' <span class="tag warn" style="font-size:10px">unavailable</span>' : ""}` +
+              `<div class="muted" style="font-size:11px">$${esc(a.priceUsd)}</div></td>` +
+              `<td class="num mono">${esc(amount)}</td>` +
+              `<td class="num"><b>${esc(rate ?? "—")}%</b>${badge}</td>` +
+              `<td class="num muted">›</td></tr>`
+            );
+          })
+          .join("");
+
+        const size = $("lnMarketSize");
+        if (size) size.textContent = "$" + totalUsd.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+        body.querySelectorAll("[data-market]").forEach((tr) => {
+          tr.addEventListener("click", () => {
+            const sel = $("lnAsset");
+            if (!sel) return;
+            sel.value = tr.dataset.market;
+            sel.dispatchEvent(new Event("change"));
+            // Scroll the action panel into view: on a phone the row that was
+            // tapped and the form it drives are a screen apart.
+            const amt = $("lnAmount");
+            if (amt) amt.scrollIntoView({ behavior: "smooth", block: "center" });
+          });
+        });
+      };
+
+      /** Rewards: what is streaming, and what this wallet can take. */
+      async function loadEmissions() {
+        const card = $("lnEmissions");
+        if (!card) return;
+        try {
+          const who = String(window.__myAddress || "");
+          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
+          const r = await (await fetch("/api/lending/emissions" + q)).json();
+          window.__emissions = r && r.ok ? r : null;
+          if (!r || !r.ok || !r.deployed || !r.configured) { card.style.display = "none"; renderMarket(); return; }
+          card.style.display = "";
+          $("lnEmAmount").textContent = r.yourClaimable ?? "0";
+          $("lnEmSymbol").textContent = r.reward.symbol;
+          const runway = r.reward.runwayDays;
+          $("lnEmNote").textContent =
+            `Pot: ${r.reward.balance} ${r.reward.symbol}` +
+            (runway == null ? " · nothing streaming" : ` · about ${runway.toFixed(1)} days left at the current rates`) +
+            (r.reward.priced ? "" : " · no market price for the reward, so rows show a rate rather than an APY") +
+            `. Paid out all time: ${r.reward.claimedAllTime}.`;
+          $("lnEmClaim").disabled = !(BigInt(r.yourClaimableRaw || "0") > 0n);
+          renderMarket();
+        } catch {
+          card.style.display = "none";
+        }
+      }
+
+      if ($("lnEmClaim")) {
+        $("lnEmClaim").addEventListener("click", async () => {
+          const em = window.__emissions;
+          if (!em || !em.configured) return;
+          // Only the streams with something in them: claiming an empty one
+          // costs gas and reverts the whole call.
+          const rows = (em.assets || []).filter(
+            (a) => BigInt(a.claimableSupply || "0") > 0n || BigInt(a.claimableBorrow || "0") > 0n,
+          );
+          const assets = [], sides = [];
+          for (const a of rows) {
+            if (BigInt(a.claimableSupply || "0") > 0n) { assets.push(a.address); sides.push(0); }
+            if (BigInt(a.claimableBorrow || "0") > 0n) { assets.push(a.address); sides.push(1); }
+          }
+          if (!assets.length) {
+            const m = $("lnEmMsg");
+            m.style.display = "block"; m.style.color = "var(--warn)";
+            m.textContent = "Nothing has accrued to claim yet.";
+            return;
+          }
+          if (!selfMode()) {
+            const m = $("lnEmMsg");
+            m.style.display = "block"; m.style.color = "var(--warn)";
+            m.textContent = "Rewards are paid to whoever earned them, so this needs your own wallet. " +
+              "Switch on \"Use my own wallet\".";
+            return;
+          }
+          const btn = $("lnEmClaim");
+          btn.disabled = true;
+          await selfCustody("lnEmMsg", `claim ${em.yourClaimable} ${em.reward.symbol}`, async (from, cfg) =>
+            sendTx(
+              from, cfg.emissions,
+              // claim(address[],uint8[]): two dynamic arrays, so the head holds
+              // an offset to each. First tail starts after two head words.
+              callData(
+                cfg.selectors.emClaim,
+                encUint(64),
+                encUint(64 + 32 + assets.length * 32),
+                encArray(assets.map((a) => BigInt(a))),
+                encArray(sides.map((x) => BigInt(x))),
+              ),
+            ),
+          );
+          btn.disabled = false;
+          loadEmissions();
+        });
+      }
+
       // --- Lending: multi-asset supply / withdraw / borrow / repay ------------
       function selectedLendingAsset() {
         const ln = window.__lending;
@@ -1585,6 +1771,7 @@ const $ = (id) => document.getElementById(id);
             why = " — your wallet holds no " + a.symbol;
           }
         }
+        if (typeof renderMarket === "function") renderMarket();
         $("lnMaxHint").textContent = "max " + action + ": " + max + " " + a.symbol +
           (action === "borrow" && !a.borrowable ? " (not borrowable)" : "") + why;
       };
@@ -3099,7 +3286,7 @@ const $ = (id) => document.getElementById(id);
         }
         loadHolders(key);
         loadVenueChart(key);
-        if (key === "Lending") { loadPoolPrices(); loadBackstop(); loadAuction(); loadBorrowers(); }
+        if (key === "Lending") { loadPoolPrices(); loadBackstop(); loadAuction(); loadBorrowers(); loadEmissions(); }
       }
 
       /** Reverse a swap pair. Two selects, one click — the common second trade. */
@@ -6477,6 +6664,8 @@ const $ = (id) => document.getElementById(id);
       setInterval(() => { refreshMyPositions().catch(() => {}); }, 12000);
       // Approvals change rarely; a slow poll keeps the panel honest without noise.
       setInterval(() => { if (typeof loadAllowances === "function") loadAllowances().catch(() => {}); }, 60000);
+      // Emissions tick slowly by design; a slow poll keeps the figure honest.
+      setInterval(() => { if (typeof loadEmissions === "function") loadEmissions().catch(() => {}); }, 30000);
       window.addEventListener("focus", () => tick());
       window.addEventListener("online", () => tick());
       if (eth() && eth().on) {

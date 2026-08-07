@@ -7,5 +7,6 @@
   "agent": "0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4",
   "provider": "0xa5b42b3Ebe7FDB187c956D310f868960015d2988",
   "deployedAt": "2026-07-17T06:22:37.721Z",
-  "tesseraPool": "0x065f1bb38fdc65a1c41e2e888940af713cabca5f"
+  "tesseraPool": "0x065f1bb38fdc65a1c41e2e888940af713cabca5f",
+  "tesseraEmissions": "0x38a00af40bd89fe2a54ce07a537dbb399de22fa9"
 }
