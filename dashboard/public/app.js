@@ -386,6 +386,7 @@ const $ = (id) => document.getElementById(id);
         setTimeout(() => {
           tick({ fresh: true });
           refreshMyPositions().catch(() => {});
+          if (defiTab === "lending" && typeof loadBorrowers === "function") loadBorrowers();
           const key = { lending: "Lending", vault: "Vault", swap: "Swap", amm: "Amm" }[defiTab];
           if (key && typeof loadHolders === "function") {
             loadHolders(key, { refresh: true });
@@ -1916,8 +1917,13 @@ const $ = (id) => document.getElementById(id);
           const f = (n) => (n >= 1000 ? n.toFixed(2) : n >= 1 ? n.toFixed(4) : n.toPrecision(4));
           rate = `1 ${ai.symbol} ≈ ${f(outPerIn)} ${ao.symbol}  ·  1 ${ao.symbol} ≈ ${f(inPerOut)} ${ai.symbol}`;
         }
-        // In self-custody mode prefer the connected wallet's own balance.
-        const mine = window.__myTokenIn;
+        // In self-custody mode prefer the connected wallet's own balance —
+        // keyed by the asset on screen, so flipping the pair cannot leave the
+        // other token's figure sitting under the new symbol.
+        const cached = window.__myBal[String(ai.address || "").toLowerCase()];
+        const mine = cached !== undefined && cached !== null
+          ? fmtUnitsStr(BigInt(cached), Number(ai.decimals ?? 6))
+          : null;
         const yours = mine != null ? mine : ai.wallet;
         el.innerHTML =
           `<div>${esc(rate)}</div>` +
@@ -2026,18 +2032,45 @@ const $ = (id) => document.getElementById(id);
        * quote for a trade they cannot make.
        */
       if ($("swMax")) {
-        $("swMax").addEventListener("click", () => {
+        $("swMax").addEventListener("click", async () => {
           const s = swapSelected();
           if (!s) return;
           const ai = swAsset(s.tokenIn);
-          const mine = window.__myTokenIn;
-          const bal = mine != null ? mine : ai && ai.wallet;
-          if (bal == null || !(parseFloat(bal) > 0)) {
-            $("swQuoteOut").textContent = `No ${ai ? ai.symbol : "input"} balance to sell.`;
-            return;
+          const btn = $("swMax");
+          btn.disabled = true;
+          try {
+            /*
+             * Read the balance of the asset that is selected *now*.
+             *
+             * `window.__myTokenIn` is one global holding "the input token's
+             * balance", written by a poll that runs every twelve seconds. Flip
+             * the pair and it describes the wrong asset until the next poll —
+             * so Max on EURC filled 72.225191, which was the USDC balance, for
+             * a wallet holding 19.37 EURC. A quote for a trade that cannot
+             * settle.
+             *
+             * One read of the selected token removes the window entirely.
+             */
+            let bal = null;
+            if (selfMode()) {
+              const raw = await myTokenBalance(s.tokenIn);
+              if (raw !== null) {
+                window.__myBal[String(s.tokenIn).toLowerCase()] = raw.toString();
+                window.__myTokenIn = fmtUnitsStr(raw, Number(s.decIn ?? 6));
+                bal = window.__myTokenIn;
+                renderSwapBalances();
+              }
+            }
+            if (bal == null) bal = ai && ai.wallet;
+            if (bal == null || !(parseFloat(bal) > 0)) {
+              $("swQuoteOut").textContent = `No ${ai ? ai.symbol : "input"} balance to sell.`;
+              return;
+            }
+            $("swAmount").value = String(bal);
+            await swapQuote();
+          } finally {
+            btn.disabled = false;
           }
-          $("swAmount").value = String(bal);
-          swapQuote();
         });
       }
 
@@ -2621,12 +2654,34 @@ const $ = (id) => document.getElementById(id);
           );
 
           const stale = r.assets.filter((a) => a.stale);
+          /*
+           * "In line with the market feed" was printed whenever nothing was
+           * flagged stale — including when nothing could be compared at all.
+           * On the live pool two of three rows have no market price, so the
+           * table showed cirBTC at $95,000 against a dash and then declared
+           * everything in order. An unchecked price is not a checked one, and
+           * saying so is the difference between a reassurance and a lie.
+           */
+          const unchecked = r.assets.filter((a) => !a.stale && !(Number(a.marketUsd) > 0));
           if (note && !note.textContent.startsWith("Repriced")) {
-            note.className = stale.length ? "feedNote bad" : "feedNote";
-            note.textContent = stale.length
-              ? `${stale.map((a) => a.symbol).join(", ")} ${stale.length === 1 ? "is" : "are"} more than 5% away from the market. ` +
-                "Borrow limits and liquidation thresholds are computed from the pool price, so this gap is real money."
-              : "Pool prices are in line with the market feed.";
+            const parts = [];
+            if (stale.length) {
+              parts.push(
+                `${stale.map((a) => a.symbol).join(", ")} ${stale.length === 1 ? "is" : "are"} more than 5% away ` +
+                "from the market. Borrow limits and liquidation thresholds are computed from the pool price, " +
+                "so this gap is real money.",
+              );
+            }
+            if (unchecked.length) {
+              parts.push(
+                `No market price for ${unchecked.map((a) => a.symbol).join(", ")}, so ` +
+                `${unchecked.length === 1 ? "its mark is" : "those marks are"} unverified — the figure ` +
+                "shown is whatever an operator last set, and it does not move on its own.",
+              );
+            }
+            if (!parts.length) parts.push("Pool prices are in line with the market feed.");
+            note.className = stale.length ? "feedNote bad" : unchecked.length ? "feedNote warn" : "feedNote";
+            note.textContent = parts.join(" ");
           }
         } catch (e) {
           body.innerHTML = `<tr><td colspan="5" class="muted">Could not read reserve prices.</td></tr>`;
@@ -2644,6 +2699,59 @@ const $ = (id) => document.getElementById(id);
        * at what the market would actually pay.
        * =================================================================== */
       let backstopAssets = [];
+
+      /** Everyone who owes the pool, from /api/lending/borrowers. */
+      async function loadBorrowers() {
+        const body = $("borrowersRows");
+        if (!body) return;
+        const note = $("borrowersNote");
+        try {
+          const r = await (await fetch("/api/lending/borrowers")).json();
+          if (!r.ok) {
+            body.innerHTML = emptyRow(6, r.error || "Borrowers unavailable.");
+            return;
+          }
+          const me = String(window.__myAddress || "").toLowerCase();
+          body.innerHTML =
+            (r.borrowers || [])
+              .map((b) => {
+                const mine = String(b.address).toLowerCase() === me;
+                const hf = b.healthFactor;
+                const hfCell = hf == null
+                  ? '<span class="tag ok">no debt</span>'
+                  : `<span class="${hf < 1 ? "down" : hf < 1.1 ? "warn" : ""}">${hf.toFixed(2)}</span>`;
+                const assets = (b.debts || [])
+                  .map((d) => `${esc(d.amount)} ${esc(d.symbol)}`)
+                  .join(", ");
+                return (
+                  `<tr${mine ? ' style="font-weight:600"' : ""}>` +
+                  `<td class="mono">${txAddrLink(b.address)}${mine ? " (you)" : ""}</td>` +
+                  `<td class="num">$${esc(b.borrowedUsd)}</td>` +
+                  `<td class="num">$${esc(b.liabilityUsd)}</td>` +
+                  `<td class="num">$${esc(b.collateralUsd)}</td>` +
+                  `<td class="num">${hfCell}</td>` +
+                  `<td>${esc(assets || "—")}</td></tr>`
+                );
+              })
+              .join("") || emptyRow(6, "Nobody is borrowing right now.");
+          if (note) {
+            const atRisk = (r.borrowers || []).filter((b) => b.atRisk).length;
+            note.textContent =
+              `${r.count} borrower${r.count === 1 ? "" : "s"}, $${r.totalBorrowedUsd} outstanding` +
+              (atRisk ? ` · ${atRisk} below a health factor of 1.00 and liquidatable now.` : ".") +
+              (r.indexed ? "" : " (No event index on this server, so only the agent's own position is listed.)");
+          }
+        } catch {
+          body.innerHTML = emptyRow(6, "Could not read borrowers.");
+        }
+      }
+      /** An address as an explorer link, or plain text when there is no explorer. */
+      function txAddrLink(addr) {
+        const a = String(addr || "");
+        if (!/^0x[0-9a-fA-F]{40}$/.test(a)) return esc(a);
+        const short = a.slice(0, 10) + "…" + a.slice(-4);
+        return `<a href="${esc(explorerBase())}/address/${esc(a)}" target="_blank" rel="noopener">${esc(short)}</a>`;
+      }
 
       async function loadBackstop() {
         const body = $("backstopRows");
@@ -2693,7 +2801,25 @@ const $ = (id) => document.getElementById(id);
 
           const box = $("backstopBox");
           if (box) {
-            box.style.display = adminId ? "" : "none";
+            /*
+             * Anyone may put up cover.
+             *
+             * `backstopDeposit`, `queueBackstopExit`, `cancelBackstopExit` and
+             * `withdrawBackstop` are all permissionless on the pool — the panel
+             * was hidden behind an admin session for no reason the contract
+             * imposes, which is why "where do I deposit backstop balance?" had
+             * no answer. A connected wallet signs its own; an operator still
+             * gets the agent path.
+             */
+            box.style.display = adminId || selfMode() ? "" : "none";
+            const who = $("backstopWho");
+            if (who) {
+              who.textContent = selfMode()
+                ? "These buttons sign from your wallet and post your own cover."
+                : adminId
+                  ? "These buttons spend the app's agent wallet."
+                  : "";
+            }
             const sel = $("bsAsset");
             if (sel && sel.options.length !== backstopAssets.length) {
               sel.innerHTML = backstopAssets
@@ -2745,6 +2871,17 @@ const $ = (id) => document.getElementById(id);
             const parsed = parseAmount(human, sharesNotAssets ? 0 : a.decimals);
             if (parsed.error) return bsShow(parsed.error, "var(--warn)");
             const raw = parsed.raw;
+            // Self-custody signs its own; the pool asks no permission for this.
+            if (selfMode()) {
+              return selfCustody("backstopMsg", label, async (from, cfg) => {
+                const sel2 = cfg.selectors;
+                if (action === "deposit") {
+                  await ensureAllowance(from, a.address, cfg.pool, raw);
+                  return sendTx(from, cfg.pool, callData(sel2.backstopDeposit, encAddr(a.address), encUint(raw)));
+                }
+                return sendTx(from, cfg.pool, callData(sel2.backstopQueue, encAddr(a.address), encUint(raw)));
+              }).then(() => loadBackstop());
+            }
             post(`/api/lending/backstop/${action}`, `asset=${a.address}&amount=${raw}`, label);
           });
         };
@@ -2759,6 +2896,17 @@ const $ = (id) => document.getElementById(id);
           btn.addEventListener("click", () => {
             const a = pick();
             if (!a) return bsShow("Pick an asset.", "var(--warn)");
+            if (selfMode()) {
+              return selfCustody("backstopMsg", label, async (from, cfg) =>
+                sendTx(
+                  from, cfg.pool,
+                  callData(
+                    action === "cancel" ? cfg.selectors.backstopCancel : cfg.selectors.backstopWithdraw,
+                    encAddr(a.address),
+                  ),
+                ),
+              ).then(() => loadBackstop());
+            }
             post(`/api/lending/backstop/${action}`, `asset=${a.address}`, label);
           });
         }
@@ -2887,7 +3035,7 @@ const $ = (id) => document.getElementById(id);
         }
         loadHolders(key);
         loadVenueChart(key);
-        if (key === "Lending") { loadPoolPrices(); loadBackstop(); loadAuction(); }
+        if (key === "Lending") { loadPoolPrices(); loadBackstop(); loadAuction(); loadBorrowers(); }
       }
 
       /** Reverse a swap pair. Two selects, one click — the common second trade. */
@@ -3374,19 +3522,77 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           const boxes = [...document.querySelectorAll(".amLpAmt")];
+          const say = (t, colour) => {
+            const m = $("ammMsg");
+            if (!m) return;
+            m.style.display = "block"; m.style.color = colour || "var(--warn)"; m.textContent = t;
+          };
+          /*
+           * Every path out of here used to be a bare `return`.
+           *
+           * On the USDC/cirBTC pool — both reserves zero — `pool > 0` is never
+           * true, so `scale` stayed Infinity, `isFinite` failed, and the handler
+           * returned without filling a box or saying a word. The button looked
+           * broken because from the outside it was.
+           */
           const balances = await amWalletBalances(p);
-          if (!balances) return;
-          // Largest scale factor the wallet can fund across every asset.
-          let scale = Infinity;
-          p.assets.forEach((a, i) => {
-            const pool = Number(a.balance), have = Number(balances[i]);
-            if (pool > 0) scale = Math.min(scale, have / pool);
+          if (!balances) {
+            say(selfMode()
+              ? "Could not read your wallet balances — check your wallet is connected to Arc."
+              : "Max fills from your own wallet. Switch on \"Use my own wallet\" first.");
+            return;
+          }
+          const raws = p.assets.map((a, i) => {
+            const r = parseAmount(balances[i], Number(a.decimals ?? 6));
+            return r.error ? 0n : BigInt(r.raw);
           });
-          if (!isFinite(scale) || scale <= 0) return;
+          const poolRaws = p.assets.map((a) => BigInt(a.raw ?? "0"));
+          const empty = poolRaws.every((r) => r === 0n);
+
+          if (empty) {
+            /*
+             * An empty pool has no ratio to match — the first deposit *sets*
+             * the price. So Max offers everything the wallet holds and says
+             * what that means, rather than refusing to fill a form whose whole
+             * purpose is to seed the pool.
+             */
+            let any = false;
+            p.assets.forEach((a, i) => {
+              if (!boxes[i]) return;
+              boxes[i].value = raws[i] > 0n ? fmtUnitsStr(raws[i], Number(a.decimals ?? 6)) : "";
+              if (raws[i] > 0n) any = true;
+            });
+            say(any
+              ? "This pool is empty, so your deposit sets its opening price. Enter the two sides at the " +
+                "rate you believe is fair — Max has filled your whole balance of each, which is unlikely to be it."
+              : "Your wallet holds none of these assets.", "var(--warn)");
+            return;
+          }
+
+          /*
+           * Largest balanced deposit the wallet can fund, in integers.
+           *
+           * scale = min(have_i / pool_i), computed as a rational so an 8-decimal
+           * asset beside a 6-decimal one cannot lose precision to a float.
+           */
+          let num = null, den = null;
           p.assets.forEach((a, i) => {
-            const want = Number(a.balance) * scale;
-            if (boxes[i]) boxes[i].value = want > 0 ? want.toFixed(Number(a.decimals) || 6).replace(/0+$/, "").replace(/\.$/, "") : "";
+            if (poolRaws[i] === 0n) return;
+            if (num === null || raws[i] * den < num * poolRaws[i]) { num = raws[i]; den = poolRaws[i]; }
           });
+          if (num === null || num === 0n) {
+            say("Your wallet holds none of at least one asset in this pool, so a balanced deposit is not possible.");
+            return;
+          }
+          let filled = false;
+          p.assets.forEach((a, i) => {
+            if (!boxes[i]) return;
+            const want = (poolRaws[i] * num) / den;
+            boxes[i].value = want > 0n ? fmtUnitsStr(want, Number(a.decimals ?? 6)) : "";
+            if (want > 0n) filled = true;
+          });
+          if (!filled) say("Your balance is too small to fund a deposit at this pool's ratio.");
+          else say("Filled the largest balanced deposit your wallet can cover.", "var(--muted)");
         });
 
         /** The connected wallet's balance of each pool asset (self-custody only). */

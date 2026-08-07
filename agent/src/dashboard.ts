@@ -188,6 +188,13 @@ const CLIENT_SELECTORS = Object.fromEntries(
     sharesOf: "function sharesOf(address)",
     balanceOfAssets: "function balanceOfAssets(address)",
     maxWithdraw: "function maxWithdraw(address)",
+    // Backstop. Every one of these is permissionless on the contract — the
+    // panel was hidden behind an admin session for no reason the pool imposes.
+    backstopDeposit: "function backstopDeposit(address,uint256)",
+    backstopQueue: "function queueBackstopExit(address,uint256)",
+    backstopCancel: "function cancelBackstopExit(address)",
+    backstopWithdraw: "function withdrawBackstop(address)",
+    backstopShares: "function backstopShares(address,address)",
     swapQuote: "function quote(address,address,uint256)",
     swapExec: "function swap(address,address,uint256,uint256,uint256)",
     // AMM. `ammAdd`/`ammRemove` take dynamic arrays, so the browser encodes them
@@ -1917,6 +1924,85 @@ async function main() {
    * point of publishing is that somebody else can do it when we are not there.
    * An access-controlled keeper feed would keep the dependency and add a login.
    */
+  /**
+   * Everyone who currently owes the pool anything.
+   *
+   * There is no on-chain enumeration of borrowers — the pool keeps shares per
+   * address and nothing walks them — so the candidate set comes from the
+   * `Borrow` event index, exactly as /api/liquidatable builds it. The reads
+   * below decide who still owes, so a borrower who has repaid drops out on
+   * their own rather than needing to be pruned.
+   *
+   * Public: a lending pool's outstanding debt is the single most useful thing
+   * a depositor can check, and it is all on chain already.
+   */
+  app.get("/api/lending/borrowers", async (_req, res) => {
+    if (!poolClient || !poolDeployment) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
+    try {
+      const candidates = new Set<string>();
+      if (eventIndex) {
+        for (const ev of eventIndex.query({ name: "Borrow", limit: 5_000 })) {
+          for (const a of ev.actors) candidates.add(a.toLowerCase());
+        }
+      }
+      candidates.add(client.account.address.toLowerCase());
+      const assets = poolDeployment.assets;
+
+      const rows = (
+        await Promise.all(
+          [...candidates].slice(0, 200).map(async (addr) => {
+            const user = addr as Hex;
+            try {
+              const [limits, data] = await Promise.all([
+                poolClient!.accountLimits(user),
+                poolClient!.accountData(user),
+              ]);
+              if (!limits || limits.liability === 0n) return null;
+              // Which assets, and how much of each — a single USD total hides
+              // whether one address owes a little of everything or a lot of one.
+              const per = await Promise.all(
+                assets.map(async (a) => {
+                  const owed = await poolClient!.borrowBalance(a.address, user);
+                  return owed > 0n
+                    ? { symbol: a.symbol, address: a.address, amount: fmtUnits(owed, Number(a.decimals ?? 6)) }
+                    : null;
+                }),
+              );
+              const hf = data.healthFactor;
+              return {
+                address: user,
+                borrowedUsd: (Number(data.borrowValue) / 1e8).toFixed(2),
+                collateralUsd: (Number(data.supplyValue) / 1e8).toFixed(2),
+                borrowLimitUsd: (Number(limits.borrowLimit) / 1e8).toFixed(2),
+                // What `_healthy` compares against, which is not borrowValue.
+                liabilityUsd: (Number(limits.liability) / 1e8).toFixed(2),
+                // Capped for display: no debt means an infinite health factor,
+                // and printing 1e77 helps nobody.
+                healthFactor: hf > 10n ** 21n ? null : Number(hf) / 1e18,
+                atRisk: hf <= 10n ** 18n,
+                debts: per.filter(Boolean),
+              };
+            } catch {
+              // A single unreadable address must not empty the table.
+              return null;
+            }
+          }),
+        )
+      ).filter(Boolean);
+
+      rows.sort((a, b) => Number(b!.borrowedUsd) - Number(a!.borrowedUsd));
+      res.json({
+        ok: true,
+        indexed: Boolean(eventIndex),
+        count: rows.length,
+        totalBorrowedUsd: rows.reduce((t, r) => t + Number(r!.borrowedUsd), 0).toFixed(2),
+        borrowers: rows,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   app.get("/api/liquidatable", async (_req, res) => {
     if (!poolClient) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
     try {
@@ -4237,15 +4323,21 @@ async function main() {
           ) as never,
           allowFailure: true,
         }),
-        feeds.crypto().catch(() => ({ ok: false, data: [] as { symbol: string; price: number }[] })),
+        feeds.crypto().catch(() => ({ ok: false, items: [] as { symbol: string; price: number }[] })),
         // EURC is a euro claim, so its dollar price is EUR/USD. Reading the FX
         // feed here is what stopped the row showing "—" forever: it was never a
         // missing price, only a missing lookup.
-        feeds.fx().catch(() => ({ ok: false, data: { rates: [] as { pair?: string; base?: string; quote?: string; rate?: number }[] } })),
+        feeds.fx().catch(() => ({ ok: false, items: { rates: [] as { pair?: string; base?: string; quote?: string; rate?: number }[] } })),
       ]);
 
       const eurUsd = (() => {
-        const rows = (fxFeed as { data?: { rates?: any[] } }).data?.rates ?? [];
+        // `items`, not `data`. FeedResult has always been { ok, items, source,
+        // asOf, ... }, so every one of these reads returned undefined and
+        // every non-stablecoin market price came out null — which is why
+        // cirBTC sat at $95,000 with a dash beside it while the crypto feed
+        // three lines away was serving BTC at $64,961, and why the price
+        // tracker had nothing to walk the mark toward.
+        const rows = (fxFeed as { items?: { rates?: any[] } }).items?.rates ?? [];
         for (const r of rows) {
           const base = String(r.base ?? "").toUpperCase();
           const quote = String(r.quote ?? "").toUpperCase();
@@ -4265,7 +4357,7 @@ async function main() {
         if (s === "USDC" || s === "USDT" || s === "DAI") return 1;
         if (s === "EURC") return eurUsd; // an FX rate — see the fx() read above
         const wanted = s.replace(/^CIR/, "").replace(/^W/, ""); // cirBTC -> BTC
-        const rows = (market as { data?: { symbol: string; price: number }[] }).data ?? [];
+        const rows = (market as { items?: { symbol: string; price: number }[] }).items ?? [];
         const hit = rows.find((r) => String(r.symbol).toUpperCase() === wanted);
         return hit && Number.isFinite(hit.price) ? hit.price : null;
       };
@@ -4354,12 +4446,18 @@ async function main() {
         ) as never,
         allowFailure: true,
       }),
-      feeds.crypto().catch(() => ({ data: [] as { symbol: string; price: number }[] })),
-      feeds.fx().catch(() => ({ data: { rates: [] as any[] } })),
+      feeds.crypto().catch(() => ({ items: [] as { symbol: string; price: number }[] })),
+      feeds.fx().catch(() => ({ items: { rates: [] as any[] } })),
     ]);
 
     const eurUsd = (() => {
-      const rows = (fxFeed as { data?: { rates?: any[] } }).data?.rates ?? [];
+      // `items`, not `data`. FeedResult has always been { ok, items, source,
+        // asOf, ... }, so every one of these reads returned undefined and
+        // every non-stablecoin market price came out null — which is why
+        // cirBTC sat at $95,000 with a dash beside it while the crypto feed
+        // three lines away was serving BTC at $64,961, and why the price
+        // tracker had nothing to walk the mark toward.
+        const rows = (fxFeed as { items?: { rates?: any[] } }).items?.rates ?? [];
       for (const r of rows) {
         const base = String(r.base ?? "").toUpperCase();
         const quote = String(r.quote ?? "").toUpperCase();
@@ -4372,7 +4470,7 @@ async function main() {
       return null;
     })();
 
-    const rows = (market as { data?: { symbol: string; price: number }[] }).data ?? [];
+    const rows = (market as { items?: { symbol: string; price: number }[] }).items ?? [];
     const marketFor = (symbol: string): number | null => {
       const sym = symbol.toUpperCase();
       if (sym === "USDC" || sym === "USDT" || sym === "DAI") return 1;

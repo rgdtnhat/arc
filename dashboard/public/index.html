@@ -1333,6 +1333,25 @@
                supply here should see how much cover stands in front of them,
                and a descending auction nobody can watch clears at the floor
                rather than at the market's answer. -->
+          <div class="card" id="borrowersCard">
+            <h2>💳 Borrowers — who owes the pool</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px" id="borrowersIntro">
+              Every address with debt outstanding, largest first. Health is distance to <b>liquidation</b>,
+              not to the borrow limit — below 1.00 the position can be seized. "Owes" is the face value of
+              the debt; "counts as" is what the pool actually measures it against, which is larger because
+              each asset's liability factor marks a debt up. That second number is the one that decides
+              whether anyone may borrow or withdraw another unit.
+            </div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr>
+                <th>Address</th><th class="num">Owes</th><th class="num">Counts as</th>
+                <th class="num">Collateral</th><th class="num">Health</th><th>Assets</th>
+              </tr></thead>
+              <tbody id="borrowersRows"></tbody>
+            </table></div>
+            <div class="kv" id="borrowersNote" style="margin-top:9px"></div>
+          </div>
+
           <div class="card" id="backstopCard">
             <h2>🛡️ Backstop — who takes the loss first</h2>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px" id="backstopIntro">
@@ -1360,6 +1379,7 @@
                 <button class="btn" id="bsCancel">Cancel exit</button>
                 <button class="btn" id="bsWithdraw">Withdraw</button>
               </div>
+              <div class="kv" id="backstopWho" style="margin-top:7px"></div>
               <div class="kv" id="backstopMsg" style="margin-top:9px;display:none"></div>
             </div>
           </div>

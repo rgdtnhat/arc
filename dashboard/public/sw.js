@@ -26,7 +26,8 @@
 //    v28: the swap desk refuses a trade worth far less than it costs.
 //    v29: standing token approvals are visible and revocable in one tap.
 //    v30: self-custody survives a late-injecting wallet; caps use liability.
-const CACHE = "tessera-v30";
+//    v31: market prices resolve, backstop opens to wallets, borrowers listed.
+const CACHE = "tessera-v31";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {
