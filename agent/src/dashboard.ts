@@ -19,6 +19,8 @@ import {
   tesseraPriceGuardAbi,
   tesseraRegistryAbi,
   tesseraEmissionsAbi,
+  tesseraLpEmissionsAbi,
+  tesseraGaugeAbi,
   tesseraGovernorAbi,
   tesseraTokenAbi,
   tesseraEmitterAbi,
@@ -205,6 +207,19 @@ const CLIENT_SELECTORS = Object.fromEntries(
     emCheckpoint: "function checkpoint(address,address,uint8)",
     emClaimable: "function claimable(address,address,uint8)",
     emClaimableTotal: "function claimableTotal(address)",
+    // LP emissions. Same accrual, keyed by pool id rather than asset and side.
+    lpClaim: "function claim(uint256[])",
+    lpCheckpoint: "function checkpoint(address,uint256)",
+    lpClaimable: "function claimable(address,uint256)",
+    lpClaimableTotal: "function claimableTotal(address)",
+    // The gauge. Voting, withdrawing a vote, and the bribe market — all of it
+    // is the holder's own transaction, never the agent's.
+    gaVote: "function vote(uint256[],uint256[])",
+    gaClear: "function clearVote()",
+    gaAvailable: "function availableWeight(address)",
+    gaAddBribe: "function addBribe(uint256,uint256,address,uint256)",
+    gaClaimBribes: "function claimBribes(uint256,uint256)",
+    gaApply: "function applyEpoch(uint256)",
     // Governance. Voting power has to be delegated before it exists, which is
     // the single step people miss, so the page offers it as its own button.
     govDelegate: "function delegate(address)",
@@ -2604,6 +2619,53 @@ async function main() {
     };
   };
 
+  /**
+   * Symbol and decimals for a token that is *not* a pool reserve.
+   *
+   * `assetMeta` falls back to six decimals, which is right for everything the
+   * pool lists and wrong for TSRA — and the failure is silent, so the reward
+   * pot rendered a million times too large with an address where the symbol
+   * should be. Anything outside the reserve list has to be read from the token
+   * itself.
+   *
+   * Cached, because bribes and reward pots are read on every poll and the
+   * answer cannot change. A token that will not answer keeps its short address
+   * as a name and is reported as unresolved, rather than being quietly assigned
+   * a decimals figure nobody checked.
+   */
+  const tokenMetaCache = new Map<string, { symbol: string; decimals: number; resolved: boolean }>();
+  const tokenMeta = async (address: Hex) => {
+    const key = address.toLowerCase();
+    const known = assetCache.get(key) ?? (poolDeployment?.assets ?? []).find((x) => x.address.toLowerCase() === key);
+    if (known) return { symbol: known.symbol, decimals: known.decimals, resolved: true };
+    const cached = tokenMetaCache.get(key);
+    if (cached) return cached;
+    // `erc20Abi` here carries balances and allowances, not `symbol` — reading
+    // it through that ABI throws before it reaches the chain.
+    const symbolAbi = [
+      { type: "function", name: "symbol", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+    ] as const;
+    const [symbol, decimals] = await Promise.all([
+      client.public
+        .readContract({ address, abi: symbolAbi, functionName: "symbol" })
+        .then((v) => String(v))
+        .catch(() => null),
+      client.public
+        .readContract({ address, abi: erc20Abi, functionName: "decimals" })
+        .then((v) => Number(v))
+        .catch(() => null),
+    ]);
+    const meta = {
+      symbol: symbol ?? `${address.slice(0, 6)}…`,
+      decimals: decimals ?? 18,
+      resolved: symbol !== null && decimals !== null,
+    };
+    // Only a real answer is worth remembering; a throttled RPC should be
+    // retried next poll rather than cached as the truth.
+    if (meta.resolved) tokenMetaCache.set(key, meta);
+    return meta;
+  };
+
   async function readAmm(): Promise<AmmSnap> {
     const snap = await ammClient!.snapshot(agentAccount.address as Hex);
     const pools = snap.pools.map((p) => {
@@ -4766,6 +4828,55 @@ async function main() {
     }
   }, PRICE_TRACK_MS).unref?.();
 
+  /* ---- The emitter keeper ---------------------------------------------- */
+
+  /**
+   * Push the emitter's released tokens out to the sinks on a timer.
+   *
+   * Accrual and funding are separate on purpose: a reward accrues as a debt the
+   * moment somebody earns it, and the pot behind it arrives when the emitter is
+   * distributed. Nothing forces those to happen together, so without somebody
+   * turning the handle the books fill with debts that have no tokens behind
+   * them — which is exactly what the first deployment did, ending up 322 TSRA
+   * owed against an empty pot.
+   *
+   * `distribute` is permissionless, so this loop is a convenience and not a
+   * privilege: it fails closed, and anybody with a wallet can do the same
+   * thing. TESSERA_EMITTER_KEEPER=off turns it off.
+   */
+  const emitterAddr = (liveDeployment.tesseraEmitter as Hex) ?? null;
+  const KEEPER_MS = Math.max(60_000, Number(process.env.TESSERA_EMITTER_KEEPER_MS ?? 15 * 60_000));
+  let keeperBusy = false;
+  setInterval(async () => {
+    if (process.env.TESSERA_EMITTER_KEEPER === "off") return;
+    if (keeperBusy || !owner || !emitterAddr) return;
+    keeperBusy = true;
+    try {
+      const count = (await client.public.readContract({
+        address: emitterAddr, abi: tesseraEmitterAbi, functionName: "sinkCount",
+      })) as bigint;
+      for (let i = 0n; i < count; i++) {
+        const pending = (await client.public.readContract({
+          address: emitterAddr, abi: tesseraEmitterAbi, functionName: "pendingOf", args: [i],
+        })) as bigint;
+        // Below a whole token the gas costs more than the transfer moves.
+        if (pending < 10n ** 18n) continue;
+        try {
+          const txHash = await owner.write(emitterAddr, tesseraEmitterAbi, "distribute", [i]);
+          console.log(`[emitter] sink ${i} paid ${Number(pending) / 1e18} TSRA ${txHash}`);
+        } catch (e) {
+          // One sink reverting must not stop the others — that is why the
+          // emitter pays them one at a time in the first place.
+          console.error(`[emitter] sink ${i} failed: ${String(e).slice(0, 140)}`);
+        }
+      }
+    } catch (e) {
+      console.error(`[emitter] keeper round failed: ${String(e).slice(0, 140)}`);
+    } finally {
+      keeperBusy = false;
+    }
+  }, KEEPER_MS).unref?.();
+
   /* ---- Pool emissions -------------------------------------------------- */
 
   const emissionsAddr = (liveDeployment.tesseraEmissions as Hex) ?? null;
@@ -4808,14 +4919,17 @@ async function main() {
         return;
       }
 
-      const rewardMeta = assetMeta(rewardToken);
-      const [held, owed, claimed, runway] = await Promise.all([
+      const rewardMeta = await tokenMeta(rewardToken);
+      const [held, owed, claimed, runway, paused] = await Promise.all([
         client.public.readContract({
           address: rewardToken, abi: erc20Abi, functionName: "balanceOf", args: [emissionsAddr],
         }) as Promise<bigint>,
         read<bigint>("totalOwed", []),
         read<bigint>("totalClaimed", []),
         read<bigint>("runwaySeconds", []),
+        // A paused contract still has rates on it. Showing them without saying
+        // so would put an APR next to a market that is paying nothing.
+        read<boolean>("paused", []).catch(() => false),
       ]);
 
       // The reward's own mark, when the pool happens to list it. An unlisted
@@ -4831,8 +4945,8 @@ async function main() {
         assets.map(async (a) => {
           const dec = BigInt(Number(a.decimals ?? 6));
           const [supplyRate, borrowRate, reserve] = await Promise.all([
-            read<readonly [bigint, bigint, bigint]>("streams", [a.address, SIDE.supply]),
-            read<readonly [bigint, bigint, bigint]>("streams", [a.address, SIDE.borrow]),
+            read<readonly [bigint, bigint, bigint, bigint]>("streams", [a.address, SIDE.supply]),
+            read<readonly [bigint, bigint, bigint, bigint]>("streams", [a.address, SIDE.borrow]),
             client.public.readContract({
               address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "reserves", args: [a.address],
             }) as Promise<readonly unknown[]>,
@@ -4866,6 +4980,8 @@ async function main() {
             symbol: a.symbol,
             supplyRatePerSecond: supplyRate[0].toString(),
             borrowRatePerSecond: borrowRate[0].toString(),
+            supplyEndsAt: Number(supplyRate[3] ?? 0n),
+            borrowEndsAt: Number(borrowRate[3] ?? 0n),
             supplyApr: apr(supplyRate[0], supplied),
             borrowApr: apr(borrowRate[0], borrowed),
             claimableSupply: mine[0].toString(),
@@ -4881,6 +4997,7 @@ async function main() {
         configured: true,
         address: emissionsAddr,
         canSet: Boolean(owner),
+        paused,
         reward: {
           address: rewardToken,
           symbol: rewardMeta.symbol,
@@ -4956,6 +5073,450 @@ async function main() {
       await owner.write(token, erc20Abi, "approve", [emissionsAddr, amount]);
       const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "fund", [amount]);
       logTx(req, { category: "defi", action: "emissions-fund", status: "success", txHash, detail: String(amount) });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Stop or restart every lending stream at once. Operator only. */
+  app.post("/api/lending/emissions/pause", requireOperator, async (req, res) => {
+    if (!emissionsAddr) { res.status(404).json({ ok: false, error: "emissions not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const next = Boolean(req.body?.paused);
+      const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "setPaused", [next]);
+      logTx(req, {
+        category: "defi", action: "emissions-pause", status: "success", txHash,
+        detail: next ? "paused" : "resumed",
+      });
+      res.json({ ok: true, txHash, paused: next });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* ---- AMM liquidity emissions ----------------------------------------- */
+
+  const lpEmissionsAddr = (liveDeployment.tesseraLpEmissions as Hex) ?? null;
+
+  /**
+   * The same shape as the lending emissions endpoint, per AMM pool.
+   *
+   * The APR here is measured against the pool's *depth* valued at the lending
+   * pool's marks — the same marks the emitter measures activity with. Using the
+   * AMM's own spot price instead would let a provider move the quoted APR by
+   * pushing the pool, which is exactly the number they are deciding against.
+   */
+  app.get("/api/amm/emissions", async (req, res) => {
+    if (!lpEmissionsAddr || !ammClient) {
+      res.json({ ok: true, deployed: false, note: "No AMM emissions contract on this deployment." });
+      return;
+    }
+    try {
+      const user = String(req.query.user ?? "");
+      const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+      const read = <T,>(fn: string, args: unknown[] = []): Promise<T> =>
+        client.public.readContract({
+          address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: fn as never, args: args as never,
+        }) as Promise<T>;
+
+      const rewardToken = await read<Hex>("rewardToken");
+      const configured = rewardToken !== "0x0000000000000000000000000000000000000000";
+      if (!configured) {
+        res.json({ ok: true, deployed: true, configured: false, address: lpEmissionsAddr });
+        return;
+      }
+      const rewardMeta = await tokenMeta(rewardToken);
+      const [held, owed, claimed, runway, paused, poolCount] = await Promise.all([
+        client.public.readContract({
+          address: rewardToken, abi: erc20Abi, functionName: "balanceOf", args: [lpEmissionsAddr],
+        }) as Promise<bigint>,
+        read<bigint>("totalOwed"),
+        read<bigint>("totalClaimed"),
+        read<bigint>("runwaySeconds"),
+        read<boolean>("paused").catch(() => false),
+        client.public.readContract({
+          address: ammClient.amm, abi: tesseraAmmAbi, functionName: "poolCount",
+        }) as Promise<bigint>,
+      ]);
+
+      const rewardPriceE8 = poolDeployment
+        ? await client.public
+            .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [rewardToken] })
+            .then((v) => v as bigint)
+            .catch(() => 0n)
+        : 0n;
+      const YEAR = 365n * 24n * 3600n;
+
+      const rows = await Promise.all(
+        Array.from({ length: Number(poolCount) }, (_, i) => BigInt(i)).map(async (poolId) => {
+          const [stream, info, mine, myShares] = await Promise.all([
+            read<readonly [bigint, bigint, bigint, bigint]>("streams", [poolId]),
+            client.public.readContract({
+              address: ammClient.amm, abi: tesseraAmmAbi, functionName: "poolInfo", args: [poolId],
+            }) as Promise<readonly [readonly Hex[], readonly bigint[], number, number, bigint, boolean, string]>,
+            who ? read<bigint>("claimable", [who, poolId]) : Promise.resolve(0n),
+            who
+              ? (client.public.readContract({
+                  address: ammClient.amm, abi: tesseraAmmAbi, functionName: "sharesOf", args: [poolId, who],
+                }) as Promise<bigint>)
+              : Promise.resolve(0n),
+          ]);
+
+          // Depth in dollars, at the lending pool's marks. An asset the pool
+          // cannot price contributes nothing rather than a guess.
+          let depthUsd = 0n;
+          if (poolDeployment) {
+            for (let j = 0; j < info[0].length; j++) {
+              const meta = assetMeta(info[0][j]);
+              const px = await client.public
+                .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [info[0][j]] })
+                .then((v) => v as bigint)
+                .catch(() => 0n);
+              if (px === 0n) continue;
+              depthUsd += (info[1][j] * px) / 10n ** BigInt(meta.decimals);
+            }
+          }
+          const rate = stream[0];
+          let apr: number | null = rate === 0n ? 0 : null;
+          if (rate !== 0n && rewardPriceE8 > 0n && depthUsd > 0n) {
+            const yearlyUsd = (rate * YEAR * rewardPriceE8) / 10n ** BigInt(rewardMeta.decimals);
+            apr = Number((yearlyUsd * 1_000_000n) / depthUsd) / 10_000;
+          }
+          return {
+            poolId: Number(poolId),
+            name: info[6],
+            ratePerSecond: rate.toString(),
+            endsAt: Number(stream[3] ?? 0n),
+            apr,
+            depthUsd: Number(depthUsd) / 1e8,
+            totalShares: info[4].toString(),
+            yourShares: myShares.toString(),
+            claimable: mine.toString(),
+          };
+        }),
+      );
+
+      const claimable = rows.reduce((t, r) => t + BigInt(r.claimable), 0n);
+      res.json({
+        ok: true,
+        deployed: true,
+        configured: true,
+        address: lpEmissionsAddr,
+        canSet: Boolean(owner),
+        paused,
+        reward: {
+          address: rewardToken,
+          symbol: rewardMeta.symbol,
+          decimals: rewardMeta.decimals,
+          balance: fmtUnits(held, rewardMeta.decimals),
+          owed: fmtUnits(owed, rewardMeta.decimals),
+          claimedAllTime: fmtUnits(claimed, rewardMeta.decimals),
+          runwayDays: runway > 10n ** 12n ? null : Number(runway) / 86_400,
+        },
+        yourClaimable: fmtUnits(claimable, rewardMeta.decimals),
+        yourClaimableRaw: claimable.toString(),
+        pools: rows,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/amm/emissions/rate", requireOperator, async (req, res) => {
+    if (!lpEmissionsAddr) { res.status(404).json({ ok: false, error: "AMM emissions not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const poolId = BigInt(String(req.body?.poolId ?? "0"));
+      const rate = BigInt(String(req.body?.ratePerSecond ?? "0"));
+      const endsAt = BigInt(String(req.body?.endsAt ?? "0"));
+      const txHash = endsAt > 0n
+        ? await owner.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "setRateUntil", [poolId, rate, endsAt])
+        : await owner.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "setRate", [poolId, rate]);
+      logTx(req, {
+        category: "defi", action: "lp-emissions-rate", status: "success", txHash,
+        detail: `pool ${poolId} -> ${rate}/s${endsAt > 0n ? ` until ${endsAt}` : ""}`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/amm/emissions/pause", requireOperator, async (req, res) => {
+    if (!lpEmissionsAddr) { res.status(404).json({ ok: false, error: "AMM emissions not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const next = Boolean(req.body?.paused);
+      const txHash = await owner.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "setPaused", [next]);
+      logTx(req, {
+        category: "defi", action: "lp-emissions-pause", status: "success", txHash,
+        detail: next ? "paused" : "resumed",
+      });
+      res.json({ ok: true, txHash, paused: next });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/amm/emissions/fund", requireOperator, async (req, res) => {
+    if (!lpEmissionsAddr) { res.status(404).json({ ok: false, error: "AMM emissions not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const amount = BigInt(String(req.body?.amount ?? "0"));
+      if (amount <= 0n) { res.status(400).json({ ok: false, error: "amount must be above zero" }); return; }
+      const token = (await client.public.readContract({
+        address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "rewardToken",
+      })) as Hex;
+      await owner.write(token, erc20Abi, "approve", [lpEmissionsAddr, amount]);
+      const txHash = await owner.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "fund", [amount]);
+      logTx(req, { category: "defi", action: "lp-emissions-fund", status: "success", txHash, detail: String(amount) });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* ---- The gauge ------------------------------------------------------- */
+
+  const gaugeAddr = (liveDeployment.tesseraGauge as Hex) ?? null;
+
+  /**
+   * Everything the voting page needs: the markets, this epoch's tally, the
+   * caller's own allocation, the reward zone, and the bribes attached to each
+   * market.
+   *
+   * The vote shares are computed here rather than in the browser because the
+   * reward-zone cutoff has to agree exactly with what `applyEpoch` will do —
+   * two implementations of "the top three" is how a page ends up promising a
+   * market an emission it never receives.
+   */
+  app.get("/api/gauge", async (req, res) => {
+    if (!gaugeAddr) {
+      res.json({ ok: true, deployed: false, note: "No gauge on this deployment." });
+      return;
+    }
+    try {
+      const user = String(req.query.user ?? "");
+      const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+      const read = <T,>(fn: string, args: unknown[] = []): Promise<T> =>
+        client.public.readContract({
+          address: gaugeAddr, abi: tesseraGaugeAbi, functionName: fn as never, args: args as never,
+        }) as Promise<T>;
+
+      const [count, epoch, epochLength, zoneSize, lendingBudget, ammBudget, lastApplied, everApplied] =
+        await Promise.all([
+          read<bigint>("marketCount"),
+          read<bigint>("currentEpoch"),
+          read<bigint>("epochLength"),
+          read<number>("rewardZoneSize"),
+          read<bigint>("lendingBudgetPerSecond"),
+          read<bigint>("ammBudgetPerSecond"),
+          read<bigint>("lastAppliedEpoch"),
+          read<boolean>("everApplied"),
+        ]);
+
+      const [total, zone, rates, epochEnd] = await Promise.all([
+        read<bigint>("totalVotes", [epoch]),
+        read<readonly bigint[]>("rewardZone", [epoch]),
+        read<readonly bigint[]>("ratesFor", [epoch]),
+        read<bigint>("epochEnd", [epoch]),
+      ]);
+      const inZone = new Set(zone.map((z) => Number(z)));
+
+      const rewardMeta = await tokenMeta(
+        (liveDeployment.tesseraToken as Hex) ?? ("0x0000000000000000000000000000000000000000" as Hex),
+      );
+      const markets = await Promise.all(
+        Array.from({ length: Number(count) }, (_, i) => BigInt(i)).map(async (id) => {
+          const [m, votes, mine, bribeCount] = await Promise.all([
+            read<readonly [number, Hex, number, bigint, boolean, string]>("markets", [id]),
+            read<bigint>("marketVotes", [epoch, id]),
+            who ? read<bigint>("voterMarketVotes", [epoch, who, id]) : Promise.resolve(0n),
+            read<bigint>("bribeCount", [epoch, id]),
+          ]);
+          const bribes = await Promise.all(
+            Array.from({ length: Number(bribeCount) }, (_, i) => BigInt(i)).map(async (i) => {
+              const b = await read<readonly [Hex, bigint, bigint, Hex]>("bribeAt", [epoch, id, i]);
+              const meta = await tokenMeta(b[0]);
+              const share = who ? await read<bigint>("bribeShare", [epoch, id, i, who]) : 0n;
+              return {
+                index: Number(i),
+                token: b[0],
+                symbol: meta.symbol,
+                amount: fmtUnits(b[1], meta.decimals),
+                yourShare: fmtUnits(share, meta.decimals),
+                yourShareRaw: share.toString(),
+                from: b[3],
+              };
+            }),
+          );
+          return {
+            id: Number(id),
+            venue: Number(m[0]) === 0 ? "lending" : "amm",
+            asset: m[1],
+            side: Number(m[2]),
+            poolId: Number(m[3]),
+            active: m[4],
+            label: m[5],
+            votes: fmtUnits(votes, 18),
+            votesRaw: votes.toString(),
+            sharePct: total > 0n ? Number((votes * 10_000n) / total) / 100 : 0,
+            inRewardZone: inZone.has(Number(id)),
+            ratePerSecond: (rates[Number(id)] ?? 0n).toString(),
+            yourVotes: fmtUnits(mine, 18),
+            yourVotesRaw: mine.toString(),
+            bribes,
+          };
+        }),
+      );
+
+      let you: Record<string, unknown> | null = null;
+      if (who) {
+        const [available, votes] = await Promise.all([
+          read<bigint>("availableWeight", [who]),
+          (liveDeployment.tesseraToken
+            ? (client.public.readContract({
+                address: liveDeployment.tesseraToken as Hex, abi: tesseraTokenAbi, functionName: "getVotes", args: [who],
+              }) as Promise<bigint>)
+            : Promise.resolve(0n)),
+        ]);
+        const used = markets.reduce((t, m) => t + BigInt(m.yourVotesRaw), 0n);
+        you = {
+          address: who,
+          votingPower: fmtUnits(votes, 18),
+          available: fmtUnits(available, 18),
+          availableRaw: available.toString(),
+          used: fmtUnits(used, 18),
+        };
+      }
+
+      res.json({
+        ok: true,
+        deployed: true,
+        address: gaugeAddr,
+        canSet: Boolean(owner),
+        epoch: Number(epoch),
+        epochLengthHours: Number(epochLength) / 3600,
+        epochEndsAt: Number(epochEnd),
+        // An epoch is applicable once it has closed and nobody has applied it.
+        applicableEpoch: Number(epoch) > 0 && (!everApplied || Number(epoch) - 1 > Number(lastApplied))
+          ? Number(epoch) - 1
+          : null,
+        lastAppliedEpoch: everApplied ? Number(lastApplied) : null,
+        rewardZoneSize: Number(zoneSize),
+        totalVotes: fmtUnits(total, 18),
+        budget: {
+          symbol: rewardMeta.symbol,
+          lendingPerSecond: fmtUnits(lendingBudget, 18),
+          ammPerSecond: fmtUnits(ammBudget, 18),
+          lendingPerDay: fmtUnits(lendingBudget * 86_400n, 18),
+          ammPerDay: fmtUnits(ammBudget * 86_400n, 18),
+        },
+        markets,
+        you,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** How much there is to split each second. Operator only — the vote decides
+   *  where it goes, this decides how much of it there is. */
+  app.post("/api/gauge/budget", requireOperator, async (req, res) => {
+    if (!gaugeAddr) { res.status(404).json({ ok: false, error: "gauge not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const lending = BigInt(String(req.body?.lendingPerSecond ?? "0"));
+      const amm = BigInt(String(req.body?.ammPerSecond ?? "0"));
+      const txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "setBudget", [lending, amm]);
+      logTx(req, {
+        category: "defi", action: "gauge-budget", status: "success", txHash,
+        detail: `lending ${lending}/s, amm ${amm}/s`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/gauge/zone", requireOperator, async (req, res) => {
+    if (!gaugeAddr) { res.status(404).json({ ok: false, error: "gauge not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const size = Number(req.body?.size ?? 0);
+      if (!Number.isInteger(size) || size < 0 || size > 1000) {
+        res.status(400).json({ ok: false, error: "size must be a whole number, 0 for no cutoff" });
+        return;
+      }
+      const txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "setRewardZoneSize", [size]);
+      logTx(req, { category: "defi", action: "gauge-zone", status: "success", txHash, detail: String(size) });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Register a market the gauge can direct emissions to. Operator only. */
+  app.post("/api/gauge/market", requireOperator, async (req, res) => {
+    if (!gaugeAddr) { res.status(404).json({ ok: false, error: "gauge not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const venue = String(req.body?.venue ?? "lending");
+      const label = String(req.body?.label ?? "").slice(0, 80);
+      if (!label) { res.status(400).json({ ok: false, error: "a market needs a name" }); return; }
+      let txHash: string;
+      if (venue === "amm") {
+        txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "addAmmMarket", [
+          BigInt(String(req.body?.poolId ?? "0")), label,
+        ]);
+      } else {
+        const asset = String(req.body?.asset ?? "");
+        const side = Number(req.body?.side ?? 0);
+        if (!/^0x[0-9a-fA-F]{40}$/.test(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
+        txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "addLendingMarket", [asset, side, label]);
+      }
+      logTx(req, { category: "defi", action: "gauge-market", status: "success", txHash, detail: label });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Retire or restore a market. Votes and bribes already placed survive it. */
+  app.post("/api/gauge/market/active", requireOperator, async (req, res) => {
+    if (!gaugeAddr) { res.status(404).json({ ok: false, error: "gauge not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const id = BigInt(String(req.body?.id ?? "0"));
+      const active = Boolean(req.body?.active);
+      const txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "setMarketActive", [id, active]);
+      logTx(req, {
+        category: "defi", action: "gauge-market-active", status: "success", txHash,
+        detail: `${id} ${active ? "active" : "retired"}`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Write a closed epoch's result to the emissions contracts.
+   *
+   * Permissionless on the contract, so this endpoint is a convenience for
+   * whoever is looking at the page rather than a privilege — anybody with a
+   * wallet can do the same thing directly, which is the property that makes the
+   * vote binding.
+   */
+  app.post("/api/gauge/apply", requireOperator, async (req, res) => {
+    if (!gaugeAddr) { res.status(404).json({ ok: false, error: "gauge not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const epoch = BigInt(String(req.body?.epoch ?? "0"));
+      const txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "applyEpoch", [epoch]);
+      logTx(req, { category: "defi", action: "gauge-apply", status: "success", txHash, detail: `epoch ${epoch}` });
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
@@ -5413,6 +5974,8 @@ async function main() {
       token: (liveDeployment.tesseraToken as Hex) ?? null,
       emitter: (liveDeployment.tesseraEmitter as Hex) ?? null,
       governor: (liveDeployment.tesseraGovernor as Hex) ?? null,
+      lpEmissions: (liveDeployment.tesseraLpEmissions as Hex) ?? null,
+      gauge: (liveDeployment.tesseraGauge as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded

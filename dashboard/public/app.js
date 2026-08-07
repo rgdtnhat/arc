@@ -143,7 +143,10 @@ const $ = (id) => document.getElementById(id);
           }
           // Governance reads a loop of contract calls, so it loads on arrival
           // rather than on every poll of every other tab.
-          if (route === "gov" && typeof loadGovernance === "function") loadGovernance().catch(() => {});
+          if (route === "gov" && typeof loadGovernance === "function") {
+            loadGovernance().catch(() => {});
+            if (typeof loadGauge === "function") loadGauge().catch(() => {});
+          }
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -1440,8 +1443,8 @@ const $ = (id) => document.getElementById(id);
             const em = emissionApr(a.address, side);
             const badge = em
               ? em.unpriced
-                ? `<div><span class="tag ok" style="font-size:10px">+ rewards</span></div>`
-                : `<div><span class="tag ok" style="font-size:10px">+${esc(Number(em.apr).toFixed(2))}% 🔥</span></div>`
+                ? `<div><span class="tag ok" style="font-size:10px"><span class="tsraIcon"></span> rewards</span></div>`
+                : `<div><span class="tag ok" style="font-size:10px"><span class="tsraIcon"></span> +${esc(Number(em.apr).toFixed(2))}%</span></div>`
               : "";
             const disabled = side === "borrow" && !a.borrowable;
             return (
@@ -1492,6 +1495,20 @@ const $ = (id) => document.getElementById(id);
             (r.reward.priced ? "" : " · no market price for the reward, so rows show a rate rather than an APY") +
             `. Paid out all time: ${r.reward.claimedAllTime}.`;
           $("lnEmClaim").disabled = !(BigInt(r.yourClaimableRaw || "0") > 0n);
+          // Say it in the panel too: an APR next to a paused market is a lie
+          // the rate itself cannot tell you about.
+          if (r.paused) {
+            $("lnEmNote").textContent =
+              "Paused — nothing is accruing right now. What you have already earned is still yours and still claimable. " +
+              $("lnEmNote").textContent;
+          }
+          const tag = $("govEmPausedTag");
+          if (tag) {
+            tag.textContent = r.paused ? "paused" : "running";
+            tag.className = r.paused ? "tag warn" : "tag ok";
+          }
+          const btn = $("govEmPause");
+          if (btn) btn.textContent = r.paused ? "Resume lending" : "Pause lending";
           renderMarket();
         } catch {
           card.style.display = "none";
@@ -3291,6 +3308,7 @@ const $ = (id) => document.getElementById(id);
         loadHolders(key);
         loadVenueChart(key);
         if (key === "Lending") { loadPoolPrices(); loadBackstop(); loadAuction(); loadBorrowers(); loadEmissions(); }
+        if (key === "Amm" && typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {});
       }
 
       /** Reverse a swap pair. Two selects, one click — the common second trade. */
@@ -4672,6 +4690,449 @@ const $ = (id) => document.getElementById(id);
               loadEmissions();
             } else govMsg("govEmMsg", r.error || "failed", "var(--warn)");
           } catch { govMsg("govEmMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
+      /* ---- The gauge: where this epoch's rewards go ------------------------
+       *
+       * The vote that happens every epoch rather than every proposal. The
+       * server computes the shares and the reward-zone cutoff, because two
+       * implementations of "the top three" is how a page ends up promising a
+       * market an emission it never receives.
+       */
+      window.__gauge = null;
+
+      async function loadGauge() {
+        const card = $("govGaugeCard");
+        if (!card) return;
+        try {
+          const who = String(window.__myAddress || "");
+          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
+          const r = await (await fetch("/api/gauge" + q)).json();
+          window.__gauge = r && r.ok && r.deployed ? r : null;
+          if (!window.__gauge) { card.style.display = "none"; return; }
+          card.style.display = "";
+          $("govGaugeAdminCard").style.display = r.canSet && adminId ? "" : "none";
+          $("govBribeCard").style.display = "";
+
+          $("gaEpoch").textContent = `#${r.epoch}`;
+          $("gaCloses").textContent = relTime(r.epochEndsAt);
+          $("gaTotal").textContent = `${r.totalVotes} TSRA`;
+          $("gaAvailable").textContent = r.you ? `${r.you.available} TSRA` : "connect a wallet";
+          $("gaBudgetNote").textContent =
+            `Budget: ${r.budget.lendingPerDay} TSRA a day across lending, ${r.budget.ammPerDay} across liquidity. ` +
+            (r.rewardZoneSize ? `Top ${r.rewardZoneSize} markets share it; ` : "Every market with a vote shares it; ") +
+            `epochs run ${r.epochLengthHours} hours.`;
+
+          const rows = (r.markets || []).filter((m) => m.active || Number(m.votesRaw) > 0);
+          $("gaRows").innerHTML = rows.length
+            ? rows.map((m) => gaugeRow(m, r)).join("")
+            : emptyRow(6, "No markets listed yet.");
+
+          $("gaRows").querySelectorAll("[data-bribe-claim]").forEach((b) =>
+            b.addEventListener("click", () => claimBribes(Number(b.dataset.bribeClaim))),
+          );
+
+          // Applying is only offered when there is actually a closed, unapplied
+          // epoch — a button that always reverts teaches people to ignore it.
+          const applyBtn = $("gaApply");
+          applyBtn.style.display = r.applicableEpoch != null ? "" : "none";
+          applyBtn.textContent = `Apply epoch #${r.applicableEpoch} result`;
+          applyBtn.dataset.epoch = String(r.applicableEpoch ?? "");
+
+          $("gaHint").textContent = !r.you
+            ? "Connect your wallet to vote."
+            : Number(r.you.available) === 0 && Number(r.you.used) === 0
+              ? "You have no delegated TSRA. Delegate below, then vote from the next epoch."
+              : `Voting with up to ${r.you.available} TSRA (${r.you.used} already allocated).`;
+
+          // The operator boxes mirror what is set, so a change is a correction
+          // rather than a re-entry from memory.
+          if (r.canSet && adminId) {
+            if (document.activeElement !== $("gaBudgetLending")) $("gaBudgetLending").value = r.budget.lendingPerSecond;
+            if (document.activeElement !== $("gaBudgetAmm")) $("gaBudgetAmm").value = r.budget.ammPerSecond;
+            if (document.activeElement !== $("gaZoneSize")) $("gaZoneSize").value = String(r.rewardZoneSize);
+            $("gaAdminNote").textContent = r.lastAppliedEpoch == null
+              ? "No epoch has been applied yet."
+              : `Last applied: epoch #${r.lastAppliedEpoch}.`;
+            renderGaugeMarketForm();
+          }
+          renderBribeForm(r);
+        } catch {
+          card.style.display = "none";
+        }
+      }
+
+      function gaugeRow(m, r) {
+        const zone = m.inRewardZone
+          ? `<span class="tag ok" style="font-size:10px">reward zone</span>`
+          : Number(m.votesRaw) > 0
+            ? `<span class="tag warn" style="font-size:10px">below the line</span>`
+            : "";
+        const perDay = Number(m.ratePerSecond) / 1e18 * 86400;
+        const pays = Number(m.ratePerSecond) > 0
+          ? `<span class="tsraIcon"></span> ${perDay.toFixed(2)}/day`
+          : "—";
+        const bribeTotal = (m.bribes || []).map((b) => `${b.amount} ${b.symbol}`).join(", ");
+        const mine = (m.bribes || []).reduce((t, b) => t + BigInt(b.yourShareRaw || "0"), 0n);
+        const bribes = (m.bribes || []).length
+          ? esc(bribeTotal) +
+            (mine > 0n
+              ? `<div><button class="btn" style="padding:2px 8px;font-size:11px" data-bribe-claim="${m.id}">Claim my share</button></div>`
+              : "")
+          : "—";
+        return (
+          `<tr${m.active ? "" : ' style="opacity:.55"'}>` +
+          `<td><b>${esc(m.label)}</b> ${zone}` +
+          `<div class="muted" style="font-size:11px">${m.venue === "lending" ? (m.side === 0 ? "lending · supply" : "lending · borrow") : "liquidity pool #" + m.poolId}` +
+          `${m.active ? "" : " · retired"}</div></td>` +
+          `<td class="num mono">${esc(m.votes)}</td>` +
+          `<td class="num">${esc(m.sharePct.toFixed(1))}%</td>` +
+          `<td class="num">${pays}</td>` +
+          `<td class="num" style="font-size:11px">${bribes}</td>` +
+          `<td class="num"><input class="field gaVote" data-market="${m.id}" inputmode="decimal" ` +
+          `value="${esc(m.yourVotes !== "0" ? m.yourVotes : "")}" placeholder="0" style="width:96px;text-align:right"` +
+          `${m.active ? "" : " disabled"} /></td>` +
+          `</tr>`
+        );
+      }
+
+      if ($("gaSubmit")) {
+        $("gaSubmit").addEventListener("click", async () => {
+          const r = window.__gauge;
+          if (!r) return;
+          if (!selfMode()) {
+            govMsg("gaMsg", "A vote is signed by the holder, so it needs your own wallet. " +
+              "Switch on \"Use my own wallet\".", "var(--warn)");
+            return;
+          }
+          const ids = [], weights = [];
+          let bad = null;
+          document.querySelectorAll(".gaVote").forEach((el) => {
+            const raw = (el.value || "").trim();
+            if (!raw || Number(raw) === 0) return;
+            const parsed = parseAmount(raw, 18);
+            if (!parsed.raw) { bad = bad || parsed.error; return; }
+            ids.push(BigInt(el.dataset.market));
+            weights.push(BigInt(parsed.raw));
+          });
+          if (bad) { govMsg("gaMsg", bad, "var(--warn)"); return; }
+          if (!ids.length) {
+            govMsg("gaMsg", "Put some weight on at least one market — or use \"Take my weight back\".", "var(--warn)");
+            return;
+          }
+          // The contract replaces the whole allocation, so the sum is measured
+          // against total power rather than what is left of it.
+          const total = weights.reduce((t, w) => t + w, 0n);
+          const power = BigInt(r.you ? r.you.availableRaw : "0") +
+            (r.markets || []).reduce((t, m) => t + BigInt(m.yourVotesRaw || "0"), 0n);
+          if (total > power) {
+            govMsg("gaMsg",
+              `That is more than your weight at the snapshot (${r.you ? r.you.available : "0"} TSRA plus what you have already allocated).`,
+              "var(--warn)");
+            return;
+          }
+          await selfCustody("gaMsg", "cast your market vote", async (from, cfg) =>
+            sendTx(from, cfg.gauge, callData(
+              cfg.selectors.gaVote,
+              encUint(64),
+              encUint(64 + 32 + ids.length * 32),
+              encArray(ids),
+              encArray(weights),
+            )),
+          );
+          loadGauge();
+        });
+      }
+
+      if ($("gaClear")) {
+        $("gaClear").addEventListener("click", async () => {
+          if (!selfMode()) {
+            govMsg("gaMsg", "Withdrawing a vote is signed by the holder — switch on \"Use my own wallet\".", "var(--warn)");
+            return;
+          }
+          await selfCustody("gaMsg", "take your weight back", async (from, cfg) =>
+            sendTx(from, cfg.gauge, callData(cfg.selectors.gaClear)),
+          );
+          loadGauge();
+        });
+      }
+
+      if ($("gaApply")) {
+        $("gaApply").addEventListener("click", async () => {
+          const epoch = $("gaApply").dataset.epoch;
+          if (epoch === "") return;
+          // Permissionless on the contract: from a connected wallet it is the
+          // holder's own transaction, and the server route is just a fallback
+          // for whoever is signed in as the operator.
+          if (selfMode()) {
+            await selfCustody("gaMsg", `apply epoch #${epoch}`, async (from, cfg) =>
+              sendTx(from, cfg.gauge, callData(cfg.selectors.gaApply, encUint(epoch))),
+            );
+          } else {
+            try {
+              const r = await (await postJson("/api/gauge/apply", { epoch })).json();
+              govMsg("gaMsg", r.ok ? `Applied. — ${r.txHash}` : (r.error || "failed"),
+                r.ok ? "var(--good)" : "var(--warn)");
+            } catch { govMsg("gaMsg", "Request failed.", "var(--warn)"); }
+          }
+          loadGauge();
+          loadEmissions();
+        });
+      }
+
+      async function claimBribes(marketId) {
+        if (!selfMode()) {
+          govMsg("gaMsg", "An incentive is paid to the address whose weight was used, so this needs your own wallet.",
+            "var(--warn)");
+          return;
+        }
+        const r = window.__gauge;
+        // Bribes settle against the epoch they were voted in, which is the one
+        // that has closed — not the one open now.
+        const epoch = r && r.applicableEpoch != null ? r.applicableEpoch : (r ? r.epoch - 1 : 0);
+        if (epoch < 0) { govMsg("gaMsg", "No epoch has closed yet.", "var(--warn)"); return; }
+        await selfCustody("gaMsg", `claim your share of the incentives on market #${marketId}`, async (from, cfg) =>
+          sendTx(from, cfg.gauge, callData(cfg.selectors.gaClaimBribes, encUint(epoch), encUint(marketId))),
+        );
+        loadGauge();
+      }
+
+      /* ---- Incentives (anyone) --------------------------------------------- */
+      function renderBribeForm(r) {
+        const sel = $("gaBribeMarket");
+        if (!sel) return;
+        const sig = (r.markets || []).map((m) => `${m.id}:${m.label}`).join("|");
+        if (sel.dataset.sig !== sig) {
+          sel.dataset.sig = sig;
+          sel.innerHTML = (r.markets || [])
+            .filter((m) => m.active)
+            .map((m) => `<option value="${m.id}">${esc(m.label)}</option>`)
+            .join("");
+        }
+        const tok = $("gaBribeToken");
+        const assets = (window.__lending && window.__lending.assets) || [];
+        const tsig = assets.map((a) => a.symbol).join(",");
+        if (tok.dataset.sig !== tsig) {
+          tok.dataset.sig = tsig;
+          tok.innerHTML = assets
+            .filter((a) => a.address)
+            .map((a) => `<option value="${esc(a.address)}" data-dec="${Number(a.decimals ?? 6)}">${esc(a.symbol)}</option>`)
+            .join("");
+        }
+      }
+
+      if ($("gaBribeAdd")) {
+        $("gaBribeAdd").addEventListener("click", async () => {
+          const r = window.__gauge;
+          if (!r) return;
+          if (!selfMode()) {
+            govMsg("gaBribeMsg", "An incentive comes out of your wallet, so it needs your own wallet.", "var(--warn)");
+            return;
+          }
+          const marketId = Number($("gaBribeMarket").value);
+          const opt = $("gaBribeToken").selectedOptions[0];
+          if (!opt) { govMsg("gaBribeMsg", "Pick a token.", "var(--warn)"); return; }
+          const token = opt.value;
+          const dec = Number(opt.dataset.dec || 6);
+          const parsed = parseAmount($("gaBribeAmount").value, dec);
+          if (!parsed.raw) { govMsg("gaBribeMsg", parsed.error || "Enter an amount.", "var(--warn)"); return; }
+          await selfCustody("gaBribeMsg", `attach ${$("gaBribeAmount").value} to a market`, async (from, cfg) => {
+            // Exactly what is being attached, and no more — the same rule every
+            // other approval in this app follows.
+            await ensureAllowance(from, token, cfg.gauge, BigInt(parsed.raw));
+            return sendTx(from, cfg.gauge, callData(
+              cfg.selectors.gaAddBribe,
+              encUint(r.epoch), encUint(marketId), encAddr(token), encUint(parsed.raw),
+            ));
+          });
+          $("gaBribeAmount").value = "";
+          loadGauge();
+        });
+      }
+
+      /* ---- Operator: budget, zone, listings -------------------------------- */
+      function renderGaugeMarketForm() {
+        const venue = $("gaNewVenue");
+        if (!venue) return;
+        const isAmm = venue.value === "amm";
+        $("gaNewAsset").style.display = isAmm ? "none" : "";
+        $("gaNewSide").style.display = isAmm ? "none" : "";
+        $("gaNewPool").style.display = isAmm ? "" : "none";
+        const sel = $("gaNewAsset");
+        const assets = (window.__lending && window.__lending.assets) || [];
+        const sig = assets.map((a) => a.symbol).join(",");
+        if (sel.dataset.sig !== sig) {
+          sel.dataset.sig = sig;
+          sel.innerHTML = assets
+            .filter((a) => a.address)
+            .map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`)
+            .join("");
+        }
+      }
+      if ($("gaNewVenue")) $("gaNewVenue").addEventListener("change", renderGaugeMarketForm);
+
+      if ($("gaBudgetSet")) {
+        $("gaBudgetSet").addEventListener("click", async () => {
+          const lending = parseAmount($("gaBudgetLending").value, 18);
+          const amm = parseAmount($("gaBudgetAmm").value, 18);
+          // Zero is a real instruction here — it stops a venue paying at all.
+          const l = ($("gaBudgetLending").value || "").trim() === "0" ? "0" : lending.raw;
+          const a = ($("gaBudgetAmm").value || "").trim() === "0" ? "0" : amm.raw;
+          if (!l || !a) {
+            govMsg("gaAdminMsg", lending.error || amm.error || "Enter both budgets.", "var(--warn)");
+            return;
+          }
+          try {
+            const r = await (await postJson("/api/gauge/budget", { lendingPerSecond: l, ammPerSecond: a })).json();
+            govMsg("gaAdminMsg", r.ok ? `Budget set. — ${r.txHash}` : (r.error || "failed"),
+              r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) loadGauge();
+          } catch { govMsg("gaAdminMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
+      if ($("gaZoneSet")) {
+        $("gaZoneSet").addEventListener("click", async () => {
+          const size = Number(($("gaZoneSize").value || "").trim());
+          if (!Number.isInteger(size) || size < 0) {
+            govMsg("gaAdminMsg", "The zone size is a whole number; 0 means no cutoff.", "var(--warn)");
+            return;
+          }
+          try {
+            const r = await (await postJson("/api/gauge/zone", { size })).json();
+            govMsg("gaAdminMsg", r.ok ? `Reward zone set to ${size}. — ${r.txHash}` : (r.error || "failed"),
+              r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) loadGauge();
+          } catch { govMsg("gaAdminMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
+      if ($("gaMarketAdd")) {
+        $("gaMarketAdd").addEventListener("click", async () => {
+          const venue = $("gaNewVenue").value;
+          const label = ($("gaNewLabel").value || "").trim();
+          if (!label) { govMsg("gaAdminMsg", "A market needs a name voters will recognise.", "var(--warn)"); return; }
+          const body = venue === "amm"
+            ? { venue, poolId: ($("gaNewPool").value || "0").trim(), label }
+            : { venue, asset: $("gaNewAsset").value, side: Number($("gaNewSide").value), label };
+          try {
+            const r = await (await postJson("/api/gauge/market", body)).json();
+            govMsg("gaAdminMsg", r.ok ? `Listed. — ${r.txHash}` : (r.error || "failed"),
+              r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) { $("gaNewLabel").value = ""; loadGauge(); }
+          } catch { govMsg("gaAdminMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
+      /* ---- Pausing emissions (operator) ------------------------------------ */
+      async function setEmissionsPaused(which, paused) {
+        const url = which === "lp" ? "/api/amm/emissions/pause" : "/api/lending/emissions/pause";
+        try {
+          const r = await (await postJson(url, { paused })).json();
+          govMsg("govPauseMsg",
+            r.ok
+              ? `${which === "lp" ? "Liquidity" : "Lending"} emissions ${paused ? "paused" : "running"} — nothing already earned was touched. ${r.txHash}`
+              : (r.error || "failed"),
+            r.ok ? "var(--good)" : "var(--warn)");
+          if (r.ok) { loadEmissions(); loadLpEmissions(); }
+        } catch { govMsg("govPauseMsg", "Request failed.", "var(--warn)"); }
+      }
+      if ($("govEmPause")) {
+        $("govEmPause").addEventListener("click", () =>
+          setEmissionsPaused("lending", !(window.__emissions && window.__emissions.paused)));
+      }
+      if ($("govLpPause")) {
+        $("govLpPause").addEventListener("click", () =>
+          setEmissionsPaused("lp", !(window.__lpEmissions && window.__lpEmissions.paused)));
+      }
+
+      /* ---- Delegation to somebody else ------------------------------------- */
+      if ($("govDelegateSet")) {
+        $("govDelegateSet").addEventListener("click", async () => {
+          if (!selfMode()) {
+            govMsg("govDelegateMsg", "Delegating is signed by the holder — switch on \"Use my own wallet\".", "var(--warn)");
+            return;
+          }
+          const typed = ($("govDelegateTo").value || "").trim();
+          if (typed && !/^0x[0-9a-fA-F]{40}$/.test(typed)) {
+            govMsg("govDelegateMsg", "That is not an address. Leave it empty to delegate to yourself.", "var(--warn)");
+            return;
+          }
+          await selfCustody("govDelegateMsg", typed ? `delegate to ${typed.slice(0, 10)}…` : "delegate to yourself",
+            async (from, cfg) => sendTx(from, cfg.token, callData(cfg.selectors.govDelegate, encAddr(typed || from))),
+          );
+          loadGovernance();
+          loadGauge();
+        });
+      }
+
+      /* ---- Liquidity emissions --------------------------------------------- */
+      window.__lpEmissions = null;
+
+      async function loadLpEmissions() {
+        const card = $("amEmissions");
+        if (!card) return;
+        try {
+          const who = String(window.__myAddress || "");
+          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
+          const r = await (await fetch("/api/amm/emissions" + q)).json();
+          window.__lpEmissions = r && r.ok && r.deployed && r.configured ? r : null;
+          if (!window.__lpEmissions) { card.style.display = "none"; return; }
+          card.style.display = "";
+          $("amEmAmount").textContent = r.yourClaimable ?? "0";
+          $("amEmSymbol").textContent = r.reward.symbol;
+          $("amEmNote").textContent =
+            (r.paused ? "Paused — nothing is accruing right now. What you have already earned is still claimable. " : "") +
+            `Pot: ${r.reward.balance} ${r.reward.symbol}` +
+            (r.reward.runwayDays == null ? " · nothing streaming" : ` · about ${r.reward.runwayDays.toFixed(1)} days left at the current rates`) +
+            `. Paid out all time: ${r.reward.claimedAllTime}.`;
+          $("amEmRows").innerHTML = (r.pools || []).length
+            ? r.pools.map((p) => {
+                const perDay = Number(p.ratePerSecond) / 1e18 * 86400;
+                const share = Number(p.totalShares) > 0
+                  ? (Number(p.yourShares) / Number(p.totalShares)) * 100
+                  : 0;
+                return (
+                  `<tr><td><b>${esc(p.name)}</b>` +
+                  `<div class="muted" style="font-size:11px">depth $${esc(p.depthUsd.toFixed(2))}</div></td>` +
+                  `<td class="num">${perDay > 0 ? `<span class="tsraIcon"></span> ${perDay.toFixed(2)}/day` : "—"}</td>` +
+                  `<td class="num">${esc(share.toFixed(2))}%</td>` +
+                  `<td class="num mono">${esc((Number(p.claimable) / 1e18).toFixed(6))}</td></tr>`
+                );
+              }).join("")
+            : emptyRow(4, "No pools.");
+          $("amEmClaim").disabled = !(BigInt(r.yourClaimableRaw || "0") > 0n);
+          const lpBtn = $("govLpPause");
+          if (lpBtn) lpBtn.textContent = r.paused ? "Resume liquidity" : "Pause liquidity";
+        } catch {
+          card.style.display = "none";
+        }
+      }
+
+      if ($("amEmClaim")) {
+        $("amEmClaim").addEventListener("click", async () => {
+          const em = window.__lpEmissions;
+          if (!em) return;
+          const ids = (em.pools || []).filter((p) => BigInt(p.claimable || "0") > 0n).map((p) => BigInt(p.poolId));
+          if (!ids.length) {
+            govMsg("amEmMsg", "Nothing has accrued to claim yet.", "var(--warn)");
+            return;
+          }
+          if (!selfMode()) {
+            govMsg("amEmMsg", "Rewards are paid to whoever earned them, so this needs your own wallet. " +
+              "Switch on \"Use my own wallet\".", "var(--warn)");
+            return;
+          }
+          const btn = $("amEmClaim");
+          btn.disabled = true;
+          await selfCustody("amEmMsg", `claim ${em.yourClaimable} ${em.reward.symbol}`, async (from, cfg) =>
+            // claim(uint256[]): one dynamic array, so the head is a single
+            // offset to the length word.
+            sendTx(from, cfg.lpEmissions, callData(cfg.selectors.lpClaim, encUint(32), encArray(ids))),
+          );
+          btn.disabled = false;
+          loadLpEmissions();
         });
       }
 
@@ -6881,8 +7342,10 @@ const $ = (id) => document.getElementById(id);
       setInterval(() => { if (typeof loadAllowances === "function") loadAllowances().catch(() => {}); }, 60000);
       // Emissions tick slowly by design; a slow poll keeps the figure honest.
       setInterval(() => { if (typeof loadEmissions === "function") loadEmissions().catch(() => {}); }, 30000);
+      setInterval(() => { if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {}); }, 30000);
       setInterval(() => {
         if ($("paneGov") && !$("paneGov").hidden && typeof loadGovernance === "function") loadGovernance().catch(() => {});
+        if ($("paneGov") && !$("paneGov").hidden && typeof loadGauge === "function") loadGauge().catch(() => {});
       }, 20000);
       window.addEventListener("focus", () => tick());
       window.addEventListener("online", () => tick());

@@ -147,6 +147,26 @@
       /* Header controls are icons with an accessible label rather than text, so
          the bar still fits on a phone. The label reappears on wide screens where
          there is room for it, because an icon alone is a guessing game. */
+      /*
+       * TSRA's mark is the app's own favicon, inlined as a data URI.
+       *
+       * A token with no icon renders as a bare ticker, and anything that shows
+       * one falls back to a grey circle with two letters in it. Reusing the
+       * product mark means the token reads as the protocol's rather than as a
+       * second identity to maintain — and inlining it keeps the strict CSP
+       * intact, because nothing is fetched.
+       */
+      .tsraIcon {
+        display: inline-block;
+        width: 1.05em;
+        height: 1.05em;
+        flex: none;
+        vertical-align: -0.15em;
+        background: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="%234c8dff"/><stop offset="1" stop-color="%237b5cff"/></linearGradient><mask id="m"><rect width="64" height="64" fill="%23fff"/><circle cx="4" cy="32" r="7" fill="%23000"/><circle cx="60" cy="32" r="7" fill="%23000"/></mask></defs><rect x="4" y="14" width="56" height="36" rx="8" fill="url(%23g)" mask="url(%23m)"/><line x1="40" y1="19" x2="40" y2="45" stroke="%23fff" stroke-width="2.5" stroke-dasharray="3 3" opacity=".85"/><circle cx="24" cy="32" r="5.5" fill="%23fff" opacity=".92"/></svg>') center/contain no-repeat;
+      }
+      /* In a table cell the mark sits before the ticker without stretching the row. */
+      td .tsraIcon, .tag .tsraIcon { width: 0.95em; height: 0.95em; }
+
       .iconBtn {
         display: inline-flex; align-items: center; justify-content: center; gap: 7px;
         border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
@@ -1318,7 +1338,10 @@
               <div class="row-actions" style="justify-content:space-between">
                 <div>
                   <div class="muted" style="font-size:10.5px;letter-spacing:.07em;text-transform:uppercase">Claim pool emissions</div>
-                  <div style="font-size:18px;font-weight:700;margin-top:2px"><span id="lnEmAmount">0</span> <span id="lnEmSymbol"></span></div>
+                  <div style="font-size:18px;font-weight:700;margin-top:2px;display:flex;align-items:center;gap:7px">
+                    <span class="tsraIcon" aria-hidden="true"></span>
+                    <span><span id="lnEmAmount">0</span> <span id="lnEmSymbol"></span></span>
+                  </div>
                 </div>
                 <button class="btn primary" id="lnEmClaim">Claim</button>
               </div>
@@ -1673,6 +1696,25 @@
               into the contract that no admin can lower. Prices come from the pool's own reserves, so no
               external oracle can be moved against you. Withdrawals stay open even if a pool is frozen.
             </div>
+            <div id="amEmissions" style="display:none;margin-bottom:16px;padding:12px;border:1px solid var(--line-strong);border-radius:12px">
+              <div class="row-actions" style="justify-content:space-between">
+                <div>
+                  <div class="muted" style="font-size:10.5px;letter-spacing:.07em;text-transform:uppercase">Claim liquidity emissions</div>
+                  <div style="font-size:18px;font-weight:700;margin-top:2px;display:flex;align-items:center;gap:7px">
+                    <span class="tsraIcon" aria-hidden="true"></span>
+                    <span><span id="amEmAmount">0</span> <span id="amEmSymbol"></span></span>
+                  </div>
+                </div>
+                <button class="btn primary" id="amEmClaim">Claim</button>
+              </div>
+              <div class="kv" id="amEmNote" style="margin-top:8px"></div>
+              <div class="tblWrap auto" style="margin-top:10px"><table class="data" style="min-width:0">
+                <thead><tr><th>Pool</th><th class="num">Rate</th><th class="num">Your share</th><th class="num">Earned</th></tr></thead>
+                <tbody id="amEmRows"></tbody>
+              </table></div>
+              <div class="msg" id="amEmMsg" style="display:none"></div>
+            </div>
+
             <div class="row-actions" style="margin-bottom:14px">
               <label style="font-size:12px;color:var(--muted)">Pool</label>
               <select id="amPool" class="field"></select>
@@ -2143,6 +2185,71 @@
             <div class="msg" id="govMsg" style="display:none"></div>
           </div>
 
+          <div class="card" id="govGaugeCard" style="display:none">
+            <h2><span class="tsraIcon" aria-hidden="true"></span> Market votes — where this epoch's rewards go</h2>
+            <div style="font-size:12.5px;color:var(--muted)">
+              The recurring decision, asked continuously instead of through a proposal every week. Point your
+              TSRA at the markets you want paid; the top few by vote share the budget and everything below the
+              line gets nothing, so getting into the <b>reward zone</b> is worth campaigning for. Anyone may
+              attach a <b>bribe</b> to a market — the addresses whose weight was used split it once the epoch
+              closes. Weight is read at the block before the epoch's first vote, so tokens bought after the
+              contest is visible carry none.
+            </div>
+            <div class="metrics tight" style="margin-top:14px">
+              <div class="metric"><div class="k">Epoch</div><div class="v" id="gaEpoch">—</div></div>
+              <div class="metric"><div class="k">Closes</div><div class="v" id="gaCloses">—</div></div>
+              <div class="metric"><div class="k">Votes cast</div><div class="v" id="gaTotal">—</div></div>
+              <div class="metric"><div class="k">Your weight left</div><div class="v" id="gaAvailable">—</div></div>
+            </div>
+            <div class="kv" id="gaBudgetNote" style="margin-top:10px"></div>
+            <div class="tblWrap auto" style="margin-top:12px"><table class="data" style="min-width:0">
+              <thead><tr>
+                <th>Market</th><th class="num">Votes</th><th class="num">Share</th>
+                <th class="num">Pays</th><th class="num">Bribes</th><th class="num">Your vote</th>
+              </tr></thead>
+              <tbody id="gaRows"></tbody>
+            </table></div>
+            <div class="row-actions" style="margin-top:12px;flex-wrap:wrap">
+              <button class="btn primary" id="gaSubmit">Cast my vote</button>
+              <button class="btn" id="gaClear">Take my weight back</button>
+              <button class="btn" id="gaApply" style="display:none">Apply last epoch's result</button>
+              <span class="kv" id="gaHint"></span>
+            </div>
+            <div class="msg" id="gaMsg" style="display:none"></div>
+          </div>
+
+          <div class="card" id="govDelegateCard">
+            <h2>Delegate your TSRA</h2>
+            <div class="kv" style="margin-bottom:10px">
+              One delegation covers both venues: whoever you point at votes your weight in proposals
+              <i>and</i> in the market vote above. Point it at yourself to vote your own, or at somebody who
+              follows these markets more closely than you do. Your tokens never leave your wallet, and you
+              can move the delegation at any time.
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap">
+              <input id="govDelegateTo" class="field" placeholder="0x… (leave empty for yourself)" style="min-width:330px" />
+              <button class="btn primary" id="govDelegateSet">Delegate</button>
+              <span class="kv" id="govDelegateCurrent"></span>
+            </div>
+            <div class="msg" id="govDelegateMsg" style="display:none"></div>
+          </div>
+
+          <div class="card" id="govBribeCard" style="display:none">
+            <h2>Add an incentive</h2>
+            <div class="kv" style="margin-bottom:10px">
+              Pay voters to point the protocol's emissions at a market. Public, priced by whoever turns up,
+              and settled to the addresses whose weight was actually used — which beats the same payment
+              happening privately to whoever holds the largest wallet. Claimable only once the epoch closes.
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap">
+              <select id="gaBribeMarket" class="field"></select>
+              <select id="gaBribeToken" class="field"></select>
+              <input id="gaBribeAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:150px" />
+              <button class="btn primary" id="gaBribeAdd">Attach incentive</button>
+            </div>
+            <div class="msg" id="gaBribeMsg" style="display:none"></div>
+          </div>
+
           <div class="card" id="govProposalsCard">
             <h2>Proposals</h2>
             <div id="govProposals" style="display:flex;flex-direction:column;gap:12px"></div>
@@ -2184,6 +2291,63 @@
             </div>
             <div class="kv" id="govEmBudget" style="margin-top:9px"></div>
             <div class="msg" id="govEmMsg" style="display:none"></div>
+
+            <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+              <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
+                <div>
+                  <b style="font-size:13px">Pause emissions</b>
+                  <div class="kv" style="margin-top:3px">
+                    Stops every stream at once without touching a rate, so resuming brings back exactly the
+                    schedule that was running. The paused seconds are skipped rather than banked. Claims keep
+                    working while paused — what people have already earned is theirs.
+                  </div>
+                </div>
+                <div class="row-actions">
+                  <span class="tag" id="govEmPausedTag">running</span>
+                  <button class="btn" id="govEmPause">Pause lending</button>
+                  <button class="btn" id="govLpPause">Pause liquidity</button>
+                </div>
+              </div>
+              <div class="msg" id="govPauseMsg" style="display:none"></div>
+            </div>
+          </div>
+
+          <div class="card" id="govGaugeAdminCard" style="display:none">
+            <h2>Market vote settings</h2>
+            <div class="kv" style="margin-bottom:10px">
+              Operator only. The budget is how much there is to split each second; the vote decides where it
+              lands. Keep the total at or below what the emitter actually delivers — set it higher and the
+              pot empties, and the shortfall stays owed rather than forgiven. The reward zone is how many
+              markets share it; zero means no cutoff.
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap">
+              <label class="kv">Lending / second</label>
+              <input id="gaBudgetLending" class="field" inputmode="decimal" style="width:140px" />
+              <label class="kv">Liquidity / second</label>
+              <input id="gaBudgetAmm" class="field" inputmode="decimal" style="width:140px" />
+              <button class="btn primary" id="gaBudgetSet">Set budget</button>
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap;margin-top:10px">
+              <label class="kv">Reward zone size</label>
+              <input id="gaZoneSize" class="field" inputmode="numeric" style="width:90px" />
+              <button class="btn" id="gaZoneSet">Set zone</button>
+              <span class="kv" id="gaAdminNote"></span>
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap;margin-top:10px">
+              <select id="gaNewVenue" class="field">
+                <option value="lending">Lending reserve</option>
+                <option value="amm">AMM pool</option>
+              </select>
+              <select id="gaNewAsset" class="field"></select>
+              <select id="gaNewSide" class="field">
+                <option value="0">Supply side</option>
+                <option value="1">Borrow side</option>
+              </select>
+              <input id="gaNewPool" class="field" inputmode="numeric" placeholder="Pool id" style="width:90px;display:none" />
+              <input id="gaNewLabel" class="field" placeholder="Name shown to voters" style="width:200px" />
+              <button class="btn" id="gaMarketAdd">List market</button>
+            </div>
+            <div class="msg" id="gaAdminMsg" style="display:none"></div>
           </div>
 
           <div class="card">

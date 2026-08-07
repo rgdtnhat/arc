@@ -7,9 +7,14 @@
   "agent": "0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4",
   "provider": "0xa5b42b3Ebe7FDB187c956D310f868960015d2988",
   "deployedAt": "2026-07-17T06:22:37.721Z",
-  "tesseraPool": "0x065f1bb38fdc65a1c41e2e888940af713cabca5f",
-  "tesseraEmissions": "0x38a00af40bd89fe2a54ce07a537dbb399de22fa9",
+  "tesseraPool": "0x4e7d2a132c048a09e561679f41e86fa2e898fdc2",
+  "tesseraEmissions": "0x7e9e268f8da37cb0cc6eee361d6f50b1d09449db",
   "tesseraToken": "0x8bb6bca8cb41147844a58327603eeab433f407b0",
   "tesseraEmitter": "0x408e0522487aec34a85b97c7a01be920b555d159",
-  "tesseraGovernor": "0x5cbd33263935471220a469527f50e47eae1fbb6e"
+  "tesseraGovernor": "0x5cbd33263935471220a469527f50e47eae1fbb6e",
+  "tesseraVault": "0x936ed194bf4b1f5d44e60e75e2d7b3655dba652a",
+  "tesseraRouter": "0x2edb172e3364d167eae1a3b7ba1fa4c8ccdcd5d1",
+  "tesseraAmm": "0x8b3ae0eb103653c4bce4d4dbff062ad7c9c9ada0",
+  "tesseraLpEmissions": "0x3f8a8f7f9612ba42b64f92120f55af0fd28d0d14",
+  "tesseraGauge": "0x7aa76a02ae084d947ccdfda27bbf4704993de996"
 }
