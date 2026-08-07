@@ -33,6 +33,49 @@ const EVENTS = {
 
 export type HolderKind = "lending" | "vault" | "amm" | "swap";
 
+/**
+ * An address a person can recognise as one.
+ *
+ * `0x360000` is neither a symbol nor an address — it is eight characters of a
+ * forty-two character string, which reads as corrupted data. `0x3600…0000`
+ * reads as an address nobody has named yet, which is the truth.
+ */
+export const shortAddress = (a: string): string =>
+  /^0x[0-9a-fA-F]{40}$/.test(a) ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
+
+/**
+ * Turn a batch of symbol()/decimals() results into asset metadata.
+ *
+ * Pure, and separated out because the interesting behaviour is what happens
+ * when the reads *fail*: the public RPC throttles, `allowFailure` returns a
+ * failure for every entry in the batch, and one 429 used to relabel every
+ * asset in the providers table as eight characters of its own address.
+ *
+ * `results` is the flat [symbol, decimals, symbol, decimals, …] array.
+ */
+export function resolveAssetMeta(
+  addresses: readonly string[],
+  results: readonly { status: string; result?: unknown }[],
+  known: readonly { address: string; symbol: string; decimals: number }[] = [],
+): { address: string; symbol: string; decimals: number }[] {
+  const knownBy = new Map(known.map((k) => [k.address.toLowerCase(), k] as const));
+  return addresses.map((a, i) => {
+    const k = knownBy.get(a.toLowerCase());
+    const sym = results[i * 2];
+    const dec = results[i * 2 + 1];
+    const symbolFromChain = sym?.status === "success" ? String(sym.result).trim() : "";
+    const decFromChain = dec?.status === "success" ? Number(dec.result) : NaN;
+    return {
+      address: a.toLowerCase(),
+      // Chain, then what the deployment already knows, then a legible address.
+      symbol: symbolFromChain || k?.symbol || shortAddress(a),
+      // 18 was the old default and it is wrong for every asset in this pool —
+      // it renders a USDC balance as a millionth of itself.
+      decimals: Number.isFinite(decFromChain) ? decFromChain : k?.decimals ?? 18,
+    };
+  });
+}
+
 export interface HolderRow {
   address: string;
   /** Raw per-asset amounts, keyed by lowercased token address. */
@@ -194,7 +237,7 @@ export class HolderReader {
   ): Promise<HolderReport> {
     if (kind === "lending") return this.lending(opts.pool, opts.assets ?? []);
     if (kind === "vault") return this.vault(opts.vault, opts.vaultAsset);
-    if (kind === "amm") return this.amm(opts.amm, opts.poolId ?? 0);
+    if (kind === "amm") return this.amm(opts.amm, opts.poolId ?? 0, opts.assets ?? []);
     return this.swap(opts.router);
   }
 
@@ -274,7 +317,11 @@ export class HolderReader {
 
   // --- AMM -------------------------------------------------------------------
 
-  private async amm(amm: Hex | undefined, poolId: number): Promise<HolderReport> {
+  private async amm(
+    amm: Hex | undefined,
+    poolId: number,
+    known: { address: string; symbol: string; decimals: number }[] = [],
+  ): Promise<HolderReport> {
     if (!amm) return { ...emptyReport("amm"), note: "No AMM is deployed on this network yet." };
 
     const { addresses, progress } = this.addressesFor(amm, "liquidity", "provider");
@@ -283,18 +330,29 @@ export class HolderReader {
     })) as readonly [Hex[], bigint[], number, number, bigint, boolean, string];
     const [assetAddrs, balances, , , totalShares] = info;
 
+    /*
+     * Name the assets, and do not invent a name when the chain won't say.
+     *
+     * The fallback used to be `a.slice(0, 8)` — the first eight characters of
+     * the address — which rendered a provider's position as
+     * "1.5983 0x360000 · 0.625418 0x89B508". Those are not symbols and they are
+     * not even recognisable as addresses; they are the shape of a failed read
+     * wearing the costume of data. And the read fails for a mundane reason:
+     * the public RPC throttles, `allowFailure` hands back a failure for every
+     * entry in the batch, and one 429 relabels every asset in the table.
+     *
+     * The deployment already knows what these tokens are called, so a failed
+     * read should fall back to that rather than to a substring. Only an asset
+     * nobody has ever named gets an address, and then a legible one.
+     */
     const metaRes = await this.public.multicall({
       contracts: assetAddrs.flatMap((a) => [
         { address: a, abi: erc20Abi, functionName: "symbol" } as const,
         { address: a, abi: erc20Abi, functionName: "decimals" } as const,
       ]) as never,
       allowFailure: true,
-    });
-    const meta = assetAddrs.map((a, i) => ({
-      address: a.toLowerCase(),
-      symbol: metaRes[i * 2]?.status === "success" ? String(metaRes[i * 2].result) : a.slice(0, 8),
-      decimals: metaRes[i * 2 + 1]?.status === "success" ? Number(metaRes[i * 2 + 1].result) : 18,
-    }));
+    }).catch(() => [] as { status: string; result?: unknown }[]);
+    const meta = resolveAssetMeta(assetAddrs, metaRes, known);
     if (!addresses.length || totalShares === 0n) {
       return { ...emptyReport("amm"), contract: amm, assets: meta, progress };
     }

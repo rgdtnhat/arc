@@ -2381,6 +2381,25 @@ const $ = (id) => document.getElementById(id);
        * ==================================================================== */
 
       /** Format a raw integer balance for one asset. */
+      /*
+       * A provider's address, short enough that the row still fits.
+       *
+       * The full forty-two characters pushed every other column off a phone
+       * screen — "SHARES" arrived as "HARES" and a share count as "999000" —
+       * so the numbers people actually came to read were the ones that got
+       * cut. The link carries the whole thing, and the title attribute has it
+       * for anyone who wants to copy it.
+       */
+      function holderAddr(addr) {
+        const a = String(addr || "");
+        if (!/^0x[0-9a-fA-F]{40}$/.test(a)) return esc(a);
+        const short = `${a.slice(0, 6)}…${a.slice(-4)}`;
+        return (
+          `<a href="${esc(explorerBase())}/address/${esc(a)}" target="_blank" rel="noopener" ` +
+          `title="${esc(a)}">${esc(short)}</a>`
+        );
+      }
+
       function holdAmount(raw, asset) {
         if (!asset) return raw;
         const n = Number(raw) / 10 ** asset.decimals;
@@ -2488,7 +2507,7 @@ const $ = (id) => document.getElementById(id);
               .join(" · ") || "—";
             return `<tr class="${h.isApp ? "selfRow" : ""}">
               <td class="num muted">${start + i + 1}</td>
-              <td class="mono" style="font-size:11.5px">${esc(h.address)}${h.isApp ? '<span class="appTag">app</span>' : ""}</td>
+              <td class="mono" style="font-size:11.5px">${holderAddr(h.address)}${h.isApp ? '<span class="appTag">app</span>' : ""}</td>
               <td class="num mono">${esc(rank)}</td>
               <td class="num">${h.pct.toFixed(2)}%</td>
               <td style="font-size:12px">${esc(position)}</td>
