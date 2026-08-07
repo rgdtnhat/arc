@@ -57,6 +57,8 @@ const NOT_EXPORTED = {
   MockAggregator: "test-only Chainlink feed stub, used from the Hardhat tests directly",
   MockFlashBorrower: "test-only flash-loan callback, used from the Hardhat tests directly",
   MockSharePool: "test-only stand-in for the pool's share accounting, used from the emissions tests directly",
+  MockFundSink: "test-only pull-funding recipient, used from the emitter tests directly",
+  MockRevertingSink: "test-only always-failing recipient, proves one bad sink cannot block the others",
 };
 
 // --- 1. structural ----------------------------------------------------------
