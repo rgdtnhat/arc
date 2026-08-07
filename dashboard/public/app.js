@@ -147,6 +147,7 @@ const $ = (id) => document.getElementById(id);
           if (route === "gov" && typeof loadGovernance === "function") {
             loadGovernance().catch(() => {});
             if (typeof loadGauge === "function") loadGauge().catch(() => {});
+            if (typeof loadRegistry === "function") loadRegistry().catch(() => {});
           }
         }
         // The document title is now the only "where am I" indicator besides the
@@ -4691,6 +4692,76 @@ const $ = (id) => document.getElementById(id);
               loadEmissions();
             } else govMsg("govEmMsg", r.error || "failed", "var(--warn)");
           } catch { govMsg("govEmMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
+      /* ---- Asset registry ---------------------------------------------------
+       *
+       * What is listed, and what listing something else would take. The one
+       * thing this refuses to blur is whether a listing vote actually enacts
+       * anything: that depends on the governor owning the pool, and a page that
+       * implied otherwise would be selling an authority the contract does not
+       * have.
+       */
+      async function loadRegistry() {
+        const card = $("govRegistryCard");
+        if (!card) return;
+        try {
+          const r = await (await fetch("/api/governance/registry")).json();
+          if (!r || !r.ok || !r.deployed) { card.style.display = "none"; return; }
+          card.style.display = "";
+          window.__registry = r;
+          $("govRegistryNote").textContent = r.enactment;
+          $("govRegistryRows").innerHTML = (r.listed || []).length
+            ? r.listed.map((a) =>
+                `<tr><td><b>${esc(a.symbol)}</b>` +
+                `<div class="muted" style="font-size:11px">${esc(a.address.slice(0, 10))}… · ${a.decimals} dp` +
+                `${a.enabled ? "" : " · disabled"}</div></td>` +
+                `<td class="num mono">$${esc(a.priceUsd.toLocaleString(undefined, { maximumFractionDigits: 2 }))}</td>` +
+                `<td class="num">${esc((a.collateralBps / 100).toFixed(0))}%</td>` +
+                `<td class="num">${esc((a.liquidationBps / 100).toFixed(0))}%</td>` +
+                `<td class="num">${esc((a.reserveBps / 100).toFixed(0))}%</td>` +
+                `<td class="num">${a.borrowable ? "yes" : "collateral only"}</td></tr>`).join("")
+            : emptyRow(6, "Nothing listed yet.");
+          $("govRegistryPropose").style.display = adminId ? "" : "none";
+        } catch {
+          card.style.display = "none";
+        }
+      }
+
+      if ($("regPropose")) {
+        $("regPropose").addEventListener("click", async () => {
+          const body = {
+            asset: ($("regAsset").value || "").trim(),
+            priceUsd: Number(($("regPrice").value || "0").trim()),
+            collateralBps: Number($("regCollateral").value),
+            liquidationBps: Number($("regLiquidation").value),
+            liabilityBps: Number($("regLiability").value),
+            reserveBps: Number($("regReserve").value),
+            borrowable: $("regBorrowable").checked,
+          };
+          try {
+            // Encode first: the parameters are checked against the pool's own
+            // bounds before a vote is opened on them, not after it passes.
+            const enc = await (await postJson("/api/governance/registry/encode", body)).json();
+            if (!enc.ok) { govMsg("regMsg", enc.error || "failed", "var(--warn)"); return; }
+            $("regSummary").textContent = enc.summary;
+
+            const r = await (await postJson("/api/governance/propose", {
+              title: `List ${enc.symbol} as a reserve`,
+              description: enc.summary +
+                (window.__registry && window.__registry.governorOwnsPool
+                  ? " Passing this executes the listing."
+                  : " The pool is operator-owned, so passing this is a mandate the operator carries out."),
+              targets: [enc.target],
+              calldatas: [enc.data],
+            })).json();
+            if (r.ok) {
+              govMsg("regMsg", `Listing proposal opened. Voting is live. — ${r.txHash}`, "var(--good)");
+              $("regAsset").value = ""; $("regPrice").value = "";
+              loadGovernance();
+            } else govMsg("regMsg", r.error || "failed", "var(--warn)");
+          } catch { govMsg("regMsg", "Request failed.", "var(--warn)"); }
         });
       }
 

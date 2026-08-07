@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
-import { verifyMessage, verifyTypedData, formatUnits, toFunctionSelector, keccak256, toHex } from "viem";
+import { verifyMessage, verifyTypedData, formatUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID } from "node:crypto";
 import {
@@ -4854,6 +4854,104 @@ async function main() {
   const emitterAddr = (liveDeployment.tesseraEmitter as Hex) ?? null;
   const KEEPER_MS = Math.max(60_000, Number(process.env.TESSERA_EMITTER_KEEPER_MS ?? 15 * 60_000));
   let keeperBusy = false;
+
+  /**
+   * Addresses to keep settled against the reward streams.
+   *
+   * Emissions accrue against a *checkpoint*, and the pool cannot call the
+   * emissions contract, so a supplier who has never been checkpointed accrues
+   * nothing at all and one who has grown their position accrues on the smaller
+   * old figure. The contract's own note says the front end settles people on
+   * every position refresh — it did not, so every reward on this deployment was
+   * quietly reading zero.
+   *
+   * `checkpoint` is permissionless and callable for anybody, which is what
+   * makes fixing it from here legitimate rather than a privilege. The set is
+   * filled by the read endpoints, so it holds people who have actually looked
+   * at their position, and it is capped so a stream of addresses cannot turn
+   * the keeper into an unbounded gas bill.
+   */
+  const KEEPER_WATCH_MAX = 200;
+  const watched = new Set<string>();
+  const watch = (who: Hex | null) => {
+    if (!who) return;
+    const key = who.toLowerCase();
+    if (watched.has(key)) return;
+    if (watched.size >= KEEPER_WATCH_MAX) return;
+    watched.add(key);
+  };
+
+  /** Settle anybody whose recorded share count no longer matches the chain. */
+  const settleStale = async () => {
+    if (!watched.size) return;
+    const targets = [...watched] as Hex[];
+
+    if (emissionsAddr && poolDeployment) {
+      const assets = poolDeployment.assets.map((a) => a.address as Hex);
+      for (const who of targets) {
+        const stale: { asset: Hex; side: number }[] = [];
+        for (const asset of assets) {
+          for (const side of [0, 1]) {
+            try {
+              const [, recorded] = (await client.public.readContract({
+                address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "positions", args: [asset, side, who],
+              })) as readonly [bigint, bigint, bigint];
+              const live = (await client.public.readContract({
+                address: poolDeployment.poolAddress, abi: tesseraPoolAbi,
+                functionName: side === 0 ? "supplyShares" : "borrowShares", args: [asset, who],
+              })) as bigint;
+              // Nothing on either side of the comparison means nothing to do;
+              // a difference means the books and the position disagree.
+              if (live === 0n && recorded === 0n) continue;
+              if (live !== recorded) stale.push({ asset, side });
+            } catch {
+              /* a reserve that will not answer is not worth a transaction */
+            }
+          }
+        }
+        if (!stale.length) continue;
+        try {
+          const txHash = await owner!.write(emissionsAddr, tesseraEmissionsAbi, "checkpointMany", [
+            who, stale.map((x) => x.asset), stale.map((x) => x.side),
+          ]);
+          console.log(`[emissions] settled ${who.slice(0, 10)}… across ${stale.length} stream(s) ${txHash}`);
+        } catch (e) {
+          console.error(`[emissions] checkpoint for ${who.slice(0, 10)}… failed: ${String(e).slice(0, 120)}`);
+        }
+      }
+    }
+
+    if (lpEmissionsAddr && ammClient) {
+      const poolCount = (await client.public.readContract({
+        address: ammClient.amm, abi: tesseraAmmAbi, functionName: "poolCount",
+      })) as bigint;
+      for (const who of targets) {
+        const stale: bigint[] = [];
+        for (let id = 0n; id < poolCount; id++) {
+          try {
+            const [, recorded] = (await client.public.readContract({
+              address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "positions", args: [id, who],
+            })) as readonly [bigint, bigint, bigint];
+            const live = (await client.public.readContract({
+              address: ammClient.amm, abi: tesseraAmmAbi, functionName: "sharesOf", args: [id, who],
+            })) as bigint;
+            if (live === 0n && recorded === 0n) continue;
+            if (live !== recorded) stale.push(id);
+          } catch {
+            /* same */
+          }
+        }
+        if (!stale.length) continue;
+        try {
+          const txHash = await owner!.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "checkpointMany", [who, stale]);
+          console.log(`[emissions] settled ${who.slice(0, 10)}… across ${stale.length} pool(s) ${txHash}`);
+        } catch (e) {
+          console.error(`[emissions] LP checkpoint for ${who.slice(0, 10)}… failed: ${String(e).slice(0, 120)}`);
+        }
+      }
+    }
+  };
+
   setInterval(async () => {
     if (process.env.TESSERA_EMITTER_KEEPER === "off") return;
     if (keeperBusy || !owner || !emitterAddr) return;
@@ -4877,6 +4975,9 @@ async function main() {
           console.error(`[emitter] sink ${i} failed: ${String(e).slice(0, 140)}`);
         }
       }
+      // Funding the pots is only half of it: somebody has to be earning from
+      // them, and nobody is until they are checkpointed at least once.
+      await settleStale();
     } catch (e) {
       console.error(`[emitter] keeper round failed: ${String(e).slice(0, 140)}`);
     } finally {
@@ -4909,6 +5010,7 @@ async function main() {
     try {
       const user = String(req.query.user ?? "");
       const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+      watch(who);
       const assets = poolDeployment.assets;
 
       const read = <T,>(fn: string, args: unknown[]): Promise<T> =>
@@ -5123,6 +5225,7 @@ async function main() {
     try {
       const user = String(req.query.user ?? "");
       const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+      watch(who);
       const read = <T,>(fn: string, args: unknown[] = []): Promise<T> =>
         client.public.readContract({
           address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: fn as never, args: args as never,
@@ -5808,9 +5911,200 @@ async function main() {
       const title = String(req.body?.title ?? "").trim();
       const description = String(req.body?.description ?? "").trim();
       if (!title) { res.status(400).json({ ok: false, error: "a proposal needs a title" }); return; }
-      const txHash = await owner.write(governorAddr, tesseraGovernorAbi, "propose", [title, description, [], []]);
-      logTx(req, { category: "defi", action: "gov-propose", status: "success", txHash, detail: title });
+
+      /*
+       * A proposal may carry calls the governor will make if it passes.
+       *
+       * Until now this endpoint only opened signalling proposals, which made
+       * every governance decision an instruction to the operator rather than a
+       * result the protocol enacts. The governor has always supported calls;
+       * nothing was passing them.
+       */
+      const rawTargets = Array.isArray(req.body?.targets) ? req.body.targets : [];
+      const rawCalldatas = Array.isArray(req.body?.calldatas) ? req.body.calldatas : [];
+      if (rawTargets.length !== rawCalldatas.length) {
+        res.status(400).json({ ok: false, error: "each target needs one calldata" });
+        return;
+      }
+      if (rawTargets.length > 8) {
+        res.status(400).json({ ok: false, error: "a proposal carries at most 8 calls" });
+        return;
+      }
+      const targets: Hex[] = [];
+      const calldatas: Hex[] = [];
+      for (let i = 0; i < rawTargets.length; i++) {
+        const t = String(rawTargets[i]);
+        const d = String(rawCalldatas[i]);
+        if (!/^0x[0-9a-fA-F]{40}$/.test(t)) {
+          res.status(400).json({ ok: false, error: `call ${i + 1} has a bad target address` });
+          return;
+        }
+        // Even-length hex with at least a selector: a malformed calldata would
+        // open a proposal that can only ever revert on execution, and nobody
+        // finds that out until the vote has already been held.
+        if (!/^0x([0-9a-fA-F]{2})+$/.test(d) || d.length < 10) {
+          res.status(400).json({ ok: false, error: `call ${i + 1} has malformed calldata` });
+          return;
+        }
+        targets.push(t as Hex);
+        calldatas.push(d as Hex);
+      }
+
+      const txHash = await owner.write(
+        governorAddr, tesseraGovernorAbi, "propose", [title, description, targets, calldatas],
+      );
+      logTx(req, {
+        category: "defi", action: "gov-propose", status: "success", txHash,
+        detail: `${title}${targets.length ? ` (${targets.length} call${targets.length === 1 ? "" : "s"})` : ""}`,
+      });
       res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * The asset registry: what the protocol has listed, and what it would take
+   * to list something else.
+   *
+   * Aquarius's registry is a whitelist governed by vote. Ours reports the same
+   * thing honestly, including the part that is usually left out: a proposal can
+   * only *enact* a listing if the governor actually owns the pool. Where it
+   * does not, the vote is a mandate the operator carries out, and the page says
+   * so rather than implying an authority the contract does not have.
+   */
+  app.get("/api/governance/registry", async (_req, res) => {
+    if (!poolDeployment) {
+      res.json({ ok: true, deployed: false, note: "No lending pool on this deployment." });
+      return;
+    }
+    try {
+      const poolAddr = poolDeployment.poolAddress;
+      const poolOwner = (await client.public
+        .readContract({ address: poolAddr, abi: tesseraPoolAbi, functionName: "owner" })
+        .catch(() => null)) as Hex | null;
+      const count = (await client.public.readContract({
+        address: poolAddr, abi: tesseraPoolAbi, functionName: "reserveCount",
+      })) as bigint;
+
+      const listed = await Promise.all(
+        Array.from({ length: Number(count) }, (_, i) => BigInt(i)).map(async (i) => {
+          const asset = (await client.public.readContract({
+            address: poolAddr, abi: tesseraPoolAbi, functionName: "reserveList", args: [i],
+          })) as Hex;
+          const r = (await client.public.readContract({
+            address: poolAddr, abi: tesseraPoolAbi, functionName: "reserves", args: [asset],
+          })) as readonly unknown[];
+          const meta = await tokenMeta(asset);
+          return {
+            address: asset,
+            symbol: meta.symbol,
+            decimals: meta.decimals,
+            resolved: meta.resolved,
+            enabled: Boolean(r[0]),
+            borrowable: Boolean(r[1]),
+            collateralBps: Number(r[3]),
+            liquidationBps: Number(r[4]),
+            liabilityBps: Number(r[5]),
+            reserveBps: Number(r[6]),
+            priceUsd: Number(r[PRICE_IX] as bigint) / 1e8,
+          };
+        }),
+      );
+
+      const governorOwnsPool =
+        Boolean(governorAddr) && Boolean(poolOwner) && poolOwner!.toLowerCase() === governorAddr!.toLowerCase();
+
+      res.json({
+        ok: true,
+        deployed: true,
+        pool: poolAddr,
+        poolOwner,
+        governor: governorAddr,
+        // The distinction that decides whether a listing vote is binding.
+        governorOwnsPool,
+        enactment: governorOwnsPool
+          ? "A listing proposal executes itself once it passes and waits out the delay."
+          : "The pool is owned by the operator, so a listing proposal is a mandate rather than an execution. " +
+            "Transfer the pool's ownership to the governor to make listing votes self-enacting.",
+        listed,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Encode an `addReserve` call so a listing proposal can carry it.
+   *
+   * Built server-side because the risk parameters have to be validated against
+   * the same bounds the pool enforces before anybody votes on them — a
+   * proposal that passes and then reverts on `BadRiskParams` has wasted a
+   * quorum, and the voters have no way to have known.
+   */
+  app.post("/api/governance/registry/encode", requireOperator, async (req, res) => {
+    if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
+    try {
+      const asset = String(req.body?.asset ?? "");
+      if (!/^0x[0-9a-fA-F]{40}$/.test(asset)) { res.status(400).json({ ok: false, error: "bad asset address" }); return; }
+      const num = (k: string, d: number) => {
+        const v = Number(req.body?.[k]);
+        return Number.isFinite(v) ? v : d;
+      };
+      const cFactor = num("collateralBps", 7500);
+      const liqFactor = num("liquidationBps", 8500);
+      const lFactor = num("liabilityBps", 9500);
+      const reserveFactor = num("reserveBps", 1000);
+      const borrowable = Boolean(req.body?.borrowable);
+      const priceUsd = Number(req.body?.priceUsd ?? 0);
+
+      // The pool's own ordering rule: collateral ≤ liquidation, and neither a
+      // factor nor the reserve cut may reach 100%.
+      for (const [name, v] of [["collateral", cFactor], ["liquidation", liqFactor], ["liability", lFactor], ["reserve", reserveFactor]] as const) {
+        if (!Number.isInteger(v) || v <= 0 || v >= 10_000) {
+          res.status(400).json({ ok: false, error: `the ${name} factor must be between 1 and 9999 basis points` });
+          return;
+        }
+      }
+      if (cFactor > liqFactor) {
+        res.status(400).json({ ok: false, error: "the collateral factor cannot exceed the liquidation factor" });
+        return;
+      }
+      if (priceUsd <= 0) { res.status(400).json({ ok: false, error: "a listing needs an opening price" }); return; }
+
+      const meta = await tokenMeta(asset as Hex);
+      if (!meta.resolved) {
+        res.status(400).json({
+          ok: false,
+          error: "That address does not answer `symbol()` and `decimals()`, so it cannot be listed safely.",
+        });
+        return;
+      }
+      const alreadyListed = (await client.public
+        .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "reserves", args: [asset as Hex] })
+        .then((r) => Boolean((r as readonly unknown[])[0]))
+        .catch(() => false));
+      if (alreadyListed) { res.status(400).json({ ok: false, error: "that asset is already listed" }); return; }
+
+      const data = encodeFunctionData({
+        abi: tesseraPoolAbi,
+        functionName: "addReserve",
+        args: [
+          asset as Hex, cFactor, liqFactor, lFactor, reserveFactor, borrowable,
+          meta.decimals, BigInt(Math.round(priceUsd * 1e8)),
+        ],
+      });
+      res.json({
+        ok: true,
+        target: poolDeployment.poolAddress,
+        data,
+        symbol: meta.symbol,
+        decimals: meta.decimals,
+        summary:
+          `List ${meta.symbol} (${meta.decimals} dp) at $${priceUsd}, ` +
+          `${cFactor / 100}% collateral, ${liqFactor / 100}% liquidation, ` +
+          `${reserveFactor / 100}% reserve cut, ${borrowable ? "borrowable" : "collateral only"}.`,
+      });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }

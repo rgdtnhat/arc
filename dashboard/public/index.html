@@ -2401,6 +2401,47 @@
             <div class="msg" id="gaAdminMsg" style="display:none"></div>
           </div>
 
+          <div class="card" id="govRegistryCard">
+            <h2>Asset registry — what the protocol has listed</h2>
+            <div class="kv" id="govRegistryNote" style="margin-bottom:10px"></div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr>
+                <th>Asset</th><th class="num">Price</th><th class="num">Collateral</th>
+                <th class="num">Liquidation</th><th class="num">Reserve cut</th><th class="num">Borrowable</th>
+              </tr></thead>
+              <tbody id="govRegistryRows"></tbody>
+            </table></div>
+
+            <div id="govRegistryPropose" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+              <b style="font-size:13px">Propose a listing</b>
+              <div class="kv" style="margin:3px 0 10px">
+                Operator only. The proposal carries the real <span class="mono">addReserve</span> call, and the
+                risk parameters are checked against the pool's own bounds before anybody votes — a proposal
+                that passes and then reverts has wasted a quorum, and the voters had no way to know.
+              </div>
+              <div class="row-actions" style="flex-wrap:wrap">
+                <input id="regAsset" class="field" placeholder="Token address 0x…" style="min-width:330px" />
+                <input id="regPrice" class="field" inputmode="decimal" placeholder="Opening price $" style="width:150px" />
+              </div>
+              <div class="row-actions" style="flex-wrap:wrap;margin-top:8px">
+                <label class="kv">Collateral bps</label>
+                <input id="regCollateral" class="field" inputmode="numeric" value="7500" style="width:100px" />
+                <label class="kv">Liquidation bps</label>
+                <input id="regLiquidation" class="field" inputmode="numeric" value="8500" style="width:100px" />
+                <label class="kv">Liability bps</label>
+                <input id="regLiability" class="field" inputmode="numeric" value="9500" style="width:100px" />
+                <label class="kv">Reserve bps</label>
+                <input id="regReserve" class="field" inputmode="numeric" value="1000" style="width:100px" />
+                <label class="kv"><input type="checkbox" id="regBorrowable" checked /> borrowable</label>
+              </div>
+              <div class="row-actions" style="margin-top:10px">
+                <button class="btn primary" id="regPropose">Open a listing proposal</button>
+                <span class="kv" id="regSummary"></span>
+              </div>
+              <div class="msg" id="regMsg" style="display:none"></div>
+            </div>
+          </div>
+
           <div class="card">
             <h2>The lock</h2>
             <div class="kv" style="margin-bottom:10px">
