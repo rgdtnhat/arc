@@ -1192,7 +1192,24 @@
             </div>
           </div>
 
-          
+          <!-- Standing token approvals for the connected wallet. Hidden until
+               there is something to say, and loud when the something is an
+               unlimited grant — those outlive the action they were made for. -->
+          <div class="card" id="allowanceCard" style="display:none">
+            <h2>Token approvals from your wallet</h2>
+            <p class="kv" style="margin:0 0 10px">
+              An approval lets a contract move that token on your behalf until you take it back.
+              Tessera now asks for the exact amount each time, but older grants may still be standing.
+            </p>
+            <div id="allowanceRows" style="display:flex;flex-direction:column;gap:8px"></div>
+            <div class="row-actions" style="margin-top:10px">
+              <button class="btn" id="allowRefresh">Refresh</button>
+              <button class="btn primary" id="allowRevokeAll" style="display:none">Revoke all unlimited</button>
+            </div>
+            <div class="msg" id="allowanceMsg" style="display:none"></div>
+          </div>
+
+
 
           <!-- One tab per DeFi function. Four long cards in a column meant
                scrolling past three to reach the fourth; the strip stays pinned

@@ -24,7 +24,8 @@
 //    v26: reads refuse to run off Arc, one amount parser, exact approvals.
 //    v27: the tick waits for the receipt; borrow/repay caps follow the signer.
 //    v28: the swap desk refuses a trade worth far less than it costs.
-const CACHE = "tessera-v28";
+//    v29: standing token approvals are visible and revocable in one tap.
+const CACHE = "tessera-v29";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

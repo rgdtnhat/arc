@@ -1272,6 +1272,7 @@ const $ = (id) => document.getElementById(id);
             setWallet(r.address);
             refreshProfile();
             refreshMyPositions().catch(() => {});
+            if (typeof loadAllowances === "function") loadAllowances().catch(() => {});
           } else {
             alert("Sign-in failed: " + r.error);
           }
@@ -3865,6 +3866,117 @@ const $ = (id) => document.getElementById(id);
         const t = $("selfCustodyToggle");
         return !!(t && t.checked && hasInjectedWallet());
       };
+      /* ---- Standing token approvals ---------------------------------------
+       *
+       * Until this session the app approved `type(uint256).max` on every
+       * supply, deposit and swap. Auditing a real wallet on Arc found three of
+       * those still live — pool, vault and AMM each holding an unlimited
+       * standing permission over its USDC, granted for a single 1-USDC action
+       * months ago and outliving it by design.
+       *
+       * Approving exactly the amount stops new ones. It does nothing about the
+       * grants already out there, and those are the ones that matter: an
+       * unlimited approval is a promise that whoever controls that contract —
+       * now or after an upgrade — can take the whole balance. Every approval
+       * drain of the last two years ran through one.
+       *
+       * So: show them, and make taking them back one tap.
+       */
+      const MAX_UINT = (1n << 256n) - 1n;
+      // Treat anything within a hair of 2^256-1 as unlimited: a max approval
+      // that has been partially spent is still, for every practical purpose,
+      // unlimited — and that is exactly what a legacy grant looks like today.
+      const isUnlimited = (v) => v > MAX_UINT / 2n;
+
+      function allowMsg(text, colour) {
+        const m = $("allowanceMsg");
+        if (!m) return;
+        m.style.display = "block"; m.textContent = text; m.style.color = colour || "var(--muted)";
+      }
+
+      async function loadAllowances() {
+        const card = $("allowanceCard");
+        if (!card) return;
+        if (!selfMode() || !eth()) { card.style.display = "none"; return; }
+        let from, cfg;
+        try {
+          const [a] = await eth().request({ method: "eth_accounts" });
+          from = a;
+          if (!from || !(await onArc())) { card.style.display = "none"; return; }
+          cfg = await loadDefiConfig();
+        } catch { card.style.display = "none"; return; }
+
+        const spenders = [
+          ["Lending pool", cfg.pool], ["Yield vault", cfg.vault],
+          ["Swap router", cfg.router], ["Liquidity pools", cfg.amm],
+        ].filter(([, addr]) => addr);
+        const assets = (cfg.assets || []).filter((a) => a && a.address);
+
+        const rows = [];
+        await Promise.all(
+          assets.flatMap((a) =>
+            spenders.map(async ([label, spender]) => {
+              try {
+                const hex = await ethCall(
+                  a.address, callData(cfg.selectors.allowance, encAddr(from), encAddr(spender)),
+                );
+                const v = BigInt(hex || "0x0");
+                if (v > 0n) rows.push({ asset: a, label, spender, value: v });
+              } catch { /* a failed read is not a zero allowance — just omit it */ }
+            }),
+          ),
+        );
+
+        if (!rows.length) { card.style.display = "none"; return; }
+        card.style.display = "";
+        // Unlimited first: it is the one worth acting on.
+        rows.sort((x, y) => (isUnlimited(y.value) ? 1 : 0) - (isUnlimited(x.value) ? 1 : 0));
+        const unlimited = rows.filter((r) => isUnlimited(r.value));
+        card.style.borderColor = unlimited.length
+          ? "color-mix(in srgb, var(--warn) 45%, var(--line))" : "";
+
+        $("allowanceRows").innerHTML = rows
+          .map((r, i) => {
+            const dec = Number(r.asset.decimals ?? 6);
+            const amount = isUnlimited(r.value)
+              ? `<b style="color:var(--warn)">unlimited</b>`
+              : `${esc(fmtUnitsStr(r.value, dec))} ${esc(r.asset.symbol)}`;
+            return (
+              `<div class="row-actions" style="justify-content:space-between;gap:10px;flex-wrap:wrap">` +
+              `<span class="kv" style="flex:1;min-width:200px">` +
+              `<b>${esc(r.asset.symbol)}</b> → ${esc(r.label)}: ${amount}</span>` +
+              `<button class="btn" data-revoke="${i}">Revoke</button></div>`
+            );
+          })
+          .join("");
+        $("allowRevokeAll").style.display = unlimited.length > 1 ? "" : "none";
+
+        const revoke = async (r) => {
+          await selfCustody("allowanceMsg", `revoke ${r.asset.symbol} for ${r.label}`, async (fromAddr, c) =>
+            sendTx(fromAddr, r.asset.address, c.selectors.approve + encAddr(r.spender) + encUint(0)),
+          );
+          loadAllowances();
+        };
+        $("allowanceRows").querySelectorAll("[data-revoke]").forEach((btn) => {
+          btn.addEventListener("click", () => revoke(rows[Number(btn.dataset.revoke)]));
+        });
+        $("allowRevokeAll").onclick = async () => {
+          // One at a time. Firing four approvals at a wallet at once produces
+          // four stacked prompts and no way to tell which is which.
+          for (const r of unlimited) await revoke(r);
+        };
+        if (unlimited.length) {
+          allowMsg(
+            `${unlimited.length} unlimited approval${unlimited.length > 1 ? "s" : ""} standing. ` +
+            `Each one lets that contract move all of your ${unlimited.map((r) => r.asset.symbol).join(", ")} ` +
+            `at any time. Revoking costs one transaction and breaks nothing — the app re-approves the exact ` +
+            `amount next time you act.`,
+            "var(--warn)",
+          );
+        } else allowMsg("No unlimited approvals. Everything below is a bounded leftover.", "var(--muted)");
+      }
+      if ($("allowRefresh")) $("allowRefresh").addEventListener("click", () => loadAllowances());
+
       (function reflectWalletAvailability() {
         const t = $("selfCustodyToggle");
         if (!t || hasInjectedWallet()) return;
@@ -3883,6 +3995,7 @@ const $ = (id) => document.getElementById(id);
         $("selfCustodyToggle").addEventListener("change", () => {
           const on = selfMode();
           if (!on) clearMine(); else refreshMyPositions().catch(() => {});
+          if (typeof loadAllowances === "function") loadAllowances().catch(() => {});
           $("custodyNote").textContent = on
             ? "Self-custody: your wallet signs and your own funds move. No sign-in needed. " +
               "(Position figures below track the app's agent wallet; your own balances live in your wallet.)"
@@ -5848,6 +5961,8 @@ const $ = (id) => document.getElementById(id);
       document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
       // Keep the user's own figures in step with the agent-state refresh.
       setInterval(() => { refreshMyPositions().catch(() => {}); }, 12000);
+      // Approvals change rarely; a slow poll keeps the panel honest without noise.
+      setInterval(() => { if (typeof loadAllowances === "function") loadAllowances().catch(() => {}); }, 60000);
       window.addEventListener("focus", () => tick());
       window.addEventListener("online", () => tick());
       if (eth() && eth().on) {

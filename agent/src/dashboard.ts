@@ -74,7 +74,7 @@ interface PoolDeploymentRef {
   assets: PoolAsset[];
 }
 import { TesseraTreasury } from "./treasury.js";
-import { TesseraPoolClient } from "./pool.js";
+import { TesseraPoolClient, PRICE_IX } from "./pool.js";
 import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
@@ -140,7 +140,16 @@ const liveDeployment = (() => {
       const d = JSON.parse(readFileSync(path.join(dir, name), "utf8"));
       if (d && d.tesseraEscrow) {
         if (name === "arc.local.json") console.log("[deployment] using deployments/arc.local.json (local override)");
-        return { ...d, explorer: process.env.ARC_EXPLORER_URL ?? "https://testnet.arcscan.app" };
+        // `??` only falls back on undefined/null, so ARC_EXPLORER_URL="" — which
+        // is what an unset-but-declared variable looks like in a compose file —
+        // sailed through as an empty explorer. Every receipt link then rendered
+        // as a relative "/tx/0x…" and 404'd on the site's own domain. Blank or
+        // non-absolute means unset.
+        const envExplorer = String(process.env.ARC_EXPLORER_URL ?? "").trim();
+        const explorer = /^https?:\/\//.test(envExplorer)
+          ? envExplorer.replace(/\/+$/, "")
+          : "https://testnet.arcscan.app";
+        return { ...d, explorer };
       }
     } catch {
       /* try the next candidate */
@@ -237,11 +246,15 @@ async function main() {
         // deploy script; USDC alone is the fallback for a bare deployment.
         assets:
           Array.isArray(liveDeployment.poolAssets) && liveDeployment.poolAssets.length
-            ? (liveDeployment.poolAssets as { symbol: string; address: string }[]).map((a) => ({
+            ? (liveDeployment.poolAssets as { symbol: string; address: string; decimals?: number }[]).map((a) => ({
                 symbol: a.symbol,
                 address: a.address as Hex,
+                // Carried through, not dropped. The browser formats raw
+                // integers with this, and a missing value defaults to 6 — which
+                // renders cirBTC's 8 decimals a hundred times too large.
+                decimals: Number(a.decimals ?? 6),
               }))
-            : [{ symbol: "USDC", address: usdcAddress }],
+            : [{ symbol: "USDC", address: usdcAddress, decimals: 6 }],
       }
     : null;
   console.log(`🔴 LIVE on ${chainLabel} — agent ${agentAccount.address}`);
@@ -2794,20 +2807,54 @@ async function main() {
        * its value, so the check that matters is value in against value out at
        * the marks the pool itself uses for collateral.
        */
-      const markOf = (t: Hex) => {
+      const cachedMark = (t: Hex) => {
         const row = (lastLending?.assets ?? []).find(
           (x) => x.address.toLowerCase() === t.toLowerCase(),
         );
         const raw = row && "priceE8" in row ? (row as { priceE8?: string }).priceE8 : undefined;
         return raw ? BigInt(raw) : 0n;
       };
+      /*
+       * Fall back to the pool itself when the cache is cold.
+       *
+       * `lastLending` is populated by a background refresh, so for the first
+       * seconds after a restart it is empty — and a missing mark makes
+       * `valueCheck` return null, which the client reads as "no verdict" and
+       * lets through. A guard that is disarmed for the first fifteen seconds of
+       * every deploy is not a guard. Two reads close it.
+       */
+      const markOf = async (t: Hex): Promise<bigint> => {
+        const cached = cachedMark(t);
+        if (cached > 0n) return cached;
+        if (!poolDeployment) return 0n;
+        try {
+          const r = (await client.public.readContract({
+            address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "reserves", args: [t],
+          })) as readonly unknown[];
+          return r[PRICE_IX] as bigint;
+        } catch {
+          return 0n;
+        }
+      };
+      const [markIn, markOut] = out > 0n
+        ? await Promise.all([markOf(tokenIn), markOf(tokenOut)])
+        : [0n, 0n];
       const value = out > 0n
         ? valueCheck({
-            amountIn, decimalsIn: inMeta.decimals, priceInE8: markOf(tokenIn), symbolIn: inMeta.symbol,
-            amountOut: out, decimalsOut: outMeta.decimals, priceOutE8: markOf(tokenOut), symbolOut: outMeta.symbol,
+            amountIn, decimalsIn: inMeta.decimals, priceInE8: markIn, symbolIn: inMeta.symbol,
+            amountOut: out, decimalsOut: outMeta.decimals, priceOutE8: markOut, symbolOut: outMeta.symbol,
           })
         : null;
       if (value && value.severity !== "fine") blockers.push(value.reason);
+      // Say when the check could not run. Silence here is indistinguishable
+      // from a clean bill of health, and this endpoint's whole job is to be
+      // the thing that tells you before you sign.
+      if (out > 0n && !value) {
+        blockers.push(
+          `Could not value this trade — no on-chain mark for ` +
+          `${markIn > 0n ? outMeta.symbol : inMeta.symbol}. Check the rate yourself before signing.`,
+        );
+      }
 
       res.json({
         ok: true,
