@@ -312,7 +312,7 @@ export class TesseraPoolClient {
       functionName: "reserves",
       args: [asset],
     })) as ReserveTuple;
-    return { enabled: r[0], borrowable: r[1], decimals: Number(r[2]), priceE8: r[PRICE_IX] };
+    return { enabled: r[0], borrowable: r[1], decimals: Number(r[2]), priceE8: r[PRICE_IX], cFactorBps: Number(r[3]), lFactorBps: Number(r[5]) };
   }
 
   /**
@@ -364,7 +364,9 @@ export class TesseraPoolClient {
       const priceOk = okR?.status === "success" ? Boolean(okR.result) : true;
       if (cfgR.status !== "success") return { asset, ok: false as const };
       const c = cfgR.result as ReserveTuple;
-      const cfg = { enabled: c[0], borrowable: c[1], decimals: Number(c[2]), priceE8: c[PRICE_IX] };
+      // Index 3 is cFactor — see the ReserveTuple comment above; the struct
+      // carries four uint16 risk parameters before the price.
+      const cfg = { enabled: c[0], borrowable: c[1], decimals: Number(c[2]), priceE8: c[PRICE_IX], cFactorBps: Number(c[3]), lFactorBps: Number(c[5]) };
       if (!cfg.enabled) return { asset, ok: true as const, cfg, meta, priceOk, reserve: null, supplied: 0n, borrowed: 0n, wallet: 0n };
       if (dataR.status !== "success") return { asset, ok: false as const };
       const d = dataR.result as readonly [bigint, bigint, bigint, bigint, bigint];

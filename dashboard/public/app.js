@@ -862,10 +862,32 @@ const $ = (id) => document.getElementById(id);
         if (res.status === 401) {
           alert("Please sign in first — Connect Wallet or use the Admin button.");
         } else if (res.status === 403) {
-          alert(
-            "This action spends the agent's own wallet, so it's operator-only — sign in with the Admin button.\n\n" +
-              "Connected wallets can view everything and get live quotes."
-          );
+          /*
+           * Two very different situations reach this branch, and telling them
+           * apart is the difference between a dead end and one tap.
+           *
+           * Somebody with a wallet right there does not need an admin
+           * password; they need self-custody switched on. Sending them to the
+           * Admin button was what made the vault, the swap desk and the
+           * liquidity pools look agent-only to a connected user — every one of
+           * them already has a working self-custody path.
+           */
+          const t = $("selfCustodyToggle");
+          if (typeof hasInjectedWallet === "function" && hasInjectedWallet() && t && !t.checked) {
+            if (confirm(
+              "This went to the app's agent wallet, which is operator-only.\n\n" +
+              "You have a wallet connected, so you can do this with your own funds instead — " +
+              "switch on \"Use my own wallet\" and try again?\n\nOK turns it on for you.",
+            )) {
+              t.checked = true;
+              t.dispatchEvent(new Event("change"));
+            }
+          } else {
+            alert(
+              "This action spends the agent's own wallet, so it's operator-only — sign in with the Admin button.\n\n" +
+                "Connect a wallet and switch on \"Use my own wallet\" to transact with your own funds instead.",
+            );
+          }
         }
         return res;
       }
@@ -1374,10 +1396,46 @@ const $ = (id) => document.getElementById(id);
           // Free liquidity in the reserve, which caps both withdrawing and
           // borrowing no matter whose account is asking.
           const cash = BigInt((a.reserve && a.reserve.cashRaw) || "0");
+          const acctPre = window.__myAccount;
+          const priceRaw = BigInt(a.priceE8 || "0");
+          const cFactor = BigInt(a.cFactorBps || 0);
+          /*
+           * A "Max" that lands exactly on the liquidation boundary always
+           * reverts, because the boundary moves between the read and the block.
+           *
+           * Interest accrues every second. Borrowing the whole headroom puts
+           * the health factor at exactly 1.0 at the moment of the read, and by
+           * the time the transaction is mined the debt has grown — so the pool
+           * refuses it. Same for withdrawing the last unit of collateral that
+           * is holding a loan up. Leaving half a percent turns a Max that
+           * always fails into one that always works.
+           */
+          const SAFE_NUM = 995n, SAFE_DEN = 1000n;
           if (pos) {
-            // Withdraw is bounded by your own supply, then by the pool's cash.
             const mineSup = BigInt(pos.supplied || "0");
-            const wd = cash > 0n && cash < mineSup ? cash : mineSup;
+            let wd = cash > 0n && cash < mineSup ? cash : mineSup;
+            /*
+             * Collateral holding up a loan cannot all come out.
+             *
+             * The cap was your supply capped by pool cash — with no reference
+             * to your own debt. Supply 5 and borrow 4, and it offered to
+             * withdraw all 5, which drops the borrow limit under the debt and
+             * reverts the whole transaction.
+             *
+             * Withdrawing Δ of this asset lowers the borrow limit by
+             * Δ × price × cFactor, so the most that may leave is the headroom
+             * divided by that weight.
+             */
+            const owed = acctPre && acctPre.liability != null
+              ? BigInt(acctPre.liability)
+              : acctPre ? BigInt(acctPre.borrowValue || "0") : 0n;
+            if (owed > 0n && priceRaw > 0n && cFactor > 0n) {
+              const limit = acctPre ? BigInt(acctPre.borrowLimit || "0") : 0n;
+              const head = limit > owed ? limit - owed : 0n;
+              const byDebt = (head * 10n ** BigInt(dec) * 10_000n) / (priceRaw * cFactor);
+              const safe = (byDebt * SAFE_NUM) / SAFE_DEN;
+              if (safe < wd) wd = safe;
+            }
             a.max.withdraw = fmtUnitsStr(wd, dec);
             a.max.withdrawRaw = wd.toString();
             a.position = {
@@ -1405,9 +1463,20 @@ const $ = (id) => document.getElementById(id);
             let cap = 0n;
             if (a.borrowable) {
               const limit = BigInt(acct.borrowLimit || "0");
-              const used = BigInt(acct.borrowValue || "0");
-              const headroom = limit > used ? limit - used : 0n;
-              cap = (headroom * 10n ** BigInt(dec)) / priceE8;
+              // `liability`, not `borrowValue` — see refreshMyPositions. This
+              // one substitution is the difference between a Max that always
+              // reverts and one that lands.
+              const owed = acct.liability != null ? BigInt(acct.liability) : BigInt(acct.borrowValue || "0");
+              const headroom = limit > owed ? limit - owed : 0n;
+              /*
+               * Borrowing x of this asset raises liability by
+               * value(x) / lFactor, so the headroom buys `lFactor` times more
+               * of it than a naive division by the price suggests. Then half a
+               * percent off the top, because interest moves the boundary
+               * between this read and the block that mines the borrow.
+               */
+              const lF = BigInt(a.lFactorBps || 10_000);
+              cap = (headroom * 10n ** BigInt(dec) * lF * SAFE_NUM) / (priceE8 * 10_000n * SAFE_DEN);
               if (cash < cap) cap = cash;
             }
             a.max.borrow = fmtUnitsStr(cap, dec);
@@ -3729,6 +3798,35 @@ const $ = (id) => document.getElementById(id);
                 supplyValue: word(0).toString(),
                 borrowValue: word(1).toString(),
                 borrowLimit: word(2).toString(),
+                liability: null, // filled below; see accountLimits
+              };
+            }
+          } catch {}
+        }
+
+        /*
+         * The number the pool actually gates on.
+         *
+         * `accountData` reports `borrowValue`: what the debt is worth. But
+         * `_healthy` compares `borrowLimit >= liability`, and liability is that
+         * value divided by each asset's liability factor — so it is always the
+         * larger number. Deriving a borrow cap from borrowValue overstated it
+         * by exactly that factor. Live, with $4.50 of limit against $4.00 of
+         * debt at a 0.95 factor, it offered 0.50 USDC where the chain allowed
+         * 0.275: every "Max borrow" reverted.
+         */
+        if (cfg.pool && sel.accountLimits) {
+          try {
+            const hex = await ethCall(cfg.pool, callData(sel.accountLimits, encAddr(from)));
+            const b = String(hex || "").replace(/^0x/, "");
+            if (b.length >= 192) {
+              const wd = (i) => BigInt("0x" + b.slice(i * 64, i * 64 + 64));
+              // (borrowLimit, liquidationLimit, liability)
+              window.__myAccount = {
+                ...(window.__myAccount || {}),
+                borrowLimit: wd(0).toString(),
+                liquidationLimit: wd(1).toString(),
+                liability: wd(2).toString(),
               };
             }
           } catch {}
@@ -3977,20 +4075,77 @@ const $ = (id) => document.getElementById(id);
       }
       if ($("allowRefresh")) $("allowRefresh").addEventListener("click", () => loadAllowances());
 
-      (function reflectWalletAvailability() {
+      /*
+       * Reflect whether a wallet is available — and keep reflecting it.
+       *
+       * This used to run once, synchronously, at load. If no provider had
+       * appeared by then it set `disabled = true` and `checked = false`, and
+       * nothing ever undid that. But a provider arriving late is the normal
+       * case, not the edge one: EIP-6963 wallets announce asynchronously, and
+       * mobile in-app browsers routinely inject `window.ethereum` a second or
+       * two after first paint.
+       *
+       * So the toggle latched off on exactly the devices this feature exists
+       * for, and everything downstream followed it: `selfMode()` returned
+       * false, so the vault, the swap desk and the liquidity pools all routed
+       * to the operator endpoints and answered "sign in with the Admin
+       * button", and the lending panel showed the *agent's* position — a
+       * wallet balance of 520 USDC and no debt, to somebody holding 73 with a
+       * loan outstanding. One latch, most of a bug report.
+       *
+       * It now re-runs whenever a provider shows up, and restores the toggle.
+       */
+      let hadWallet = null; // tri-state: unknown until the first check
+      function reflectWalletAvailability() {
         const t = $("selfCustodyToggle");
-        if (!t || hasInjectedWallet()) return;
-        t.checked = false;
-        t.disabled = true;
-        t.title = "No browser wallet detected";
+        if (!t) return;
+        const have = hasInjectedWallet();
+        if (have === hadWallet) return; // nothing changed; don't fight the user
+        hadWallet = have;
         const note = $("custodyNote");
-        if (note) {
-          note.textContent =
-            "No browser wallet detected, so self-custody is unavailable here. Actions use the app's " +
-            "agent wallet and need an operator (Admin) sign-in. Open this page in a wallet browser, " +
-            "or install a wallet extension, to transact with your own funds.";
+        if (have) {
+          // A wallet appeared. Give the control back and turn it on — landing
+          // in operator mode with a wallet connected is never what was wanted.
+          const wasDisabled = t.disabled;
+          t.disabled = false;
+          t.title = "";
+          if (wasDisabled) t.checked = true;
+          if (note) {
+            note.textContent = selfMode()
+              ? "Self-custody: your wallet signs and your own funds move. No sign-in needed."
+              : "Agent wallet: actions spend the app's agent funds and require an operator (Admin) sign-in.";
+          }
+          refreshMyPositions().catch(() => {});
+          if (typeof loadAllowances === "function") loadAllowances().catch(() => {});
+          tick();
+        } else {
+          t.checked = false;
+          t.disabled = true;
+          t.title = "No browser wallet detected";
+          if (note) {
+            note.textContent =
+              "No browser wallet detected, so self-custody is unavailable here. Actions use the app's " +
+              "agent wallet and need an operator (Admin) sign-in. Open this page in a wallet browser, " +
+              "or install a wallet extension, to transact with your own funds.";
+          }
         }
+      }
+      reflectWalletAvailability();
+      // Three ways a provider announces itself, and none of them is reliably
+      // before load — so listen for all three rather than sampling once.
+      window.addEventListener("eip6963:announceProvider", () => reflectWalletAvailability());
+      window.addEventListener("ethereum#initialized", () => reflectWalletAvailability());
+      (function pollForWallet() {
+        // Bounded: ten seconds is far longer than any wallet takes, and after
+        // that the "no wallet detected" message is the honest answer.
+        let n = 0;
+        const id = setInterval(() => {
+          askWallets();
+          reflectWalletAvailability();
+          if (hasInjectedWallet() || ++n > 20) clearInterval(id);
+        }, 500);
       })();
+
       if ($("selfCustodyToggle")) {
         $("selfCustodyToggle").addEventListener("change", () => {
           const on = selfMode();

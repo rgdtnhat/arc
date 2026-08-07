@@ -176,6 +176,13 @@ const CLIENT_SELECTORS = Object.fromEntries(
     supplyBalance: "function supplyBalance(address,address)",
     borrowBalance: "function borrowBalance(address,address)",
     accountData: "function accountData(address)",
+    // The three numbers `_healthy` actually compares. `accountData` reports
+    // `borrowValue` — the face value of the debt — but the pool gates borrowing
+    // and withdrawing on `liability`, which is that value divided by each
+    // asset's liability factor and therefore always larger. Deriving a cap from
+    // borrowValue overstates it by exactly that factor, which is why "Max
+    // borrow" reverted every time.
+    accountLimits: "function accountLimits(address)",
     vaultDeposit: "function deposit(uint256)",
     vaultWithdraw: "function withdraw(uint256)",
     sharesOf: "function sharesOf(address)",
@@ -991,6 +998,13 @@ async function main() {
           // computed for the agent — and it cannot do that from a two-decimal
           // display string without being wrong by up to half a cent per unit.
           priceE8: cfg.priceE8.toString(),
+          // Collateral factor in basis points. A connected wallet needs it to
+          // work out how much collateral it may withdraw while a loan is open:
+          // pulling out the full supply drops the borrow limit below the debt
+          // and the pool refuses the whole transaction.
+          cFactorBps: Number(cfg.cFactorBps ?? 0),
+          // Liability factor: a debt counts against you as value / lFactor.
+          lFactorBps: Number(cfg.lFactorBps ?? 10_000),
           reserve: {
             cash: fmtUnits(r.cash, dec),
             // Free liquidity as an integer, for the same reason.
