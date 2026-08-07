@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!--
+    TSRA's token mark.
+
+    The same ticket motif as the app's favicon, redrawn for the place a token
+    icon actually appears: a small circle in a wallet list. That means
+    full-bleed rather than the favicon's wide, transparent-margined badge —
+    every wallet crops to a circle, and a mark with empty sides ends up a
+    postage stamp floating in a void with its own edges clipped off.
+
+    So: the gradient fills the frame, and the ticket sits inside the safe circle
+    in white, which keeps it legible at 24px and against either theme.
+  -->
+  <defs>
+    <linearGradient id="tsraBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4c8dff"/>
+      <stop offset="1" stop-color="#7b5cff"/>
+    </linearGradient>
+    <mask id="tsraNotch">
+      <rect width="256" height="256" fill="#fff"/>
+      <circle cx="62" cy="128" r="18" fill="#000"/>
+      <circle cx="194" cy="128" r="18" fill="#000"/>
+    </mask>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="url(#tsraBg)"/>
+  <g mask="url(#tsraNotch)">
+    <rect x="62" y="92" width="132" height="72" rx="18" fill="#fff" opacity=".96"/>
+  </g>
+  <line x1="152" y1="104" x2="152" y2="152" stroke="#5f7dff" stroke-width="6"
+        stroke-linecap="round" stroke-dasharray="7 9" opacity=".85"/>
+  <circle cx="115" cy="128" r="13" fill="#5f7dff" opacity=".9"/>
+</svg>

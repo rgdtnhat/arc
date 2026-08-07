@@ -32,8 +32,11 @@
 //    v34: provider rows show symbols and short addresses, not fragments.
 //    v35: every reserve in one table, and claimable pool emissions.
 //    v36: a Governance tab, TSRA voting, and operator emission controls.
-const CACHE = "tessera-v41";
-const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
+const CACHE = "tessera-v42";
+// `tsra.svg` is the token mark, and every panel that names TSRA draws it —
+// leaving it out meant the one icon on the page went missing offline.
+const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg",
+  "./icon-192.png", "./icon-512.png", "./tsra.svg"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(

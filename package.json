@@ -25,7 +25,8 @@
     "deck:check": "node scripts/check-deck.mjs",
     "deck:pdf": "soffice --headless --norestore --convert-to pdf --outdir docs docs/deck.pptx",
     "router:deploy": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/deploy-router.mjs",
-    "pools:reset": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/reset-pools.mjs"
+    "pools:reset": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/reset-pools.mjs",
+    "icon": "node scripts/make-token-icon.mjs"
   },
   "overrides": {
     "adm-zip": "^0.6.0",

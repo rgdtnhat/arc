@@ -6040,6 +6040,58 @@ async function main() {
   });
 
   /** Open a proposal. Operator only — an open queue is mostly spam. */
+  /**
+   * A token list, in the format wallets and aggregators already read.
+   *
+   * The "Add to my wallet" button covers one person at a time. This is the
+   * machine-readable version of the same facts — address, symbol, decimals,
+   * logo — so anything that consumes a token list can pick TSRA up without
+   * anybody clicking. It is the standard Uniswap schema, because inventing a
+   * format nothing reads would be a file rather than a fix.
+   *
+   * Served from the deployment record rather than hard-coded, so a redeployed
+   * contract cannot leave this pointing at the old one.
+   */
+  app.get("/tokenlist.json", (req, res) => {
+    const origin = `${req.protocol}://${req.get("host")}`;
+    const chainId = Number(liveDeployment.chainId);
+    const tokens: Record<string, unknown>[] = [];
+
+    if (liveDeployment.tesseraToken) {
+      tokens.push({
+        chainId,
+        address: liveDeployment.tesseraToken,
+        name: "Tessera",
+        symbol: "TSRA",
+        decimals: 18,
+        logoURI: `${origin}/tsra-256.png`,
+        tags: ["governance", "rewards"],
+      });
+    }
+    // The assets the pool actually lends against, so a wallet pointed at this
+    // list can price a position without a second source.
+    for (const a of poolDeployment?.assets ?? []) {
+      tokens.push({
+        chainId,
+        address: a.address,
+        name: a.symbol,
+        symbol: a.symbol,
+        decimals: Number(a.decimals ?? 6),
+      });
+    }
+
+    res.json({
+      name: "Tessera on Arc",
+      timestamp: new Date().toISOString(),
+      // Bumped by hand when the shape changes; the list is generated, so the
+      // minor version tracks the deployment rather than an editorial revision.
+      version: { major: 1, minor: tokens.length, patch: 0 },
+      keywords: ["tessera", "arc", "agentic"],
+      logoURI: `${origin}/tsra-256.png`,
+      tokens,
+    });
+  });
+
   /* ---- Discussions: the stage before a vote ------------------------------
    *
    * Aquarius's governance has a step Tessera did not: a proposal exists as a

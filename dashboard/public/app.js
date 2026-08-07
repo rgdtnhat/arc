@@ -4561,6 +4561,51 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
+      /* ---- Getting the token into a wallet ---------------------------------
+       *
+       * A wallet cannot discover a token's name, decimals or logo from the
+       * chain — ERC-20 carries no icon, and nothing indexes an Arc testnet
+       * deployment. Until something tells it, TSRA shows as a grey circle with
+       * a truncated address, and the balance reads as raw units.
+       *
+       * `wallet_watchAsset` is the standard way to say it. The image has to be
+       * an absolute URL the wallet can fetch, so it is built from this page's
+       * own origin rather than hard-coded.
+       */
+      if ($("govAddToken")) {
+        $("govAddToken").addEventListener("click", async () => {
+          if (!hasInjectedWallet()) {
+            govMsg("govMsg", "No wallet detected in this browser.", "var(--warn)");
+            return;
+          }
+          try {
+            const cfg = await loadDefiConfig();
+            if (!cfg.token) { govMsg("govMsg", "No token on this deployment.", "var(--warn)"); return; }
+            const added = await eth().request({
+              method: "wallet_watchAsset",
+              params: {
+                type: "ERC20",
+                options: {
+                  address: cfg.token,
+                  symbol: "TSRA",
+                  decimals: 18,
+                  // Absolute, because the wallet fetches it from its own
+                  // context and a relative path resolves against nothing there.
+                  image: new URL("tsra-256.png", location.href).href,
+                },
+              },
+            });
+            govMsg("govMsg",
+              added
+                ? "TSRA added — your wallet will show the balance and the mark from now on."
+                : "Your wallet declined to add it.",
+              added ? "var(--good)" : "var(--warn)");
+          } catch (e) {
+            govMsg("govMsg", String(e && e.message ? e.message : e).slice(0, 160), "var(--warn)");
+          }
+        });
+      }
+
       /* ---- Proposal list: filtering and paging ------------------------------
        *
        * A governance page is read from the top and grows forever. Both of these
