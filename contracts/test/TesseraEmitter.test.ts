@@ -5,8 +5,22 @@ import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
 const T = (n: number) => BigInt(n) * 10n ** 18n;
 const HUNDRED_BILLION = 100_000_000_000n * 10n ** 18n;
 const TEN_YEARS = 10 * 365 * 24 * 3600;
-const RATE = HUNDRED_BILLION / BigInt(TEN_YEARS); // ≈317 tokens/second
 const SEND = 0, FUND = 1;
+
+/*
+ * The release is activity-driven, so the tests need a protocol to be busy.
+ * MockActivity stands in for the pool and the AMM: it reports a dollar figure
+ * and nothing else, because a dollar figure is all the emitter reads.
+ */
+const PER_USD_PER_SEC = 10n ** 12n;      // 1e-6 TSRA per $1 per second
+const MAX_RATE = 1000n * 10n ** 18n;     // 1000 TSRA/s, whatever happens
+const USD = (n: number) => BigInt(n) * 10n ** 8n; // the pool's 1e8 scale
+/*
+ * The mock answers for both the lending pool and the AMM, so a figure set on it
+ * is counted twice — which is the sum the emitter is meant to take. Rather than
+ * mirror that arithmetic here and risk the test agreeing with itself, the
+ * expectations read the rate the contract reports.
+ */
 
 /**
  * "Locked" is a claim about what cannot happen, so these are mostly tests of
@@ -26,15 +40,19 @@ async function deployFixture() {
   // the script computes the address, but a two-step keeps the test honest
   // about the ordering rather than pretending it is free.
   const predicted = await hre.viem.deployContract("TesseraToken", [deployer.account.address]);
+  const activity = await hre.viem.deployContract("MockActivity");
+  await activity.write.setActivityUsd([USD(1_000_000)]); // a busy protocol
   const emitter = await hre.viem.deployContract("TesseraEmitter", [
-    predicted.address, deployer.account.address, RATE,
+    predicted.address, deployer.account.address,
+    activity.address, activity.address,
+    PER_USD_PER_SEC, MAX_RATE,
   ]);
   // Move the whole supply in, which is what the real constructor does directly.
   await predicted.write.transfer([emitter.address, HUNDRED_BILLION]);
 
   const sink = await hre.viem.deployContract("MockFundSink", [predicted.address]);
   const as = async (w: any) => hre.viem.getContractAt("TesseraEmitter", emitter.address, { client: { wallet: w } });
-  return { deployer, alice, liquidity, token: predicted, emitter, sink, as, pub };
+  return { deployer, alice, liquidity, token: predicted, emitter, sink, activity, as, pub };
 }
 
 describe("TesseraEmitter (a lock you can read the balance of)", () => {
@@ -54,18 +72,81 @@ describe("TesseraEmitter (a lock you can read the balance of)", () => {
     }
   });
 
-  it("cannot have its clock wound forward", async () => {
-    // rate and start are immutable, so there is nothing to call and nothing to
-    // set. If either were governable, an accelerated unlock would be one
-    // transaction away — which is the risk holders are being asked to accept
-    // the lock against.
+  it("cannot have its curve wound forward", async () => {
+    // Both parameters are immutable. If either were governable an accelerated
+    // unlock would be one transaction away, which is the risk holders are
+    // being asked to accept the lock against.
     const f = await loadFixture(deployFixture);
-    const rate = await f.emitter.read.ratePerSecond();
-    expect(rate).to.equal(RATE);
+    expect(await f.emitter.read.emissionPerUsdPerSecond()).to.equal(PER_USD_PER_SEC);
+    expect(await f.emitter.read.maxRatePerSecond()).to.equal(MAX_RATE);
     const setters = f.emitter.abi
       .filter((x: any) => x.type === "function" && x.stateMutability !== "view")
       .map((x: any) => x.name);
-    expect(setters).to.not.include("setRatePerSecond");
+    for (const forbidden of ["setRatePerSecond", "setEmissionPerUsd", "setMaxRate", "setActivity"]) {
+      expect(setters).to.not.include(forbidden);
+    }
+  });
+
+  it("emits nothing at all while the protocol is idle", async () => {
+    /*
+     * The point of the change: a calendar schedule pays whether or not anybody
+     * shows up, so an unused protocol dilutes its holders on time and the
+     * tokens land on whoever is standing under the tap.
+     */
+    const f = await loadFixture(deployFixture);
+    await f.activity.write.setActivityUsd([0n]);
+    await f.emitter.write.addSink([f.liquidity.account.address, SEND, 100n, "liquidity"]);
+    await time.increase(100_000);
+    await f.emitter.write.release();
+    expect(await f.emitter.read.releasedTotal()).to.equal(0n);
+    expect(await f.emitter.read.currentRatePerSecond()).to.equal(0n);
+    expect(await f.token.read.balanceOf([f.emitter.address])).to.equal(HUNDRED_BILLION);
+  });
+
+  it("emits faster when the pools are busier", async () => {
+    const f = await loadFixture(deployFixture);
+    await f.emitter.write.addSink([f.liquidity.account.address, SEND, 100n, "liquidity"]);
+
+    await f.activity.write.setActivityUsd([USD(100_000)]);
+    await time.increase(1000);
+    await f.emitter.write.distributeAll();
+    const quiet = await f.token.read.balanceOf([f.liquidity.account.address]);
+
+    await f.activity.write.setActivityUsd([USD(1_000_000)]); // ten times busier
+    await time.increase(1000);
+    await f.emitter.write.distributeAll();
+    const busy = (await f.token.read.balanceOf([f.liquidity.account.address])) - quiet;
+
+    expect(busy > quiet * 8n).to.equal(true);
+    expect(busy < quiet * 12n).to.equal(true);
+  });
+
+  it("caps the rate however much capital arrives", async () => {
+    // Without this, one very large deposit could drain the supply in an
+    // afternoon and call it activity.
+    const f = await loadFixture(deployFixture);
+    await f.emitter.write.addSink([f.liquidity.account.address, SEND, 100n, "liquidity"]);
+    await f.activity.write.setActivityUsd([USD(1_000_000_000_000)]); // absurd
+    expect(await f.emitter.read.currentRatePerSecond()).to.equal(MAX_RATE);
+    await time.increase(100);
+    await f.emitter.write.distributeAll();
+    const got = await f.token.read.balanceOf([f.liquidity.account.address]);
+    expect(got <= MAX_RATE * 102n).to.equal(true);
+  });
+
+  it("counts both venues", async () => {
+    const f = await loadFixture(deployFixture);
+    // The mock answers for both interfaces, so its figure lands twice — which
+    // is the sum the emitter is supposed to take.
+    const lending = await f.emitter.read.lendingActivityUsd();
+    const amm = await f.emitter.read.ammActivityUsd();
+    expect(await f.emitter.read.activityUsd()).to.equal(lending + amm);
+  });
+
+  it("says the supply lasts indefinitely when nothing is happening", async () => {
+    const f = await loadFixture(deployFixture);
+    await f.activity.write.setActivityUsd([0n]);
+    expect(await f.emitter.read.secondsRemaining()).to.equal(2n ** 256n - 1n);
   });
 
   it("releases on the clock and splits by weight", async () => {
@@ -73,14 +154,15 @@ describe("TesseraEmitter (a lock you can read the balance of)", () => {
     await f.emitter.write.addSink([f.sink.address, FUND, 70n, "lending emissions"]);
     await f.emitter.write.addSink([f.liquidity.account.address, SEND, 30n, "liquidity"]);
 
+    const rate = await f.emitter.read.currentRatePerSecond();
     await time.increase(1000);
     await f.emitter.write.distributeAll();
 
     const toSink = await f.token.read.balanceOf([f.sink.address]);
     const toLiq = await f.token.read.balanceOf([f.liquidity.account.address]);
     const total = toSink + toLiq;
-    expect(total > RATE * 990n).to.equal(true);
-    expect(total < RATE * 1010n).to.equal(true);
+    expect(total > rate * 990n).to.equal(true);
+    expect(total < rate * 1010n).to.equal(true);
     // 70/30, within the rounding of one release.
     expect(toSink > (total * 69n) / 100n).to.equal(true);
     expect(toSink < (total * 71n) / 100n).to.equal(true);
@@ -120,26 +202,28 @@ describe("TesseraEmitter (a lock you can read the balance of)", () => {
     expect(await f.token.read.balanceOf([f.emitter.address])).to.equal(HUNDRED_BILLION);
 
     await f.emitter.write.addSink([f.liquidity.account.address, SEND, 100n, "liquidity"]);
+    const rate = await f.emitter.read.currentRatePerSecond();
     await time.increase(100);
     await f.emitter.write.distributeAll();
     const got = await f.token.read.balanceOf([f.liquidity.account.address]);
     // A hundred seconds' worth, not ten thousand and a hundred.
-    expect(got < RATE * 200n).to.equal(true);
-    expect(got > RATE * 50n).to.equal(true);
+    expect(got < rate * 200n).to.equal(true);
+    expect(got > rate * 50n).to.equal(true);
   });
 
-  it("leaves nothing behind at the end of the schedule", async () => {
-    // The leak the previous version had, pinned so it cannot come back.
+  it("leaves nothing behind once the supply is finally exhausted", async () => {
+    // The leak the previous version had, pinned so it cannot come back. There
+    // is no deadline now, so "the end" is whenever enough activity has run.
     const f = await loadFixture(deployFixture);
     await f.emitter.write.addSink([f.liquidity.account.address, SEND, 60n, "liquidity"]);
     await f.emitter.write.addSink([f.alice.account.address, SEND, 40n, "grants"]);
-    await time.increase(TEN_YEARS * 2);
+    await f.activity.write.setActivityUsd([USD(1_000_000_000_000)]); // pinned at the cap
+    await time.increase(Number(HUNDRED_BILLION / MAX_RATE) * 2);
     await f.emitter.write.distributeAll();
     await f.emitter.write.distributeAll(); // sweep up the final carry
 
     const left = await f.token.read.balanceOf([f.emitter.address]);
-    // At most one wei of dust per sink, which integer division cannot avoid.
-    expect(left <= 2n).to.equal(true);
+    expect(left <= 2n).to.equal(true); // at most a wei of dust per sink
     const out = (await f.token.read.balanceOf([f.liquidity.account.address])) +
       (await f.token.read.balanceOf([f.alice.account.address]));
     expect(out).to.equal(HUNDRED_BILLION - left);
@@ -154,10 +238,11 @@ describe("TesseraEmitter (a lock you can read the balance of)", () => {
     // Alice's weight goes up only from here; the first 1000 seconds were the
     // liquidity sink's and stay that way.
     await f.emitter.write.setSinkWeight([1n, 100n]);
+    const rate = await f.emitter.read.currentRatePerSecond();
     const owedAlice = await f.emitter.read.pendingOf([1n]);
-    expect(owedAlice < RATE * 10n).to.equal(true);
+    expect(owedAlice < rate * 10n).to.equal(true);
     const owedLiq = await f.emitter.read.pendingOf([0n]);
-    expect(owedLiq > RATE * 900n).to.equal(true);
+    expect(owedLiq > rate * 900n).to.equal(true);
   });
 
   it("retires a sink without losing what it is already owed", async () => {
@@ -197,7 +282,8 @@ describe("TesseraEmitter (a lock you can read the balance of)", () => {
      */
     const f = await loadFixture(deployFixture);
     await f.emitter.write.addSink([f.liquidity.account.address, SEND, 100n, "liquidity"]);
-    await time.increase(TEN_YEARS * 2); // twice the schedule
+    await f.activity.write.setActivityUsd([USD(1_000_000_000_000)]); // pinned at the cap
+    await time.increase(Number(HUNDRED_BILLION / MAX_RATE) * 2);
     await f.emitter.write.distributeAll();
     expect(await f.token.read.balanceOf([f.emitter.address])).to.equal(0n);
     expect(await f.token.read.balanceOf([f.liquidity.account.address])).to.equal(HUNDRED_BILLION);
@@ -207,11 +293,11 @@ describe("TesseraEmitter (a lock you can read the balance of)", () => {
     await expect(f.emitter.write.distribute([0n])).to.be.rejected;
   });
 
-  it("reports how long the schedule has left", async () => {
+  it("reports how long the supply lasts at the current pace", async () => {
     const f = await loadFixture(deployFixture);
+    const rate = await f.emitter.read.currentRatePerSecond();
     const left = await f.emitter.read.secondsRemaining();
-    expect(left > BigInt(TEN_YEARS) - 100n).to.equal(true);
-    expect(left <= BigInt(TEN_YEARS)).to.equal(true);
+    expect(left).to.equal(HUNDRED_BILLION / rate);
   });
 
   it("pays each sink separately so one failure cannot block the rest", async () => {

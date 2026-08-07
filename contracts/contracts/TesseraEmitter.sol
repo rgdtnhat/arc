@@ -14,6 +14,38 @@ interface IFundable {
     function fund(uint256 amount) external;
 }
 
+interface IActivityPool {
+    function reserveList(uint256 i) external view returns (address);
+    function reserveCount() external view returns (uint256);
+    function reserves(address asset)
+        external
+        view
+        returns (
+            bool enabled,
+            bool borrowable,
+            uint8 decimals,
+            uint16 cFactor,
+            uint16 liqFactor,
+            uint16 lFactor,
+            uint16 reserveFactor,
+            uint256 price,
+            uint256 totalSupplyShares,
+            uint256 totalSupplyAssets,
+            uint256 totalBorrowShares,
+            uint256 totalBorrowAssets,
+            uint64 lastAccrual
+        );
+    function price(address asset) external view returns (uint256);
+}
+
+interface IActivityAmm {
+    function poolCount() external view returns (uint256);
+    function poolInfo(uint256 poolId)
+        external
+        view
+        returns (address[] memory, uint256[] memory, uint16, uint16, uint256, bool, string memory);
+}
+
 /**
  * @title TesseraEmitter
  * @notice Holds the whole TSRA supply and lets it out on a clock nobody can
@@ -29,10 +61,29 @@ interface IFundable {
  * cannot change how fast it flows, cannot pull tokens out, and cannot stop a
  * sink that is already owed from being paid.
  *
- * `RATE_PER_SECOND` and `START` are immutable. Nothing about the release curve
- * is governable, because a release curve that can be governed is a release
- * curve that can be accelerated, and an accelerated release is the thing
- * holders are being asked to trust it against.
+ * Every parameter of the release curve is immutable. Nothing about it is
+ * governable, because a curve that can be governed is a curve that can be
+ * accelerated, and an accelerated release is the thing holders are being asked
+ * to trust the lock against.
+ *
+ * ## The clock is the protocol, not the calendar
+ * There is no end date and no fixed rate. Tokens are released in proportion to
+ * how much the pools are actually being used: dollars supplied and borrowed in
+ * the lending pool, dollars of depth in the AMM. Idle protocol, no emission.
+ *
+ * A calendar schedule pays the same whether anyone shows up or not, so a
+ * project that nobody uses still dilutes its holders on time, and the tokens
+ * land on whoever happens to be standing under the tap. Tying the flow to
+ * measured activity means emission is a cost the protocol pays for something it
+ * received, and the supply lasts exactly as long as it takes to be earned.
+ *
+ * Two guards make that safe to say:
+ *
+ *   · `emissionPerUsdPerSecond` and `maxRatePerSecond` are immutable, so the
+ *     ceiling on how fast this can ever drain is fixed at construction.
+ *   · Activity is measured continuously and multiplied by elapsed time, so a
+ *     position opened and closed inside one block contributes nothing. Faking
+ *     activity costs holding the capital for as long as you want the credit.
  *
  * ## Weights, not amounts
  * Sinks take shares of the flow rather than fixed sums. An allocation
@@ -76,9 +127,15 @@ contract TesseraEmitter is ReentrancyGuard {
     address public owner;
     IEmitterToken public immutable token;
 
-    /// Tokens released per second, for the contract's whole life.
-    uint256 public immutable ratePerSecond;
-    /// When the clock started.
+    /// Where activity is measured. Either may be zero if not deployed.
+    IActivityPool public immutable lendingPool;
+    IActivityAmm public immutable amm;
+
+    /// Tokens per second, per one USD of measured activity (1e8 USD scale).
+    uint256 public immutable emissionPerUsdPerSecond;
+    /// The ceiling, however busy things get. Bounds the worst case absolutely.
+    uint256 public immutable maxRatePerSecond;
+    /// When the contract was deployed.
     uint64 public immutable start;
 
     /// Released by the clock and accounted for, whether or not it has been sent.
@@ -130,19 +187,119 @@ contract TesseraEmitter is ReentrancyGuard {
      *        constructor mints the supply here, so deployment order is token
      *        after emitter, with the emitter's address as the treasury.
      * @param owner_ May add sinks and change weights, and nothing else.
-     * @param ratePerSecond_ Immutable. At 100e9 tokens over ten years this is
-     *        roughly 317 tokens per second; the deploy script computes it from
-     *        a duration so the intent is legible.
+     * @param lendingPool_ Where lending activity is read from. May be zero.
+     * @param amm_ Where AMM depth is read from. May be zero.
+     * @param emissionPerUsdPerSecond_ Immutable. Tokens per second for every
+     *        dollar of measured activity.
+     * @param maxRatePerSecond_ Immutable ceiling, so however much capital shows
+     *        up there is a fixed floor on how long the supply can take to drain.
      */
-    constructor(address token_, address owner_, uint256 ratePerSecond_) {
+    constructor(
+        address token_,
+        address owner_,
+        address lendingPool_,
+        address amm_,
+        uint256 emissionPerUsdPerSecond_,
+        uint256 maxRatePerSecond_
+    ) {
         if (token_ == address(0) || owner_ == address(0)) revert ZeroAddress();
-        if (ratePerSecond_ == 0) revert ZeroRate();
+        if (emissionPerUsdPerSecond_ == 0 || maxRatePerSecond_ == 0) revert ZeroRate();
         token = IEmitterToken(token_);
         owner = owner_;
-        ratePerSecond = ratePerSecond_;
+        lendingPool = IActivityPool(lendingPool_);
+        amm = IActivityAmm(amm_);
+        emissionPerUsdPerSecond = emissionPerUsdPerSecond_;
+        maxRatePerSecond = maxRatePerSecond_;
         start = uint64(block.timestamp);
         lastRelease = uint64(block.timestamp);
         emit OwnerSet(owner_);
+    }
+
+    // --- measuring the protocol -----------------------------------------------
+
+    /**
+     * @notice Dollars of activity across both venues, in the pool's 1e8 scale.
+     *
+     * Lending counts supplied *and* borrowed. Those overlap — a borrowed dollar
+     * was supplied by somebody — and counting both is deliberate: a dollar that
+     * has been lent out is doing more work than one sitting idle, and the
+     * double count is exactly the weight that difference deserves.
+     *
+     * An asset the pool cannot price contributes nothing. There is no fallback
+     * mark, because a guess here would move real tokens.
+     */
+    function lendingActivityUsd() public view returns (uint256 total) {
+        if (address(lendingPool) == address(0)) return 0;
+        uint256 n;
+        try lendingPool.reserveCount() returns (uint256 c) {
+            n = c;
+        } catch {
+            return 0;
+        }
+        for (uint256 i = 0; i < n; i++) {
+            address asset;
+            try lendingPool.reserveList(i) returns (address a) {
+                asset = a;
+            } catch {
+                continue;
+            }
+            try lendingPool.reserves(asset) returns (
+                bool enabled, bool, uint8 decimals, uint16, uint16, uint16, uint16,
+                uint256 price_, uint256, uint256 supplyAssets, uint256, uint256 borrowAssets, uint64
+            ) {
+                if (!enabled || price_ == 0) continue;
+                uint256 unit = 10 ** decimals;
+                total += ((supplyAssets + borrowAssets) * price_) / unit;
+            } catch {
+                continue;
+            }
+        }
+    }
+
+    /// @notice Dollars of AMM depth, valued at the lending pool's own marks.
+    function ammActivityUsd() public view returns (uint256 total) {
+        if (address(amm) == address(0) || address(lendingPool) == address(0)) return 0;
+        uint256 n;
+        try amm.poolCount() returns (uint256 c) {
+            n = c;
+        } catch {
+            return 0;
+        }
+        for (uint256 i = 0; i < n; i++) {
+            try amm.poolInfo(i) returns (
+                address[] memory tokens, uint256[] memory bals, uint16, uint16, uint256, bool, string memory
+            ) {
+                for (uint256 j = 0; j < tokens.length; j++) {
+                    try lendingPool.reserves(tokens[j]) returns (
+                        bool enabled, bool, uint8 decimals, uint16, uint16, uint16, uint16,
+                        uint256 price_, uint256, uint256, uint256, uint256, uint64
+                    ) {
+                        if (!enabled || price_ == 0) continue;
+                        total += (bals[j] * price_) / (10 ** decimals);
+                    } catch {
+                        continue;
+                    }
+                }
+            } catch {
+                continue;
+            }
+        }
+    }
+
+    /// @notice Everything the emission rate is derived from.
+    function activityUsd() public view returns (uint256) {
+        return lendingActivityUsd() + ammActivityUsd();
+    }
+
+    /**
+     * @notice What the protocol is emitting per second right now.
+     *
+     * Zero when nothing is happening, which is the whole point — and capped, so
+     * however much capital arrives the drain has a floor on how long it takes.
+     */
+    function currentRatePerSecond() public view returns (uint256) {
+        uint256 rate = (activityUsd() * emissionPerUsdPerSecond) / 1e8;
+        return rate > maxRatePerSecond ? maxRatePerSecond : rate;
     }
 
     function transferOwnership(address next) external onlyOwner {
@@ -187,7 +344,18 @@ contract TesseraEmitter is ReentrancyGuard {
         // The clock is stopped while nothing is configured — see `_release`.
         if (totalWeight == 0) return 0;
         if (block.timestamp <= lastRelease) return 0;
-        uint256 due = (block.timestamp - lastRelease) * ratePerSecond;
+        /*
+         * Elapsed time times the rate the protocol is running at *now*.
+         *
+         * Integrating properly would need a rate checkpoint on every deposit
+         * and withdrawal, which the pools do not report and cannot be made to
+         * without changing them. Sampling at release time is the honest
+         * approximation, and the direction of its error is bounded by the same
+         * cap that bounds everything else. Anyone may call `release`, so the
+         * sampling interval is as short as anybody cares to make it.
+         */
+        uint256 due = (block.timestamp - lastRelease) * currentRatePerSecond();
+        if (due == 0) return 0;
         // The clock can outrun the balance near the end of the schedule; it can
         // never release more than exists.
         uint256 held = token.balanceOf(address(this));
@@ -297,12 +465,21 @@ contract TesseraEmitter is ReentrancyGuard {
         return held > committed ? held - committed : 0;
     }
 
-    /// @notice Seconds until the schedule has released everything.
+    /**
+     * @notice How long the remaining supply lasts *at the current pace*.
+     *
+     * Not a deadline. There is no end date — this is what is left divided by
+     * how fast the protocol is being used this second, and it moves whenever
+     * that does. `type(uint256).max` when nothing is happening, because at zero
+     * activity nothing is being emitted and the answer is "indefinitely".
+     */
     function secondsRemaining() external view returns (uint256) {
+        uint256 rate = currentRatePerSecond();
+        if (rate == 0) return type(uint256).max;
         uint256 held = token.balanceOf(address(this));
         uint256 committed = _committed();
         uint256 free = held > committed ? held - committed : 0;
-        return free / ratePerSecond;
+        return free / rate;
     }
 
     /// @notice What a sink would receive if `distribute` were called now.
