@@ -10,6 +10,50 @@ and you get a public URL.
 > then pass `AGENT_PRIVATE_KEY`, `PROVIDER_PRIVATE_KEY`, and `ARC_RPC_URL` to the
 > container. Give it **~512 MB–1 GB RAM** (a "starter"/"hobby" instance).
 
+## Updating a running host
+
+```bash
+cd /root/tessera
+git pull --ff-only
+docker compose up -d --build
+```
+
+That is the whole procedure. It used to be longer, because the addresses had to
+be hand-patched into `deployments/arc.local.json` after every contract deploy —
+and a step like that gets skipped, which is how a host ends up serving pages
+from contracts nobody meant it to use.
+
+**Never run `npm run compile` on the host.** The ABIs are committed precisely so
+the image needs no Solidity toolchain; compiling on a small instance runs it out
+of memory.
+
+### How the two deployment files decide
+
+`deployments/arc.json` is committed and reviewed. `deployments/arc.local.json`
+is gitignored and records contracts deployed *from the dashboard on that host*,
+which by definition are not in the repo yet.
+
+The committed file is the base. The local file overlays only the keys it names
+in its `overrides` list — so what a host deployed itself keeps winning, and what
+it merely remembers from an older release does not. Anything the committed file
+has never heard of (the pool's asset list, for instance) is taken from the local
+file regardless, since there is nothing to overrule.
+
+Every disagreement is named at startup:
+
+```
+[deployment] local override in effect for tesseraPool
+[deployment] deployments/arc.json is newer for tesseraGauge — using the committed
+             addresses. Add these to the "overrides" list in
+             deployments/arc.local.json, or delete that file, if the local ones
+             were meant to win.
+```
+
+A file written before `overrides` existed has no list, so its stale addresses
+are overruled and its host-only keys are kept — which is the right answer for
+every host that has ever been patched by hand. Deleting `arc.local.json`
+entirely is also safe on a host that has never deployed from the dashboard.
+
 ## Reading a `pool:arc` run
 
 `pool:arc` is re-runnable. It adopts contracts that are already live rather than

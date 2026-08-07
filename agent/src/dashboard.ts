@@ -2,6 +2,7 @@ import express from "express";
 import path from "node:path";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
+import { mergeDeployment, explorerFrom } from "./deployment.js";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
 import { verifyMessage, verifyTypedData, formatUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
@@ -136,34 +137,58 @@ const KEEPER_MIN_INTERVAL_MS = 5 * 60_000; // and no more often than every 5 min
 const keeperState = { lastActionAt: 0, actions: 0 };
 const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
 
-// The Arc testnet deployment (contracts + wallets) recorded in deployments/arc.json.
-// Shown on the dashboard so it's clear which on-chain contracts/wallets are live.
-// `arc.local.json` (gitignored, written by the deploy scripts) wins over the
-// committed `arc.json`, so pulling/resetting the repo can never point a running
-// server at older contract addresses than the ones it actually deployed.
+/**
+ * Which contracts this server talks to.
+ *
+ * Two files. `deployments/arc.json` is committed and reviewed; the gitignored
+ * `arc.local.json` records contracts deployed from the dashboard on this host,
+ * which by definition are not in the repo yet.
+ *
+ * ## Why this is a merge and not "the local file wins"
+ * It used to be the latter, and that was wrong in a way that took a while to
+ * show. A host's local file is a *snapshot* of the addresses that existed when
+ * it was written. Every contract deployed since — the gauge, the register, the
+ * emissions rewrite — is a key that file has never heard of, and one it was
+ * silently answering for. Worse, for keys it *did* hold, it went on winning
+ * with an address the repo had deliberately moved past, so an update could be
+ * pulled, built and restarted while the app kept using superseded contracts.
+ * The only fix was to hand-patch the file on every deploy, which is exactly the
+ * kind of step that gets skipped.
+ *
+ * So: the committed file is the base, and the local file overlays only the keys
+ * it names in `overrides`. Anything it deployed itself keeps winning; anything
+ * it merely remembers from an older release does not. A file written before
+ * `overrides` existed has no such list, so its extra keys are still read but
+ * its stale contract addresses are ignored — and every difference is named at
+ * startup rather than resolved in silence.
+ */
 const liveDeployment = (() => {
   const dir = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../deployments");
-  for (const name of ["arc.local.json", "arc.json"]) {
+  const read = (name: string): Record<string, unknown> | null => {
     try {
       const d = JSON.parse(readFileSync(path.join(dir, name), "utf8"));
-      if (d && d.tesseraEscrow) {
-        if (name === "arc.local.json") console.log("[deployment] using deployments/arc.local.json (local override)");
-        // `??` only falls back on undefined/null, so ARC_EXPLORER_URL="" — which
-        // is what an unset-but-declared variable looks like in a compose file —
-        // sailed through as an empty explorer. Every receipt link then rendered
-        // as a relative "/tx/0x…" and 404'd on the site's own domain. Blank or
-        // non-absolute means unset.
-        const envExplorer = String(process.env.ARC_EXPLORER_URL ?? "").trim();
-        const explorer = /^https?:\/\//.test(envExplorer)
-          ? envExplorer.replace(/\/+$/, "")
-          : "https://testnet.arcscan.app";
-        return { ...d, explorer };
-      }
+      return d && typeof d === "object" ? d : null;
     } catch {
-      /* try the next candidate */
+      return null;
     }
+  };
+  const withExplorer = (d: Record<string, unknown>) => ({
+    ...d,
+    explorer: explorerFrom(process.env.ARC_EXPLORER_URL),
+  });
+
+  const base = read("arc.json");
+  const local = read("arc.local.json");
+  const { merged, applied, ignored } = mergeDeployment(base, local);
+  if (applied.length) console.log(`[deployment] local override in effect for ${applied.join(", ")}`);
+  if (ignored.length) {
+    console.log(
+      `[deployment] deployments/arc.json is newer for ${ignored.join(", ")} — using the committed ` +
+      `addresses. Add these to the "overrides" list in deployments/arc.local.json, or delete that ` +
+      `file, if the local ones were meant to win.`,
+    );
   }
-  return null;
+  return merged.tesseraEscrow ? withExplorer(merged) : null;
 })();
 
 type UiEvent = (AgentEvent & { source: "agent" }) | (ProviderEvent & { source: "provider"; ts: number; level: string });
@@ -4267,7 +4292,15 @@ async function main() {
       try {
         const dir = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../deployments");
         const file = path.join(dir, "arc.local.json");
-        const next = { ...liveDeployment, [key]: address };
+        // Claim the key. Only what this host deployed itself outranks the
+        // committed file — everything else it merely remembers goes stale, and
+        // a remembered address winning is what made every update a hand-patch.
+        const prior = (() => {
+          try { return JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>; } catch { return {}; }
+        })();
+        const claimed = new Set<string>(Array.isArray(prior.overrides) ? (prior.overrides as string[]) : []);
+        claimed.add(key);
+        const next = { ...liveDeployment, [key]: address, overrides: [...claimed] };
         delete (next as Record<string, unknown>).explorer;
         writeFileSync(file, JSON.stringify(next, null, 2) + "\n");
         wrote = true;
