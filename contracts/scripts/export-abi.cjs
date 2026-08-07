@@ -40,6 +40,7 @@ const receiptAnchor = readArtifact("TesseraReceiptAnchor");
 const emissions = readArtifact("TesseraEmissions");
 const tsra = readArtifact("TesseraToken");
 const emitter = readArtifact("TesseraEmitter");
+const governor = readArtifact("TesseraGovernor");
 
 const outDir = path.resolve(root, "..", "shared", "src");
 fs.mkdirSync(outDir, { recursive: true });
@@ -68,7 +69,8 @@ const abiTs =
   `export const tesseraReceiptAnchorAbi = ${JSON.stringify(receiptAnchor.abi)} as const;\n` +
   `export const tesseraEmissionsAbi = ${JSON.stringify(emissions.abi)} as const;\n` +
   `export const tesseraTokenAbi = ${JSON.stringify(tsra.abi)} as const;\n` +
-  `export const tesseraEmitterAbi = ${JSON.stringify(emitter.abi)} as const;\n`;
+  `export const tesseraEmitterAbi = ${JSON.stringify(emitter.abi)} as const;\n` +
+  `export const tesseraGovernorAbi = ${JSON.stringify(governor.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 
 // Bytecode is only needed to deploy the mock locally from a plain viem script.
@@ -96,7 +98,8 @@ const bytecodeTs =
   `export const tesseraReceiptAnchorBytecode = "${receiptAnchor.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraEmissionsBytecode = "${emissions.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraTokenBytecode = "${tsra.bytecode}" as \`0x\${string}\`;\n` +
-  `export const tesseraEmitterBytecode = "${emitter.bytecode}" as \`0x\${string}\`;\n`;
+  `export const tesseraEmitterBytecode = "${emitter.bytecode}" as \`0x\${string}\`;\n` +
+  `export const tesseraGovernorBytecode = "${governor.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);
 
 console.log("[export-abi] wrote shared/src/abi.ts and shared/src/bytecode.ts");

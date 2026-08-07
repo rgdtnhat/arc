@@ -109,6 +109,15 @@ contract TesseraEmissions is ReentrancyGuard {
         /// Cumulative reward per share, 1e18-scaled.
         uint128 index;
         uint64 lastAccrual;
+        /**
+         * When this stream stops. Zero means it runs until somebody stops it.
+         *
+         * An operator who wants "5 TSRA a second for the next fortnight" would
+         * otherwise have to come back in a fortnight and remember to set the
+         * rate to zero — and a campaign that keeps paying because nobody
+         * remembered is how a reward budget quietly becomes the whole budget.
+         */
+        uint64 endsAt;
     }
 
     struct Position {
@@ -195,6 +204,20 @@ contract TesseraEmissions is ReentrancyGuard {
      * rewriting what everyone has already earned.
      */
     function setRate(address asset, uint8 side, uint256 ratePerSecond) external onlyOwner {
+        _setRate(asset, side, ratePerSecond, 0);
+    }
+
+    /**
+     * @notice Set a rate that stops on its own at `endsAt` (unix seconds).
+     *
+     * Zero runs indefinitely. A campaign with an end date written into it
+     * cannot outlive the intention behind it because somebody forgot.
+     */
+    function setRateUntil(address asset, uint8 side, uint256 ratePerSecond, uint64 endsAt) external onlyOwner {
+        _setRate(asset, side, ratePerSecond, endsAt);
+    }
+
+    function _setRate(address asset, uint8 side, uint256 ratePerSecond, uint64 endsAt) internal onlyOwner {
         if (asset == address(0)) revert ZeroAddress();
         if (side > SIDE_BORROW) revert BadSide();
         if (ratePerSecond > MAX_RATE_PER_SECOND) revert RateTooHigh(ratePerSecond, MAX_RATE_PER_SECOND);
@@ -202,6 +225,7 @@ contract TesseraEmissions is ReentrancyGuard {
 
         _accrue(asset, side);
         streams[asset][side].ratePerSecond = uint128(ratePerSecond);
+        streams[asset][side].endsAt = endsAt;
         if (!listed[asset]) {
             listed[asset] = true;
             streamedAssets.push(asset);
@@ -262,9 +286,12 @@ contract TesseraEmissions is ReentrancyGuard {
             return;
         }
         if (nowTs == s.lastAccrual) return;
-        uint256 dt = nowTs - s.lastAccrual;
+        // Nothing accrues past the end. Time after it is not paid for, and the
+        // accrual clock still moves so a later restart does not backdate.
+        uint64 until = s.endsAt != 0 && s.endsAt < nowTs ? s.endsAt : nowTs;
+        uint256 dt = until > s.lastAccrual ? until - s.lastAccrual : 0;
         s.lastAccrual = nowTs;
-        if (s.ratePerSecond == 0) return;
+        if (s.ratePerSecond == 0 || dt == 0) return;
 
         uint256 total = _totalShares(asset, side);
         // Nobody to pay: the seconds simply do not emit. Carrying them forward
@@ -379,9 +406,10 @@ contract TesseraEmissions is ReentrancyGuard {
 
         uint256 index = s.index;
         if (s.lastAccrual != 0 && block.timestamp > s.lastAccrual && s.ratePerSecond != 0) {
+            uint256 until = s.endsAt != 0 && s.endsAt < block.timestamp ? s.endsAt : block.timestamp;
             uint256 total = _totalShares(asset, side);
-            if (total != 0) {
-                uint256 emitted = uint256(s.ratePerSecond) * (block.timestamp - s.lastAccrual);
+            if (total != 0 && until > s.lastAccrual) {
+                uint256 emitted = uint256(s.ratePerSecond) * (until - s.lastAccrual);
                 index += (emitted * INDEX_SCALE) / total;
             }
         }
@@ -409,8 +437,13 @@ contract TesseraEmissions is ReentrancyGuard {
     function totalRatePerSecond() external view returns (uint256 total) {
         uint256 n = streamedAssets.length;
         for (uint256 i = 0; i < n; i++) {
-            total += streams[streamedAssets[i]][SIDE_SUPPLY].ratePerSecond;
-            total += streams[streamedAssets[i]][SIDE_BORROW].ratePerSecond;
+            for (uint8 side = SIDE_SUPPLY; side <= SIDE_BORROW; side++) {
+                Stream storage s = streams[streamedAssets[i]][side];
+                // An expired stream is not an outflow, so it must not shorten
+                // the runway of the ones still running.
+                if (s.endsAt != 0 && s.endsAt <= block.timestamp) continue;
+                total += s.ratePerSecond;
+            }
         }
     }
 
