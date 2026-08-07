@@ -60,6 +60,7 @@ const NOT_EXPORTED = {
   MockFundSink: "test-only pull-funding recipient, used from the emitter tests directly",
   MockRevertingSink: "test-only always-failing recipient, proves one bad sink cannot block the others",
   MockActivity: "test-only stand-in for pool and AMM activity, used from the emitter tests directly",
+  MockAmmPool: "test-only stand-in for the AMM's share accounting, used from the LP emissions tests directly",
 };
 
 // --- 1. structural ----------------------------------------------------------

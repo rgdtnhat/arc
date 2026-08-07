@@ -75,6 +75,15 @@ interface IEmissionsERC20 {
  * pays out at most the reward balance the contract is holding, and what it
  * cannot pay stays owed rather than reverting. A pot that runs dry stops
  * paying; it does not strand the claim, and it does not lie about the debt.
+ *
+ * ## Pausing, and what a pause is allowed to touch
+ * `setPaused` stops every stream at once without disturbing a single rate, so
+ * resuming brings back exactly the schedule that was running. It cannot touch
+ * anything already earned: claims keep working while paused, because freezing
+ * withdrawals is how an operator turns a rewards pause into a hostage
+ * situation. The paused seconds are skipped rather than banked — a pause that
+ * pays out its own duration on resume is a deferral, and an operator reaching
+ * for this during an incident needs the emission to actually stop.
  */
 contract TesseraEmissions is ReentrancyGuard {
     /// Supply side of a reserve.
@@ -99,6 +108,31 @@ contract TesseraEmissions is ReentrancyGuard {
 
     address public owner;
     IEmissionsPool public immutable pool;
+
+    /**
+     * A second address allowed to set rates, and nothing else.
+     *
+     * This is where the gauge plugs in: holders vote on which markets deserve
+     * the emissions, and the gauge writes the result here without ever being
+     * able to change the reward token, sweep the pot, or pause anything. The
+     * owner keeps every other lever, including the ability to overwrite a rate
+     * the gauge just set — a vote that cannot be overridden in an emergency is
+     * a vote that can drain the pot before anyone can react.
+     */
+    address public rateSetter;
+
+    /**
+     * While true, no stream emits.
+     *
+     * The clock still moves — see `_accrue` — so a pause is a gap in the
+     * schedule rather than a delay of it. What was earned before the pause
+     * stays earned and stays claimable; what would have been earned during it
+     * is simply never created. Resuming does not backdate, because a pause
+     * that pays out the paused seconds on resume is not a pause, it is a
+     * deferral, and an operator reaching for this switch during an incident
+     * needs the emission to actually stop.
+     */
+    bool public paused;
 
     /// The asset holders are paid in. Zero until an operator sets one.
     IEmissionsERC20 public rewardToken;
@@ -144,6 +178,7 @@ contract TesseraEmissions is ReentrancyGuard {
     uint256 public totalClaimed;
 
     error NotOwner();
+    error NotRateSetter();
     error ZeroAddress();
     error BadSide();
     error RateTooHigh(uint256 given, uint256 max);
@@ -154,6 +189,8 @@ contract TesseraEmissions is ReentrancyGuard {
     error LengthMismatch();
 
     event OwnerSet(address indexed owner);
+    event RateSetterSet(address indexed setter);
+    event PausedSet(bool paused);
     event RewardTokenSet(address indexed token);
     event RateSet(address indexed asset, uint8 indexed side, uint256 ratePerSecond);
     event Accrued(address indexed asset, uint8 indexed side, uint256 index, uint256 emitted);
@@ -164,6 +201,12 @@ contract TesseraEmissions is ReentrancyGuard {
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    /// The owner is always allowed to set a rate; the gauge is allowed only this.
+    modifier onlyRateSetter() {
+        if (msg.sender != owner && msg.sender != rateSetter) revert NotRateSetter();
         _;
     }
 
@@ -180,6 +223,31 @@ contract TesseraEmissions is ReentrancyGuard {
         if (next == address(0)) revert ZeroAddress();
         owner = next;
         emit OwnerSet(next);
+    }
+
+    /// @notice Appoint (or, with the zero address, remove) the gauge.
+    function setRateSetter(address next) external onlyOwner {
+        rateSetter = next;
+        emit RateSetterSet(next);
+    }
+
+    /**
+     * @notice Stop or restart every stream at once.
+     *
+     * Accrues first so the seconds up to the switch are booked at the old
+     * setting, and does not touch any rate — resuming brings back exactly the
+     * schedule that was running, which is what makes this usable as an
+     * emergency stop rather than a thing an operator has to undo by hand.
+     */
+    function setPaused(bool next) external onlyOwner {
+        if (paused == next) return;
+        uint256 n = streamedAssets.length;
+        for (uint256 i = 0; i < n; i++) {
+            _accrue(streamedAssets[i], SIDE_SUPPLY);
+            _accrue(streamedAssets[i], SIDE_BORROW);
+        }
+        paused = next;
+        emit PausedSet(next);
     }
 
     /**
@@ -203,7 +271,7 @@ contract TesseraEmissions is ReentrancyGuard {
      * Accrues first, so the change applies from now rather than retroactively
      * rewriting what everyone has already earned.
      */
-    function setRate(address asset, uint8 side, uint256 ratePerSecond) external onlyOwner {
+    function setRate(address asset, uint8 side, uint256 ratePerSecond) external onlyRateSetter {
         _setRate(asset, side, ratePerSecond, 0);
     }
 
@@ -213,11 +281,11 @@ contract TesseraEmissions is ReentrancyGuard {
      * Zero runs indefinitely. A campaign with an end date written into it
      * cannot outlive the intention behind it because somebody forgot.
      */
-    function setRateUntil(address asset, uint8 side, uint256 ratePerSecond, uint64 endsAt) external onlyOwner {
+    function setRateUntil(address asset, uint8 side, uint256 ratePerSecond, uint64 endsAt) external onlyRateSetter {
         _setRate(asset, side, ratePerSecond, endsAt);
     }
 
-    function _setRate(address asset, uint8 side, uint256 ratePerSecond, uint64 endsAt) internal onlyOwner {
+    function _setRate(address asset, uint8 side, uint256 ratePerSecond, uint64 endsAt) internal {
         if (asset == address(0)) revert ZeroAddress();
         if (side > SIDE_BORROW) revert BadSide();
         if (ratePerSecond > MAX_RATE_PER_SECOND) revert RateTooHigh(ratePerSecond, MAX_RATE_PER_SECOND);
@@ -234,11 +302,19 @@ contract TesseraEmissions is ReentrancyGuard {
     }
 
     /// @notice Set both sides at once — the common case when opening a market.
-    function setRates(address asset, uint256 supplyRate, uint256 borrowRate) external {
-        // Deliberately not `onlyOwner`: both calls below check it themselves,
-        // and duplicating the check here would only make the error less clear.
-        this.setRate(asset, SIDE_SUPPLY, supplyRate);
-        this.setRate(asset, SIDE_BORROW, borrowRate);
+    function setRates(address asset, uint256 supplyRate, uint256 borrowRate) external onlyRateSetter {
+        _setRate(asset, SIDE_SUPPLY, supplyRate, 0);
+        _setRate(asset, SIDE_BORROW, borrowRate, 0);
+    }
+
+    /// @notice Set several streams in one call. What the gauge uses each epoch.
+    function setRatesBatch(
+        address[] calldata assets,
+        uint8[] calldata sides,
+        uint256[] calldata ratesPerSecond
+    ) external onlyRateSetter {
+        if (assets.length != sides.length || assets.length != ratesPerSecond.length) revert LengthMismatch();
+        for (uint256 i = 0; i < assets.length; i++) _setRate(assets[i], sides[i], ratesPerSecond[i], 0);
     }
 
     /**
@@ -286,6 +362,14 @@ contract TesseraEmissions is ReentrancyGuard {
             return;
         }
         if (nowTs == s.lastAccrual) return;
+        /*
+         * A pause moves the clock without emitting, so the paused seconds are
+         * skipped rather than saved up and paid on resume.
+         */
+        if (paused) {
+            s.lastAccrual = nowTs;
+            return;
+        }
         // Nothing accrues past the end. Time after it is not paid for, and the
         // accrual clock still moves so a later restart does not backdate.
         uint64 until = s.endsAt != 0 && s.endsAt < nowTs ? s.endsAt : nowTs;
@@ -405,7 +489,7 @@ contract TesseraEmissions is ReentrancyGuard {
         Position storage p = positions[asset][side][user];
 
         uint256 index = s.index;
-        if (s.lastAccrual != 0 && block.timestamp > s.lastAccrual && s.ratePerSecond != 0) {
+        if (!paused && s.lastAccrual != 0 && block.timestamp > s.lastAccrual && s.ratePerSecond != 0) {
             uint256 until = s.endsAt != 0 && s.endsAt < block.timestamp ? s.endsAt : block.timestamp;
             uint256 total = _totalShares(asset, side);
             if (total != 0 && until > s.lastAccrual) {
@@ -435,6 +519,7 @@ contract TesseraEmissions is ReentrancyGuard {
 
     /// @notice Reward units per second currently promised across every stream.
     function totalRatePerSecond() external view returns (uint256 total) {
+        if (paused) return 0; // paused is not "slow", it is "stopped"
         uint256 n = streamedAssets.length;
         for (uint256 i = 0; i < n; i++) {
             for (uint8 side = SIDE_SUPPLY; side <= SIDE_BORROW; side++) {

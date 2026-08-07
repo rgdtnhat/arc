@@ -285,4 +285,101 @@ describe("TesseraEmissions (rewards that cannot outrun the pot)", () => {
     expect((await f.em.read.streamedAssets([0n])).toLowerCase()).to.equal(f.usdc.address.toLowerCase());
     expect((await f.em.read.streamedAssets([1n])).toLowerCase()).to.equal(f.reward.address.toLowerCase());
   });
+
+  it("stops emitting while paused, without disturbing what was already earned", async () => {
+    /*
+     * The property an operator reaching for this switch during an incident
+     * needs: the emission actually stops, and the balance people have already
+     * earned is untouched — including still being claimable.
+     */
+    const f = await loadFixture(deployFixture);
+    await f.pool.write.setShares([f.usdc.address, f.alice.account.address, 1000n, 0n]);
+    await f.pool.write.setTotals([f.usdc.address, 1000n, 0n]);
+    await f.em.write.fund([RWD(100_000)]);
+    await f.em.write.setRate([f.usdc.address, SUPPLY, RWD(1)]);
+    await f.em.write.checkpoint([f.alice.account.address, f.usdc.address, SUPPLY]);
+    await time.increase(100);
+
+    await f.em.write.setPaused([true]);
+    const atPause = await f.em.read.claimable([f.alice.account.address, f.usdc.address, SUPPLY]);
+    expect(atPause > RWD(99)).to.equal(true);
+
+    await time.increase(1000);
+    expect(await f.em.read.claimable([f.alice.account.address, f.usdc.address, SUPPLY])).to.equal(atPause);
+
+    // Paused rewards are not frozen rewards: the claim still pays.
+    const a = await f.emAs(f.alice);
+    await a.write.claim([[f.usdc.address], [SUPPLY]]);
+    expect(await f.reward.read.balanceOf([f.alice.account.address]) >= atPause).to.equal(true);
+  });
+
+  it("does not pay out the paused seconds when it resumes", async () => {
+    // A pause that settles up on resume is a deferral, and would mean an
+    // operator who paused for a week owes a week of emissions afterwards.
+    const f = await loadFixture(deployFixture);
+    await f.pool.write.setShares([f.usdc.address, f.alice.account.address, 1000n, 0n]);
+    await f.pool.write.setTotals([f.usdc.address, 1000n, 0n]);
+    await f.em.write.fund([RWD(100_000)]);
+    await f.em.write.setRate([f.usdc.address, SUPPLY, RWD(1)]);
+    await f.em.write.checkpoint([f.alice.account.address, f.usdc.address, SUPPLY]);
+
+    await f.em.write.setPaused([true]);
+    await time.increase(5000);
+    await f.em.write.setPaused([false]);
+    await time.increase(100);
+
+    const due = await f.em.read.claimable([f.alice.account.address, f.usdc.address, SUPPLY]);
+    expect(due < RWD(200)).to.equal(true); // ~100, not ~5100
+  });
+
+  it("keeps the rates across a pause, so resuming needs no reconstruction", async () => {
+    const f = await loadFixture(deployFixture);
+    await f.em.write.setRate([f.usdc.address, SUPPLY, RWD(3)]);
+    await f.em.write.setPaused([true]);
+    expect(await f.em.read.totalRatePerSecond()).to.equal(0n); // paused is stopped, not slow
+    await f.em.write.setPaused([false]);
+    expect(await f.em.read.totalRatePerSecond()).to.equal(RWD(3));
+  });
+
+  it("only the owner may pause", async () => {
+    const f = await loadFixture(deployFixture);
+    const a = await f.emAs(f.alice);
+    await expect(a.write.setPaused([true])).to.be.rejected;
+  });
+
+  it("lets an appointed rate setter set rates and nothing else", async () => {
+    /*
+     * This is the gauge's seat: it writes the vote result and cannot touch the
+     * reward token, the pot, or the pause.
+     */
+    const f = await loadFixture(deployFixture);
+    const a = await f.emAs(f.alice);
+    await expect(a.write.setRate([f.usdc.address, SUPPLY, RWD(1)])).to.be.rejected;
+
+    await f.em.write.setRateSetter([f.alice.account.address]);
+    await a.write.setRate([f.usdc.address, SUPPLY, RWD(1)]);
+    expect(await f.em.read.totalRatePerSecond()).to.equal(RWD(1));
+
+    await expect(a.write.setPaused([true])).to.be.rejected;
+    await expect(a.write.setRewardToken([f.usdc.address])).to.be.rejected;
+    await expect(a.write.sweep([f.alice.account.address, 1n])).to.be.rejected;
+    await expect(a.write.setRateSetter([f.bob.account.address])).to.be.rejected;
+  });
+
+  it("sets a batch of streams in one call, which is what the gauge writes", async () => {
+    const f = await loadFixture(deployFixture);
+    await f.em.write.setRatesBatch([[f.usdc.address, f.usdc.address], [SUPPLY, BORROW], [RWD(1), RWD(2)]]);
+    expect(await f.em.read.totalRatePerSecond()).to.equal(RWD(3));
+    await expect(
+      f.em.write.setRatesBatch([[f.usdc.address], [SUPPLY, BORROW], [RWD(1)]]),
+    ).to.be.rejected;
+  });
+
+  it("sets both sides of a market at once", async () => {
+    // `setRates` used to route through `this.setRate`, which made the contract
+    // its own caller and failed the owner check every single time.
+    const f = await loadFixture(deployFixture);
+    await f.em.write.setRates([f.usdc.address, RWD(1), RWD(2)]);
+    expect(await f.em.read.totalRatePerSecond()).to.equal(RWD(3));
+  });
 });
