@@ -2330,9 +2330,69 @@
             <div class="msg" id="gaBribeMsg" style="display:none"></div>
           </div>
 
+          <div class="card" id="govDiscussionsCard">
+            <h2>Discussions — before it becomes a vote</h2>
+            <div class="kv" id="govDiscussionNote" style="margin-bottom:10px"></div>
+            <div id="govDiscussions" style="display:flex;flex-direction:column;gap:12px"></div>
+            <div class="row-actions" style="flex-wrap:wrap;margin-top:12px">
+              <input id="govDiscTitle" class="field" placeholder="What are you proposing?" style="min-width:280px" />
+            </div>
+            <textarea id="govDiscBody" class="field" placeholder="The case for it, and what it would change"
+              style="width:100%;min-height:80px;margin-top:8px"></textarea>
+            <div class="row-actions" style="margin-top:8px">
+              <button class="btn" id="govDiscPost">Open a discussion</button>
+              <span class="kv">Signed by your wallet, so authorship can be checked.</span>
+            </div>
+            <div class="msg" id="govDiscMsg" style="display:none"></div>
+          </div>
+
           <div class="card" id="govProposalsCard">
-            <h2>Proposals</h2>
-            <div id="govProposals" style="display:flex;flex-direction:column;gap:12px"></div>
+            <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
+              <h2 style="margin:0">Proposals</h2>
+              <div class="row-actions">
+                <select id="govFilter" class="field">
+                  <option value="all">All</option>
+                  <option value="open">Open for voting</option>
+                  <option value="passed">Passed</option>
+                  <option value="failed">Did not pass</option>
+                  <option value="mine">You can vote</option>
+                </select>
+              </div>
+            </div>
+            <div id="govProposals" style="display:flex;flex-direction:column;gap:12px;margin-top:12px"></div>
+            <div class="row-actions" id="govPager" style="justify-content:center;margin-top:12px;display:none">
+              <button class="btn" id="govPrev">‹</button>
+              <span class="kv" id="govPageLabel"></span>
+              <button class="btn" id="govNext">›</button>
+            </div>
+          </div>
+
+          <div class="card" id="govDetailCard" style="display:none">
+            <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
+              <h2 style="margin:0" id="govDetailTitle">Proposal</h2>
+              <button class="btn" id="govDetailBack">‹ Back to proposals</button>
+            </div>
+            <div class="kv" id="govDetailMeta" style="margin-top:8px"></div>
+            <div class="kv" id="govDetailBody" style="margin-top:10px;white-space:pre-wrap"></div>
+
+            <h3 style="font-size:13px;margin:18px 0 8px">Final result</h3>
+            <div id="govDetailBars"></div>
+            <div class="kv" id="govDetailQuorum" style="margin-top:10px"></div>
+
+            <div id="govDetailActionsWrap" style="display:none;margin-top:16px">
+              <h3 style="font-size:13px;margin:0 0 8px">What it carries</h3>
+              <div class="tblWrap auto"><table class="data" style="min-width:0">
+                <thead><tr><th>#</th><th>Target</th><th>Call</th></tr></thead>
+                <tbody id="govDetailActions"></tbody>
+              </table></div>
+            </div>
+
+            <h3 style="font-size:13px;margin:18px 0 8px" id="govVotesHeading">Votes</h3>
+            <div class="kv" id="govVotesNote" style="margin-bottom:8px;display:none"></div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr><th>Account</th><th class="num">Vote</th><th class="num">Weight</th><th class="num">% of cast</th></tr></thead>
+              <tbody id="govVotesRows"></tbody>
+            </table></div>
           </div>
 
           <div class="card" id="govCreateCard" style="display:none">

@@ -148,6 +148,7 @@ const $ = (id) => document.getElementById(id);
             loadGovernance().catch(() => {});
             if (typeof loadGauge === "function") loadGauge().catch(() => {});
             if (typeof loadRegistry === "function") loadRegistry().catch(() => {});
+            if (typeof loadDiscussions === "function") loadDiscussions().catch(() => {});
           }
         }
         // The document title is now the only "where am I" indicator besides the
@@ -4536,12 +4537,7 @@ const $ = (id) => document.getElementById(id);
           $("govCreateCard").style.display = r.canPropose && adminId ? "" : "none";
           $("govEmissionsCard").style.display = r.canPropose && adminId ? "" : "none";
 
-          host.innerHTML = (r.proposals || []).length
-            ? r.proposals.map((p) => govCard(p, r)).join("")
-            : `<div class="kv">No proposals yet.</div>`;
-          host.querySelectorAll("[data-vote]").forEach((b) =>
-            b.addEventListener("click", () => castVote(Number(b.dataset.id), Number(b.dataset.vote))),
-          );
+          renderProposals(r);
 
           // The lock.
           if (r.lock) {
@@ -4565,6 +4561,251 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
+      /* ---- Proposal list: filtering and paging ------------------------------
+       *
+       * A governance page is read from the top and grows forever. Both of these
+       * are display only — nothing here changes which proposals exist or what
+       * anybody may vote on.
+       */
+      let govFilter = "all";
+      let govPage = 1;
+      const GOV_PAGE_SIZE = 5;
+
+      if ($("govFilter")) {
+        $("govFilter").addEventListener("change", () => {
+          govFilter = $("govFilter").value;
+          govPage = 1;
+          if (window.__gov) renderProposals(window.__gov);
+        });
+      }
+      if ($("govPrev")) $("govPrev").addEventListener("click", () => {
+        if (govPage > 1) { govPage--; renderProposals(window.__gov); }
+      });
+      if ($("govNext")) $("govNext").addEventListener("click", () => {
+        govPage++; renderProposals(window.__gov);
+      });
+
+      const PASSED = ["Succeeded", "Queued", "Executed"];
+      const FAILED = ["Defeated", "Cancelled"];
+
+      function renderProposals(r) {
+        const host = $("govProposals");
+        if (!host || !r) return;
+        let rows = r.proposals || [];
+        if (govFilter === "open") rows = rows.filter((p) => p.state === "Active");
+        if (govFilter === "passed") rows = rows.filter((p) => PASSED.includes(p.state));
+        if (govFilter === "failed") rows = rows.filter((p) => FAILED.includes(p.state));
+        if (govFilter === "mine") {
+          rows = rows.filter((p) => p.state === "Active" && !p.youVoted && Number(p.yourWeightRaw) > 0);
+        }
+
+        const pages = Math.max(1, Math.ceil(rows.length / GOV_PAGE_SIZE));
+        if (govPage > pages) govPage = pages;
+        const slice = rows.slice((govPage - 1) * GOV_PAGE_SIZE, govPage * GOV_PAGE_SIZE);
+
+        host.innerHTML = slice.length
+          ? slice.map((p) => govCard(p, r)).join("")
+          : `<div class="kv">${esc(
+              govFilter === "mine"
+                ? "Nothing open that you can still vote on."
+                : "No proposals match that filter.",
+            )}</div>`;
+        host.querySelectorAll("[data-vote]").forEach((b) =>
+          b.addEventListener("click", (ev) => { ev.stopPropagation(); castVote(Number(b.dataset.id), Number(b.dataset.vote)); }),
+        );
+        host.querySelectorAll("[data-open-proposal]").forEach((el) =>
+          el.addEventListener("click", () => openProposal(Number(el.dataset.openProposal))),
+        );
+
+        const pager = $("govPager");
+        if (pager) {
+          pager.style.display = rows.length > GOV_PAGE_SIZE ? "" : "none";
+          $("govPageLabel").textContent =
+            `${(govPage - 1) * GOV_PAGE_SIZE + 1}–${Math.min(govPage * GOV_PAGE_SIZE, rows.length)} of ${rows.length}`;
+          $("govPrev").disabled = govPage <= 1;
+          $("govNext").disabled = govPage >= pages;
+        }
+      }
+
+      /* ---- One proposal, in full ------------------------------------------- */
+      async function openProposal(id) {
+        const card = $("govDetailCard");
+        if (!card) return;
+        try {
+          const who = String(window.__myAddress || "");
+          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `&user=${encodeURIComponent(who)}` : "";
+          const r = await (await fetch(`/api/governance/proposal?id=${id}${q}`)).json();
+          if (!r || !r.ok) { govMsg("govMsg", (r && r.error) || "Could not read that proposal.", "var(--warn)"); return; }
+
+          $("govProposalsCard").style.display = "none";
+          $("govDiscussionsCard").style.display = "none";
+          card.style.display = "";
+          card.scrollIntoView({ behavior: "smooth", block: "start" });
+
+          $("govDetailTitle").textContent = `#${r.id} ${r.title}`;
+          const ex = r.explorer;
+          const link = (addr) =>
+            ex ? `<a href="${esc(ex)}/address/${esc(addr)}" target="_blank" rel="noopener">${esc(shortAddr(addr))}</a>`
+               : esc(shortAddr(addr));
+          $("govDetailMeta").innerHTML =
+            `<span class="tag">${esc(r.state)}</span> · Proposed by ${link(r.proposer)} · ` +
+            `snapshot block ${esc(r.snapshotBlock)} · voting ${r.state === "Active" ? "closes" : "closed"} ${esc(relTime(r.voteEnd))}`;
+          $("govDetailBody").textContent = r.description || "";
+
+          const sym = r.token.symbol;
+          const bar = (label, amount, pct, colour) =>
+            `<div style="margin-bottom:10px">` +
+            `<div class="row-actions" style="justify-content:space-between">` +
+            `<span>${label}</span><span class="mono">${esc(pct.toFixed(2))}% — ${esc(amount)} ${esc(sym)}</span></div>` +
+            `<div style="height:8px;border-radius:4px;background:var(--line);overflow:hidden;margin-top:4px">` +
+            `<div style="height:100%;width:${Math.max(0, Math.min(100, pct))}%;background:${colour}"></div></div></div>`;
+          $("govDetailBars").innerHTML =
+            bar("For", r.result.for, r.result.forPct, "var(--good)") +
+            bar("Abstain", r.result.abstain, r.result.abstainPct, "var(--muted)") +
+            bar("Against", r.result.against, r.result.againstPct, "var(--warn)");
+
+          // Turnout against the bar it had to clear, rather than two numbers to
+          // divide in your head.
+          $("govDetailQuorum").innerHTML =
+            `Participation: <b>${esc(r.result.participationPct.toFixed(2))}%</b> of circulating ` +
+            `(&gt;${esc(r.result.quorumPct.toFixed(0))}% needed) — ` +
+            `<span class="${r.result.quorumMet ? "" : "warn"}">${r.result.quorumMet ? "quorum met" : "below quorum"}</span>. ` +
+            `${esc(r.result.cast)} of ${esc(r.result.circulating)} ${esc(sym)} voted.`;
+
+          const aw = $("govDetailActionsWrap");
+          aw.style.display = (r.actions || []).length ? "" : "none";
+          if ((r.actions || []).length) {
+            $("govDetailActions").innerHTML = r.actions.map((a) =>
+              `<tr><td>${a.index + 1}</td><td class="mono" style="font-size:11px">${link(a.target)}</td>` +
+              `<td class="mono" style="font-size:11px">${esc(a.selector)}…</td></tr>`).join("");
+          }
+
+          $("govVotesHeading").textContent = `Votes (${r.voteCount})`;
+          const note = $("govVotesNote");
+          // A short scan must never present itself as the whole roll.
+          note.style.display = r.votesPartial ? "" : "none";
+          note.textContent = r.votesPartial
+            ? "The node returned only part of the log range, so this list may be missing entries. The totals above are read from the contract and are complete."
+            : "";
+          $("govVotesRows").innerHTML = (r.votes || []).length
+            ? r.votes.map((v) => {
+                const tone = v.support === "For" ? "ok" : v.support === "Against" ? "warn" : "";
+                const you = window.__myAddress && v.voter.toLowerCase() === String(window.__myAddress).toLowerCase();
+                return `<tr><td class="mono" style="font-size:11.5px">${link(v.voter)}` +
+                  `${you ? ' <span class="tag ok" style="font-size:10px">you</span>' : ""}</td>` +
+                  `<td class="num"><span class="tag ${tone}" style="font-size:10px">${esc(v.support)}</span></td>` +
+                  `<td class="num mono">${esc(v.weight)}</td>` +
+                  `<td class="num">${esc(v.pctOfCast < 0.01 ? "<0.01" : v.pctOfCast.toFixed(2))}%</td></tr>`;
+              }).join("")
+            : emptyRow(4, "Nobody has voted on this yet.");
+        } catch {
+          govMsg("govMsg", "Could not read that proposal.", "var(--warn)");
+        }
+      }
+
+      if ($("govDetailBack")) {
+        $("govDetailBack").addEventListener("click", () => {
+          $("govDetailCard").style.display = "none";
+          $("govProposalsCard").style.display = "";
+          $("govDiscussionsCard").style.display = "";
+          $("govProposalsCard").scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+      }
+
+      /* ---- Discussions ------------------------------------------------------ */
+      async function loadDiscussions() {
+        const host = $("govDiscussions");
+        if (!host) return;
+        try {
+          const r = await (await fetch("/api/governance/discussions")).json();
+          if (!r || !r.ok) { host.innerHTML = ""; return; }
+          window.__discussions = r;
+          $("govDiscussionNote").textContent = r.note;
+          host.innerHTML = (r.drafts || []).length
+            ? r.drafts.map((d) =>
+                `<div style="padding:12px;border:1px solid var(--line-strong);border-radius:12px">` +
+                `<div class="row-actions" style="justify-content:space-between">` +
+                `<b style="font-size:14px">${esc(d.title)}</b>` +
+                `<span class="tag ${d.published ? "ok" : ""}">${d.published ? "proposal #" + d.proposalId : "not published"}</span>` +
+                `</div>` +
+                `<div class="kv" style="margin:6px 0 8px;white-space:pre-wrap">${esc(d.body)}</div>` +
+                `<div class="muted" style="font-size:11px">by ${esc(shortAddr(d.author))} · ${esc(relTime(Math.floor(d.createdAt / 1000)))}</div>` +
+                (d.comments || []).map((c) =>
+                  `<div style="margin-top:8px;padding-left:10px;border-left:2px solid var(--line)">` +
+                  `<div class="kv" style="white-space:pre-wrap">${esc(c.body)}</div>` +
+                  `<div class="muted" style="font-size:10.5px">${esc(shortAddr(c.author))} · ${esc(relTime(Math.floor(c.createdAt / 1000)))}</div></div>`).join("") +
+                `<div class="row-actions" style="margin-top:10px;flex-wrap:wrap">` +
+                `<input class="field discReply" data-parent="${esc(d.id)}" placeholder="Reply" style="min-width:220px" />` +
+                `<button class="btn" data-disc-reply="${esc(d.id)}" style="padding:3px 10px;font-size:11px">Reply</button>` +
+                (r.canPublish && !d.published
+                  ? `<button class="btn primary" data-disc-publish="${esc(d.id)}" style="padding:3px 10px;font-size:11px">Publish as a proposal</button>`
+                  : "") +
+                `</div></div>`).join("")
+            : `<div class="kv">Nothing under discussion. Open one below.</div>`;
+
+          host.querySelectorAll("[data-disc-reply]").forEach((b) =>
+            b.addEventListener("click", () => postDiscussion("comment", b.dataset.discReply)),
+          );
+          host.querySelectorAll("[data-disc-publish]").forEach((b) =>
+            b.addEventListener("click", async () => {
+              try {
+                const res = await (await postJson("/api/governance/discussions/publish", { id: b.dataset.discPublish })).json();
+                govMsg("govDiscMsg", res.ok ? `Opened as proposal #${res.proposalId}. Voting is live. — ${res.txHash}` : (res.error || "failed"),
+                  res.ok ? "var(--good)" : "var(--warn)");
+                if (res.ok) { loadDiscussions(); loadGovernance(); }
+              } catch { govMsg("govDiscMsg", "Request failed.", "var(--warn)"); }
+            }),
+          );
+        } catch {
+          host.innerHTML = "";
+        }
+      }
+
+      async function postDiscussion(kind, parent) {
+        if (!selfMode()) {
+          govMsg("govDiscMsg", "A post is signed by its author, so this needs your own wallet. " +
+            'Switch on "Use my own wallet".', "var(--warn)");
+          return;
+        }
+        const title = kind === "draft" ? ($("govDiscTitle").value || "").trim() : "";
+        const body = kind === "draft"
+          ? ($("govDiscBody").value || "").trim()
+          : (document.querySelector(`.discReply[data-parent="${parent}"]`)?.value || "").trim();
+        if (!body) { govMsg("govDiscMsg", "Say something first.", "var(--warn)"); return; }
+        if (kind === "draft" && !title) { govMsg("govDiscMsg", "A discussion needs a title.", "var(--warn)"); return; }
+
+        try {
+          const from = await selfAccount();
+          if (!from) { govMsg("govDiscMsg", "Connect a wallet first.", "var(--warn)"); return; }
+          const at = Date.now();
+          const cfg = await loadDefiConfig();
+          // The signed text names this governor and this chain, so a signature
+          // gathered here cannot be replayed as a post somewhere else.
+          const message =
+            `Tessera governance ${kind}\n` +
+            `governor: ${cfg.governor}\n` +
+            `chain: ${cfg.chainId}\n` +
+            `at: ${at}\n\n` +
+            (kind === "draft" ? `${title}\n\n${body}` : body);
+          const signature = await window.ethereum.request({
+            method: "personal_sign",
+            params: [message, from],
+          });
+          const r = await (await postJson("/api/governance/discussions", {
+            kind, title, body, parent, author: from, at, signature,
+          })).json();
+          govMsg("govDiscMsg", r.ok ? "Posted." : (r.error || "failed"), r.ok ? "var(--good)" : "var(--warn)");
+          if (r.ok) {
+            if (kind === "draft") { $("govDiscTitle").value = ""; $("govDiscBody").value = ""; }
+            loadDiscussions();
+          }
+        } catch (e) {
+          govMsg("govDiscMsg", String(e && e.message ? e.message : e).slice(0, 160), "var(--warn)");
+        }
+      }
+
+      if ($("govDiscPost")) $("govDiscPost").addEventListener("click", () => postDiscussion("draft"));
+
       /** One proposal, with only the buttons that would actually work. */
       function govCard(p, r) {
         const sym = r.token.symbol;
@@ -4581,20 +4822,22 @@ const $ = (id) => document.getElementById(id);
         const bar = (label, v) =>
           `<div class="kv" style="justify-content:space-between"><span>${label}</span><b>${esc(v)} ${esc(sym)}</b></div>`;
         return (
-          `<div style="padding:12px;border:1px solid var(--line-strong);border-radius:12px">` +
+          `<div data-open-proposal="${p.id}" style="padding:12px;border:1px solid var(--line-strong);border-radius:12px;cursor:pointer">` +
           `<div class="row-actions" style="justify-content:space-between">` +
           `<b style="font-size:14px">#${p.id} ${esc(p.title)}</b>` +
           `<span class="tag ${tone}">${esc(p.state)}</span></div>` +
           `<div class="kv" style="margin:6px 0 10px">${esc(p.description || "")}</div>` +
           bar("For", p.forVotes) + bar("Against", p.againstVotes) + bar("Abstain", p.abstainVotes) +
           `<div class="kv" style="justify-content:space-between;margin-top:4px">` +
-          `<span>Turnout ${esc(p.castVotes)} / ${esc(r.quorum)} needed</span>` +
+          `<span>Participation ${esc((p.participationPct ?? 0).toFixed(2))}%` +
+          `${r.quorumPct ? ` (&gt;${esc(r.quorumPct.toFixed(0))}% needed)` : ""}</span>` +
           `<span class="${p.quorumMet ? "" : "warn"}">${p.quorumMet ? "quorum met" : "below quorum"}</span></div>` +
           `<div class="kv" style="margin-top:6px">` +
           (live ? `Voting closes ${esc(relTime(p.voteEnd))}.` : `Voting closed ${esc(relTime(p.voteEnd))}.`) +
           (p.actions ? ` Carries ${p.actions} on-chain call${p.actions === 1 ? "" : "s"}.` : " Signalling only.") +
           `</div>` +
           (why ? `<div class="kv" style="margin-top:6px">${esc(why)}</div>` : "") +
+          `<div class="muted" style="font-size:11px;margin-top:6px">Open for the full result and every vote ›</div>` +
           (canVote
             ? `<div class="row-actions" style="margin-top:10px">` +
               `<button class="btn primary" data-vote="1" data-id="${p.id}">For</button>` +
@@ -5943,7 +6186,10 @@ const $ = (id) => document.getElementById(id);
         if (ids.length !== 1) { cfgHiMsg("Tick exactly one record for this.", false); return null; }
         return historyState.records.find((r) => r.id === ids[0]) || null;
       };
-      const shortAddr = (a) => String(a).slice(0, 8) + "…" + String(a).slice(-4);
+      /* Hoisted: the governance detail view renders addresses too, and two
+         definitions of "short" is how the same wallet reads differently in
+         two places on one page. */
+      var shortAddr = (a) => String(a).slice(0, 8) + "…" + String(a).slice(-4);
 
       async function loadCfgHistory() {
         const host = $("cfgHiList");

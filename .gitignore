@@ -24,6 +24,8 @@ deployments/arc.local.json
 .tessera-txlog.json
 # Persisted holder-address index. A cache rebuilt from the chain, never truth.
 .tessera-holders.json
+# Governance drafts and comments: operator-stored, wallet-signed, per-deployment.
+.tessera-discussions.json
 deployments/arc.history.json
 # Scratch directory for local QA scripts; never part of the app.
 .tmpqa/

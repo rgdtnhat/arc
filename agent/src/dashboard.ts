@@ -5902,6 +5902,7 @@ async function main() {
         G<bigint>("proposalCount"), G<bigint>("circulatingSupply"), G<bigint>("quorumVotes"),
         T2<string>("symbol"), T2<number>("decimals"),
       ]);
+      const quorumBps = await G<number>("quorumBps").catch(() => 0);
       const dec = Number(decimals);
       const fmtT = (v: bigint) => fmtUnits(v, dec);
 
@@ -5935,6 +5936,10 @@ async function main() {
             abstainVotes: fmtT(p[7]),
             castVotes: fmtT(cast),
             quorumMet: cast >= quorum,
+            // The turnout figure a voter actually reads: what share of the
+            // supply that could vote did, against the share that was needed.
+            participationPct: circulating === 0n ? 0 : Number((cast * 10_000n) / circulating) / 100,
+            forPct: cast === 0n ? 0 : Number((p[5] * 10_000n) / cast) / 100,
             state: STATES[Number(p[8])] ?? "Unknown",
             title: p[9],
             description: p[10],
@@ -5990,6 +5995,8 @@ async function main() {
         canPropose: Boolean(owner),
         circulating: fmtT(circulating),
         quorum: fmtT(quorum),
+        quorumPct: Number(quorumBps) / 100,
+        proposalCount: total,
         you: { balance: fmtT(yours[0] as bigint), votes: fmtT(yours[1] as bigint), delegate: yours[2] as Hex },
         proposals,
         lock,
@@ -6000,6 +6007,387 @@ async function main() {
   });
 
   /** Open a proposal. Operator only — an open queue is mostly spam. */
+  /* ---- Discussions: the stage before a vote ------------------------------
+   *
+   * Aquarius's governance has a step Tessera did not: a proposal exists as a
+   * *discussion* before it is published to the chain, so the wording can be
+   * argued over while changing it is still free. Once a vote opens the text is
+   * immutable and the snapshot is taken — which is right, and is exactly why
+   * there has to be somewhere to think first.
+   *
+   * ## What is and is not on chain, said plainly
+   * Drafts and comments are stored by this server, not by a contract. Putting a
+   * forum on chain would mean paying gas to disagree, and would make deleting
+   * spam impossible. What the server cannot do is forge authorship: every post
+   * carries the wallet signature that produced it, over a message naming this
+   * governor and the post's own text, so anybody can check a post really came
+   * from the address next to it. The operator can remove a post; it cannot
+   * write one in somebody else's name.
+   *
+   * The vote itself is on chain, and nothing here touches it.
+   */
+  type DiscussionPost = {
+    id: string;
+    author: string;
+    kind: "draft" | "comment";
+    /** Drafts only. */
+    title?: string;
+    body: string;
+    /** Comments only: which draft. */
+    parent?: string;
+    createdAt: number;
+    signature: string;
+    /** Set once an operator opens the vote, so a draft points at its result. */
+    proposalId?: number;
+    removed?: boolean;
+  };
+
+  const discussionsFile = statePath(".tessera-discussions.json");
+  const loadDiscussions = (): DiscussionPost[] => {
+    try {
+      const raw = JSON.parse(readFileSync(discussionsFile, "utf8"));
+      return Array.isArray(raw) ? raw : [];
+    } catch {
+      return [];
+    }
+  };
+  let discussions = loadDiscussions();
+  const saveDiscussions = () => {
+    try { writeFileSync(discussionsFile, JSON.stringify(discussions, null, 2)); }
+    catch (e) { console.error(`[discussions] could not save: ${String(e).slice(0, 120)}`); }
+  };
+
+  /**
+   * The message a post's signature covers.
+   *
+   * Naming the governor and the chain stops a signature gathered for one
+   * deployment being replayed as a post on another, and including the text
+   * means editing a post invalidates its own proof of authorship.
+   */
+  const discussionMessage = (kind: string, text: string, at: number) =>
+    `Tessera governance ${kind}\n` +
+    `governor: ${governorAddr}\n` +
+    `chain: ${liveDeployment.chainId}\n` +
+    `at: ${at}\n\n${text}`;
+
+  app.get("/api/governance/discussions", async (req, res) => {
+    try {
+      const identity = identityOf(req);
+      const rows = discussions.filter((d) => !d.removed);
+      const drafts = rows
+        .filter((d) => d.kind === "draft")
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .map((d) => ({
+          id: d.id,
+          author: d.author,
+          title: d.title ?? "",
+          body: d.body,
+          createdAt: d.createdAt,
+          // "Not published" is the honest label: it exists, and it is not a
+          // vote yet.
+          published: d.proposalId != null,
+          proposalId: d.proposalId ?? null,
+          comments: rows
+            .filter((c) => c.kind === "comment" && c.parent === d.id)
+            .sort((a, b) => a.createdAt - b.createdAt)
+            .map((c) => ({ id: c.id, author: c.author, body: c.body, createdAt: c.createdAt })),
+        }));
+      res.json({
+        ok: true,
+        canPublish: Boolean(identity?.kind === "admin" && owner),
+        // Said once, on the page, rather than left to be assumed.
+        note:
+          "Drafts and comments are stored by this server and signed by the wallet that wrote them, so " +
+          "authorship can be checked but the thread is not on chain. The vote itself is.",
+        drafts,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Open a discussion, or comment on one. Signed by the author's wallet. */
+  app.post("/api/governance/discussions", async (req, res) => {
+    try {
+      const kind = String(req.body?.kind ?? "draft") === "comment" ? "comment" : "draft";
+      const body = String(req.body?.body ?? "").trim().slice(0, 4000);
+      const title = String(req.body?.title ?? "").trim().slice(0, 140);
+      const author = String(req.body?.author ?? "");
+      const signature = String(req.body?.signature ?? "");
+      const at = Number(req.body?.at ?? 0);
+      const parent = String(req.body?.parent ?? "");
+
+      if (!body) { res.status(400).json({ ok: false, error: "say something" }); return; }
+      if (kind === "draft" && !title) { res.status(400).json({ ok: false, error: "a discussion needs a title" }); return; }
+      if (kind === "comment" && !discussions.some((d) => d.id === parent && d.kind === "draft" && !d.removed)) {
+        res.status(400).json({ ok: false, error: "no such discussion" });
+        return;
+      }
+      if (!/^0x[0-9a-fA-F]{40}$/.test(author)) { res.status(400).json({ ok: false, error: "bad author address" }); return; }
+      // Five minutes of clock skew, so a stale signature cannot be replayed for
+      // long and an honest one is never refused for being a second out.
+      if (!Number.isFinite(at) || Math.abs(Date.now() - at) > 5 * 60_000) {
+        res.status(400).json({ ok: false, error: "that signature is too old — try again" });
+        return;
+      }
+
+      const message = discussionMessage(kind, kind === "draft" ? `${title}\n\n${body}` : body, at);
+      const okSig = await verifyMessage({ address: author as Hex, message, signature: signature as Hex })
+        .catch(() => false);
+      if (!okSig) {
+        res.status(401).json({ ok: false, error: "that signature does not match the address" });
+        return;
+      }
+
+      // Holding the token is not required to read, but it is to post: an open
+      // write endpoint is a spam endpoint, and the token is the cheapest
+      // available proof of being a participant rather than a passer-by.
+      if (tokenAddr) {
+        const bal = (await client.public
+          .readContract({ address: tokenAddr, abi: tesseraTokenAbi, functionName: "balanceOf", args: [author as Hex] })
+          .catch(() => 0n)) as bigint;
+        if (bal === 0n) {
+          res.status(403).json({ ok: false, error: "posting needs a TSRA balance — earn some by supplying or providing liquidity" });
+          return;
+        }
+      }
+
+      const post: DiscussionPost = {
+        id: `${kind}-${at}-${author.slice(2, 10).toLowerCase()}`,
+        author, kind, body, createdAt: at, signature,
+        ...(kind === "draft" ? { title } : { parent }),
+      };
+      discussions.push(post);
+      saveDiscussions();
+      res.json({ ok: true, id: post.id });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Publish a draft as a real proposal.
+   *
+   * The draft's text goes on chain unchanged, and the draft keeps a pointer to
+   * the proposal it became — so the argument and the vote stay connected
+   * instead of the discussion vanishing the moment it matters.
+   */
+  app.post("/api/governance/discussions/publish", requireOperator, async (req, res) => {
+    if (!governorAddr) { res.status(404).json({ ok: false, error: "governor not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const id = String(req.body?.id ?? "");
+      const draft = discussions.find((d) => d.id === id && d.kind === "draft" && !d.removed);
+      if (!draft) { res.status(404).json({ ok: false, error: "no such discussion" }); return; }
+      if (draft.proposalId != null) { res.status(400).json({ ok: false, error: "already published" }); return; }
+
+      const before = (await client.public.readContract({
+        address: governorAddr, abi: tesseraGovernorAbi, functionName: "proposalCount",
+      })) as bigint;
+      const txHash = await owner.write(governorAddr, tesseraGovernorAbi, "propose", [
+        draft.title ?? "Untitled",
+        `${draft.body}\n\nOpened from discussion by ${draft.author}.`,
+        [], [],
+      ]);
+      draft.proposalId = Number(before);
+      saveDiscussions();
+      logTx(req, {
+        category: "defi", action: "gov-publish", status: "success", txHash,
+        detail: `#${before} from discussion ${id}`,
+      });
+      res.json({ ok: true, txHash, proposalId: Number(before) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Remove a post. The operator can hide spam; it cannot write in your name. */
+  app.post("/api/governance/discussions/remove", requireOperator, async (req, res) => {
+    try {
+      const id = String(req.body?.id ?? "");
+      const post = discussions.find((d) => d.id === id);
+      if (!post) { res.status(404).json({ ok: false, error: "no such post" }); return; }
+      post.removed = true;
+      saveDiscussions();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * One proposal in full: who opened it, what the result was, and who voted.
+   *
+   * The tally on the list page says what was decided. This says *by whom* —
+   * every vote, its weight, and what share of the outcome it was. A governance
+   * page that shows only totals asks people to take the totals on faith, and
+   * the whole point of voting on chain is that they do not have to.
+   *
+   * The roll is read from `VoteCast` logs between the snapshot block and now.
+   * That range is exact rather than a guess: votes cannot exist before the
+   * proposal opened, and the snapshot is the block before it did.
+   */
+  app.get("/api/governance/proposal", async (req, res) => {
+    if (!governorAddr || !tokenAddr) {
+      res.json({ ok: true, deployed: false, note: "No governor on this deployment." });
+      return;
+    }
+    try {
+      const id = BigInt(String(req.query.id ?? "-1"));
+      if (id < 0n) { res.status(400).json({ ok: false, error: "which proposal?" }); return; }
+      const user = String(req.query.user ?? "");
+      const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+
+      const G = <T,>(fn: string, args: unknown[] = []) =>
+        client.public.readContract({
+          address: governorAddr, abi: tesseraGovernorAbi, functionName: fn as never, args: args as never,
+        }) as Promise<T>;
+
+      const count = await G<bigint>("proposalCount");
+      if (id >= count) { res.status(404).json({ ok: false, error: "no such proposal" }); return; }
+
+      const [p, circulating, quorum, quorumBps, symbol, decimals] = await Promise.all([
+        G<readonly unknown[]>("proposalInfo", [id]) as Promise<readonly [
+          Hex, bigint, bigint, bigint, bigint, bigint, bigint, bigint, number, string, string, bigint,
+        ]>,
+        G<bigint>("circulatingSupply"),
+        G<bigint>("quorumVotes"),
+        G<number>("quorumBps"),
+        client.public.readContract({ address: tokenAddr, abi: tesseraTokenAbi, functionName: "symbol" }) as Promise<string>,
+        client.public.readContract({ address: tokenAddr, abi: tesseraTokenAbi, functionName: "decimals" }) as Promise<number>,
+      ]);
+      const dec = Number(decimals);
+      const fmtT = (v: bigint) => fmtUnits(v, dec);
+      const STATES = ["Pending", "Active", "Defeated", "Succeeded", "Queued", "Executed", "Cancelled"];
+
+      const forV = p[5], againstV = p[6], abstainV = p[7];
+      const cast = forV + againstV + abstainV;
+      /** Share of the *cast* vote, which is what decides the outcome. */
+      const pct = (v: bigint) => (cast === 0n ? 0 : Number((v * 10_000n) / cast) / 100);
+      /** Share of circulating supply that turned up — the quorum measure. */
+      const participation = circulating === 0n ? 0 : Number((cast * 10_000n) / circulating) / 100;
+
+      // The actions a proposal carries, so a voter can see what they approve.
+      const actions = await Promise.all(
+        Array.from({ length: Number(p[11]) }, (_, i) => BigInt(i)).map(async (i) => {
+          const a = (await G<readonly [Hex, Hex]>("proposalAction", [id, i]));
+          return { index: Number(i), target: a[0], data: a[1], selector: a[1].slice(0, 10) };
+        }),
+      );
+
+      /*
+       * The roll. Windowed because Arc caps `eth_getLogs` spans, and honest
+       * about a short scan: a partial roll that presented itself as complete
+       * would understate somebody's participation, which is worse than saying
+       * the list may be missing entries.
+       */
+      const VOTE_CAST = {
+        type: "event",
+        name: "VoteCast",
+        inputs: [
+          { name: "id", type: "uint256", indexed: true },
+          { name: "voter", type: "address", indexed: true },
+          { name: "support", type: "uint8", indexed: false },
+          { name: "weight", type: "uint256", indexed: false },
+        ],
+      } as const;
+      const WINDOW = BigInt(process.env.ARC_LOG_WINDOW ?? "9000");
+      const MAX_WINDOWS = Number(process.env.ARC_LOG_MAX_WINDOWS ?? "220");
+      const latest = await client.public.getBlockNumber();
+      const CHOICE = ["Against", "For", "Abstain"];
+
+      let from = p[1]; // the snapshot block: nothing can have voted before it
+      let windows = 0;
+      let partial = false;
+      const votes: {
+        voter: Hex; support: string; weight: string; weightRaw: string; pctOfCast: number;
+        block: number; txHash: Hex;
+      }[] = [];
+      while (from <= latest) {
+        if (windows++ >= MAX_WINDOWS) { partial = true; break; }
+        const to = from + WINDOW > latest ? latest : from + WINDOW;
+        try {
+          const logs = await client.public.getLogs({
+            address: governorAddr, event: VOTE_CAST, args: { id }, fromBlock: from, toBlock: to,
+          });
+          for (const l of logs) {
+            const a = l.args as { voter?: Hex; support?: number; weight?: bigint };
+            if (!a.voter || a.weight === undefined) continue;
+            votes.push({
+              voter: a.voter,
+              support: CHOICE[Number(a.support ?? 0)] ?? "Against",
+              weight: fmtT(a.weight),
+              weightRaw: a.weight.toString(),
+              pctOfCast: cast === 0n ? 0 : Number((a.weight * 1_000_000n) / cast) / 10_000,
+              block: Number(l.blockNumber ?? 0n),
+              txHash: (l.transactionHash ?? "0x") as Hex,
+            });
+          }
+        } catch {
+          partial = true;
+        }
+        if (to === latest) break;
+        from = to + 1n;
+      }
+      // Largest first: the votes that decided it, at the top.
+      votes.sort((a, b) => (BigInt(b.weightRaw) > BigInt(a.weightRaw) ? 1 : -1));
+
+      const [mine, voted, myChoice] = who
+        ? await Promise.all([
+            G<bigint>("votingPowerFor", [id, who]),
+            G<boolean>("hasVoted", [id, who]),
+            G<number>("voteOf", [id, who]).catch(() => 0),
+          ])
+        : [0n, false, 0];
+
+      res.json({
+        ok: true,
+        deployed: true,
+        governor: governorAddr,
+        explorer: liveDeployment.explorer ?? null,
+        id: Number(id),
+        proposer: p[0],
+        snapshotBlock: p[1].toString(),
+        voteStart: Number(p[2]),
+        voteEnd: Number(p[3]),
+        executableAt: Number(p[4]),
+        state: STATES[Number(p[8])] ?? "Unknown",
+        title: p[9],
+        description: p[10],
+        actions,
+        token: { symbol, decimals: dec },
+        result: {
+          for: fmtT(forV), forPct: pct(forV),
+          against: fmtT(againstV), againstPct: pct(againstV),
+          abstain: fmtT(abstainV), abstainPct: pct(abstainV),
+          cast: fmtT(cast),
+          circulating: fmtT(circulating),
+          quorum: fmtT(quorum),
+          // Stated the way a voter reads it: what turned up against what was
+          // needed, rather than two absolute numbers to divide in their head.
+          participationPct: participation,
+          quorumPct: Number(quorumBps) / 100,
+          quorumMet: cast >= quorum,
+        },
+        votes,
+        voteCount: votes.length,
+        // Never present a short scan as the whole roll.
+        votesPartial: partial,
+        you: who
+          ? {
+              address: who,
+              weight: fmtT(mine as bigint),
+              weightRaw: (mine as bigint).toString(),
+              voted: voted as boolean,
+              choice: voted ? (CHOICE[Number(myChoice)] ?? null) : null,
+            }
+          : null,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   app.post("/api/governance/propose", requireOperator, async (req, res) => {
     if (!governorAddr) { res.status(404).json({ ok: false, error: "governor not deployed" }); return; }
     if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
