@@ -110,7 +110,7 @@ const $ = (id) => document.getElementById(id);
        * The hash drives it (#/dashboard, #/defi, …) so links and the browser
        * back button work, and "#" (or no hash) is the landing page.
        * ==================================================================== */
-      const TABS = ["dashboard", "defi", "agents", "other"];
+      const TABS = ["dashboard", "defi", "agents", "gov", "other"];
       // Plain names: the icons live in the drawer markup as SVG now, so the
       // labels no longer smuggle a glyph that would end up in the tab title.
       const NAV_LABELS = {
@@ -118,6 +118,7 @@ const $ = (id) => document.getElementById(id);
         dashboard: "Dashboard",
         defi: "DeFi",
         agents: "Agent workspace",
+        gov: "Governance",
         other: "Treasury & system",
       };
       const NAV_OPEN_KEY = "tessera_nav_open";
@@ -140,6 +141,9 @@ const $ = (id) => document.getElementById(id);
             const pane = $("pane" + t[0].toUpperCase() + t.slice(1));
             if (pane) pane.hidden = t !== route;
           }
+          // Governance reads a loop of contract calls, so it loads on arrival
+          // rather than on every poll of every other tab.
+          if (route === "gov" && typeof loadGovernance === "function") loadGovernance().catch(() => {});
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -4460,6 +4464,217 @@ const $ = (id) => document.getElementById(id);
         const t = $("selfCustodyToggle");
         return !!(t && t.checked && hasInjectedWallet());
       };
+      /* ---- Governance ------------------------------------------------------
+       *
+       * Voting power is not a balance. Tokens carry no weight until they are
+       * delegated, which is the one step people miss — so the panel measures
+       * both and offers the fix as its own button rather than leaving somebody
+       * to wonder why their thousand tokens counted for nothing.
+       */
+      window.__gov = null;
+
+      function govMsg(id, text, colour) {
+        const m = $(id);
+        if (!m) return;
+        m.style.display = "block"; m.textContent = text; m.style.color = colour || "var(--muted)";
+      }
+
+      const relTime = (secs) => {
+        const d = secs - Math.floor(Date.now() / 1000);
+        const a = Math.abs(d), unit = a < 3600 ? [60, "min"] : a < 86400 ? [3600, "hour"] : [86400, "day"];
+        const n = Math.round(a / unit[0]);
+        return `${d >= 0 ? "in " : ""}${n} ${unit[1]}${n === 1 ? "" : "s"}${d < 0 ? " ago" : ""}`;
+      };
+
+      async function loadGovernance() {
+        const host = $("govProposals");
+        if (!host) return;
+        try {
+          const who = String(window.__myAddress || "");
+          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
+          const r = await (await fetch("/api/governance" + q)).json();
+          window.__gov = r && r.ok ? r : null;
+          if (!r || !r.ok || !r.deployed) {
+            host.innerHTML = `<div class="kv">${esc((r && r.note) || "Governance is not deployed here.")}</div>`;
+            return;
+          }
+          const sym = r.token.symbol;
+          $("govBalance").textContent = `${r.you.balance} ${sym}`;
+          $("govVotes").textContent = `${r.you.votes} ${sym}`;
+          $("govCirculating").textContent = `${r.circulating} ${sym}`;
+          $("govQuorum").textContent = `${r.quorum} ${sym}`;
+
+          // The delegation gap, stated rather than left to be discovered.
+          const undelegated = Number(r.you.balance) > 0 && Number(r.you.votes) === 0;
+          $("govDelegate").style.display = undelegated ? "" : "none";
+          $("govDelegateNote").textContent = undelegated
+            ? `You hold ${r.you.balance} ${sym} but none of it is voting. One transaction points it at yourself.`
+            : Number(r.you.votes) > 0
+              ? `Your weight is active. It moves with your tokens automatically from here.`
+              : `Hold ${sym} — earned by supplying or borrowing — to take part.`;
+
+          $("govCreateCard").style.display = r.canPropose && adminId ? "" : "none";
+          $("govEmissionsCard").style.display = r.canPropose && adminId ? "" : "none";
+
+          host.innerHTML = (r.proposals || []).length
+            ? r.proposals.map((p) => govCard(p, r)).join("")
+            : `<div class="kv">No proposals yet.</div>`;
+          host.querySelectorAll("[data-vote]").forEach((b) =>
+            b.addEventListener("click", () => castVote(Number(b.dataset.id), Number(b.dataset.vote))),
+          );
+
+          // The lock.
+          if (r.lock) {
+            $("govLocked").textContent = `${r.lock.locked} ${sym}`;
+            $("govActivity").textContent = `$${r.lock.activityUsd}`;
+            $("govRate").textContent = `${r.lock.ratePerSecond} ${sym}/s`;
+            $("govLasts").textContent = r.lock.lastsDays == null
+              ? "indefinitely (idle)"
+              : r.lock.lastsDays > 365
+                ? `${(r.lock.lastsDays / 365).toFixed(1)} years`
+                : `${r.lock.lastsDays.toFixed(1)} days`;
+            $("govSinks").innerHTML = (r.lock.sinks || [])
+              .map((k) =>
+                `<tr><td>${esc(k.label)}<div class="muted" style="font-size:11px">${esc(k.kind)} → ${esc(k.to.slice(0, 10))}…</div></td>` +
+                `<td class="num">${esc(String(k.weight))}</td><td class="num mono">${esc(k.pending)}</td></tr>`)
+              .join("") || emptyRow(3, "No sinks configured.");
+          }
+          renderEmissionAssets();
+        } catch {
+          host.innerHTML = `<div class="kv">Could not read governance.</div>`;
+        }
+      }
+
+      /** One proposal, with only the buttons that would actually work. */
+      function govCard(p, r) {
+        const sym = r.token.symbol;
+        const live = p.state === "Active";
+        const tone = { Active: "ok", Succeeded: "ok", Queued: "ok", Executed: "ok", Defeated: "warn", Cancelled: "warn" }[p.state] || "";
+        const canVote = live && !p.youVoted && Number(p.yourWeightRaw) > 0;
+        const why = !live
+          ? ""
+          : p.youVoted
+            ? "You have voted on this."
+            : Number(p.yourWeightRaw) === 0
+              ? "You had no delegated TSRA at the snapshot block, so you cannot vote on this one. Delegate now and the next proposal will count you."
+              : `Voting with ${p.yourWeight} ${sym}.`;
+        const bar = (label, v) =>
+          `<div class="kv" style="justify-content:space-between"><span>${label}</span><b>${esc(v)} ${esc(sym)}</b></div>`;
+        return (
+          `<div style="padding:12px;border:1px solid var(--line-strong);border-radius:12px">` +
+          `<div class="row-actions" style="justify-content:space-between">` +
+          `<b style="font-size:14px">#${p.id} ${esc(p.title)}</b>` +
+          `<span class="tag ${tone}">${esc(p.state)}</span></div>` +
+          `<div class="kv" style="margin:6px 0 10px">${esc(p.description || "")}</div>` +
+          bar("For", p.forVotes) + bar("Against", p.againstVotes) + bar("Abstain", p.abstainVotes) +
+          `<div class="kv" style="justify-content:space-between;margin-top:4px">` +
+          `<span>Turnout ${esc(p.castVotes)} / ${esc(r.quorum)} needed</span>` +
+          `<span class="${p.quorumMet ? "" : "warn"}">${p.quorumMet ? "quorum met" : "below quorum"}</span></div>` +
+          `<div class="kv" style="margin-top:6px">` +
+          (live ? `Voting closes ${esc(relTime(p.voteEnd))}.` : `Voting closed ${esc(relTime(p.voteEnd))}.`) +
+          (p.actions ? ` Carries ${p.actions} on-chain call${p.actions === 1 ? "" : "s"}.` : " Signalling only.") +
+          `</div>` +
+          (why ? `<div class="kv" style="margin-top:6px">${esc(why)}</div>` : "") +
+          (canVote
+            ? `<div class="row-actions" style="margin-top:10px">` +
+              `<button class="btn primary" data-vote="1" data-id="${p.id}">For</button>` +
+              `<button class="btn" data-vote="0" data-id="${p.id}">Against</button>` +
+              `<button class="btn" data-vote="2" data-id="${p.id}">Abstain</button></div>`
+            : "") +
+          `</div>`
+        );
+      }
+
+      async function castVote(id, support) {
+        if (!selfMode()) {
+          govMsg("govMsg", "Voting is signed by the holder, so it needs your own wallet. " +
+            "Switch on \"Use my own wallet\".", "var(--warn)");
+          return;
+        }
+        await selfCustody("govMsg", `vote on proposal #${id}`, async (from, cfg) =>
+          sendTx(from, cfg.governor, callData(cfg.selectors.govVote, encUint(id), encUint(support))),
+        );
+        loadGovernance();
+      }
+
+      if ($("govDelegate")) {
+        $("govDelegate").addEventListener("click", async () => {
+          if (!selfMode()) {
+            govMsg("govMsg", "Delegating is signed by the holder — switch on \"Use my own wallet\".", "var(--warn)");
+            return;
+          }
+          await selfCustody("govMsg", "activate voting power", async (from, cfg) =>
+            sendTx(from, cfg.token, callData(cfg.selectors.govDelegate, encAddr(from))),
+          );
+          loadGovernance();
+        });
+      }
+
+      if ($("govPropose")) {
+        $("govPropose").addEventListener("click", async () => {
+          const title = ($("govTitle").value || "").trim();
+          const description = ($("govBody").value || "").trim();
+          if (!title) { govMsg("govCreateMsg", "A proposal needs a title.", "var(--warn)"); return; }
+          try {
+            const r = await (await postJson("/api/governance/propose", { title, description })).json();
+            if (r.ok) {
+              $("govTitle").value = ""; $("govBody").value = "";
+              govMsg("govCreateMsg", "Proposal opened. Voting is live.", "var(--good)");
+              loadGovernance();
+            } else govMsg("govCreateMsg", r.error || "failed", "var(--warn)");
+          } catch { govMsg("govCreateMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
+      /* ---- Emission rates (operator) --------------------------------------- */
+      function renderEmissionAssets() {
+        const sel = $("govEmAsset");
+        if (!sel) return;
+        const assets = (window.__lending && window.__lending.assets) || [];
+        const sig = assets.map((a) => a.symbol).join(",");
+        if (sel.dataset.sig === sig) return;
+        sel.dataset.sig = sig;
+        sel.innerHTML = assets
+          .filter((a) => a.address)
+          .map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`)
+          .join("");
+        const em = window.__emissions;
+        if (em && em.configured) {
+          $("govEmBudget").textContent =
+            `Pot ${em.reward.balance} ${em.reward.symbol}` +
+            (em.reward.runwayDays == null ? " · nothing streaming" : ` · ${em.reward.runwayDays.toFixed(2)} days at the current rates`) +
+            `. Set rates above what the emitter delivers and the pot empties — the shortfall stays owed, not forgiven.`;
+        }
+      }
+
+      if ($("govEmSet")) {
+        $("govEmSet").addEventListener("click", async () => {
+          const asset = $("govEmAsset").value;
+          const side = Number($("govEmSide").value);
+          const em = window.__emissions;
+          const dec = em && em.reward ? Number(em.reward.decimals) : 18;
+          const parsed = parseAmount($("govEmRate").value, dec);
+          // A rate of zero is a legitimate instruction — it stops a stream — so
+          // it is accepted here even though parseAmount refuses it elsewhere.
+          const raw = ($("govEmRate").value || "").trim() === "0" ? "0" : parsed.raw;
+          if (!raw) { govMsg("govEmMsg", parsed.error || "Enter a rate.", "var(--warn)"); return; }
+          const until = $("govEmUntil").value
+            ? Math.floor(new Date($("govEmUntil").value + "T23:59:59Z").getTime() / 1000)
+            : 0;
+          try {
+            const r = await (await postJson("/api/lending/emissions/rate", {
+              asset, side, ratePerSecond: raw, endsAt: until,
+            })).json();
+            if (r.ok) {
+              govMsg("govEmMsg",
+                `Rate set${until ? `, ending ${new Date(until * 1000).toDateString()}` : " (no end date)"}. ` +
+                `— ${r.txHash}`, "var(--good)");
+              loadEmissions();
+            } else govMsg("govEmMsg", r.error || "failed", "var(--warn)");
+          } catch { govMsg("govEmMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
       /* ---- Standing token approvals ---------------------------------------
        *
        * Until this session the app approved `type(uint256).max` on every
@@ -6666,6 +6881,9 @@ const $ = (id) => document.getElementById(id);
       setInterval(() => { if (typeof loadAllowances === "function") loadAllowances().catch(() => {}); }, 60000);
       // Emissions tick slowly by design; a slow poll keeps the figure honest.
       setInterval(() => { if (typeof loadEmissions === "function") loadEmissions().catch(() => {}); }, 30000);
+      setInterval(() => {
+        if ($("paneGov") && !$("paneGov").hidden && typeof loadGovernance === "function") loadGovernance().catch(() => {});
+      }, 20000);
       window.addEventListener("focus", () => tick());
       window.addEventListener("online", () => tick());
       if (eth() && eth().on) {

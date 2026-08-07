@@ -10,5 +10,6 @@
   "tesseraPool": "0x065f1bb38fdc65a1c41e2e888940af713cabca5f",
   "tesseraEmissions": "0x38a00af40bd89fe2a54ce07a537dbb399de22fa9",
   "tesseraToken": "0x8bb6bca8cb41147844a58327603eeab433f407b0",
-  "tesseraEmitter": "0x408e0522487aec34a85b97c7a01be920b555d159"
+  "tesseraEmitter": "0x408e0522487aec34a85b97c7a01be920b555d159",
+  "tesseraGovernor": "0x5cbd33263935471220a469527f50e47eae1fbb6e"
 }

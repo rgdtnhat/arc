@@ -19,6 +19,9 @@ import {
   tesseraPriceGuardAbi,
   tesseraRegistryAbi,
   tesseraEmissionsAbi,
+  tesseraGovernorAbi,
+  tesseraTokenAbi,
+  tesseraEmitterAbi,
   tesseraRateLimiterAbi,
   tesseraTabAbi,
   ARC_USDC_ADDRESS,
@@ -202,6 +205,11 @@ const CLIENT_SELECTORS = Object.fromEntries(
     emCheckpoint: "function checkpoint(address,address,uint8)",
     emClaimable: "function claimable(address,address,uint8)",
     emClaimableTotal: "function claimableTotal(address)",
+    // Governance. Voting power has to be delegated before it exists, which is
+    // the single step people miss, so the page offers it as its own button.
+    govDelegate: "function delegate(address)",
+    govVote: "function castVote(uint256,uint8)",
+    govGetVotes: "function getVotes(address)",
     swapQuote: "function quote(address,address,uint256)",
     swapExec: "function swap(address,address,uint256,uint256,uint256)",
     // AMM. `ammAdd`/`ammRemove` take dynamic arrays, so the browser encodes them
@@ -4904,10 +4912,13 @@ async function main() {
       const rate = BigInt(String(req.body?.ratePerSecond ?? "0"));
       if (!/^0x[0-9a-fA-F]{40}$/.test(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
       if (side !== 0 && side !== 1) { res.status(400).json({ ok: false, error: "side must be 0 (supply) or 1 (borrow)" }); return; }
-      const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "setRate", [asset, side, rate]);
+      const endsAt = BigInt(String(req.body?.endsAt ?? "0"));
+      const txHash = endsAt > 0n
+        ? await owner.write(emissionsAddr, tesseraEmissionsAbi, "setRateUntil", [asset, side, rate, endsAt])
+        : await owner.write(emissionsAddr, tesseraEmissionsAbi, "setRate", [asset, side, rate]);
       logTx(req, {
         category: "defi", action: "emissions-rate", status: "success", txHash,
-        detail: `${asset} ${side === 0 ? "supply" : "borrow"} -> ${rate}/s`,
+        detail: `${asset} ${side === 0 ? "supply" : "borrow"} -> ${rate}/s${endsAt > 0n ? ` until ${endsAt}` : ""}`,
       });
       res.json({ ok: true, txHash });
     } catch (e) {
@@ -4945,6 +4956,164 @@ async function main() {
       await owner.write(token, erc20Abi, "approve", [emissionsAddr, amount]);
       const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "fund", [amount]);
       logTx(req, { category: "defi", action: "emissions-fund", status: "success", txHash, detail: String(amount) });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* ---- Governance ------------------------------------------------------ */
+
+  const governorAddr = (liveDeployment.tesseraGovernor as Hex) ?? null;
+  const tokenAddr = (liveDeployment.tesseraToken as Hex) ?? null;
+  const emitterAddr2 = (liveDeployment.tesseraEmitter as Hex) ?? null;
+
+  /**
+   * Everything the governance tab shows, in one read.
+   *
+   * Assembled server-side because a proposal list is a loop of contract calls
+   * and doing it from the browser would be one round trip per proposal per
+   * poll — on a public RPC that is the difference between a page that fills in
+   * and a page that gets throttled.
+   */
+  app.get("/api/governance", async (req, res) => {
+    if (!governorAddr || !tokenAddr) {
+      res.json({ ok: true, deployed: false, note: "No governor on this deployment." });
+      return;
+    }
+    try {
+      const user = String(req.query.user ?? "");
+      const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+      const G = <T,>(fn: string, args: unknown[] = []) =>
+        client.public.readContract({ address: governorAddr, abi: tesseraGovernorAbi, functionName: fn as never, args: args as never }) as Promise<T>;
+      const T2 = <T,>(fn: string, args: unknown[] = []) =>
+        client.public.readContract({ address: tokenAddr, abi: tesseraTokenAbi, functionName: fn as never, args: args as never }) as Promise<T>;
+
+      const [count, circulating, quorum, symbol, decimals] = await Promise.all([
+        G<bigint>("proposalCount"), G<bigint>("circulatingSupply"), G<bigint>("quorumVotes"),
+        T2<string>("symbol"), T2<number>("decimals"),
+      ]);
+      const dec = Number(decimals);
+      const fmtT = (v: bigint) => fmtUnits(v, dec);
+
+      const STATES = ["Pending", "Active", "Defeated", "Succeeded", "Queued", "Executed", "Cancelled"];
+      // Newest first, and bounded: a governance page is read from the top.
+      const total = Number(count);
+      const ids: number[] = [];
+      for (let i = total - 1; i >= 0 && ids.length < 25; i--) ids.push(i);
+
+      const proposals = await Promise.all(
+        ids.map(async (id) => {
+          const p = (await G<readonly unknown[]>("proposalInfo", [BigInt(id)])) as readonly [
+            Hex, bigint, bigint, bigint, bigint, bigint, bigint, bigint, number, string, string, bigint,
+          ];
+          const [mine, voted] = who
+            ? await Promise.all([
+                G<bigint>("votingPowerFor", [BigInt(id), who]),
+                G<boolean>("hasVoted", [BigInt(id), who]),
+              ])
+            : [0n, false];
+          const cast = p[5] + p[6] + p[7];
+          return {
+            id,
+            proposer: p[0],
+            snapshotBlock: p[1].toString(),
+            voteStart: Number(p[2]),
+            voteEnd: Number(p[3]),
+            executableAt: Number(p[4]),
+            forVotes: fmtT(p[5]),
+            againstVotes: fmtT(p[6]),
+            abstainVotes: fmtT(p[7]),
+            castVotes: fmtT(cast),
+            quorumMet: cast >= quorum,
+            state: STATES[Number(p[8])] ?? "Unknown",
+            title: p[9],
+            description: p[10],
+            actions: Number(p[11]),
+            yourWeight: fmtT(mine),
+            yourWeightRaw: mine.toString(),
+            youVoted: voted,
+          };
+        }),
+      );
+
+      const yours = who
+        ? await Promise.all([T2<bigint>("balanceOf", [who]), T2<bigint>("getVotes", [who]), T2<Hex>("delegates", [who])])
+        : [0n, 0n, "0x0000000000000000000000000000000000000000" as Hex];
+
+      // The lock, for the panel underneath.
+      let lock: Record<string, unknown> | null = null;
+      if (emitterAddr2) {
+        const E = <T,>(fn: string, args: unknown[] = []) =>
+          client.public.readContract({ address: emitterAddr2, abi: tesseraEmitterAbi, functionName: fn as never, args: args as never }) as Promise<T>;
+        try {
+          const [locked, activity, rate, remaining, sinkCount] = await Promise.all([
+            E<bigint>("locked"), E<bigint>("activityUsd"), E<bigint>("currentRatePerSecond"),
+            E<bigint>("secondsRemaining"), E<bigint>("sinkCount"),
+          ]);
+          const sinks = await Promise.all(
+            Array.from({ length: Number(sinkCount) }, (_, i) => i).map(async (i) => {
+              const sk = (await E<readonly unknown[]>("sinks", [BigInt(i)])) as readonly [Hex, number, bigint, string];
+              return {
+                label: sk[3], to: sk[0], kind: sk[1] === 1 ? "fund" : "send", weight: Number(sk[2]),
+                pending: fmtT(await E<bigint>("pendingOf", [BigInt(i)])),
+              };
+            }),
+          );
+          lock = {
+            address: emitterAddr2,
+            locked: fmtT(locked),
+            activityUsd: (Number(activity) / 1e8).toFixed(2),
+            ratePerSecond: fmtT(rate),
+            // Unbounded means nothing is being emitted, which is the honest
+            // reading of "the pools are idle" rather than a number of years.
+            lastsDays: remaining > 10n ** 15n ? null : Number(remaining) / 86_400,
+            sinks,
+          };
+        } catch { lock = null; }
+      }
+
+      res.json({
+        ok: true,
+        deployed: true,
+        address: governorAddr,
+        token: { address: tokenAddr, symbol, decimals: dec },
+        canPropose: Boolean(owner),
+        circulating: fmtT(circulating),
+        quorum: fmtT(quorum),
+        you: { balance: fmtT(yours[0] as bigint), votes: fmtT(yours[1] as bigint), delegate: yours[2] as Hex },
+        proposals,
+        lock,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Open a proposal. Operator only — an open queue is mostly spam. */
+  app.post("/api/governance/propose", requireOperator, async (req, res) => {
+    if (!governorAddr) { res.status(404).json({ ok: false, error: "governor not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const title = String(req.body?.title ?? "").trim();
+      const description = String(req.body?.description ?? "").trim();
+      if (!title) { res.status(400).json({ ok: false, error: "a proposal needs a title" }); return; }
+      const txHash = await owner.write(governorAddr, tesseraGovernorAbi, "propose", [title, description, [], []]);
+      logTx(req, { category: "defi", action: "gov-propose", status: "success", txHash, detail: title });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Cancel a proposal before voting closes. */
+  app.post("/api/governance/cancel", requireOperator, async (req, res) => {
+    if (!governorAddr) { res.status(404).json({ ok: false, error: "governor not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const id = BigInt(String(req.body?.id ?? "0"));
+      const txHash = await owner.write(governorAddr, tesseraGovernorAbi, "cancel", [id]);
+      logTx(req, { category: "defi", action: "gov-cancel", status: "success", txHash, detail: `#${id}` });
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
@@ -5243,6 +5412,7 @@ async function main() {
       // The protocol token and the contract holding its locked supply.
       token: (liveDeployment.tesseraToken as Hex) ?? null,
       emitter: (liveDeployment.tesseraEmitter as Hex) ?? null,
+      governor: (liveDeployment.tesseraGovernor as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded

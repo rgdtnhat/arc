@@ -996,6 +996,12 @@
               <circle cx="9.2" cy="13.4" r="1.1" fill="currentColor" stroke="none"/><circle cx="14.8" cy="13.4" r="1.1" fill="currentColor" stroke="none"/>
             </svg></span> Agent workspace
           </button>
+          <button class="btn" data-nav="gov">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.4 4.2 7.2v1.4h15.6V7.2Z"/><path d="M6.4 10.4v6.2M10.1 10.4v6.2M13.9 10.4v6.2M17.6 10.4v6.2"/>
+              <path d="M3.8 19.2h16.4"/>
+            </svg></span> Governance
+          </button>
           <button class="btn" data-nav="other">
             <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M3.4 9.4 12 4.2l8.6 5.2"/><path d="M5.4 10.6v7M9.8 10.6v7M14.2 10.6v7M18.6 10.6v7"/><path d="M3.4 20.2h17.2"/>
@@ -2113,6 +2119,93 @@
         </div>
 
         <!-- ---------- OTHER ---------- -->
+        <!-- ---------- GOVERNANCE ---------- -->
+        <div class="tabPane" id="paneGov" hidden>
+          <div class="card">
+            <h2>🏛 Governance — TSRA decides where the emissions go</h2>
+            <div style="font-size:12.5px;color:var(--muted)">
+              Emissions are the protocol's only recurring outflow, so directing them is the decision with
+              real money attached. TSRA holders vote on where rewards are pointed; a passed proposal makes
+              the calls it carries. Weight is a <b>snapshot</b> taken the block before a proposal opened, so
+              buying tokens after seeing the question buys no say in it — and tokens you hold carry no
+              weight until you delegate them, which is why a pool or an exchange cannot vote with yours.
+            </div>
+            <div class="metrics tight" style="margin-top:14px">
+              <div class="metric"><div class="k">Your TSRA</div><div class="v" id="govBalance">—</div></div>
+              <div class="metric"><div class="k">Your voting power</div><div class="v" id="govVotes">—</div></div>
+              <div class="metric"><div class="k">Circulating</div><div class="v" id="govCirculating">—</div></div>
+              <div class="metric"><div class="k">Quorum</div><div class="v" id="govQuorum">—</div></div>
+            </div>
+            <div class="row-actions" style="margin-top:12px">
+              <button class="btn primary" id="govDelegate">Activate my voting power</button>
+              <span class="kv" id="govDelegateNote"></span>
+            </div>
+            <div class="msg" id="govMsg" style="display:none"></div>
+          </div>
+
+          <div class="card" id="govProposalsCard">
+            <h2>Proposals</h2>
+            <div id="govProposals" style="display:flex;flex-direction:column;gap:12px"></div>
+          </div>
+
+          <div class="card" id="govCreateCard" style="display:none">
+            <h2>Open a proposal</h2>
+            <div class="kv" style="margin-bottom:10px">
+              Operator only. Voting opens immediately and the snapshot is the previous block, so nobody
+              can arrange their weight after seeing the question.
+            </div>
+            <input id="govTitle" class="field" placeholder="Title" style="width:100%;margin-bottom:8px" />
+            <textarea id="govBody" class="field" placeholder="What is being proposed, and why"
+              style="width:100%;min-height:90px;margin-bottom:8px"></textarea>
+            <div class="row-actions">
+              <button class="btn primary" id="govPropose">Open proposal</button>
+              <span class="kv">Signalling only — this form carries no on-chain calls.</span>
+            </div>
+            <div class="msg" id="govCreateMsg" style="display:none"></div>
+          </div>
+
+          <div class="card" id="govEmissionsCard" style="display:none">
+            <h2>Emission rates — what each market pays</h2>
+            <div class="kv" style="margin-bottom:10px">
+              Operator only. A rate is in reward units per second across every share on that side, so the
+              APY a supplier sees falls as more of them arrive. Leave the end date empty to run
+              indefinitely; set one and the stream stops on its own, so a campaign cannot outlive the
+              intention behind it because nobody remembered to switch it off.
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap">
+              <select id="govEmAsset" class="field"></select>
+              <select id="govEmSide" class="field">
+                <option value="0">Supply side</option>
+                <option value="1">Borrow side</option>
+              </select>
+              <input id="govEmRate" class="field" inputmode="decimal" placeholder="Tokens / second" style="width:150px" />
+              <input id="govEmUntil" class="field" type="date" style="width:165px" />
+              <button class="btn primary" id="govEmSet">Set rate</button>
+            </div>
+            <div class="kv" id="govEmBudget" style="margin-top:9px"></div>
+            <div class="msg" id="govEmMsg" style="display:none"></div>
+          </div>
+
+          <div class="card">
+            <h2>The lock</h2>
+            <div class="kv" style="margin-bottom:10px">
+              The whole supply was minted straight into the emitter, and comes out in proportion to how
+              much the pools are used — not on a calendar. Idle protocol, no emission. The rate constants
+              are immutable, so nobody can wind the release forward.
+            </div>
+            <div class="metrics tight">
+              <div class="metric"><div class="k">Still locked</div><div class="v" id="govLocked">—</div></div>
+              <div class="metric"><div class="k">Measured activity</div><div class="v" id="govActivity">—</div></div>
+              <div class="metric"><div class="k">Emitting now</div><div class="v" id="govRate">—</div></div>
+              <div class="metric"><div class="k">Lasts</div><div class="v" id="govLasts">—</div></div>
+            </div>
+            <div class="tblWrap auto" style="margin-top:12px"><table class="data" style="min-width:0">
+              <thead><tr><th>Sink</th><th class="num">Weight</th><th class="num">Owed</th></tr></thead>
+              <tbody id="govSinks"></tbody>
+            </table></div>
+          </div>
+        </div>
+
         <div class="tabPane" id="paneOther" hidden>
           <div class="card">
             <h2>Treasury &amp; faucet — working capital</h2>

@@ -31,7 +31,8 @@
 //    v33: stop re-asking wallet permission; batch revoke-all.
 //    v34: provider rows show symbols and short addresses, not fragments.
 //    v35: every reserve in one table, and claimable pool emissions.
-const CACHE = "tessera-v35";
+//    v36: a Governance tab, TSRA voting, and operator emission controls.
+const CACHE = "tessera-v36";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {
