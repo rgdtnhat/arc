@@ -13,15 +13,38 @@ and you get a public URL.
 ## Updating a running host
 
 ```bash
-cd /root/tessera && git pull --ff-only && docker compose up -d --build
+cd /root/tessera && ./scripts/deploy.sh
 ```
 
-**Chained with `&&`, deliberately.** Written on separate lines, a `git pull`
-that *refuses* — local edits to a tracked file, a detached HEAD, the wrong
-branch — still lets the rebuild run, and it happily rebuilds the old code and
-reports success. Every visible sign says the update worked. `&&` stops at the
-first failure, which is the only way the shell can tell you the thing that
-matters.
+That is the whole thing. It fetches, fast-forwards, rebuilds, and then **checks
+that the server is actually serving this commit** — comparing the shell version
+the app reports with the one in the repo — and exits non-zero if it is not.
+
+### Do not add `npm ci` or `npm run compile`
+
+Neither belongs on a host, and both make things worse. The image runs its own
+`npm install --omit=dev`, so installing on the host changes nothing about what
+gets served; it only unpacks the full Solidity toolchain onto the host's disk,
+which is the most likely way a small box then fails the Docker build for want
+of space. When that build fails, `restart: unless-stopped` leaves the **old
+container running** — so `docker compose logs` looks perfectly healthy and the
+site simply never changes. The ABIs are committed precisely so no host ever
+needs a compiler.
+
+### Why a script rather than a list of commands
+
+A list pasted into a terminal runs every line whether or not the previous one
+worked. A `git pull` that refuses scrolls past; a build that dies scrolls past;
+the old container answers either way. Every visible sign says the update
+worked. `set -e` plus a check at the end is the difference between "it printed
+some things" and "it is serving what you think it is".
+
+If you would rather run it by hand, chain with `&&` so the shell stops at the
+first failure:
+
+```bash
+cd /root/tessera && git pull --ff-only && docker compose up -d --build
+```
 
 It used to be longer still, because addresses had to be hand-patched into
 `deployments/arc.local.json` after every contract deploy — and a step like that
