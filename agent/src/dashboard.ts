@@ -6041,6 +6041,48 @@ async function main() {
 
   /** Open a proposal. Operator only — an open queue is mostly spam. */
   /**
+   * Which build is actually running.
+   *
+   * This exists because "did the update take?" had no answer from a phone. A
+   * host can pull, rebuild, restart and still be serving the previous release
+   * — a `git merge` that refused, a chained command that carried on after a
+   * failure, a browser holding the old shell — and every one of those looks
+   * identical from the outside: the site loads, and it is wrong.
+   *
+   * The marker is the service worker's cache name, because that is already
+   * bumped on every change to the shell and lives in the image rather than in
+   * the build environment. `.git` is excluded from the Docker context, so
+   * there is no commit to read; the digest of the two files that make up the
+   * front end covers the rest, and changes even when the cache name is
+   * forgotten.
+   */
+  const buildStamp = (() => {
+    const pub = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../dashboard/public");
+    const read = (f: string) => {
+      try { return readFileSync(path.join(pub, f), "utf8"); } catch { return ""; }
+    };
+    const sw = read("sw.js");
+    const shell = /const CACHE = "([^"]+)"/.exec(sw)?.[1] ?? "unknown";
+    const digest = keccak256(toHex(read("index.html") + read("app.js"))).slice(2, 10);
+    return { shell, digest, startedAt: new Date().toISOString() };
+  })();
+
+  app.get("/api/version", (_req, res) => {
+    res.json({
+      ok: true,
+      ...buildStamp,
+      // The other half of "is this current": which contracts it came up on.
+      contracts: {
+        pool: poolDeployment?.poolAddress ?? null,
+        token: (liveDeployment.tesseraToken as Hex) ?? null,
+        gauge: (liveDeployment.tesseraGauge as Hex) ?? null,
+        assetRegistry: (liveDeployment.tesseraAssetRegistry as Hex) ?? null,
+        serviceFees: (liveDeployment.tesseraServiceFees as Hex) ?? null,
+      },
+    });
+  });
+
+  /**
    * A token list, in the format wallets and aggregators already read.
    *
    * The "Add to my wallet" button covers one person at a time. This is the

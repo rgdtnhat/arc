@@ -13,15 +13,57 @@ and you get a public URL.
 ## Updating a running host
 
 ```bash
-cd /root/tessera
-git pull --ff-only
-docker compose up -d --build
+cd /root/tessera && git pull --ff-only && docker compose up -d --build
 ```
 
-That is the whole procedure. It used to be longer, because the addresses had to
-be hand-patched into `deployments/arc.local.json` after every contract deploy —
-and a step like that gets skipped, which is how a host ends up serving pages
-from contracts nobody meant it to use.
+**Chained with `&&`, deliberately.** Written on separate lines, a `git pull`
+that *refuses* — local edits to a tracked file, a detached HEAD, the wrong
+branch — still lets the rebuild run, and it happily rebuilds the old code and
+reports success. Every visible sign says the update worked. `&&` stops at the
+first failure, which is the only way the shell can tell you the thing that
+matters.
+
+It used to be longer still, because addresses had to be hand-patched into
+`deployments/arc.local.json` after every contract deploy — and a step like that
+gets skipped, which is how a host ends up serving pages from contracts nobody
+meant it to use.
+
+### Checking that it took
+
+```bash
+curl -s https://your-domain/api/version
+```
+
+```json
+{ "shell": "tessera-v42", "digest": "e1e9f815", "startedAt": "…",
+  "contracts": { "pool": "0x4e7d…", "gauge": "0x27b3…" } }
+```
+
+`shell` is bumped on every change to the front end, so comparing it with
+`grep CACHE dashboard/public/sw.js` in the repo answers "is the container
+running this commit" in one line. The dashboard shows the same string in a
+**build** pill on the Status card, so it can be checked from a phone.
+
+The pill turns amber and shows *two* versions when the browser's cached shell is
+older than the server's. That distinction is the whole point: they are the two
+different ways an update fails to appear, and they need opposite fixes.
+
+### If the site looks unchanged
+
+Three causes, in the order they actually happen:
+
+1. **The pull did not land.** `git log --oneline -1` on the host against the
+   branch head. A refused `--ff-only` merge is silent if the commands were not
+   chained. Local edits to a tracked file are the usual reason: `git status`,
+   then `git checkout -- <file>` for anything you did not mean to keep.
+2. **The container did not rebuild.** `docker compose ps` for the created time.
+   Docker will happily reuse a cached layer; `docker compose build --no-cache`
+   settles it.
+3. **The browser is holding the old shell.** The build pill shows both versions
+   when this is the case. A normal reload is not always enough because the
+   service worker answers first — pull-to-refresh twice, or close every tab of
+   the site and reopen it.
+
 
 **Never run `npm run compile` on the host.** The ABIs are committed precisely so
 the image needs no Solidity toolchain; compiling on a small instance runs it out

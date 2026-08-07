@@ -11,6 +11,8 @@
     <meta name="apple-mobile-web-app-title" content="Tessera" />
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
+    <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
+    <meta name="tessera-shell" content="tessera-v43" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1149,6 +1151,12 @@
               <span class="pill" id="policyPill" title="Spends above this per-call cap need guardian approval">🛡 —</span>
               <span class="pill" id="chainPill">chain: —</span>
               <span class="pill live"><span class="dot"></span> live</span>
+              <!-- Which build is serving this page. "Did the update take?" had
+                   no answer from a phone before: a host can pull, rebuild and
+                   restart while still serving the previous release, and every
+                   way that happens looks identical from outside — the site
+                   loads, and it is wrong. -->
+              <span class="pill" id="buildPill" title="The build serving this page, and the shell your browser has cached">build: —</span>
             </div>
             <!-- What Tessera actually is, now that it is more than the escrow
                  rail it started as. Kept to one line per capability so it stays

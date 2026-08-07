@@ -28,6 +28,12 @@ jobs:
       - name: Committed ABIs match the contracts
         run: npm run compile && npm run abi:check -- --compiled
 
+      # The shell version lives in two files; a bump that lands in only one
+      # means a browser either never drops its cache or reports a staleness
+      # that is not real.
+      - name: Shell version agrees across sw.js and index.html
+        run: npm run shell:check
+
       - name: Agent unit tests (decision engine, guardian, memory, agentkit, wallet, treasury, fleet)
         run: npm test --workspace agent
 

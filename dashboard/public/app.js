@@ -4561,6 +4561,38 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
+      /* ---- Which build is serving this page --------------------------------
+       *
+       * Two versions, deliberately, because they fail apart. The server's is
+       * what the container is running; the browser's is what the service worker
+       * has cached. A stale server needs a redeploy; a stale browser needs a
+       * hard refresh. Showing one number could not tell those apart, and they
+       * are the two ways an update "does not take".
+       */
+      async function loadBuild() {
+        const pill = $("buildPill");
+        if (!pill) return;
+        try {
+          const r = await (await fetch("/api/version", { cache: "no-store" })).json();
+          if (!r || !r.ok) return;
+          const mine = (typeof CLIENT_SHELL === "string" && CLIENT_SHELL) || null;
+          const stale = mine && mine !== r.shell;
+          pill.textContent = `build: ${r.shell}·${r.digest}` + (stale ? ` (page: ${mine})` : "");
+          pill.title = stale
+            ? `The server is serving ${r.shell} but this page came from ${mine}. Pull to refresh, or ` +
+              `close every tab of the site and reopen it.`
+            : `Server build ${r.shell}, front end ${r.digest}, up since ${new Date(r.startedAt).toLocaleString()}.`;
+          pill.className = stale ? "pill warn" : "pill";
+        } catch { /* the pill just stays as it was */ }
+      }
+      // The shell this page was served with, so a cached browser can notice it
+      // is behind the server rather than silently disagreeing with it.
+      const CLIENT_SHELL = (() => {
+        try {
+          return document.querySelector('meta[name="tessera-shell"]')?.content || null;
+        } catch { return null; }
+      })();
+
       /* ---- Getting the token into a wallet ---------------------------------
        *
        * A wallet cannot discover a token's name, decimals or logo from the
@@ -8002,6 +8034,8 @@ const $ = (id) => document.getElementById(id);
       setInterval(() => { if (typeof loadEmissions === "function") loadEmissions().catch(() => {}); }, 30000);
       setInterval(() => { if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {}); }, 30000);
       setInterval(() => { if (typeof loadFeeCredit === "function") loadFeeCredit().catch(() => {}); }, 30000);
+      if (typeof loadBuild === "function") loadBuild().catch(() => {});
+      setInterval(() => { if (typeof loadBuild === "function") loadBuild().catch(() => {}); }, 60000);
       setInterval(() => {
         if ($("paneGov") && !$("paneGov").hidden && typeof loadGovernance === "function") loadGovernance().catch(() => {});
         if ($("paneGov") && !$("paneGov").hidden && typeof loadGauge === "function") loadGauge().catch(() => {});
