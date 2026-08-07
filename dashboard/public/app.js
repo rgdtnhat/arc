@@ -143,6 +143,7 @@ const $ = (id) => document.getElementById(id);
           }
           // Governance reads a loop of contract calls, so it loads on arrival
           // rather than on every poll of every other tab.
+          if (route === "agents" && typeof loadFeeCredit === "function") loadFeeCredit().catch(() => {});
           if (route === "gov" && typeof loadGovernance === "function") {
             loadGovernance().catch(() => {});
             if (typeof loadGauge === "function") loadGauge().catch(() => {});
@@ -5136,6 +5137,143 @@ const $ = (id) => document.getElementById(id);
         });
       }
 
+      /* ---- Agent service fees: USDC or TSRA --------------------------------
+       *
+       * Two ways to pay for the same thing, priced side by side so the choice
+       * is a comparison rather than a leap of faith.
+       */
+      window.__feeCredit = null;
+
+      async function loadFeeCredit() {
+        const card = $("feeCreditCard");
+        if (!card) return;
+        try {
+          const who = String(window.__myAddress || "");
+          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
+          const r = await (await fetch("/api/fees/credit" + q)).json();
+          window.__feeCredit = r && r.ok && r.deployed ? r : null;
+          if (!window.__feeCredit) { card.style.display = "none"; return; }
+          card.style.display = "";
+          $("feeCredit").textContent = r.you ? `${r.you.credit} USDC` : "connect a wallet";
+          $("feeHeldUsdc").textContent = r.you ? r.you.usdcHeld : "—";
+          $("feeHeldTsra").textContent = r.you ? r.you.tsraHeld : "—";
+          $("feeDiscount").textContent = r.rateSet ? `${(r.discountBps / 100).toFixed(0)}%` : "no rate set";
+          $("feeBuyTsra").disabled = !r.rateSet;
+          $("feeWithdraw").disabled = !(r.you && r.you.canWithdraw);
+          $("feeQuote").textContent = r.rateSet
+            ? `A dollar of credit costs 1.00 USDC, or ${r.tsraPerUsdcCredit} TSRA. ` +
+              `${r.totalCredit} USDC of credit outstanding across all buyers; ${r.totalSpent} drawn down all time.`
+            : "No TSRA rate is set, so credit is USDC-only for now.";
+
+          $("feeAdmin").style.display = adminId ? "" : "none";
+          if (adminId && r.rateSet) {
+            // Shown as tokens per dollar, which is the number a human sets.
+            const perDollar = Number(r.tsraPerUsdcCredit) / (1 - r.discountBps / 10000);
+            if (document.activeElement !== $("feeRateTokens")) $("feeRateTokens").value = perDollar.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+            if (document.activeElement !== $("feeRateDiscount")) $("feeRateDiscount").value = String(r.discountBps);
+          }
+        } catch {
+          card.style.display = "none";
+        }
+      }
+
+      /** Live TSRA cost for the amount typed, so neither route is a guess. */
+      let feeQuoteTimer = null;
+      if ($("feeAmount")) {
+        $("feeAmount").addEventListener("input", () => {
+          clearTimeout(feeQuoteTimer);
+          feeQuoteTimer = setTimeout(async () => {
+            const r = window.__feeCredit;
+            if (!r || !r.rateSet) return;
+            const parsed = parseAmount($("feeAmount").value, 6);
+            if (!parsed.raw) return;
+            try {
+              const q = await (await fetch(`/api/fees/quote?credit=${parsed.raw}`)).json();
+              if (q.ok) {
+                $("feeQuote").textContent =
+                  `${q.creditUsdc} USDC of credit costs ${q.creditUsdc} USDC — or ${q.costTsra} TSRA, ` +
+                  `which is ${(r.discountBps / 100).toFixed(0)}% less than the same credit at the headline rate.`;
+              }
+            } catch { /* leave the standing text */ }
+          }, 250);
+        });
+      }
+
+      async function buyCredit(inTsra) {
+        const r = window.__feeCredit;
+        if (!r) return;
+        if (!selfMode()) {
+          govMsg("feeMsg", "Credit is bought out of your own wallet, so this needs it. " +
+            "Switch on \"Use my own wallet\".", "var(--warn)");
+          return;
+        }
+        const parsed = parseAmount($("feeAmount").value, 6);
+        if (!parsed.raw) { govMsg("feeMsg", parsed.error || "Enter an amount.", "var(--warn)"); return; }
+        const cfgAll = await loadDefiConfig();
+        const asset = inTsra ? cfgAll.token : cfgAll.usdc;
+        // What has to be approved differs by route: USDC is credited at par, so
+        // the approval is the credit itself; TSRA is priced by the contract, so
+        // the approval is the quote.
+        let approve = BigInt(parsed.raw);
+        if (inTsra) {
+          const q = await (await fetch(`/api/fees/quote?credit=${parsed.raw}`)).json();
+          if (!q.ok) { govMsg("feeMsg", q.error || "Could not price that in TSRA.", "var(--warn)"); return; }
+          approve = BigInt(q.costRaw);
+        }
+        await selfCustody("feeMsg", `buy ${$("feeAmount").value} USDC of credit`, async (from, cfg) => {
+          await ensureAllowance(from, asset, cfg.serviceFees, approve);
+          return sendTx(from, cfg.serviceFees, callData(
+            inTsra ? cfg.selectors.feeTopUpTsra : cfg.selectors.feeTopUpUsdc, encUint(parsed.raw),
+          ));
+        });
+        loadFeeCredit();
+      }
+
+      if ($("feeBuyUsdc")) $("feeBuyUsdc").addEventListener("click", () => buyCredit(false));
+      if ($("feeBuyTsra")) $("feeBuyTsra").addEventListener("click", () => buyCredit(true));
+
+      if ($("feeWithdraw")) {
+        $("feeWithdraw").addEventListener("click", async () => {
+          if (!selfMode()) {
+            govMsg("feeMsg", "A refund goes back to the address that paid — switch on \"Use my own wallet\".", "var(--warn)");
+            return;
+          }
+          await selfCustody("feeMsg", "take back your unspent credit", async (from, cfg) =>
+            sendTx(from, cfg.serviceFees, callData(cfg.selectors.feeWithdraw)),
+          );
+          loadFeeCredit();
+        });
+      }
+
+      if ($("feeRateSet")) {
+        $("feeRateSet").addEventListener("click", async () => {
+          const tokensPerDollar = ($("feeRateTokens").value || "").trim();
+          const discountBps = Number(($("feeRateDiscount").value || "0").trim());
+          try {
+            const r = await (await postJson("/api/fees/rate", { tokensPerDollar, discountBps })).json();
+            govMsg("feeAdminMsg", r.ok ? `Rate set — credit already bought keeps the value it was bought at. ${r.txHash}` : (r.error || "failed"),
+              r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) loadFeeCredit();
+          } catch { govMsg("feeAdminMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
+      if ($("feeCharge")) {
+        $("feeCharge").addEventListener("click", async () => {
+          const user = ($("feeChargeUser").value || "").trim();
+          const parsed = parseAmount($("feeChargeAmount").value, 6);
+          if (!parsed.raw) { govMsg("feeAdminMsg", parsed.error || "Enter an amount.", "var(--warn)"); return; }
+          try {
+            const r = await (await postJson("/api/fees/charge", {
+              user, amount: parsed.raw, memo: ($("feeChargeMemo").value || "agent services").trim(),
+            })).json();
+            govMsg("feeAdminMsg", r.ok ? `Charged. — ${r.txHash}` : (r.error || "failed"),
+              r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) { $("feeChargeAmount").value = ""; loadFeeCredit(); }
+          } catch { govMsg("feeAdminMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
       /* ---- Standing token approvals ---------------------------------------
        *
        * Until this session the app approved `type(uint256).max` on every
@@ -7343,6 +7481,7 @@ const $ = (id) => document.getElementById(id);
       // Emissions tick slowly by design; a slow poll keeps the figure honest.
       setInterval(() => { if (typeof loadEmissions === "function") loadEmissions().catch(() => {}); }, 30000);
       setInterval(() => { if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {}); }, 30000);
+      setInterval(() => { if (typeof loadFeeCredit === "function") loadFeeCredit().catch(() => {}); }, 30000);
       setInterval(() => {
         if ($("paneGov") && !$("paneGov").hidden && typeof loadGovernance === "function") loadGovernance().catch(() => {});
         if ($("paneGov") && !$("paneGov").hidden && typeof loadGauge === "function") loadGauge().catch(() => {});

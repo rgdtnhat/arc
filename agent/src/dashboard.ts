@@ -21,6 +21,7 @@ import {
   tesseraEmissionsAbi,
   tesseraLpEmissionsAbi,
   tesseraGaugeAbi,
+  tesseraServiceFeesAbi,
   tesseraGovernorAbi,
   tesseraTokenAbi,
   tesseraEmitterAbi,
@@ -220,6 +221,12 @@ const CLIENT_SELECTORS = Object.fromEntries(
     gaAddBribe: "function addBribe(uint256,uint256,address,uint256)",
     gaClaimBribes: "function claimBribes(uint256,uint256)",
     gaApply: "function applyEpoch(uint256)",
+    // Service-fee credit. Buying it is the buyer's own transaction either way —
+    // the agent may only draw it down.
+    feeTopUpUsdc: "function topUpUsdc(uint256)",
+    feeTopUpTsra: "function topUpTsra(uint256)",
+    feeWithdraw: "function withdraw()",
+    feeAccount: "function accountOf(address)",
     // Governance. Voting power has to be delegated before it exists, which is
     // the single step people miss, so the page offers it as its own button.
     govDelegate: "function delegate(address)",
@@ -5278,6 +5285,148 @@ async function main() {
     }
   });
 
+  /* ---- Agent service fees: USDC or TSRA -------------------------------- */
+
+  const serviceFeesAddr = (liveDeployment.tesseraServiceFees as Hex) ?? null;
+
+  /**
+   * Prepaid credit for the agent's own work, buyable with either asset.
+   *
+   * Credit is denominated in USDC because that is what the services are priced
+   * in; TSRA buys the same credit at a discount. The contract remembers what it
+   * was paid rather than only what it credited, so a refund returns the assets
+   * that are actually still there.
+   */
+  app.get("/api/fees/credit", async (req, res) => {
+    if (!serviceFeesAddr) {
+      res.json({ ok: true, deployed: false, note: "No service-fee contract on this deployment." });
+      return;
+    }
+    try {
+      const user = String(req.query.user ?? "");
+      const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+      const read = <T,>(fn: string, args: unknown[] = []): Promise<T> =>
+        client.public.readContract({
+          address: serviceFeesAddr, abi: tesseraServiceFeesAbi, functionName: fn as never, args: args as never,
+        }) as Promise<T>;
+
+      const [rate, discount, totalCredit, totalSpent, treasury] = await Promise.all([
+        read<bigint>("tsraPerUsdc"),
+        read<number>("tsraDiscountBps"),
+        read<bigint>("totalCredit"),
+        read<bigint>("totalSpent"),
+        read<Hex>("treasury"),
+      ]);
+
+      // What a dollar of credit costs each way, which is the only comparison
+      // anybody actually makes at the moment of paying.
+      const perUsdc = rate > 0n ? await read<bigint>("quoteTsra", [1_000_000n]) : 0n;
+
+      let you: Record<string, unknown> | null = null;
+      if (who) {
+        const [credit, usdcHeld, tsraHeld] = await read<readonly [bigint, bigint, bigint]>("accountOf", [who]);
+        you = {
+          address: who,
+          credit: fmtUnits(credit, 6),
+          creditRaw: credit.toString(),
+          usdcHeld: fmtUnits(usdcHeld, 6),
+          tsraHeld: fmtUnits(tsraHeld, 18),
+          canWithdraw: usdcHeld > 0n || tsraHeld > 0n,
+        };
+      }
+
+      res.json({
+        ok: true,
+        deployed: true,
+        address: serviceFeesAddr,
+        treasury,
+        rateSet: rate > 0n,
+        discountBps: Number(discount),
+        // Zero when no rate is set: the page says "USDC only" rather than
+        // offering a token route that would revert.
+        tsraPerUsdcCredit: fmtUnits(perUsdc, 18),
+        totalCredit: fmtUnits(totalCredit, 6),
+        totalSpent: fmtUnits(totalSpent, 6),
+        you,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** What a given amount of credit costs in TSRA, before committing to it. */
+  app.get("/api/fees/quote", async (req, res) => {
+    if (!serviceFeesAddr) { res.status(404).json({ ok: false, error: "service fees not deployed" }); return; }
+    try {
+      const credit = BigInt(String(req.query.credit ?? "0"));
+      if (credit <= 0n) { res.status(400).json({ ok: false, error: "amount must be above zero" }); return; }
+      const cost = (await client.public.readContract({
+        address: serviceFeesAddr, abi: tesseraServiceFeesAbi, functionName: "quoteTsra", args: [credit],
+      })) as bigint;
+      res.json({ ok: true, creditUsdc: fmtUnits(credit, 6), costTsra: fmtUnits(cost, 18), costRaw: cost.toString() });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** What a TSRA top-up is worth, and the discount on it. Operator only. */
+  app.post("/api/fees/rate", requireOperator, async (req, res) => {
+    if (!serviceFeesAddr) { res.status(404).json({ ok: false, error: "service fees not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const tokensPerDollar = String(req.body?.tokensPerDollar ?? "");
+      const discountBps = Number(req.body?.discountBps ?? 0);
+      if (!/^\d+(\.\d+)?$/.test(tokensPerDollar) || Number(tokensPerDollar) <= 0) {
+        res.status(400).json({ ok: false, error: "tokens per dollar must be a positive number" });
+        return;
+      }
+      if (!Number.isInteger(discountBps) || discountBps < 0 || discountBps > 5000) {
+        res.status(400).json({ ok: false, error: "the discount is 0–5000 basis points" });
+        return;
+      }
+      // TSRA base units per USDC base unit at 1e18 scale: for 18 decimals
+      // against 6, that is tokens-per-dollar times 1e30.
+      const [whole, frac = ""] = tokensPerDollar.split(".");
+      const scaled = BigInt(whole + frac.padEnd(18, "0").slice(0, 18)) * 10n ** 12n; // tokens * 1e18
+      const rate = scaled * 10n ** 12n; // * 1e30 / 1e18
+      const txHash = await owner.write(serviceFeesAddr, tesseraServiceFeesAbi, "setRate", [rate, discountBps]);
+      logTx(req, {
+        category: "agent", action: "fee-rate", status: "success", txHash,
+        detail: `${tokensPerDollar} TSRA/USDC, ${discountBps / 100}% off`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Draw a buyer's credit down for work done.
+   *
+   * The agent's own key signs this, and only an address the contract has been
+   * told is a spender may call it — so an operator session cannot bill an
+   * arbitrary account from a deployment that has not appointed one.
+   */
+  app.post("/api/fees/charge", requireOperator, async (req, res) => {
+    if (!serviceFeesAddr) { res.status(404).json({ ok: false, error: "service fees not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const user = String(req.body?.user ?? "");
+      const amount = BigInt(String(req.body?.amount ?? "0"));
+      const memo = String(req.body?.memo ?? "agent services").slice(0, 120);
+      if (!/^0x[0-9a-fA-F]{40}$/.test(user)) { res.status(400).json({ ok: false, error: "bad address" }); return; }
+      if (amount <= 0n) { res.status(400).json({ ok: false, error: "amount must be above zero" }); return; }
+      const txHash = await owner.write(serviceFeesAddr, tesseraServiceFeesAbi, "spend", [user, amount, memo]);
+      logTx(req, {
+        category: "agent", action: "fee-charge", status: "success", txHash,
+        detail: `${fmtUnits(amount, 6)} USDC of credit from ${user.slice(0, 10)}… — ${memo}`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   /* ---- The gauge ------------------------------------------------------- */
 
   const gaugeAddr = (liveDeployment.tesseraGauge as Hex) ?? null;
@@ -5976,6 +6125,7 @@ async function main() {
       governor: (liveDeployment.tesseraGovernor as Hex) ?? null,
       lpEmissions: (liveDeployment.tesseraLpEmissions as Hex) ?? null,
       gauge: (liveDeployment.tesseraGauge as Hex) ?? null,
+      serviceFees: (liveDeployment.tesseraServiceFees as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded

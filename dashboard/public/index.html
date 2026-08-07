@@ -2047,6 +2047,57 @@
             </div>
           </div>
 
+          <div class="card" id="feeCreditCard" style="display:none">
+            <h2>Service fees — pay in USDC or <span class="tsraIcon" aria-hidden="true"></span> TSRA</h2>
+            <div style="font-size:12.5px;color:var(--muted)">
+              The agent bills per call, and a call is worth a fraction of a cent — settling each one on
+              chain would cost more in gas than the service costs. So credit is bought once and drawn down
+              as work is done. Buy it with either asset: credit is priced in USDC because that is what the
+              services are priced in, and paying in TSRA buys the same credit for less.
+              Whatever is unspent comes back on request, in the assets it was paid in.
+            </div>
+            <div class="metrics tight" style="margin-top:14px">
+              <div class="metric"><div class="k">Your credit</div><div class="v" id="feeCredit">—</div></div>
+              <div class="metric"><div class="k">Held as USDC</div><div class="v" id="feeHeldUsdc">—</div></div>
+              <div class="metric"><div class="k">Held as TSRA</div><div class="v" id="feeHeldTsra">—</div></div>
+              <div class="metric"><div class="k">TSRA discount</div><div class="v" id="feeDiscount">—</div></div>
+            </div>
+            <div class="row-actions" style="margin-top:14px;flex-wrap:wrap">
+              <label class="kv">Credit to buy</label>
+              <input id="feeAmount" class="field" inputmode="decimal" placeholder="10.00" style="width:130px" />
+              <span class="kv">USDC</span>
+              <button class="btn primary" id="feeBuyUsdc">Pay in USDC</button>
+              <button class="btn" id="feeBuyTsra">Pay in TSRA</button>
+              <button class="btn" id="feeWithdraw">Take back what is unspent</button>
+            </div>
+            <div class="kv" id="feeQuote" style="margin-top:9px"></div>
+            <div class="msg" id="feeMsg" style="display:none"></div>
+
+            <div id="feeAdmin" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+              <b style="font-size:13px">What a TSRA top-up is worth</b>
+              <div class="kv" style="margin:3px 0 9px">
+                Operator only. TSRA has no market yet, so this is a parameter and not a price — which is why
+                credit is fixed at the moment it is bought and never re-priced when this moves, and why the
+                discount is capped at 50%. Hand this to the governor when there is one worth handing it to.
+              </div>
+              <div class="row-actions" style="flex-wrap:wrap">
+                <label class="kv">TSRA per USDC</label>
+                <input id="feeRateTokens" class="field" inputmode="decimal" style="width:120px" />
+                <label class="kv">Discount (bps)</label>
+                <input id="feeRateDiscount" class="field" inputmode="numeric" style="width:100px" />
+                <button class="btn" id="feeRateSet">Set rate</button>
+              </div>
+              <div class="row-actions" style="flex-wrap:wrap;margin-top:10px">
+                <label class="kv">Charge</label>
+                <input id="feeChargeUser" class="field" placeholder="0x…" style="min-width:300px" />
+                <input id="feeChargeAmount" class="field" inputmode="decimal" placeholder="USDC" style="width:110px" />
+                <input id="feeChargeMemo" class="field" placeholder="what for" style="width:180px" />
+                <button class="btn" id="feeCharge">Draw credit down</button>
+              </div>
+              <div class="msg" id="feeAdminMsg" style="display:none"></div>
+            </div>
+          </div>
+
           <div class="card" id="approvalsCard" style="display:none;border-color:color-mix(in srgb, var(--warn) 40%, var(--line))">
             <h2 style="color:var(--warn)">🛡 Guardian approvals — agent wants to exceed its policy cap</h2>
             <div id="approvals" style="display:flex;flex-direction:column;gap:10px"></div>

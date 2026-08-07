@@ -16,5 +16,6 @@
   "tesseraRouter": "0x2edb172e3364d167eae1a3b7ba1fa4c8ccdcd5d1",
   "tesseraAmm": "0x8b3ae0eb103653c4bce4d4dbff062ad7c9c9ada0",
   "tesseraLpEmissions": "0x3f8a8f7f9612ba42b64f92120f55af0fd28d0d14",
-  "tesseraGauge": "0x7aa76a02ae084d947ccdfda27bbf4704993de996"
+  "tesseraGauge": "0x7aa76a02ae084d947ccdfda27bbf4704993de996",
+  "tesseraServiceFees": "0x88b15bdfa20c90e7aa7de00b129aa4d1ed4fb424"
 }
