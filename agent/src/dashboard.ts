@@ -3397,12 +3397,24 @@ async function main() {
    * "your escrow predates this feature" is a very different thing to report
    * than "the call reverted".
    */
-  const SET_PROTOCOL_FEE_SELECTOR = toFunctionSelector("function setProtocolFee(uint16,address)").slice(2);
   let escrowFeeSupported: boolean | null = null;
   const escrowSupportsFee = async () => {
     if (escrowFeeSupported !== null) return escrowFeeSupported;
-    const code = String((await client.public.getCode({ address: escrowAddress })) ?? "").toLowerCase();
-    escrowFeeSupported = code.includes(SET_PROTOCOL_FEE_SELECTOR);
+    let current = { bps: 0, treasury: escrowAddress as Hex };
+    try {
+      const r = await readEscrowFee();
+      current = { bps: r.bps, treasury: r.treasury };
+    } catch {
+      // Cannot even read the fee — the lever is certainly not there.
+      escrowFeeSupported = false;
+      return false;
+    }
+    // Re-setting the values it already carries: a no-op that still proves the
+    // function exists and that this owner may call it.
+    escrowFeeSupported = await hasLever(
+      escrowAddress, tesseraEscrowAbi, "setProtocolFee", [current.bps, current.treasury],
+      toFunctionSelector("function setProtocolFee(uint16,address)").slice(2),
+    );
     return escrowFeeSupported;
   };
 
@@ -4285,6 +4297,55 @@ async function main() {
   };
   let poolPriceSupport: { read: boolean; write: boolean; freeze: boolean; feed: boolean } | null = null;
   /**
+   * Does this deployment actually have `fn`, and may the owner call it?
+   *
+   * Scanning the runtime bytecode for a selector is a guess, and it has now
+   * been caught guessing wrong twice on this very deployment: `setPrice` on
+   * the pool and `setProtocolFee` on the escrow both scan as absent and
+   * simulate as present. viaIR and the optimizer compile the dispatch into a
+   * comparison tree that builds selector values arithmetically, so the literal
+   * four bytes need never appear in the code of a contract that implements the
+   * function perfectly well.
+   *
+   * Simulating from the owner answers the question that is actually being
+   * asked — "can I send this?" — instead of a proxy for it. `args` should be
+   * the values the contract already holds, so the probe is a semantic no-op.
+   * With no owner key there is nothing to simulate from, and the scan is the
+   * honest fallback.
+   */
+  const hasLever = async (
+    address: Hex, abi: unknown, fn: string, args: unknown[], selector: string,
+  ): Promise<boolean> => {
+    const code = String((await client.public.getCode({ address })) ?? "").toLowerCase();
+    const scan = code.includes(selector);
+    if (!owner) return scan;
+    try {
+      await client.public.simulateContract({
+        address, abi: abi as never, functionName: fn as never, args: args as never,
+        account: owner.account.address,
+      });
+      return true; // definitive: it ran
+    } catch {
+      /*
+       * A revert is not proof of absence.
+       *
+       * A missing function and a guarded one both revert, and on a contract
+       * with no fallback both can come back with empty returndata — so the
+       * error alone cannot tell them apart. Treating every revert as "present"
+       * is the worse mistake of the two: it lights up a button that can only
+       * fail. So a revert falls back to the scan, which is a weak signal but
+       * an independent one.
+       *
+       * Between them the two cover each other's blind spots. The pool's
+       * `setPrice` scans absent and simulates fine — caught by the simulation.
+       * The escrow's `setProtocolFee` reverts and scans absent, and really is
+       * missing — caught by the scan. Neither test alone gets both right.
+       */
+      return scan;
+    }
+  };
+
+  /**
    * Which operator levers does the deployed pool actually have?
    *
    * Scanning the runtime bytecode for a 4-byte selector is a guess, and on
@@ -4324,28 +4385,23 @@ async function main() {
       }
     }
 
-    // Write: settled by simulating it from the owner, where one exists.
-    let write = code.includes(POOL_SELECTORS.write);
-    if (owner && asset && current !== null) {
-      try {
-        await client.public.simulateContract({
-          address: pool, abi: tesseraPoolAbi, functionName: "setPrice",
-          args: [asset, current], account: owner.account.address,
-        });
-        write = true;
-      } catch (e) {
-        // A revert that names the function as missing is a real "no"; anything
-        // else (a guard, a paused pool) means the function is there.
-        write = !/does not have the function|returned no data/i.test(String(e));
-      }
-    }
+    // The three write levers, each probed at the value it already holds.
+    const [write, freeze, feed] = asset && current !== null
+      ? await Promise.all([
+          hasLever(pool, tesseraPoolAbi, "setPrice", [asset, current], POOL_SELECTORS.write),
+          hasLever(pool, tesseraPoolAbi, "setFrozen", [asset, 0], POOL_SELECTORS.freeze),
+          hasLever(
+            pool, tesseraPoolAbi, "setPriceFeed",
+            [asset, "0x0000000000000000000000000000000000000000", 3600], POOL_SELECTORS.feed,
+          ),
+        ])
+      : [
+          code.includes(POOL_SELECTORS.write),
+          code.includes(POOL_SELECTORS.freeze),
+          code.includes(POOL_SELECTORS.feed),
+        ];
 
-    poolPriceSupport = {
-      read,
-      write,
-      freeze: code.includes(POOL_SELECTORS.freeze),
-      feed: code.includes(POOL_SELECTORS.feed),
-    };
+    poolPriceSupport = { read, write, freeze, feed };
     console.log(
       `[pool] levers — read=${read} write=${write} freeze=${poolPriceSupport.freeze} feed=${poolPriceSupport.feed}`,
     );
