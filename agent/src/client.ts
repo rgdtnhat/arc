@@ -1,4 +1,5 @@
 import {
+  toFunctionSelector,
   createPublicClient,
   createWalletClient,
   maxUint256,
@@ -361,13 +362,30 @@ export class TesseraClient {
     };
   }
 
+  /**
+   * A provider's record, read so that an older escrow still answers.
+   *
+   * `reputation` grew from three words to five when distinct-buyer counting
+   * and a last-settled timestamp were added. A deployment made before that
+   * returns 96 bytes where the committed ABI expects 160, and viem's decoder
+   * throws `Position 127 is out of bounds` — so on the live escrow this read
+   * failed on every single refresh cycle, logging a stack trace and leaving
+   * provider reputation blank.
+   *
+   * Decoding by hand costs nothing here: the return is a flat run of static
+   * words, so taking the first three and treating the rest as optional works
+   * against both shapes. The alternative — pinning the ABI to whatever is
+   * deployed — breaks the next deployment instead of this one.
+   */
   async reputation(provider: Hex): Promise<{ fulfilled: bigint; failed: bigint; earned: bigint }> {
-    const r = (await this.public.readContract({
-      address: this.escrow,
-      abi: tesseraEscrowAbi,
-      functionName: "reputation",
-      args: [provider],
-    })) as [bigint, bigint, bigint];
-    return { fulfilled: r[0], failed: r[1], earned: r[2] };
+    const data = await this.public.call({
+      to: this.escrow,
+      data: (toFunctionSelector("function reputation(address)") +
+        provider.replace(/^0x/, "").toLowerCase().padStart(64, "0")) as Hex,
+    });
+    const body = String(data.data ?? "").replace(/^0x/, "");
+    if (body.length < 192) throw new Error("reputation: escrow returned fewer than three words");
+    const word = (i: number) => BigInt("0x" + body.slice(i * 64, i * 64 + 64));
+    return { fulfilled: word(0), failed: word(1), earned: word(2) };
   }
 }
