@@ -168,8 +168,29 @@ test("backs off instead of hammering the endpoint", async () => {
 
   await waitForAttestation(0, "0xabc", { fetchImpl, intervalMs: 5, maxIntervalMs: 40, timeoutMs: 120 });
   assert.ok(gaps.length >= 3, "should have polled a few times");
-  // Later gaps are wider than the first.
-  assert.ok(gaps[gaps.length - 1]! >= gaps[1]!, `gaps did not widen: ${gaps.join(",")}`);
+
+  /*
+   * The *widest* gap, not the last one.
+   *
+   * `waitForAttestation` clamps its final sleep to whatever is left before the
+   * deadline, which is correct — otherwise the last wait overshoots the timeout
+   * the caller asked for. It also means that on a machine slow enough to reach
+   * the deadline mid-backoff there is one extra poll with a gap of ~0 at the
+   * end, and asserting on the last gap compares against a number the deadline
+   * produced rather than one the backoff did. CI failed on exactly that:
+   * 0,5,10,21,41,42,0 — a textbook doubling curve and a truncated tail.
+   *
+   * `gaps[0]` is always 0 (the first poll fires immediately), so the first real
+   * interval is `gaps[1]`. Requiring the widest to be at least double it holds
+   * for any doubling schedule and fails flat for a fixed one, which is the
+   * distinction this test exists to make.
+   */
+  const intervals = gaps.slice(1);
+  const widest = Math.max(...intervals);
+  assert.ok(
+    widest >= intervals[0]! * 2,
+    `backoff did not widen: ${gaps.join(",")}`,
+  );
 });
 
 // --- planning ---------------------------------------------------------------
