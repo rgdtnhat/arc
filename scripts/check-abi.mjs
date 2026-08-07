@@ -56,6 +56,7 @@ const NOT_EXPORTED = {
   ReentrancyGuard: "abstract base contract, never deployed on its own",
   MockAggregator: "test-only Chainlink feed stub, used from the Hardhat tests directly",
   MockFlashBorrower: "test-only flash-loan callback, used from the Hardhat tests directly",
+  MockSharePool: "test-only stand-in for the pool's share accounting, used from the emissions tests directly",
 };
 
 // --- 1. structural ----------------------------------------------------------

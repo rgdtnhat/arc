@@ -18,6 +18,7 @@ import {
   tesseraOracleAbi,
   tesseraPriceGuardAbi,
   tesseraRegistryAbi,
+  tesseraEmissionsAbi,
   tesseraRateLimiterAbi,
   tesseraTabAbi,
   ARC_USDC_ADDRESS,
@@ -195,6 +196,12 @@ const CLIENT_SELECTORS = Object.fromEntries(
     backstopCancel: "function cancelBackstopExit(address)",
     backstopWithdraw: "function withdrawBackstop(address)",
     backstopShares: "function backstopShares(address,address)",
+    // Emissions. `claim` and `checkpointMany` take parallel arrays, so the
+    // browser encodes them with offset + length headers like the AMM's.
+    emClaim: "function claim(address[],uint8[])",
+    emCheckpoint: "function checkpoint(address,address,uint8)",
+    emClaimable: "function claimable(address,address,uint8)",
+    emClaimableTotal: "function claimableTotal(address)",
     swapQuote: "function quote(address,address,uint256)",
     swapExec: "function swap(address,address,uint256,uint256,uint256)",
     // AMM. `ammAdd`/`ammRemove` take dynamic arrays, so the browser encodes them
@@ -3827,6 +3834,7 @@ async function main() {
         router: routerClient?.router ?? null,
         collector: (liveDeployment.tesseraFeeCollector as Hex) ?? null,
         amm: ammClient?.amm ?? null,
+        emissions: (liveDeployment.tesseraEmissions as Hex) ?? null,
       },
     });
   });
@@ -4750,6 +4758,199 @@ async function main() {
     }
   }, PRICE_TRACK_MS).unref?.();
 
+  /* ---- Pool emissions -------------------------------------------------- */
+
+  const emissionsAddr = (liveDeployment.tesseraEmissions as Hex) ?? null;
+  const SIDE = { supply: 0, borrow: 1 } as const;
+
+  /**
+   * Rewards, per reserve and per side, as an APR the page can put next to the
+   * interest rate.
+   *
+   * The conversion is the whole point of doing this server-side. A rate is
+   * reward-units-per-second; what a supplier wants to know is what fraction of
+   * their deposit that comes to in a year. So: value the yearly emission at the
+   * reward token's mark, value the side's outstanding balance at its own, and
+   * divide. Both marks come from the pool, which is the same valuation it
+   * lends and liquidates against — mixing in a second price source here would
+   * make the badge disagree with the borrow limit two panels up.
+   */
+  app.get("/api/lending/emissions", async (req, res) => {
+    if (!emissionsAddr || !poolDeployment) {
+      res.json({ ok: true, deployed: false, note: "No emissions contract on this deployment." });
+      return;
+    }
+    try {
+      const user = String(req.query.user ?? "");
+      const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+      const assets = poolDeployment.assets;
+
+      const read = <T,>(fn: string, args: unknown[]): Promise<T> =>
+        client.public.readContract({
+          address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: fn as never, args: args as never,
+        }) as Promise<T>;
+
+      const rewardToken = await read<Hex>("rewardToken", []);
+      const configured = rewardToken !== "0x0000000000000000000000000000000000000000";
+      if (!configured) {
+        res.json({
+          ok: true, deployed: true, configured: false, address: emissionsAddr,
+          note: "Deployed, but no reward asset has been set yet.",
+        });
+        return;
+      }
+
+      const rewardMeta = assetMeta(rewardToken);
+      const [held, owed, claimed, runway] = await Promise.all([
+        client.public.readContract({
+          address: rewardToken, abi: erc20Abi, functionName: "balanceOf", args: [emissionsAddr],
+        }) as Promise<bigint>,
+        read<bigint>("totalOwed", []),
+        read<bigint>("totalClaimed", []),
+        read<bigint>("runwaySeconds", []),
+      ]);
+
+      // The reward's own mark, when the pool happens to list it. An unlisted
+      // reward token has no price here, and an APR computed from a guess would
+      // be worse than none — the rows say "rate only" instead.
+      const rewardPriceE8 = await client.public
+        .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [rewardToken] })
+        .then((v) => v as bigint)
+        .catch(() => 0n);
+
+      const YEAR = 365n * 24n * 3600n;
+      const rows = await Promise.all(
+        assets.map(async (a) => {
+          const dec = BigInt(Number(a.decimals ?? 6));
+          const [supplyRate, borrowRate, reserve] = await Promise.all([
+            read<readonly [bigint, bigint, bigint]>("streams", [a.address, SIDE.supply]),
+            read<readonly [bigint, bigint, bigint]>("streams", [a.address, SIDE.borrow]),
+            client.public.readContract({
+              address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "reserves", args: [a.address],
+            }) as Promise<readonly unknown[]>,
+          ]);
+          const assetPriceE8 = reserve[PRICE_IX] as bigint;
+          const supplied = reserve[9] as bigint;
+          const borrowed = reserve[11] as bigint;
+
+          /** Yearly emission value over the side's value, as a percentage. */
+          const apr = (ratePerSecond: bigint, sideAssets: bigint): number | null => {
+            if (ratePerSecond === 0n) return 0;
+            if (rewardPriceE8 === 0n || assetPriceE8 === 0n || sideAssets === 0n) return null;
+            const rewardUnit = 10n ** BigInt(rewardMeta.decimals);
+            // Both legs in the pool's 1e8 USD scale, scaled by 1e6 so the
+            // division keeps four decimal places of a percent.
+            const yearlyUsd = (ratePerSecond * YEAR * rewardPriceE8) / rewardUnit;
+            const sideUsd = (sideAssets * assetPriceE8) / 10n ** dec;
+            if (sideUsd === 0n) return null;
+            return Number((yearlyUsd * 1_000_000n) / sideUsd) / 10_000;
+          };
+
+          const mine = who
+            ? await Promise.all([
+                read<bigint>("claimable", [who, a.address, SIDE.supply]),
+                read<bigint>("claimable", [who, a.address, SIDE.borrow]),
+              ])
+            : [0n, 0n];
+
+          return {
+            address: a.address,
+            symbol: a.symbol,
+            supplyRatePerSecond: supplyRate[0].toString(),
+            borrowRatePerSecond: borrowRate[0].toString(),
+            supplyApr: apr(supplyRate[0], supplied),
+            borrowApr: apr(borrowRate[0], borrowed),
+            claimableSupply: mine[0].toString(),
+            claimableBorrow: mine[1].toString(),
+          };
+        }),
+      );
+
+      const claimable = rows.reduce((t, r) => t + BigInt(r.claimableSupply) + BigInt(r.claimableBorrow), 0n);
+      res.json({
+        ok: true,
+        deployed: true,
+        configured: true,
+        address: emissionsAddr,
+        canSet: Boolean(owner),
+        reward: {
+          address: rewardToken,
+          symbol: rewardMeta.symbol,
+          decimals: rewardMeta.decimals,
+          priced: rewardPriceE8 > 0n,
+          balance: fmtUnits(held, rewardMeta.decimals),
+          owed: fmtUnits(owed, rewardMeta.decimals),
+          claimedAllTime: fmtUnits(claimed, rewardMeta.decimals),
+          // Capped for display: an unbounded runway is "nothing is emitting",
+          // and printing 1e77 days helps nobody.
+          runwayDays: runway > 10n ** 12n ? null : Number(runway) / 86_400,
+        },
+        yourClaimable: fmtUnits(claimable, rewardMeta.decimals),
+        yourClaimableRaw: claimable.toString(),
+        assets: rows,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Set a reserve's emission rate, per side. Operator only. */
+  app.post("/api/lending/emissions/rate", requireOperator, async (req, res) => {
+    if (!emissionsAddr) { res.status(404).json({ ok: false, error: "emissions not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const asset = String(req.body?.asset ?? "");
+      const side = Number(req.body?.side ?? 0);
+      const rate = BigInt(String(req.body?.ratePerSecond ?? "0"));
+      if (!/^0x[0-9a-fA-F]{40}$/.test(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
+      if (side !== 0 && side !== 1) { res.status(400).json({ ok: false, error: "side must be 0 (supply) or 1 (borrow)" }); return; }
+      const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "setRate", [asset, side, rate]);
+      logTx(req, {
+        category: "defi", action: "emissions-rate", status: "success", txHash,
+        detail: `${asset} ${side === 0 ? "supply" : "borrow"} -> ${rate}/s`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Choose the asset rewards are paid in. Operator only. */
+  app.post("/api/lending/emissions/token", requireOperator, async (req, res) => {
+    if (!emissionsAddr) { res.status(404).json({ ok: false, error: "emissions not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const token = String(req.body?.token ?? "");
+      if (!/^0x[0-9a-fA-F]{40}$/.test(token)) { res.status(400).json({ ok: false, error: "bad token" }); return; }
+      const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "setRewardToken", [token]);
+      logTx(req, { category: "defi", action: "emissions-token", status: "success", txHash, detail: token });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Top the reward pot up from the agent wallet. Operator only. */
+  app.post("/api/lending/emissions/fund", requireOperator, async (req, res) => {
+    if (!emissionsAddr) { res.status(404).json({ ok: false, error: "emissions not deployed" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const amount = BigInt(String(req.body?.amount ?? "0"));
+      if (amount <= 0n) { res.status(400).json({ ok: false, error: "amount must be above zero" }); return; }
+      const token = (await client.public.readContract({
+        address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "rewardToken",
+      })) as Hex;
+      // Approve exactly what is being funded, for the same reason every other
+      // approval in this codebase is exact.
+      await owner.write(token, erc20Abi, "approve", [emissionsAddr, amount]);
+      const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "fund", [amount]);
+      logTx(req, { category: "defi", action: "emissions-fund", status: "success", txHash, detail: String(amount) });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   /** Wire (or clear) a Chainlink-compatible price feed for a reserve. */
   app.post("/api/lending/admin/oracle", requireOperator, async (req, res) => {
     if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
@@ -5036,6 +5237,9 @@ async function main() {
       vaultAsset: (liveDeployment.vaultAsset as Hex) ?? usdcAddress,
       router: routerClient?.router ?? null,
       amm: ammClient?.amm ?? null,
+      // Null until an operator deploys one; the panel hides itself rather than
+      // offering a claim button that cannot go anywhere.
+      emissions: (liveDeployment.tesseraEmissions as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded
