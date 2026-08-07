@@ -15,6 +15,10 @@ interface IGaugeLpEmissions {
     function setRatesBatch(uint256[] calldata poolIds, uint256[] calldata rates) external;
 }
 
+interface IGaugeRegistry {
+    function allWhitelisted(address[] calldata assets) external view returns (bool);
+}
+
 interface IGaugeERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -87,6 +91,14 @@ contract TesseraGauge is ReentrancyGuard {
         /// A retired market keeps its history but takes no new votes.
         bool active;
         string label;
+        /**
+         * The assets this market is made of, checked against the register.
+         *
+         * Declared when the market is listed rather than read from the venue,
+         * so the gauge does not have to know the AMM's or the pool's interface
+         * to answer "is this eligible" — and so the same rule covers both.
+         */
+        address[] assets;
     }
 
     /// One bribe: a token, an amount, and how much of it is left to claim.
@@ -128,6 +140,46 @@ contract TesseraGauge is ReentrancyGuard {
     mapping(uint256 => mapping(address => uint256[])) private voterMarkets;
     /// epoch => voter => total weight they used.
     mapping(uint256 => mapping(address => uint256)) public voterUsed;
+    /**
+     * epoch => market => how many addresses put weight on it.
+     *
+     * A tally in tokens says how much conviction turned up; a head count says
+     * how many people it came from. One address with the whole supply and a
+     * thousand holders agreeing produce the same number in the first measure
+     * and very different numbers in the second, and voters deserve to see
+     * which one they are looking at.
+     */
+    mapping(uint256 => mapping(uint256 => uint256)) public marketVoters;
+
+    /**
+     * The register that decides which assets are eligible for emissions.
+     *
+     * Optional: with none set every market is eligible, which is the right
+     * default for a deployment that has not decided anything yet. Once set, a
+     * market whose assets are not all whitelisted cannot enter the reward zone
+     * — it can still be voted on, and the votes still count as signal, but the
+     * emissions do not follow them.
+     */
+    IGaugeRegistry public registry;
+
+    /**
+     * Addresses offering to vote on other people's behalf.
+     *
+     * Self-registered rather than curated: an admin-kept list of "trusted
+     * community members" is a list whose trust comes from the admin, which is
+     * the opposite of what delegation is for. Anyone may add themselves, the
+     * voting power shown next to them is read from the token, and the
+     * delegation itself is the holder's own transaction and revocable at any
+     * time. The list is a directory, not an endorsement.
+     */
+    struct Delegate {
+        address who;
+        string name;
+        string statement;
+        bool active;
+    }
+    Delegate[] public delegates;
+    mapping(address => uint256) private delegateIndex; // 1-based; 0 means none
 
     /// epoch => market => bribes attached to it.
     mapping(uint256 => mapping(uint256 => Bribe[])) private bribes;
@@ -159,12 +211,17 @@ contract TesseraGauge is ReentrancyGuard {
     error NothingToClaim();
     error TransferFailed();
     error ZeroAmount();
+    error NoAssets();
+    error TextTooLong();
 
     event AdminSet(address indexed admin);
     event EmissionsSet(address indexed lending, address indexed lp);
     event MarketAdded(uint256 indexed id, Venue venue, address asset, uint8 side, uint64 poolId, string label);
     event MarketActiveSet(uint256 indexed id, bool active);
     event RewardZoneSet(uint16 size);
+    event RegistrySet(address indexed registry);
+    event DelegateRegistered(uint256 indexed id, address indexed who, string name);
+    event DelegateActiveSet(uint256 indexed id, bool active);
     event BudgetSet(uint256 lendingPerSecond, uint256 ammPerSecond);
     event Voted(uint256 indexed epoch, address indexed voter, uint256 indexed market, uint256 weight);
     event VoteCleared(uint256 indexed epoch, address indexed voter);
@@ -209,16 +266,65 @@ contract TesseraGauge is ReentrancyGuard {
     function addLendingMarket(address asset, uint8 side, string calldata label) external onlyAdmin returns (uint256 id) {
         if (asset == address(0)) revert ZeroAddress();
         id = markets.length;
-        markets.push(Market({ venue: Venue.Lending, asset: asset, side: side, poolId: 0, active: true, label: label }));
+        Market storage m = markets.push();
+        m.venue = Venue.Lending;
+        m.asset = asset;
+        m.side = side;
+        m.active = true;
+        m.label = label;
+        m.assets.push(asset);
         emit MarketAdded(id, Venue.Lending, asset, side, 0, label);
     }
 
-    function addAmmMarket(uint64 poolId, string calldata label) external onlyAdmin returns (uint256 id) {
+    /**
+     * @param assets What the pool holds. Declared rather than read from the AMM
+     *        so the register's rule covers both venues with one check.
+     */
+    function addAmmMarket(uint64 poolId, address[] calldata assets, string calldata label)
+        external
+        onlyAdmin
+        returns (uint256 id)
+    {
+        if (assets.length == 0) revert NoAssets();
         id = markets.length;
-        markets.push(
-            Market({ venue: Venue.Amm, asset: address(0), side: 0, poolId: poolId, active: true, label: label })
-        );
+        Market storage m = markets.push();
+        m.venue = Venue.Amm;
+        m.poolId = poolId;
+        m.active = true;
+        m.label = label;
+        for (uint256 i = 0; i < assets.length; i++) {
+            if (assets[i] == address(0)) revert ZeroAddress();
+            m.assets.push(assets[i]);
+        }
         emit MarketAdded(id, Venue.Amm, address(0), 0, poolId, label);
+    }
+
+    /// @notice Point the gauge at a register, or at nothing to drop the rule.
+    function setRegistry(address next) external onlyAdmin {
+        registry = IGaugeRegistry(next);
+        emit RegistrySet(next);
+    }
+
+    /**
+     * @notice Whether a market's assets are all on the register.
+     *
+     * True for everything when no register is set — a deployment that has not
+     * decided anything should not behave as though it decided "no".
+     */
+    function eligible(uint256 id) public view returns (bool) {
+        if (id >= markets.length) return false;
+        if (address(registry) == address(0)) return true;
+        try registry.allWhitelisted(markets[id].assets) returns (bool okAll) {
+            return okAll;
+        } catch {
+            // A register that will not answer must not silently open the gate.
+            return false;
+        }
+    }
+
+    /// @notice The assets a market was listed against.
+    function marketAssets(uint256 id) external view returns (address[] memory) {
+        return markets[id].assets;
     }
 
     /**
@@ -302,6 +408,7 @@ contract TesseraGauge is ReentrancyGuard {
             voterMarketVotes[epoch][msg.sender][id] = weights[i];
             voterMarkets[epoch][msg.sender].push(id);
             marketVotes[epoch][id] += weights[i];
+            marketVoters[epoch][id] += 1;
             emit Voted(epoch, msg.sender, id, weights[i]);
         }
         if (used == 0) revert NothingToVoteWith();
@@ -327,6 +434,7 @@ contract TesseraGauge is ReentrancyGuard {
             if (w == 0) continue;
             voterMarketVotes[epoch][voter][id] = 0;
             marketVotes[epoch][id] -= w;
+            if (marketVoters[epoch][id] != 0) marketVoters[epoch][id] -= 1;
         }
         totalVotes[epoch] -= voterUsed[epoch][voter];
         voterUsed[epoch][voter] = 0;
@@ -388,7 +496,10 @@ contract TesseraGauge is ReentrancyGuard {
         uint256 n = markets.length;
         uint256 counted;
         for (uint256 i = 0; i < n; i++) {
-            if (marketVotes[epoch][i] != 0) counted++;
+            // Votes on an ineligible market still count as signal; they just do
+            // not move money. That distinction is the whole point of having a
+            // register rather than refusing the vote outright.
+            if (marketVotes[epoch][i] != 0 && eligible(i)) counted++;
         }
         uint256 size = rewardZoneSize == 0 || rewardZoneSize > counted ? counted : rewardZoneSize;
         ids = new uint256[](size);
@@ -399,7 +510,7 @@ contract TesseraGauge is ReentrancyGuard {
             for (uint256 i = 0; i < n; i++) {
                 if (taken[i]) continue;
                 uint256 v = marketVotes[epoch][i];
-                if (v == 0) continue;
+                if (v == 0 || !eligible(i)) continue;
                 if (v > bestVotes) {
                     bestVotes = v;
                     best = i;
@@ -503,6 +614,54 @@ contract TesseraGauge is ReentrancyGuard {
         lastAppliedEpoch = epoch;
         everApplied = true;
         emit Applied(epoch, zoneVotes(epoch), n);
+    }
+
+    // --- the delegate directory -------------------------------------------------
+
+    /**
+     * @notice Offer to vote on other people's behalf.
+     *
+     * Permissionless, and deliberately so. A curated list of "trusted community
+     * members" is a list whose trust comes from whoever curates it, which is
+     * the opposite of what delegation is for. What makes this safe to leave
+     * open is that appearing here confers nothing: the weight shown next to a
+     * delegate is read from the token, the delegation is the holder's own
+     * transaction, and it can be moved at any time.
+     *
+     * Registering again updates the entry rather than creating a second one.
+     */
+    function registerDelegate(string calldata name, string calldata statement) external returns (uint256 id) {
+        // Bounded so the directory cannot be filled with prose nobody can
+        // render — this is a name and a sentence, not a manifesto.
+        if (bytes(name).length == 0 || bytes(name).length > 48) revert TextTooLong();
+        if (bytes(statement).length > 280) revert TextTooLong();
+
+        uint256 existing = delegateIndex[msg.sender];
+        if (existing != 0) {
+            id = existing - 1;
+            delegates[id].name = name;
+            delegates[id].statement = statement;
+            delegates[id].active = true;
+        } else {
+            id = delegates.length;
+            delegates.push(Delegate({ who: msg.sender, name: name, statement: statement, active: true }));
+            delegateIndex[msg.sender] = id + 1;
+        }
+        emit DelegateRegistered(id, msg.sender, name);
+    }
+
+    /// @notice Withdraw from the directory. Does not touch anybody's delegation
+    ///         — that is theirs to move, and taking it away from here would be
+    ///         a delegate deciding on their delegators' behalf.
+    function setDelegateActive(bool active) external {
+        uint256 existing = delegateIndex[msg.sender];
+        if (existing == 0) revert ZeroAddress();
+        delegates[existing - 1].active = active;
+        emit DelegateActiveSet(existing - 1, active);
+    }
+
+    function delegateCount() external view returns (uint256) {
+        return delegates.length;
     }
 
     // --- bribes ---------------------------------------------------------------

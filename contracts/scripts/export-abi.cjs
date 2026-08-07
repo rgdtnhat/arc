@@ -44,6 +44,7 @@ const governor = readArtifact("TesseraGovernor");
 const lpEmissions = readArtifact("TesseraLpEmissions");
 const gauge = readArtifact("TesseraGauge");
 const serviceFees = readArtifact("TesseraServiceFees");
+const assetRegistry = readArtifact("TesseraAssetRegistry");
 
 const outDir = path.resolve(root, "..", "shared", "src");
 fs.mkdirSync(outDir, { recursive: true });
@@ -76,7 +77,8 @@ const abiTs =
   `export const tesseraGovernorAbi = ${JSON.stringify(governor.abi)} as const;\n` +
   `export const tesseraLpEmissionsAbi = ${JSON.stringify(lpEmissions.abi)} as const;\n` +
   `export const tesseraGaugeAbi = ${JSON.stringify(gauge.abi)} as const;\n` +
-  `export const tesseraServiceFeesAbi = ${JSON.stringify(serviceFees.abi)} as const;\n`;
+  `export const tesseraServiceFeesAbi = ${JSON.stringify(serviceFees.abi)} as const;\n` +
+  `export const tesseraAssetRegistryAbi = ${JSON.stringify(assetRegistry.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 
 // Bytecode is only needed to deploy the mock locally from a plain viem script.
@@ -108,7 +110,8 @@ const bytecodeTs =
   `export const tesseraGovernorBytecode = "${governor.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraLpEmissionsBytecode = "${lpEmissions.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraGaugeBytecode = "${gauge.bytecode}" as \`0x\${string}\`;\n` +
-  `export const tesseraServiceFeesBytecode = "${serviceFees.bytecode}" as \`0x\${string}\`;\n`;
+  `export const tesseraServiceFeesBytecode = "${serviceFees.bytecode}" as \`0x\${string}\`;\n` +
+  `export const tesseraAssetRegistryBytecode = "${assetRegistry.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);
 
 console.log("[export-abi] wrote shared/src/abi.ts and shared/src/bytecode.ts");

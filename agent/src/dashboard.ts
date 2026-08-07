@@ -22,6 +22,7 @@ import {
   tesseraLpEmissionsAbi,
   tesseraGaugeAbi,
   tesseraServiceFeesAbi,
+  tesseraAssetRegistryAbi,
   tesseraGovernorAbi,
   tesseraTokenAbi,
   tesseraEmitterAbi,
@@ -221,6 +222,10 @@ const CLIENT_SELECTORS = Object.fromEntries(
     gaAddBribe: "function addBribe(uint256,uint256,address,uint256)",
     gaClaimBribes: "function claimBribes(uint256,uint256)",
     gaApply: "function applyEpoch(uint256)",
+    // The delegate directory is self-registered, so listing yourself is your
+    // own transaction — an operator-signed entry would make it an endorsement.
+    gaRegisterDelegate: "function registerDelegate(string,string)",
+    gaDelegateActive: "function setDelegateActive(bool)",
     // Service-fee credit. Buying it is the buyer's own transaction either way —
     // the agent may only draw it down.
     feeTopUpUsdc: "function topUpUsdc(uint256)",
@@ -5575,6 +5580,26 @@ async function main() {
         read<readonly bigint[]>("ratesFor", [epoch]),
         read<bigint>("epochEnd", [epoch]),
       ]);
+
+      /*
+       * What one TSRA is taken to be worth, for the incentive APR only.
+       *
+       * There is no TSRA market, so this comes from the service-fee contract's
+       * reference rate — the same number the protocol charges against. It is a
+       * parameter and not a price, so every figure derived from it is labelled
+       * as such and is null when no rate is set.
+       */
+      let tsraReferenceUsd = 0;
+      if (serviceFeesAddr) {
+        const perCredit = await client.public
+          .readContract({
+            address: serviceFeesAddr, abi: tesseraServiceFeesAbi, functionName: "quoteTsra", args: [1_000_000n],
+          })
+          .then((v) => v as bigint)
+          .catch(() => 0n);
+        // `quoteTsra(1 USDC)` is discounted TSRA per dollar; invert it.
+        if (perCredit > 0n) tsraReferenceUsd = 1 / (Number(perCredit) / 1e18);
+      }
       const inZone = new Set(zone.map((z) => Number(z)));
 
       const rewardMeta = await tokenMeta(
@@ -5582,31 +5607,67 @@ async function main() {
       );
       const markets = await Promise.all(
         Array.from({ length: Number(count) }, (_, i) => BigInt(i)).map(async (id) => {
-          const [m, votes, mine, bribeCount] = await Promise.all([
+          const [m, votes, mine, bribeCount, voters, eligible, assets] = await Promise.all([
             read<readonly [number, Hex, number, bigint, boolean, string]>("markets", [id]),
             read<bigint>("marketVotes", [epoch, id]),
             who ? read<bigint>("voterMarketVotes", [epoch, who, id]) : Promise.resolve(0n),
             read<bigint>("bribeCount", [epoch, id]),
+            read<bigint>("marketVoters", [epoch, id]).catch(() => 0n),
+            read<boolean>("eligible", [id]).catch(() => true),
+            read<readonly Hex[]>("marketAssets", [id]).catch(() => [] as readonly Hex[]),
           ]);
           const bribes = await Promise.all(
             Array.from({ length: Number(bribeCount) }, (_, i) => BigInt(i)).map(async (i) => {
               const b = await read<readonly [Hex, bigint, bigint, Hex]>("bribeAt", [epoch, id, i]);
               const meta = await tokenMeta(b[0]);
               const share = who ? await read<bigint>("bribeShare", [epoch, id, i, who]) : 0n;
+              // Value it at the pool's own mark, which is the mark everything
+              // else on this page is quoted at. An asset the pool cannot price
+              // contributes nothing rather than a guess.
+              const px = poolDeployment
+                ? await client.public
+                    .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [b[0]] })
+                    .then((v) => v as bigint)
+                    .catch(() => 0n)
+                : 0n;
               return {
                 index: Number(i),
                 token: b[0],
                 symbol: meta.symbol,
                 amount: fmtUnits(b[1], meta.decimals),
+                usd: px > 0n ? Number((b[1] * px) / 10n ** BigInt(meta.decimals)) / 1e8 : null,
                 yourShare: fmtUnits(share, meta.decimals),
                 yourShareRaw: share.toString(),
                 from: b[3],
               };
             }),
           );
+          /*
+           * The return on voting here, annualised.
+           *
+           * Incentives are paid per epoch, so the yearly figure is the epoch's
+           * incentive value scaled by how many epochs fit in a year, over the
+           * value of the votes that share it. TSRA has no market, so the votes
+           * are valued at the protocol's own reference rate — a parameter, not
+           * a price. The field is null when that rate is unset rather than
+           * quietly substituting one, and the page says which it is.
+           */
+          const bribeUsd = bribes.reduce((t, b) => t + (b.usd ?? 0), 0);
+          const votesTsra = Number(votes) / 1e18;
+          const epochsPerYear = (365 * 24 * 3600) / Number(epochLength);
+          const bribeApr =
+            tsraReferenceUsd > 0 && votesTsra > 0 && bribeUsd > 0
+              ? ((bribeUsd * epochsPerYear) / (votesTsra * tsraReferenceUsd)) * 100
+              : null;
+
           return {
             id: Number(id),
             venue: Number(m[0]) === 0 ? "lending" : "amm",
+            eligible,
+            assets,
+            usersVoted: Number(voters),
+            bribeUsd,
+            bribeApr,
             asset: m[1],
             side: Number(m[2]),
             poolId: Number(m[3]),
@@ -5644,11 +5705,40 @@ async function main() {
         };
       }
 
+      // The directory. Voting power is read live from the token, so an entry
+      // shows what somebody would actually vote with rather than a claim.
+      const delegateCount = await read<bigint>("delegateCount").catch(() => 0n);
+      const delegates = await Promise.all(
+        Array.from({ length: Number(delegateCount) }, (_, i) => BigInt(i)).map(async (i) => {
+          const dgt = await read<readonly [Hex, string, string, boolean]>("delegates", [i]);
+          const power = liveDeployment.tesseraToken
+            ? ((await client.public
+                .readContract({
+                  address: liveDeployment.tesseraToken as Hex, abi: tesseraTokenAbi,
+                  functionName: "getVotes", args: [dgt[0]],
+                })
+                .catch(() => 0n)) as bigint)
+            : 0n;
+          return {
+            id: Number(i),
+            address: dgt[0],
+            name: dgt[1],
+            statement: dgt[2],
+            active: dgt[3],
+            votingPower: fmtUnits(power, 18),
+            isYou: Boolean(who && dgt[0].toLowerCase() === who.toLowerCase()),
+          };
+        }),
+      );
+
       res.json({
         ok: true,
         deployed: true,
         address: gaugeAddr,
         canSet: Boolean(owner),
+        // Null means "no reference rate is set", not "the price is zero".
+        tsraReferenceUsd: tsraReferenceUsd > 0 ? tsraReferenceUsd : null,
+        delegates: delegates.filter((x) => x.active || x.isYou),
         epoch: Number(epoch),
         epochLengthHours: Number(epochLength) / 3600,
         epochEndsAt: Number(epochEnd),
@@ -5720,9 +5810,15 @@ async function main() {
       if (!label) { res.status(400).json({ ok: false, error: "a market needs a name" }); return; }
       let txHash: string;
       if (venue === "amm") {
-        txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "addAmmMarket", [
-          BigInt(String(req.body?.poolId ?? "0")), label,
-        ]);
+        const poolId = BigInt(String(req.body?.poolId ?? "0"));
+        if (!ammClient) { res.status(400).json({ ok: false, error: "no AMM on this deployment" }); return; }
+        // Read what the pool actually holds rather than trusting a form: the
+        // declared assets are what the register is checked against, and a
+        // mistyped one would make the market permanently ineligible.
+        const info = (await client.public.readContract({
+          address: ammClient.amm, abi: tesseraAmmAbi, functionName: "poolInfo", args: [poolId],
+        })) as readonly [readonly Hex[], ...unknown[]];
+        txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "addAmmMarket", [poolId, info[0], label]);
       } else {
         const asset = String(req.body?.asset ?? "");
         const side = Number(req.body?.side ?? 0);
@@ -5980,6 +6076,7 @@ async function main() {
     }
     try {
       const poolAddr = poolDeployment.poolAddress;
+      const registryAddr = (liveDeployment.tesseraAssetRegistry as Hex) ?? null;
       const poolOwner = (await client.public
         .readContract({ address: poolAddr, abi: tesseraPoolAbi, functionName: "owner" })
         .catch(() => null)) as Hex | null;
@@ -5987,33 +6084,91 @@ async function main() {
         address: poolAddr, abi: tesseraPoolAbi, functionName: "reserveCount",
       })) as bigint;
 
-      const listed = await Promise.all(
-        Array.from({ length: Number(count) }, (_, i) => BigInt(i)).map(async (i) => {
-          const asset = (await client.public.readContract({
-            address: poolAddr, abi: tesseraPoolAbi, functionName: "reserveList", args: [i],
+      const STATUS = ["unlisted", "whitelisted", "revoked"] as const;
+      const readStatus = async (asset: Hex) => {
+        if (!registryAddr) return { status: "unlisted" as const, changedAt: 0, reason: "" };
+        const e = (await client.public
+          .readContract({
+            address: registryAddr, abi: tesseraAssetRegistryAbi, functionName: "entryOf", args: [asset],
+          })
+          .catch(() => null)) as readonly [number, bigint, string] | null;
+        if (!e) return { status: "unlisted" as const, changedAt: 0, reason: "" };
+        return { status: STATUS[Number(e[0])] ?? "unlisted", changedAt: Number(e[1]), reason: e[2] };
+      };
+
+      // Everything the pool lends against, plus anything the register has ever
+      // decided about — a revoked asset that was delisted from the pool should
+      // not vanish from the record of the decision.
+      const reserveAssets: Hex[] = [];
+      for (let i = 0n; i < count; i++) {
+        reserveAssets.push((await client.public.readContract({
+          address: poolAddr, abi: tesseraPoolAbi, functionName: "reserveList", args: [i],
+        })) as Hex);
+      }
+      const extra: Hex[] = [];
+      if (registryAddr) {
+        const known = (await client.public
+          .readContract({ address: registryAddr, abi: tesseraAssetRegistryAbi, functionName: "knownAssetCount" })
+          .catch(() => 0n)) as bigint;
+        for (let i = 0n; i < known; i++) {
+          const a = (await client.public.readContract({
+            address: registryAddr, abi: tesseraAssetRegistryAbi, functionName: "knownAssets", args: [i],
           })) as Hex;
+          if (!reserveAssets.some((r) => r.toLowerCase() === a.toLowerCase())) extra.push(a);
+        }
+      }
+
+      const listed = await Promise.all(
+        [...reserveAssets, ...extra].map(async (asset) => {
+          const isReserve = reserveAssets.some((r) => r.toLowerCase() === asset.toLowerCase());
+          const meta = await tokenMeta(asset);
+          const reg = await readStatus(asset);
+          if (!isReserve) {
+            return {
+              address: asset, symbol: meta.symbol, decimals: meta.decimals, resolved: meta.resolved,
+              inPool: false, ...reg,
+              enabled: false, borrowable: false,
+              collateralBps: 0, liquidationBps: 0, liabilityBps: 0, reserveBps: 0,
+              priceUsd: 0, suppliedUsd: 0, borrowedUsd: 0, holders: null as number | null,
+            };
+          }
           const r = (await client.public.readContract({
             address: poolAddr, abi: tesseraPoolAbi, functionName: "reserves", args: [asset],
           })) as readonly unknown[];
-          const meta = await tokenMeta(asset);
+          const price = r[PRICE_IX] as bigint;
+          const unit = 10n ** BigInt(Number(r[2]));
           return {
             address: asset,
             symbol: meta.symbol,
             decimals: meta.decimals,
             resolved: meta.resolved,
+            inPool: true,
+            ...reg,
             enabled: Boolean(r[0]),
             borrowable: Boolean(r[1]),
             collateralBps: Number(r[3]),
             liquidationBps: Number(r[4]),
             liabilityBps: Number(r[5]),
             reserveBps: Number(r[6]),
-            priceUsd: Number(r[PRICE_IX] as bigint) / 1e8,
+            priceUsd: Number(price) / 1e8,
+            // TVL and what is out on loan, at the pool's own marks — the same
+            // marks it lends and liquidates against.
+            suppliedUsd: Number(((r[9] as bigint) * price) / unit) / 1e8,
+            borrowedUsd: Number(((r[11] as bigint) * price) / unit) / 1e8,
+            holders: null as number | null,
           };
         }),
       );
 
       const governorOwnsPool =
         Boolean(governorAddr) && Boolean(poolOwner) && poolOwner!.toLowerCase() === governorAddr!.toLowerCase();
+      const registryOwner = registryAddr
+        ? ((await client.public
+            .readContract({ address: registryAddr, abi: tesseraAssetRegistryAbi, functionName: "owner" })
+            .catch(() => null)) as Hex | null)
+        : null;
+      const governorOwnsRegistry =
+        Boolean(governorAddr) && Boolean(registryOwner) && registryOwner!.toLowerCase() === governorAddr!.toLowerCase();
 
       res.json({
         ok: true,
@@ -6021,14 +6176,46 @@ async function main() {
         pool: poolAddr,
         poolOwner,
         governor: governorAddr,
-        // The distinction that decides whether a listing vote is binding.
+        registry: registryAddr,
+        registryOwner,
         governorOwnsPool,
+        governorOwnsRegistry,
+        canSet: Boolean(owner),
+        // The rule the register enforces, said once rather than implied.
+        rule: registryAddr
+          ? "Emissions reach only the markets whose assets are all whitelisted. A vote on anything else still " +
+            "counts as signal; it just does not move money."
+          : "No register is set, so every market is eligible for emissions.",
         enactment: governorOwnsPool
           ? "A listing proposal executes itself once it passes and waits out the delay."
           : "The pool is owned by the operator, so a listing proposal is a mandate rather than an execution. " +
             "Transfer the pool's ownership to the governor to make listing votes self-enacting.",
         listed,
       });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Whitelist or revoke an asset for emissions. Operator only, for now. */
+  app.post("/api/governance/registry/status", requireOperator, async (req, res) => {
+    const registryAddr = (liveDeployment.tesseraAssetRegistry as Hex) ?? null;
+    if (!registryAddr) { res.status(404).json({ ok: false, error: "no asset register on this deployment" }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    try {
+      const asset = String(req.body?.asset ?? "");
+      const status = Number(req.body?.status ?? 0);
+      const reason = String(req.body?.reason ?? "").slice(0, 200);
+      if (!/^0x[0-9a-fA-F]{40}$/.test(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
+      if (![0, 1, 2].includes(status)) { res.status(400).json({ ok: false, error: "status must be 0, 1 or 2" }); return; }
+      // A decision without a reason is a decision nobody can audit later.
+      if (!reason) { res.status(400).json({ ok: false, error: "say why — the register keeps the reason" }); return; }
+      const txHash = await owner.write(registryAddr, tesseraAssetRegistryAbi, "setStatus", [asset, status, reason]);
+      logTx(req, {
+        category: "defi", action: "registry-status", status: "success", txHash,
+        detail: `${asset.slice(0, 10)}… -> ${["unlisted", "whitelisted", "revoked"][status]}`,
+      });
+      res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -6420,6 +6607,7 @@ async function main() {
       lpEmissions: (liveDeployment.tesseraLpEmissions as Hex) ?? null,
       gauge: (liveDeployment.tesseraGauge as Hex) ?? null,
       serviceFees: (liveDeployment.tesseraServiceFees as Hex) ?? null,
+      assetRegistry: (liveDeployment.tesseraAssetRegistry as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded

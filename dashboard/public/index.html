@@ -2253,10 +2253,20 @@
               <div class="metric"><div class="k">Your weight left</div><div class="v" id="gaAvailable">—</div></div>
             </div>
             <div class="kv" id="gaBudgetNote" style="margin-top:10px"></div>
+            <div class="kv" id="gaRuleNote" style="margin-top:4px"></div>
+            <div class="sheetTabs" id="gaFilters" role="tablist" style="border-bottom:0;padding:10px 0 0;margin:0">
+              <button class="sheetTab active" data-gafilter="top" role="tab">Top voted</button>
+              <button class="sheetTab" data-gafilter="incentives" role="tab">With incentives</button>
+              <button class="sheetTab" data-gafilter="mine" role="tab">Your votes</button>
+              <button class="sheetTab" data-gafilter="zone" role="tab">Reward zone</button>
+            </div>
+            <label class="kv" style="margin-top:8px;display:flex;gap:8px;align-items:center">
+              <input type="checkbox" id="gaWhitelistOnly" /> Eligible for rewards only
+            </label>
             <div class="tblWrap auto" style="margin-top:12px"><table class="data" style="min-width:0">
               <thead><tr>
-                <th>Market</th><th class="num">Votes</th><th class="num">Share</th>
-                <th class="num">Pays</th><th class="num">Bribes</th><th class="num">Your vote</th>
+                <th>Market</th><th class="num">Votes</th><th class="num">Voters</th>
+                <th class="num">Pays</th><th class="num">Incentives</th><th class="num">Your vote</th>
               </tr></thead>
               <tbody id="gaRows"></tbody>
             </table></div>
@@ -2283,6 +2293,25 @@
               <span class="kv" id="govDelegateCurrent"></span>
             </div>
             <div class="msg" id="govDelegateMsg" style="display:none"></div>
+
+            <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+              <b style="font-size:13px">Delegates</b>
+              <div class="kv" style="margin:3px 0 9px">
+                Anyone may list themselves here, and appearing on the list confers nothing — the voting power
+                shown is read from the token, and your delegation stays yours to move at any time. It is a
+                directory, not an endorsement: a curated list of "trusted community members" would be a list
+                whose trust comes from whoever curates it.
+              </div>
+              <div class="tblWrap auto"><table class="data" style="min-width:0">
+                <thead><tr><th>Delegate</th><th class="num">Voting power</th><th class="num"></th></tr></thead>
+                <tbody id="govDelegateList"></tbody>
+              </table></div>
+              <div class="row-actions" style="flex-wrap:wrap;margin-top:10px">
+                <input id="govDelegateName" class="field" placeholder="Your name" style="width:170px" />
+                <input id="govDelegateStatement" class="field" placeholder="What you will vote for" style="min-width:280px" />
+                <button class="btn" id="govDelegateRegister">List me as a delegate</button>
+              </div>
+            </div>
           </div>
 
           <div class="card" id="govBribeCard" style="display:none">
@@ -2403,14 +2432,35 @@
 
           <div class="card" id="govRegistryCard">
             <h2>Asset registry — what the protocol has listed</h2>
+            <div class="kv" id="govRegistryRule" style="margin-bottom:6px"></div>
             <div class="kv" id="govRegistryNote" style="margin-bottom:10px"></div>
             <div class="tblWrap auto"><table class="data" style="min-width:0">
               <thead><tr>
-                <th>Asset</th><th class="num">Price</th><th class="num">Collateral</th>
-                <th class="num">Liquidation</th><th class="num">Reserve cut</th><th class="num">Borrowable</th>
+                <th>Asset</th><th class="num">Price</th><th class="num">Supplied</th>
+                <th class="num">Borrowed</th><th class="num">Collateral</th><th class="num">Status</th>
               </tr></thead>
               <tbody id="govRegistryRows"></tbody>
             </table></div>
+
+            <div id="govRegistryAdmin" style="display:none;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+              <b style="font-size:13px">Whitelist or revoke</b>
+              <div class="kv" style="margin:3px 0 9px">
+                Operator only. A revocation stops future emissions and touches nothing anybody already holds —
+                liquidity stays withdrawable and earned rewards stay claimable. The reason is kept on chain, so
+                the register explains itself without anybody having to trust whoever is holding it now.
+              </div>
+              <div class="row-actions" style="flex-wrap:wrap">
+                <select id="regStatusAsset" class="field"></select>
+                <select id="regStatusValue" class="field">
+                  <option value="1">Whitelist</option>
+                  <option value="2">Revoke</option>
+                  <option value="0">Back to undecided</option>
+                </select>
+                <input id="regStatusReason" class="field" placeholder="Why" style="min-width:240px" />
+                <button class="btn" id="regStatusSet">Record the decision</button>
+              </div>
+              <div class="msg" id="regStatusMsg" style="display:none"></div>
+            </div>
 
             <div id="govRegistryPropose" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
               <b style="font-size:13px">Propose a listing</b>

@@ -4711,22 +4711,72 @@ const $ = (id) => document.getElementById(id);
           if (!r || !r.ok || !r.deployed) { card.style.display = "none"; return; }
           card.style.display = "";
           window.__registry = r;
+          $("govRegistryRule").textContent = r.rule || "";
           $("govRegistryNote").textContent = r.enactment;
+          // The vote board states the same rule, so somebody deciding where to
+          // put their weight sees it without opening the register.
+          if ($("gaRuleNote")) $("gaRuleNote").textContent = r.rule || "";
+          const statusTag = (st) =>
+            st === "whitelisted"
+              ? `<span class="tag ok" style="font-size:10px">whitelisted</span>`
+              : st === "revoked"
+                ? `<span class="tag warn" style="font-size:10px">revoked</span>`
+                : `<span class="tag" style="font-size:10px">undecided</span>`;
           $("govRegistryRows").innerHTML = (r.listed || []).length
-            ? r.listed.map((a) =>
-                `<tr><td><b>${esc(a.symbol)}</b>` +
-                `<div class="muted" style="font-size:11px">${esc(a.address.slice(0, 10))}… · ${a.decimals} dp` +
-                `${a.enabled ? "" : " · disabled"}</div></td>` +
-                `<td class="num mono">$${esc(a.priceUsd.toLocaleString(undefined, { maximumFractionDigits: 2 }))}</td>` +
-                `<td class="num">${esc((a.collateralBps / 100).toFixed(0))}%</td>` +
-                `<td class="num">${esc((a.liquidationBps / 100).toFixed(0))}%</td>` +
-                `<td class="num">${esc((a.reserveBps / 100).toFixed(0))}%</td>` +
-                `<td class="num">${a.borrowable ? "yes" : "collateral only"}</td></tr>`).join("")
+            ? r.listed.map((a) => {
+                // A revoked asset is struck through rather than removed: that
+                // somebody looked and said no is information the list would
+                // otherwise erase.
+                const name = a.status === "revoked"
+                  ? `<s>${esc(a.symbol)}</s>`
+                  : `<b>${esc(a.symbol)}</b>`;
+                return `<tr${a.status === "revoked" ? ' style="opacity:.6"' : ""}>` +
+                  `<td>${name}` +
+                  `<div class="muted" style="font-size:11px">${esc(a.address.slice(0, 10))}… · ${a.decimals} dp` +
+                  `${a.inPool ? "" : " · not in the pool"}${a.enabled || !a.inPool ? "" : " · disabled"}</div>` +
+                  (a.reason ? `<div class="muted" style="font-size:10.5px">${esc(a.reason)}</div>` : "") + `</td>` +
+                  `<td class="num mono">${a.inPool ? "$" + esc(a.priceUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })) : "—"}</td>` +
+                  `<td class="num mono">${a.inPool ? "$" + esc(a.suppliedUsd.toFixed(2)) : "—"}</td>` +
+                  `<td class="num mono">${a.inPool ? "$" + esc(a.borrowedUsd.toFixed(2)) : "—"}</td>` +
+                  `<td class="num">${a.inPool ? esc((a.collateralBps / 100).toFixed(0)) + "%" : "—"}</td>` +
+                  `<td class="num">${statusTag(a.status)}</td></tr>`;
+              }).join("")
             : emptyRow(6, "Nothing listed yet.");
           $("govRegistryPropose").style.display = adminId ? "" : "none";
+          $("govRegistryAdmin").style.display = adminId && r.registry ? "" : "none";
+
+          const sel = $("regStatusAsset");
+          if (sel) {
+            const sig = (r.listed || []).map((a) => a.address).join(",");
+            if (sel.dataset.sig !== sig) {
+              sel.dataset.sig = sig;
+              sel.innerHTML = (r.listed || [])
+                .map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`)
+                .join("");
+            }
+          }
         } catch {
           card.style.display = "none";
         }
+      }
+
+      if ($("regStatusSet")) {
+        $("regStatusSet").addEventListener("click", async () => {
+          const asset = $("regStatusAsset").value;
+          const status = Number($("regStatusValue").value);
+          const reason = ($("regStatusReason").value || "").trim();
+          if (!reason) {
+            govMsg("regStatusMsg", "Say why — the register keeps the reason, and a decision nobody can " +
+              "audit later is not much of a register.", "var(--warn)");
+            return;
+          }
+          try {
+            const r = await (await postJson("/api/governance/registry/status", { asset, status, reason })).json();
+            govMsg("regStatusMsg", r.ok ? `Recorded. — ${r.txHash}` : (r.error || "failed"),
+              r.ok ? "var(--good)" : "var(--warn)");
+            if (r.ok) { $("regStatusReason").value = ""; loadRegistry(); loadGauge(); }
+          } catch { govMsg("regStatusMsg", "Request failed.", "var(--warn)"); }
+        });
       }
 
       if ($("regPropose")) {
@@ -4773,6 +4823,45 @@ const $ = (id) => document.getElementById(id);
        * market an emission it never receives.
        */
       window.__gauge = null;
+      /** Which slice of the board is on screen. Filtering only, never hiding
+       *  a market from the vote itself. */
+      let gaFilter = "top";
+      let gaEligibleOnly = false;
+
+      document.querySelectorAll("[data-gafilter]").forEach((b) =>
+        b.addEventListener("click", () => {
+          gaFilter = b.dataset.gafilter;
+          document.querySelectorAll("[data-gafilter]").forEach((x) => x.classList.toggle("active", x === b));
+          if (window.__gauge) renderGaugeRows(window.__gauge);
+        }),
+      );
+      if ($("gaWhitelistOnly")) {
+        $("gaWhitelistOnly").addEventListener("change", () => {
+          gaEligibleOnly = $("gaWhitelistOnly").checked;
+          if (window.__gauge) renderGaugeRows(window.__gauge);
+        });
+      }
+
+      function renderGaugeRows(r) {
+        let rows = (r.markets || []).filter((m) => m.active || Number(m.votesRaw) > 0);
+        if (gaEligibleOnly) rows = rows.filter((m) => m.eligible);
+        if (gaFilter === "incentives") rows = rows.filter((m) => (m.bribes || []).length > 0);
+        if (gaFilter === "mine") rows = rows.filter((m) => Number(m.yourVotesRaw) > 0);
+        if (gaFilter === "zone") rows = rows.filter((m) => m.inRewardZone);
+        rows = rows.slice().sort((a, b) => Number(b.votesRaw) - Number(a.votesRaw) || a.id - b.id);
+
+        $("gaRows").innerHTML = rows.length
+          ? rows.map((m) => gaugeRow(m, r)).join("")
+          : emptyRow(6, gaFilter === "mine"
+              ? "You have not put weight on anything this epoch."
+              : gaFilter === "incentives"
+                ? "No incentives are attached this epoch."
+                : "Nothing matches that filter.");
+
+        $("gaRows").querySelectorAll("[data-bribe-claim]").forEach((b) =>
+          b.addEventListener("click", () => claimBribes(Number(b.dataset.bribeClaim))),
+        );
+      }
 
       async function loadGauge() {
         const card = $("govGaugeCard");
@@ -4796,14 +4885,9 @@ const $ = (id) => document.getElementById(id);
             (r.rewardZoneSize ? `Top ${r.rewardZoneSize} markets share it; ` : "Every market with a vote shares it; ") +
             `epochs run ${r.epochLengthHours} hours.`;
 
-          const rows = (r.markets || []).filter((m) => m.active || Number(m.votesRaw) > 0);
-          $("gaRows").innerHTML = rows.length
-            ? rows.map((m) => gaugeRow(m, r)).join("")
-            : emptyRow(6, "No markets listed yet.");
-
-          $("gaRows").querySelectorAll("[data-bribe-claim]").forEach((b) =>
-            b.addEventListener("click", () => claimBribes(Number(b.dataset.bribeClaim))),
-          );
+          $("gaRuleNote").textContent = (window.__registry && window.__registry.rule) || "";
+          renderGaugeRows(r);
+          renderDelegates(r);
 
           // Applying is only offered when there is actually a closed, unapplied
           // epoch — a button that always reverts teaches people to ignore it.
@@ -4836,30 +4920,37 @@ const $ = (id) => document.getElementById(id);
       }
 
       function gaugeRow(m, r) {
-        const zone = m.inRewardZone
-          ? `<span class="tag ok" style="font-size:10px">reward zone</span>`
-          : Number(m.votesRaw) > 0
-            ? `<span class="tag warn" style="font-size:10px">below the line</span>`
-            : "";
+        const badges =
+          (m.inRewardZone
+            ? `<span class="tag ok" style="font-size:10px">♛ reward zone</span> `
+            : Number(m.votesRaw) > 0 && m.eligible
+              ? `<span class="tag warn" style="font-size:10px">below the line</span> `
+              : "") +
+          // Eligibility is a different fact from position, and conflating them
+          // is how somebody spends an epoch's weight on a market that was never
+          // going to be paid.
+          (m.eligible ? "" : `<span class="tag warn" style="font-size:10px">not eligible</span> `);
         const perDay = Number(m.ratePerSecond) / 1e18 * 86400;
         const pays = Number(m.ratePerSecond) > 0
           ? `<span class="tsraIcon"></span> ${perDay.toFixed(2)}/day`
-          : "—";
-        const bribeTotal = (m.bribes || []).map((b) => `${b.amount} ${b.symbol}`).join(", ");
+          : m.eligible ? "—" : "never";
         const mine = (m.bribes || []).reduce((t, b) => t + BigInt(b.yourShareRaw || "0"), 0n);
         const bribes = (m.bribes || []).length
-          ? esc(bribeTotal) +
+          ? (m.bribeApr != null
+              ? `<b>up to ${esc(m.bribeApr.toFixed(2))}%</b><div class="muted" style="font-size:10.5px">APR</div>`
+              : `<b>$${esc(m.bribeUsd.toFixed(2))}</b>`) +
+            `<div class="muted" style="font-size:10.5px">${esc((m.bribes || []).map((b) => b.symbol).join(", "))}</div>` +
             (mine > 0n
               ? `<div><button class="btn" style="padding:2px 8px;font-size:11px" data-bribe-claim="${m.id}">Claim my share</button></div>`
               : "")
           : "—";
         return (
-          `<tr${m.active ? "" : ' style="opacity:.55"'}>` +
-          `<td><b>${esc(m.label)}</b> ${zone}` +
+          `<tr${m.active && m.eligible ? "" : ' style="opacity:.6"'}>` +
+          `<td><b>${esc(m.label)}</b> ${badges}` +
           `<div class="muted" style="font-size:11px">${m.venue === "lending" ? (m.side === 0 ? "lending · supply" : "lending · borrow") : "liquidity pool #" + m.poolId}` +
           `${m.active ? "" : " · retired"}</div></td>` +
-          `<td class="num mono">${esc(m.votes)}</td>` +
-          `<td class="num">${esc(m.sharePct.toFixed(1))}%</td>` +
+          `<td class="num mono">${esc(m.votes)}<div class="muted" style="font-size:10.5px">${esc(m.sharePct.toFixed(1))}%</div></td>` +
+          `<td class="num">${esc(String(m.usersVoted ?? 0))}</td>` +
           `<td class="num">${pays}</td>` +
           `<td class="num" style="font-size:11px">${bribes}</td>` +
           `<td class="num"><input class="field gaVote" data-market="${m.id}" inputmode="decimal" ` +
@@ -4867,6 +4958,73 @@ const $ = (id) => document.getElementById(id);
           `${m.active ? "" : " disabled"} /></td>` +
           `</tr>`
         );
+      }
+
+      /* ---- The delegate directory ------------------------------------------ */
+      function renderDelegates(r) {
+        const host = $("govDelegateList");
+        if (!host) return;
+        const list = r.delegates || [];
+        host.innerHTML = list.length
+          ? list.map((d) =>
+              `<tr><td><b>${esc(d.name)}</b>${d.isYou ? ' <span class="tag ok" style="font-size:10px">you</span>' : ""}` +
+              `${d.active ? "" : ' <span class="tag warn" style="font-size:10px">stepped down</span>'}` +
+              `<div class="muted" style="font-size:11px">${esc(d.statement || "")}</div>` +
+              `<div class="muted mono" style="font-size:10.5px">${esc(d.address)}</div></td>` +
+              `<td class="num mono">${esc(d.votingPower)}</td>` +
+              `<td class="num"><button class="btn" style="padding:2px 8px;font-size:11px" ` +
+              `data-delegate-to="${esc(d.address)}">Delegate to them</button></td></tr>`)
+            .join("")
+          : emptyRow(3, "Nobody has listed themselves yet.");
+        host.querySelectorAll("[data-delegate-to]").forEach((b) =>
+          b.addEventListener("click", () => delegateTo(b.dataset.delegateTo)),
+        );
+      }
+
+      async function delegateTo(to) {
+        if (!selfMode()) {
+          govMsg("govDelegateMsg", "Delegating is signed by the holder — switch on \"Use my own wallet\".", "var(--warn)");
+          return;
+        }
+        await selfCustody("govDelegateMsg", `delegate to ${to.slice(0, 10)}…`, async (from, cfg) =>
+          sendTx(from, cfg.token, callData(cfg.selectors.govDelegate, encAddr(to))),
+        );
+        loadGovernance();
+        loadGauge();
+      }
+
+      if ($("govDelegateRegister")) {
+        $("govDelegateRegister").addEventListener("click", async () => {
+          if (!selfMode()) {
+            govMsg("govDelegateMsg", "Listing yourself is your own transaction — an operator-signed entry " +
+              "would make it an endorsement. Switch on \"Use my own wallet\".", "var(--warn)");
+            return;
+          }
+          const name = ($("govDelegateName").value || "").trim();
+          const statement = ($("govDelegateStatement").value || "").trim();
+          if (!name) { govMsg("govDelegateMsg", "A directory entry needs a name.", "var(--warn)"); return; }
+          await selfCustody("govDelegateMsg", "list yourself as a delegate", async (from, cfg) =>
+            // registerDelegate(string,string): two dynamic arguments, so the
+            // head holds an offset to each and the tails carry length + bytes.
+            sendTx(from, cfg.gauge, callData(
+              cfg.selectors.gaRegisterDelegate,
+              encUint(64),
+              encUint(64 + encStringTail(name).length / 2),
+              encStringTail(name),
+              encStringTail(statement),
+            )),
+          );
+          loadGauge();
+        });
+      }
+
+      /** A dynamic string, ABI-style: length word then right-padded bytes. */
+      function encStringTail(str) {
+        const bytes = new TextEncoder().encode(str);
+        let hex = "";
+        for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+        const words = Math.ceil(bytes.length / 32) * 64;
+        return encUint(bytes.length) + hex.padEnd(words, "0");
       }
 
       if ($("gaSubmit")) {

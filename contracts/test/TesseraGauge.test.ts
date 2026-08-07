@@ -56,8 +56,8 @@ async function deployFixture() {
   // Four markets: two lending reserves, two AMM pools.
   await gauge.write.addLendingMarket([usdc.address, SUPPLY, "USDC supply"]);
   await gauge.write.addLendingMarket([eurc.address, SUPPLY, "EURC supply"]);
-  await gauge.write.addAmmMarket([0n, "USDC/EURC"]);
-  await gauge.write.addAmmMarket([1n, "USDC/cirBTC"]);
+  await gauge.write.addAmmMarket([0n, [usdc.address, eurc.address], "USDC/EURC"]);
+  await gauge.write.addAmmMarket([1n, [usdc.address], "USDC/cirBTC"]);
   await gauge.write.setBudget([T(10), T(4)]); // per second, per venue
 
   const gaugeAs = async (w: any) => hre.viem.getContractAt("TesseraGauge", gauge.address, { client: { wallet: w } });
@@ -276,7 +276,7 @@ describe("TesseraGauge (holders choose where the emissions land)", () => {
     const a = await f.gaugeAs(f.alice);
     await expect(a.write.setBudget([T(1), T(1)])).to.be.rejected;
     await expect(a.write.setRewardZoneSize([1])).to.be.rejected;
-    await expect(a.write.addAmmMarket([2n, "sneaky"])).to.be.rejected;
+    await expect(a.write.addAmmMarket([2n, [f.usdc.address], "sneaky"])).to.be.rejected;
     await expect(a.write.setEmissions([f.lending.address, f.lp.address])).to.be.rejected;
   });
 
@@ -397,6 +397,156 @@ describe("TesseraGauge (holders choose where the emissions land)", () => {
       await time.increase(WEEK + 1);
       await a.write.claimBribes([0n, 1n]);
       expect(await f.gauge.read.bribeShare([0n, 1n, 0n, f.alice.account.address])).to.equal(0n);
+    });
+  });
+
+  describe("the asset register", () => {
+    it("keeps an unregistered market out of the reward zone without silencing its vote", async () => {
+      /*
+       * The attack a register exists to stop: mint a token, pair it with
+       * something real, vote your own market into the zone, and collect the
+       * emissions with the votes those emissions paid for.
+       *
+       * Votes on an ineligible market still count as signal. They just do not
+       * move money, which is the distinction between a register and a gag.
+       */
+      const f = await loadFixture(deployFixture);
+      const reg = await hre.viem.deployContract("TesseraAssetRegistry", [f.admin.account.address]);
+      await reg.write.setStatus([f.usdc.address, 1, "the unit everything is priced in"]);
+      await f.gauge.write.setRegistry([reg.address]);
+
+      const a = await f.gaugeAs(f.alice);
+      const b = await f.gaugeAs(f.bob);
+      await a.write.vote([[1n], [T(600)]]); // EURC, not on the register
+      await b.write.vote([[0n], [T(300)]]); // USDC, on it
+
+      expect(await f.gauge.read.eligible([0n])).to.equal(true);
+      expect(await f.gauge.read.eligible([1n])).to.equal(false);
+      expect(await f.gauge.read.marketVotes([0n, 1n])).to.equal(T(600)); // the vote is recorded
+      expect((await f.gauge.read.rewardZone([0n])).map(Number)).to.deep.equal([0]); // it just is not paid
+
+      const rates = await f.gauge.read.ratesFor([0n]);
+      expect(rates[0]).to.equal(T(10)); // the whole lending budget, to the eligible one
+      expect(rates[1]).to.equal(0n);
+    });
+
+    it("stops paying a market whose asset is revoked", async () => {
+      const f = await loadFixture(deployFixture);
+      const reg = await hre.viem.deployContract("TesseraAssetRegistry", [f.admin.account.address]);
+      await reg.write.setStatus([f.usdc.address, 1, "listed"]);
+      await reg.write.setStatus([f.eurc.address, 1, "listed"]);
+      await f.gauge.write.setRegistry([reg.address]);
+
+      const a = await f.gaugeAs(f.alice);
+      await a.write.vote([[1n], [T(600)]]);
+      expect(await f.gauge.read.eligible([1n])).to.equal(true);
+
+      await reg.write.setStatus([f.eurc.address, 2, "issuer went quiet"]);
+      expect(await f.gauge.read.eligible([1n])).to.equal(false);
+      expect((await f.gauge.read.rewardZone([0n])).length).to.equal(0);
+    });
+
+    it("needs every asset of a pair, not just one", async () => {
+      // Otherwise pairing a real asset with anything at all is enough.
+      const f = await loadFixture(deployFixture);
+      const reg = await hre.viem.deployContract("TesseraAssetRegistry", [f.admin.account.address]);
+      await reg.write.setStatus([f.usdc.address, 1, "listed"]);
+      await f.gauge.write.setRegistry([reg.address]);
+      // Market 2 is USDC/EURC; only USDC is on the register.
+      expect(await f.gauge.read.eligible([2n])).to.equal(false);
+      await reg.write.setStatus([f.eurc.address, 1, "listed"]);
+      expect(await f.gauge.read.eligible([2n])).to.equal(true);
+    });
+
+    it("treats every market as eligible when no register is set", async () => {
+      // A deployment that has decided nothing must not behave as though it
+      // decided "no".
+      const f = await loadFixture(deployFixture);
+      for (const id of [0n, 1n, 2n, 3n]) expect(await f.gauge.read.eligible([id])).to.equal(true);
+    });
+
+    it("only the owner changes the register", async () => {
+      const f = await loadFixture(deployFixture);
+      const reg = await hre.viem.deployContract("TesseraAssetRegistry", [f.admin.account.address]);
+      const asAlice = await hre.viem.getContractAt("TesseraAssetRegistry", reg.address, { client: { wallet: f.alice } });
+      await expect(asAlice.write.setStatus([f.usdc.address, 1, "mine now"])).to.be.rejected;
+      const g = await f.gaugeAs(f.alice);
+      await expect(g.write.setRegistry([reg.address])).to.be.rejected;
+    });
+  });
+
+  describe("head count and the delegate directory", () => {
+    it("counts voters as well as weight", async () => {
+      /*
+       * One address with the whole supply and a thousand holders agreeing
+       * produce the same tally and very different head counts, and a voter
+       * deserves to see which of the two they are looking at.
+       */
+      const f = await loadFixture(deployFixture);
+      const a = await f.gaugeAs(f.alice);
+      const b = await f.gaugeAs(f.bob);
+      await a.write.vote([[0n], [T(600)]]);
+      await b.write.vote([[0n], [T(300)]]);
+      expect(await f.gauge.read.marketVoters([0n, 0n])).to.equal(2n);
+    });
+
+    it("takes a voter off the head count when they withdraw", async () => {
+      const f = await loadFixture(deployFixture);
+      const a = await f.gaugeAs(f.alice);
+      await a.write.vote([[0n], [T(600)]]);
+      expect(await f.gauge.read.marketVoters([0n, 0n])).to.equal(1n);
+      await a.write.clearVote();
+      expect(await f.gauge.read.marketVoters([0n, 0n])).to.equal(0n);
+    });
+
+    it("does not double-count somebody who changes their mind", async () => {
+      const f = await loadFixture(deployFixture);
+      const a = await f.gaugeAs(f.alice);
+      await a.write.vote([[0n], [T(600)]]);
+      await a.write.vote([[0n], [T(500)]]);
+      expect(await f.gauge.read.marketVoters([0n, 0n])).to.equal(1n);
+    });
+
+    it("lets anyone list themselves as a delegate, and nobody else vouch for them", async () => {
+      /*
+       * A curated list of "trusted community members" is a list whose trust
+       * comes from whoever curates it. What makes an open one safe is that
+       * appearing on it confers nothing.
+       */
+      const f = await loadFixture(deployFixture);
+      const a = await f.gaugeAs(f.alice);
+      await a.write.registerDelegate(["Alice", "I read every emissions thread so you do not have to."]);
+      expect(await f.gauge.read.delegateCount()).to.equal(1n);
+      const d = await f.gauge.read.delegates([0n]);
+      expect(d[0].toLowerCase()).to.equal(f.alice.account.address.toLowerCase());
+      expect(d[3]).to.equal(true);
+    });
+
+    it("updates an existing entry rather than making a second one", async () => {
+      const f = await loadFixture(deployFixture);
+      const a = await f.gaugeAs(f.alice);
+      await a.write.registerDelegate(["Alice", "first"]);
+      await a.write.registerDelegate(["Alice v2", "second"]);
+      expect(await f.gauge.read.delegateCount()).to.equal(1n);
+      expect((await f.gauge.read.delegates([0n]))[1]).to.equal("Alice v2");
+    });
+
+    it("lets a delegate step down without touching anybody's delegation", async () => {
+      // Their delegators' weight is theirs to move; withdrawing from the
+      // directory must not decide it for them.
+      const f = await loadFixture(deployFixture);
+      const a = await f.gaugeAs(f.alice);
+      await a.write.registerDelegate(["Alice", "here"]);
+      await a.write.setDelegateActive([false]);
+      expect((await f.gauge.read.delegates([0n]))[3]).to.equal(false);
+      expect(await f.token.read.getVotes([f.alice.account.address])).to.equal(T(600));
+    });
+
+    it("bounds the text, so the directory cannot be filled with prose", async () => {
+      const f = await loadFixture(deployFixture);
+      const a = await f.gaugeAs(f.alice);
+      await expect(a.write.registerDelegate(["", "no name"])).to.be.rejected;
+      await expect(a.write.registerDelegate(["Alice", "x".repeat(281)])).to.be.rejected;
     });
   });
 });
