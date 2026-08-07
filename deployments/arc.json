@@ -17,5 +17,26 @@
   "tesseraAmm": "0x8b3ae0eb103653c4bce4d4dbff062ad7c9c9ada0",
   "tesseraLpEmissions": "0x3f8a8f7f9612ba42b64f92120f55af0fd28d0d14",
   "tesseraGauge": "0x7aa76a02ae084d947ccdfda27bbf4704993de996",
-  "tesseraServiceFees": "0x88b15bdfa20c90e7aa7de00b129aa4d1ed4fb424"
+  "tesseraServiceFees": "0x88b15bdfa20c90e7aa7de00b129aa4d1ed4fb424",
+  "vaultAsset": "0x3600000000000000000000000000000000000000",
+  "poolAssets": [
+    {
+      "symbol": "USDC",
+      "address": "0x3600000000000000000000000000000000000000",
+      "decimals": 6,
+      "borrowable": true
+    },
+    {
+      "symbol": "EURC",
+      "address": "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a",
+      "decimals": 6,
+      "borrowable": true
+    },
+    {
+      "symbol": "cirBTC",
+      "address": "0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF",
+      "decimals": 8,
+      "borrowable": true
+    }
+  ]
 }
