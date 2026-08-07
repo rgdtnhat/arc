@@ -1,0 +1,432 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "./ReentrancyGuard.sol";
+
+interface IEmissionsPool {
+    function supplyShares(address asset, address user) external view returns (uint256);
+    function borrowShares(address asset, address user) external view returns (uint256);
+    function reserves(address asset)
+        external
+        view
+        returns (
+            bool enabled,
+            bool borrowable,
+            uint8 decimals,
+            uint16 cFactor,
+            uint16 liqFactor,
+            uint16 lFactor,
+            uint16 reserveFactor,
+            uint256 price,
+            uint256 totalSupplyShares,
+            uint256 totalSupplyAssets,
+            uint256 totalBorrowShares,
+            uint256 totalBorrowAssets,
+            uint64 lastAccrual
+        );
+}
+
+interface IEmissionsERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address who) external view returns (uint256);
+    function decimals() external view returns (uint8);
+}
+
+/**
+ * @title TesseraEmissions
+ * @notice Pays lenders and borrowers in a reward asset the operator chooses,
+ *         on top of whatever interest the pool itself produces.
+ *
+ * ## Why this is a separate contract
+ * The pool is 455 bytes short of the 24,576-byte limit. Threading an accrual
+ * hook through four entry points would not fit, and more importantly it would
+ * put a third-party token transfer in the path of every supply and withdraw —
+ * a reward token that reverts would take lending down with it. Rewards are a
+ * strictly optional layer, so they live somewhere they can fail alone.
+ *
+ * ## Accrual, and the trade it makes
+ * Emissions accrue against *shares*, not balances. A share count only moves
+ * when somebody actually supplies, withdraws, borrows or repays; a balance
+ * moves every second as interest accrues, which would make the reward a
+ * function of the interest rate rather than of the deposit.
+ *
+ * The pool does not call this contract, so there is no hook to update a user's
+ * position the moment it changes. Instead each user carries a checkpoint, and
+ * accrual between checkpoints uses `min(sharesAtCheckpoint, sharesNow)`. That
+ * asymmetry is deliberate:
+ *
+ *   · Supply more and forget to checkpoint, and you accrue on the smaller old
+ *     figure until you do — you are under-paid, and one permissionless call
+ *     fixes it.
+ *   · Withdraw, and the smaller *current* figure applies immediately — so
+ *     depositing, checkpointing and withdrawing cannot keep earning on money
+ *     that has left.
+ *
+ * Under-paying an inattentive user is a nuisance. Over-paying someone who has
+ * withdrawn is a drain, and the whole point of taking the minimum is that the
+ * error can only ever fall on the safe side. `checkpoint` is callable by
+ * anyone, for anyone, so a keeper — or the front end, which does it on every
+ * position refresh — can keep everybody exact at no cost to them.
+ *
+ * ## Paying only what is actually there
+ * A rate is a promise about the future, and this contract cannot make the
+ * operator keep it. Accrual is therefore bookkeeping and nothing more: a claim
+ * pays out at most the reward balance the contract is holding, and what it
+ * cannot pay stays owed rather than reverting. A pot that runs dry stops
+ * paying; it does not strand the claim, and it does not lie about the debt.
+ */
+contract TesseraEmissions is ReentrancyGuard {
+    /// Supply side of a reserve.
+    uint8 public constant SIDE_SUPPLY = 0;
+    /// Borrow side of a reserve.
+    uint8 public constant SIDE_BORROW = 1;
+
+    /// Reward-per-share is carried at 1e18 so small rates against large share
+    /// counts do not truncate to nothing.
+    uint256 private constant INDEX_SCALE = 1e18;
+
+    /**
+     * @notice The most any single stream may emit per second.
+     *
+     * A rate is set in the reward token's own base units, so a operator who
+     * means "one token an hour" and types the 18-decimal figure by mistake
+     * would otherwise commit the contract to emptying itself. This bounds the
+     * damage of a fat finger to something a human can notice — it is not a
+     * security boundary, since the owner can always set it again next second.
+     */
+    uint256 public constant MAX_RATE_PER_SECOND = 1e24;
+
+    address public owner;
+    IEmissionsPool public immutable pool;
+
+    /// The asset holders are paid in. Zero until an operator sets one.
+    IEmissionsERC20 public rewardToken;
+
+    struct Stream {
+        /// Reward-token base units per second, split across every share.
+        uint128 ratePerSecond;
+        /// Cumulative reward per share, 1e18-scaled.
+        uint128 index;
+        uint64 lastAccrual;
+    }
+
+    struct Position {
+        /// The stream index this user was last settled at.
+        uint128 index;
+        /// Shares recorded at that settlement — see the accrual note above.
+        uint128 shares;
+        /// Earned and not yet paid out.
+        uint256 accrued;
+    }
+
+    /// asset => side => stream
+    mapping(address => mapping(uint8 => Stream)) public streams;
+    /// asset => side => user => position
+    mapping(address => mapping(uint8 => mapping(address => Position))) public positions;
+
+    /// Every asset that has ever had a rate set, so the UI can enumerate them.
+    address[] public streamedAssets;
+    mapping(address => bool) private listed;
+
+    /// Owed and not yet paid. Lets anyone compare the promise to the balance.
+    uint256 public totalOwed;
+    /// Paid out over the contract's life, for the same reason.
+    uint256 public totalClaimed;
+
+    error NotOwner();
+    error ZeroAddress();
+    error BadSide();
+    error RateTooHigh(uint256 given, uint256 max);
+    error RewardTokenNotSet();
+    error RewardTokenInUse(uint256 owed);
+    error TransferFailed();
+    error NothingToClaim();
+    error LengthMismatch();
+
+    event OwnerSet(address indexed owner);
+    event RewardTokenSet(address indexed token);
+    event RateSet(address indexed asset, uint8 indexed side, uint256 ratePerSecond);
+    event Accrued(address indexed asset, uint8 indexed side, uint256 index, uint256 emitted);
+    event Checkpointed(address indexed user, address indexed asset, uint8 indexed side, uint256 accrued);
+    event Claimed(address indexed user, uint256 amount);
+    event Funded(address indexed from, uint256 amount);
+    event Swept(address indexed to, uint256 amount);
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    constructor(address pool_, address owner_) {
+        if (pool_ == address(0) || owner_ == address(0)) revert ZeroAddress();
+        pool = IEmissionsPool(pool_);
+        owner = owner_;
+        emit OwnerSet(owner_);
+    }
+
+    // --- administration -------------------------------------------------------
+
+    function transferOwnership(address next) external onlyOwner {
+        if (next == address(0)) revert ZeroAddress();
+        owner = next;
+        emit OwnerSet(next);
+    }
+
+    /**
+     * @notice Choose the asset holders are paid in.
+     *
+     * Refused while anything is owed. Swapping the token underneath an accrued
+     * balance would silently redenominate every outstanding claim — somebody
+     * who earned 100 of a stablecoin would find themselves owed 100 of whatever
+     * replaced it. Zero the rates, let claims settle, then change it.
+     */
+    function setRewardToken(address token) external onlyOwner {
+        if (token == address(0)) revert ZeroAddress();
+        if (totalOwed != 0) revert RewardTokenInUse(totalOwed);
+        rewardToken = IEmissionsERC20(token);
+        emit RewardTokenSet(token);
+    }
+
+    /**
+     * @notice Set what a side of a reserve pays, in reward units per second.
+     *
+     * Accrues first, so the change applies from now rather than retroactively
+     * rewriting what everyone has already earned.
+     */
+    function setRate(address asset, uint8 side, uint256 ratePerSecond) external onlyOwner {
+        if (asset == address(0)) revert ZeroAddress();
+        if (side > SIDE_BORROW) revert BadSide();
+        if (ratePerSecond > MAX_RATE_PER_SECOND) revert RateTooHigh(ratePerSecond, MAX_RATE_PER_SECOND);
+        if (address(rewardToken) == address(0)) revert RewardTokenNotSet();
+
+        _accrue(asset, side);
+        streams[asset][side].ratePerSecond = uint128(ratePerSecond);
+        if (!listed[asset]) {
+            listed[asset] = true;
+            streamedAssets.push(asset);
+        }
+        emit RateSet(asset, side, ratePerSecond);
+    }
+
+    /// @notice Set both sides at once — the common case when opening a market.
+    function setRates(address asset, uint256 supplyRate, uint256 borrowRate) external {
+        // Deliberately not `onlyOwner`: both calls below check it themselves,
+        // and duplicating the check here would only make the error less clear.
+        this.setRate(asset, SIDE_SUPPLY, supplyRate);
+        this.setRate(asset, SIDE_BORROW, borrowRate);
+    }
+
+    /**
+     * @notice Top the reward pot up. Permissionless — anyone may fund rewards,
+     *         and requiring the owner would make a community top-up impossible.
+     */
+    function fund(uint256 amount) external nonReentrant {
+        if (address(rewardToken) == address(0)) revert RewardTokenNotSet();
+        if (amount == 0) revert NothingToClaim();
+        if (!rewardToken.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
+        emit Funded(msg.sender, amount);
+    }
+
+    /**
+     * @notice Recover reward tokens beyond what is owed.
+     *
+     * Bounded by `totalOwed` so the owner cannot withdraw the backing for
+     * balances people have already earned. Rewards that are promised stop being
+     * the operator's money the moment they accrue.
+     */
+    function sweep(address to, uint256 amount) external onlyOwner nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        if (address(rewardToken) == address(0)) revert RewardTokenNotSet();
+        uint256 held = rewardToken.balanceOf(address(this));
+        uint256 free = held > totalOwed ? held - totalOwed : 0;
+        if (amount > free) amount = free;
+        if (amount == 0) revert NothingToClaim();
+        if (!rewardToken.transfer(to, amount)) revert TransferFailed();
+        emit Swept(to, amount);
+    }
+
+    // --- accrual --------------------------------------------------------------
+
+    /// @notice Bring a stream's index up to the current block.
+    function accrue(address asset, uint8 side) public {
+        if (side > SIDE_BORROW) revert BadSide();
+        _accrue(asset, side);
+    }
+
+    function _accrue(address asset, uint8 side) internal {
+        Stream storage s = streams[asset][side];
+        uint64 nowTs = uint64(block.timestamp);
+        if (s.lastAccrual == 0) {
+            s.lastAccrual = nowTs;
+            return;
+        }
+        if (nowTs == s.lastAccrual) return;
+        uint256 dt = nowTs - s.lastAccrual;
+        s.lastAccrual = nowTs;
+        if (s.ratePerSecond == 0) return;
+
+        uint256 total = _totalShares(asset, side);
+        // Nobody to pay: the seconds simply do not emit. Carrying them forward
+        // would hand the whole backlog to whoever deposits first.
+        if (total == 0) return;
+
+        uint256 emitted = uint256(s.ratePerSecond) * dt;
+        s.index = uint128(uint256(s.index) + (emitted * INDEX_SCALE) / total);
+        emit Accrued(asset, side, s.index, emitted);
+    }
+
+    function _totalShares(address asset, uint8 side) internal view returns (uint256) {
+        (, , , , , , , , uint256 totalSupplyShares, , uint256 totalBorrowShares, , ) = pool.reserves(asset);
+        return side == SIDE_SUPPLY ? totalSupplyShares : totalBorrowShares;
+    }
+
+    function _userShares(address asset, uint8 side, address user) internal view returns (uint256) {
+        return side == SIDE_SUPPLY ? pool.supplyShares(asset, user) : pool.borrowShares(asset, user);
+    }
+
+    /**
+     * @notice Settle one user against one stream. Callable by anyone, for
+     *         anyone — see the accrual note on why that matters.
+     */
+    function checkpoint(address user, address asset, uint8 side) public {
+        if (side > SIDE_BORROW) revert BadSide();
+        _accrue(asset, side);
+        Position storage p = positions[asset][side][user];
+        Stream storage s = streams[asset][side];
+
+        uint256 nowShares = _userShares(asset, side, user);
+        if (p.index != 0 || p.shares != 0) {
+            uint256 basis = p.shares < nowShares ? p.shares : nowShares; // the safe side
+            if (basis != 0 && s.index > p.index) {
+                uint256 gained = (basis * (uint256(s.index) - uint256(p.index))) / INDEX_SCALE;
+                if (gained != 0) {
+                    p.accrued += gained;
+                    totalOwed += gained;
+                }
+            }
+        }
+        p.index = s.index;
+        p.shares = uint128(nowShares);
+        emit Checkpointed(user, asset, side, p.accrued);
+    }
+
+    /// @notice Settle a user against several streams in one transaction.
+    function checkpointMany(address user, address[] calldata assets, uint8[] calldata sides) external {
+        if (assets.length != sides.length) revert LengthMismatch();
+        for (uint256 i = 0; i < assets.length; i++) checkpoint(user, assets[i], sides[i]);
+    }
+
+    // --- claiming -------------------------------------------------------------
+
+    /**
+     * @notice Settle the given streams and pay out what the pot can cover.
+     *
+     * A short pot is not an error. What cannot be paid stays on the books, so
+     * the claim still records the debt and a later top-up settles it.
+     */
+    function claim(address[] calldata assets, uint8[] calldata sides) external nonReentrant returns (uint256 paid) {
+        if (assets.length != sides.length) revert LengthMismatch();
+        if (address(rewardToken) == address(0)) revert RewardTokenNotSet();
+
+        uint256 owed;
+        for (uint256 i = 0; i < assets.length; i++) {
+            checkpoint(msg.sender, assets[i], sides[i]);
+            owed += positions[assets[i]][sides[i]][msg.sender].accrued;
+        }
+        if (owed == 0) revert NothingToClaim();
+
+        uint256 held = rewardToken.balanceOf(address(this));
+        paid = owed > held ? held : owed;
+        if (paid == 0) revert NothingToClaim();
+
+        // Deduct proportionally across the streams claimed, so a partial
+        // payment leaves a coherent remainder rather than emptying the first
+        // stream and leaving the rest untouched.
+        uint256 remaining = paid;
+        for (uint256 i = 0; i < assets.length; i++) {
+            Position storage p = positions[assets[i]][sides[i]][msg.sender];
+            if (p.accrued == 0) continue;
+            uint256 cut = i == assets.length - 1 ? remaining : (paid * p.accrued) / owed;
+            if (cut > p.accrued) cut = p.accrued;
+            if (cut > remaining) cut = remaining;
+            p.accrued -= cut;
+            remaining -= cut;
+        }
+        totalOwed -= paid;
+        totalClaimed += paid;
+        if (!rewardToken.transfer(msg.sender, paid)) revert TransferFailed();
+        emit Claimed(msg.sender, paid);
+    }
+
+    // --- views ----------------------------------------------------------------
+
+    /// @notice How many assets have ever had a rate set.
+    function streamedAssetCount() external view returns (uint256) {
+        return streamedAssets.length;
+    }
+
+    /**
+     * @notice What `user` would have after a checkpoint, without sending one.
+     *
+     * Mirrors `checkpoint` exactly, including the minimum — a preview that
+     * disagreed with the settlement would be worse than no preview.
+     */
+    function claimable(address user, address asset, uint8 side) public view returns (uint256) {
+        if (side > SIDE_BORROW) return 0;
+        Stream storage s = streams[asset][side];
+        Position storage p = positions[asset][side][user];
+
+        uint256 index = s.index;
+        if (s.lastAccrual != 0 && block.timestamp > s.lastAccrual && s.ratePerSecond != 0) {
+            uint256 total = _totalShares(asset, side);
+            if (total != 0) {
+                uint256 emitted = uint256(s.ratePerSecond) * (block.timestamp - s.lastAccrual);
+                index += (emitted * INDEX_SCALE) / total;
+            }
+        }
+        uint256 gained;
+        if (p.index != 0 || p.shares != 0) {
+            uint256 nowShares = _userShares(asset, side, user);
+            uint256 basis = p.shares < nowShares ? p.shares : nowShares;
+            if (basis != 0 && index > p.index) {
+                gained = (basis * (index - uint256(p.index))) / INDEX_SCALE;
+            }
+        }
+        return p.accrued + gained;
+    }
+
+    /// @notice Total claimable across every streamed asset, both sides.
+    function claimableTotal(address user) external view returns (uint256 total) {
+        uint256 n = streamedAssets.length;
+        for (uint256 i = 0; i < n; i++) {
+            total += claimable(user, streamedAssets[i], SIDE_SUPPLY);
+            total += claimable(user, streamedAssets[i], SIDE_BORROW);
+        }
+    }
+
+    /// @notice Reward units per second currently promised across every stream.
+    function totalRatePerSecond() external view returns (uint256 total) {
+        uint256 n = streamedAssets.length;
+        for (uint256 i = 0; i < n; i++) {
+            total += streams[streamedAssets[i]][SIDE_SUPPLY].ratePerSecond;
+            total += streams[streamedAssets[i]][SIDE_BORROW].ratePerSecond;
+        }
+    }
+
+    /**
+     * @notice Seconds the current balance can sustain the current rates.
+     *
+     * `type(uint256).max` when nothing is being emitted. This is the number an
+     * operator actually needs — "there is money in the pot" says nothing about
+     * whether it lasts the week.
+     */
+    function runwaySeconds() external view returns (uint256) {
+        if (address(rewardToken) == address(0)) return 0;
+        uint256 rate = this.totalRatePerSecond();
+        if (rate == 0) return type(uint256).max;
+        uint256 held = rewardToken.balanceOf(address(this));
+        uint256 free = held > totalOwed ? held - totalOwed : 0;
+        return free / rate;
+    }
+}
