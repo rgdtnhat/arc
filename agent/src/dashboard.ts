@@ -5240,6 +5240,9 @@ async function main() {
       // Null until an operator deploys one; the panel hides itself rather than
       // offering a claim button that cannot go anywhere.
       emissions: (liveDeployment.tesseraEmissions as Hex) ?? null,
+      // The protocol token and the contract holding its locked supply.
+      token: (liveDeployment.tesseraToken as Hex) ?? null,
+      emitter: (liveDeployment.tesseraEmitter as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded
