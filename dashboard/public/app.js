@@ -2706,7 +2706,11 @@ const $ = (id) => document.getElementById(id);
         if (!body) return;
         const note = $("borrowersNote");
         try {
-          const r = await (await fetch("/api/lending/borrowers")).json();
+          // Name yourself, so your own row is there even on a server with no
+          // event index to enumerate borrowers from.
+          const mineAddr = String(window.__myAddress || "");
+          const q = /^0x[0-9a-fA-F]{40}$/.test(mineAddr) ? `?include=${encodeURIComponent(mineAddr)}` : "";
+          const r = await (await fetch("/api/lending/borrowers" + q)).json();
           if (!r.ok) {
             body.innerHTML = emptyRow(6, r.error || "Borrowers unavailable.");
             return;

@@ -1936,7 +1936,7 @@ async function main() {
    * Public: a lending pool's outstanding debt is the single most useful thing
    * a depositor can check, and it is all on chain already.
    */
-  app.get("/api/lending/borrowers", async (_req, res) => {
+  app.get("/api/lending/borrowers", async (req, res) => {
     if (!poolClient || !poolDeployment) { res.status(404).json({ ok: false, error: "lending not available" }); return; }
     try {
       const candidates = new Set<string>();
@@ -1946,6 +1946,17 @@ async function main() {
         }
       }
       candidates.add(client.account.address.toLowerCase());
+      /*
+       * Always be able to answer "where do I stand".
+       *
+       * The candidate set comes from an event index, and a server without one
+       * can only speak for the agent — so a connected borrower would look at a
+       * table that did not contain them and reasonably conclude their loan had
+       * vanished. `?include=` lets the page name itself, which costs three
+       * reads and never depends on history being available.
+       */
+      const include = String(req.query.include ?? "");
+      if (/^0x[0-9a-fA-F]{40}$/.test(include)) candidates.add(include.toLowerCase());
       const assets = poolDeployment.assets;
 
       const rows = (
