@@ -414,6 +414,12 @@
       }
       .grid2 { display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; align-items: start; }
       @media (max-width: 880px) { .grid2 { grid-template-columns: 1fr; } }
+      /* With the wallet card showing there are three cards in a two-column
+         grid, which would strand the briefing alone in a half-width column.
+         The two wallets are the pair; the briefing takes the full row under
+         them. Toggled from JS so a hidden wallet card leaves the original
+         side-by-side layout untouched. */
+      .grid2.hasWallet > .card:nth-child(3) { grid-column: 1 / -1; }
       .metrics { display: flex; flex-wrap: wrap; gap: 22px; }
       .metric { min-width: 0; }
       .metric .k { font-size: 11px; color: var(--muted); }
@@ -1155,21 +1161,27 @@
             <div class="card">
               <h2>Agent wallet</h2>
               <div class="balance" id="agentBal">—<span class="u">USDC</span></div>
-              <!-- The signed-in user's own balance, beside the agent's. Two
-                   different pots of money that were easy to confuse when only
-                   one of them was on screen. -->
-              <!-- Its own bordered block, not a line of small print under the
-                   agent's figure. They are two different pots of money and the
-                   layout should say so before the labels have to. -->
-              <div id="myWalletRow" style="display:none;margin-top:14px;padding:12px;border:1px solid var(--line-strong);border-radius:12px;background:var(--panel-2)">
-                <div class="muted" style="font-size:10.5px;letter-spacing:.07em;text-transform:uppercase">Your wallet</div>
-                <div class="balance" id="myWalletBal" style="margin-top:2px">—</div>
-              </div>
               <div class="bar"><span id="balBar" style="width:100%"></span></div>
               <div class="kv"><span class="mono" id="agentAddr">—</span><span id="balDelta"></span></div>
               <svg id="spark" viewBox="0 0 300 56" preserveAspectRatio="none" style="width:100%;height:56px;margin-top:12px;display:block"></svg>
               <div class="kv"><span>balance over session</span><span id="sparkRange"></span></div>
             </div>
+            <!-- Your own wallet, as its own card.
+                 It used to sit inside the agent's card as a bordered block,
+                 which still read as a sub-total of the figure above it — the
+                 exact confusion the block was added to prevent. Two pots of
+                 money belonging to two different parties get two cards, and
+                 this one carries the address so there is no doubt whose. -->
+            <div class="card" id="myWalletCard" style="display:none">
+              <h2>Your wallet</h2>
+              <div class="balance" id="myWalletBal">—<span class="u">USDC</span></div>
+              <div class="kv" style="margin-top:10px;align-items:center;gap:8px">
+                <span class="mono" id="myWalletAddr" style="word-break:break-all">—</span>
+                <button class="btn" id="myWalletCopy" style="padding:3px 9px;font-size:11px">Copy</button>
+              </div>
+              <div class="kv" style="margin-top:8px"><span>Signed in with this address. Self-custody actions spend from here.</span></div>
+            </div>
+
             <div class="card">
               <h2>Mission briefing</h2>
               <div id="briefing" style="font-size:13.5px;color:var(--muted)">Waiting for the agent…</div>

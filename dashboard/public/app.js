@@ -462,14 +462,47 @@ const $ = (id) => document.getElementById(id);
         // money; a signed-in user looking at this card wants to know their own,
         // and had no way to see it without opening a wallet.
         (async () => {
-          const row = $("myWalletRow");
-          if (!row) return;
-          if (!selfMode() || !window.__myAddress) { row.style.display = "none"; return; }
+          const card = $("myWalletCard");
+          if (!card) return;
+          const addr = String(window.__myAddress || "");
+          const grid = card.parentElement;
+          if (!selfMode() || !addr) {
+            card.style.display = "none";
+            if (grid) grid.classList.remove("hasWallet");
+            return;
+          }
+          if (grid) grid.classList.add("hasWallet");
           const cfg = await loadDefiConfig().catch(() => null);
           const bal = cfg ? await myTokenBalance(cfg.usdc || cfg.vaultAsset) : null;
-          row.style.display = "";
-          $("myWalletBal").textContent = bal === null ? "unavailable" : fmtUnitsStr(bal, 6) + " USDC";
+          card.style.display = "";
+          $("myWalletBal").innerHTML = bal === null
+            ? '<span class="muted">unavailable</span>'
+            : esc(fmtUnitsStr(bal, 6)) + '<span class="u">USDC</span>';
+          // The full address, not a truncation. This is the card that answers
+          // "which wallet is this?", and half an address answers it halfway.
+          $("myWalletAddr").textContent = addr;
         })();
+        if ($("myWalletCopy") && !$("myWalletCopy").dataset.wired) {
+          $("myWalletCopy").dataset.wired = "1";
+          $("myWalletCopy").addEventListener("click", async () => {
+            const btn = $("myWalletCopy"), addr = String(window.__myAddress || "");
+            if (!addr) return;
+            try {
+              await navigator.clipboard.writeText(addr);
+            } catch {
+              // A wallet browser may withhold the clipboard; select it instead
+              // so a long-press can copy, rather than failing in silence.
+              const r = document.createRange();
+              r.selectNodeContents($("myWalletAddr"));
+              const selNow = window.getSelection();
+              selNow.removeAllRanges();
+              selNow.addRange(r);
+            }
+            const was = btn.textContent;
+            btn.textContent = "Copied";
+            setTimeout(() => { btn.textContent = was; }, 1200);
+          });
+        }
         $("agentAddr").textContent = s.agent.address;
         const start = +s.agent.startBalanceUsdc || 1;
         const balNum = s.agent.balanceUsdc == null ? null : +s.agent.balanceUsdc;
