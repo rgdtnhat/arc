@@ -1333,7 +1333,15 @@ const $ = (id) => document.getElementById(id);
             alert("Sign-in failed: " + r.error);
           }
         } catch (e) {
-          alert("Wallet connection cancelled or failed.");
+          /*
+           * "Cancelled or failed" covers two situations that need opposite
+           * responses, and after a wallet decides a site is spamming it, the
+           * one it hides is the one that matters: the site is *blocked*, and no
+           * amount of tapping Connect will get past it — the permission has to
+           * be given back in the wallet's own settings. Saying so is the
+           * difference between a fixable state and a dead button.
+           */
+          alert(walletError(e));
         } finally {
           btn.disabled = false;
         }
@@ -3776,12 +3784,35 @@ const $ = (id) => document.getElementById(id);
 
       async function selfAccount() {
         if (!eth()) throw new Error("No browser wallet detected.");
-        const [a] = await eth().request({ method: "eth_requestAccounts" });
+        /*
+         * `eth_accounts` first, and only ask for permission when there is none.
+         *
+         * `eth_requestAccounts` is a *permission* request, and this function
+         * runs before every self-custody action. Revoking three approvals in a
+         * row therefore fired three permission prompts interleaved with three
+         * transaction prompts, and wallets read that burst as an attack: the
+         * one in the report offered to block the site outright, and blocked
+         * site cannot reconnect.
+         *
+         * An already-connected wallet answers `eth_accounts` with no prompt at
+         * all, which is the normal case here — the user connected before they
+         * could see this panel.
+         */
+        let a;
+        try {
+          const accts = await eth().request({ method: "eth_accounts" });
+          a = accts && accts[0];
+        } catch { /* fall through to the permission request */ }
+        if (!a) {
+          const asked = await eth().request({ method: "eth_requestAccounts" });
+          a = asked && asked[0];
+        }
+        if (!a) throw new Error("No account is connected in your wallet.");
         const cfg = await loadDefiConfig();
         // Make sure the wallet is on Arc, offering to add the network if unknown.
         const want = "0x" + Number(cfg.chainId).toString(16);
         const have = await eth().request({ method: "eth_chainId" });
-        if (have !== want) {
+        if (BigInt(have) !== BigInt(want)) {
           try {
             await eth().request({ method: "wallet_switchEthereumChain", params: [{ chainId: want }] });
           } catch (e) {
@@ -3983,6 +4014,22 @@ const $ = (id) => document.getElementById(id);
         const raw = String((e && (e.data && e.data.message)) || (e && e.message) || e);
         const s = raw.toLowerCase();
         if (e && (e.code === 4001 || s.includes("user rejected") || s.includes("user denied"))) return "You cancelled it in your wallet.";
+        // -32002: a prompt is already open. Common when several actions are
+        // started at once, and it reads as a dead button rather than a queue.
+        if (e && (e.code === -32002 || s.includes("already pending") || s.includes("already processing"))) {
+          return "Your wallet already has a request open — approve or dismiss it, then try again.";
+        }
+        // 4100 / "unauthorized" is what a wallet returns once it has blocked
+        // the site. Tapping Connect again cannot lift it.
+        if (
+          e && (e.code === 4100 || e.code === 4900 ||
+            s.includes("unauthorized") || s.includes("blocked") || s.includes("not been authorized"))
+        ) {
+          return (
+            "Your wallet has blocked this site, so it cannot connect. Open your wallet's settings, " +
+            "remove tesra.xyz from its blocked or disconnected sites, then tap Connect again."
+          );
+        }
         if (s.includes("no browser wallet")) return "No browser wallet detected — install or enable one, then reconnect.";
         if (s.includes("insufficient funds") || s.includes("gas")) return "Not enough USDC in your wallet to cover network fees.";
         if (s.includes("noroute") || s.includes("no route")) return "No pool can fill that size right now. Try less, or add liquidity for the pair.";
@@ -4301,10 +4348,60 @@ const $ = (id) => document.getElementById(id);
         $("allowanceRows").querySelectorAll("[data-revoke]").forEach((btn) => {
           btn.addEventListener("click", () => revoke(rows[Number(btn.dataset.revoke)]));
         });
+        /*
+         * Revoke several without looking like an attack.
+         *
+         * The first version called the single-revoke path in a loop, and each
+         * pass re-entered the whole self-custody flow: a permission request, a
+         * chain check, a transaction, then `afterTx` and a full reload of this
+         * panel — every one of them firing more calls at the wallet. Three
+         * revokes became a rapid burst of prompts and RPC, the wallet offered
+         * to block the site, and a blocked site cannot reconnect.
+         *
+         * So the account and chain are resolved once, the transactions go out
+         * one at a time with each confirmed before the next is offered, and the
+         * panel reloads once at the end instead of after every item.
+         */
         $("allowRevokeAll").onclick = async () => {
-          // One at a time. Firing four approvals at a wallet at once produces
-          // four stacked prompts and no way to tell which is which.
-          for (const r of unlimited) await revoke(r);
+          const btn = $("allowRevokeAll");
+          btn.disabled = true;
+          const done = [];
+          try {
+            const from = await selfAccount(); // once, not once per approval
+            const c = await loadDefiConfig();
+            for (let i = 0; i < unlimited.length; i++) {
+              const r = unlimited[i];
+              allowMsg(
+                `Revoking ${r.asset.symbol} for ${r.label} — ${i + 1} of ${unlimited.length}. ` +
+                `Confirm in your wallet.`,
+                "var(--muted)",
+              );
+              const hash = await sendTx(from, r.asset.address, c.selectors.approve + encAddr(r.spender) + encUint(0));
+              // Wait for each one. Queueing them all at once is what makes a
+              // wallet suspicious, and it also makes a failure impossible to
+              // attribute to the approval it belongs to.
+              const rec = await waitForTx(hash);
+              if (rec && !receiptOkHex(rec.status)) {
+                allowMsg(`Revoking ${r.asset.symbol} for ${r.label} failed on chain. Stopped here.`, "var(--warn)");
+                return;
+              }
+              done.push(`${r.asset.symbol} → ${r.label}`);
+            }
+            allowMsg(
+              done.length ? `Revoked ${done.join(", ")}. Nothing else can move those tokens.` : "Nothing to revoke.",
+              "var(--good)",
+            );
+          } catch (e) {
+            allowMsg(
+              (done.length ? `Revoked ${done.join(", ")}, then stopped: ` : "") + walletError(e),
+              "var(--warn)",
+            );
+          } finally {
+            btn.disabled = false;
+            // One reload, at the end.
+            loadAllowances().catch(() => {});
+            afterTx();
+          }
         };
         if (unlimited.length) {
           allowMsg(

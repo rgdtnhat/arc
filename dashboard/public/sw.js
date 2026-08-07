@@ -28,7 +28,8 @@
 //    v30: self-custody survives a late-injecting wallet; caps use liability.
 //    v31: market prices resolve, backstop opens to wallets, borrowers listed.
 //    v32: your wallet is its own dashboard card, with its address.
-const CACHE = "tessera-v32";
+//    v33: stop re-asking wallet permission; batch revoke-all.
+const CACHE = "tessera-v33";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {
