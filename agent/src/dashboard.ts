@@ -4284,16 +4284,71 @@ async function main() {
     feed: toFunctionSelector("function setPriceFeed(address,address,uint32)").slice(2),
   };
   let poolPriceSupport: { read: boolean; write: boolean; freeze: boolean; feed: boolean } | null = null;
+  /**
+   * Which operator levers does the deployed pool actually have?
+   *
+   * Scanning the runtime bytecode for a 4-byte selector is a guess, and on
+   * this deployment it guessed wrong: `setPrice`'s selector (00e4768b) does
+   * not appear literally in the code, because viaIR + the optimizer compile
+   * the dispatch into a comparison tree that builds selector values by
+   * arithmetic rather than leaving them lying about as constants. So the scan
+   * reported "this pool cannot set prices" about a pool that sets prices
+   * perfectly well — and `canSend` was false, the POST endpoint answered 409,
+   * and the price tracker returned on its first line every time it fired.
+   * cirBTC would have stayed at $95,000 no matter how good the feed got.
+   *
+   * The only trustworthy answer is to ask the contract. `price` is a view, so
+   * an eth_call settles it. `setPrice` is owner-only, so it is simulated from
+   * the owner at the price the reserve already carries — semantically a no-op
+   * that still exercises the exact path the tracker uses. Without an owner key
+   * there is nothing to simulate from, and the scan is the honest fallback.
+   */
   const poolSupportsPrices = async () => {
     if (poolPriceSupport) return poolPriceSupport;
     if (!poolDeployment) return { read: false, write: false, freeze: false, feed: false };
-    const code = String((await client.public.getCode({ address: poolDeployment.poolAddress })) ?? "").toLowerCase();
+    const pool = poolDeployment.poolAddress;
+    const code = String((await client.public.getCode({ address: pool })) ?? "").toLowerCase();
+    const asset = poolDeployment.assets[0]?.address;
+
+    // Read: settled by calling it.
+    let read = code.includes(POOL_SELECTORS.read);
+    let current: bigint | null = null;
+    if (asset) {
+      try {
+        current = (await client.public.readContract({
+          address: pool, abi: tesseraPoolAbi, functionName: "price", args: [asset],
+        })) as bigint;
+        read = true;
+      } catch {
+        read = false;
+      }
+    }
+
+    // Write: settled by simulating it from the owner, where one exists.
+    let write = code.includes(POOL_SELECTORS.write);
+    if (owner && asset && current !== null) {
+      try {
+        await client.public.simulateContract({
+          address: pool, abi: tesseraPoolAbi, functionName: "setPrice",
+          args: [asset, current], account: owner.account.address,
+        });
+        write = true;
+      } catch (e) {
+        // A revert that names the function as missing is a real "no"; anything
+        // else (a guard, a paused pool) means the function is there.
+        write = !/does not have the function|returned no data/i.test(String(e));
+      }
+    }
+
     poolPriceSupport = {
-      read: code.includes(POOL_SELECTORS.read),
-      write: code.includes(POOL_SELECTORS.write),
+      read,
+      write,
       freeze: code.includes(POOL_SELECTORS.freeze),
       feed: code.includes(POOL_SELECTORS.feed),
     };
+    console.log(
+      `[pool] levers — read=${read} write=${write} freeze=${poolPriceSupport.freeze} feed=${poolPriceSupport.feed}`,
+    );
     return poolPriceSupport;
   };
 
