@@ -35,3 +35,4 @@ deployments/arc.history.json
 # Records which holders a pool reset has already paid; deleting it and re-running
 # would pay every one of them a second time.
 deployments/reset-state.json
+.qa/

@@ -114,3 +114,59 @@ export function maxInputWithin(
   }
   return lo;
 }
+
+/**
+ * What the trade is worth, measured against the marks — not the pool.
+ *
+ * Price impact answers "how much did *my order* move this pool". It cannot
+ * answer "is this pool priced anywhere near reality", and those are different
+ * hazards with the same cost. A live example: the USDC/EURC pool held 1.6 USDC
+ * and 0.63 EURC, an implied rate of 1 USDC = 0.39 EURC against a market near
+ * 0.92. Every trade into it lost roughly 57% — and a *small* one lost that
+ * with almost no price impact at all, so an impact guard waved it through.
+ *
+ * Comparing the value in against the value out at the pool's own marks catches
+ * both shapes at once, and it works for a multi-hop route where per-pool
+ * reserves do not compose into a single number.
+ *
+ * Returns null when either mark is missing. An unknown value must not be
+ * reported as a safe one — that is the failure mode this codebase keeps
+ * finding, and inventing a zero here would silently disarm the guard.
+ */
+export const VALUE_WARN_PCT = 2;
+export const VALUE_SEVERE_PCT = 10;
+
+export interface ValueCheck {
+  inUsd: number;
+  outUsd: number;
+  /** Positive when you receive less than you paid, as a percentage. */
+  lossPct: number;
+  severity: "fine" | "warn" | "severe";
+  reason: string;
+}
+
+export function valueCheck(args: {
+  amountIn: bigint; decimalsIn: number; priceInE8: bigint; symbolIn: string;
+  amountOut: bigint; decimalsOut: number; priceOutE8: bigint; symbolOut: string;
+}): ValueCheck | null {
+  const { amountIn, decimalsIn, priceInE8, symbolIn, amountOut, decimalsOut, priceOutE8, symbolOut } = args;
+  if (priceInE8 <= 0n || priceOutE8 <= 0n || amountIn <= 0n) return null;
+
+  const inUsd = (Number(amountIn) / 10 ** decimalsIn) * (Number(priceInE8) / 1e8);
+  const outUsd = (Number(amountOut) / 10 ** decimalsOut) * (Number(priceOutE8) / 1e8);
+  if (!Number.isFinite(inUsd) || !Number.isFinite(outUsd) || inUsd <= 0) return null;
+
+  const lossPct = ((inUsd - outUsd) / inUsd) * 100;
+  const severity = lossPct >= VALUE_SEVERE_PCT ? "severe" : lossPct >= VALUE_WARN_PCT ? "warn" : "fine";
+  const money = (v: number) => "$" + v.toFixed(v < 1 ? 4 : 2);
+  const reason =
+    severity === "fine"
+      ? ""
+      : `You would pay ${money(inUsd)} of ${symbolIn} and receive ${money(outUsd)} of ${symbolOut} — ` +
+        `about ${lossPct.toFixed(1)}% less than you put in, valued at the pool's own marks. ` +
+        (severity === "severe"
+          ? "That is not slippage on your order; the pool itself is priced away from the market. " +
+            "Adding liquidity at a fair ratio, or waiting for an arbitrageur, costs you nothing."
+          : "Check the rate before signing.");
+  return { inUsd, outUsd, lossPct, severity, reason };
+}

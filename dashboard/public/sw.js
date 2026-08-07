@@ -23,7 +23,8 @@
 //    v25: withdraw cap and position come from the signer, and refresh after a tx.
 //    v26: reads refuse to run off Arc, one amount parser, exact approvals.
 //    v27: the tick waits for the receipt; borrow/repay caps follow the signer.
-const CACHE = "tessera-v27";
+//    v28: the swap desk refuses a trade worth far less than it costs.
+const CACHE = "tessera-v28";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./favicon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

@@ -79,7 +79,7 @@ import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
 import { fillPreview } from "./auction.js";
-import { priceImpact, maxInputWithin, IMPACT_MAX_PCT } from "./impact.js";
+import { priceImpact, maxInputWithin, valueCheck, IMPACT_MAX_PCT } from "./impact.js";
 import { DefiOracle } from "@tessera/shared";
 import { AdminAuth } from "./auth.js";
 import { AppConfigStore, CADENCES, LIMITS, nextWeeklyRun, type AppConfig } from "./config.js";
@@ -2780,6 +2780,35 @@ async function main() {
         );
       }
 
+      /*
+       * Is this trade worth doing at all?
+       *
+       * The desk had no price guard of any kind, while the AMM tab — routing
+       * through the very same pools — blocks a severe one. Live, that gap sold
+       * 0.5 USDC for 0.148 EURC: the pool held 1.6 USDC against 0.63 EURC, an
+       * implied rate of 0.39 where the market is near 0.92. The quote came back
+       * `ok: true` with an empty `blockers` array.
+       *
+       * Impact alone would not have caught it. A *small* trade into a
+       * permanently mispriced pool has almost no impact and still loses half
+       * its value, so the check that matters is value in against value out at
+       * the marks the pool itself uses for collateral.
+       */
+      const markOf = (t: Hex) => {
+        const row = (lastLending?.assets ?? []).find(
+          (x) => x.address.toLowerCase() === t.toLowerCase(),
+        );
+        const raw = row && "priceE8" in row ? (row as { priceE8?: string }).priceE8 : undefined;
+        return raw ? BigInt(raw) : 0n;
+      };
+      const value = out > 0n
+        ? valueCheck({
+            amountIn, decimalsIn: inMeta.decimals, priceInE8: markOf(tokenIn), symbolIn: inMeta.symbol,
+            amountOut: out, decimalsOut: outMeta.decimals, priceOutE8: markOf(tokenOut), symbolOut: outMeta.symbol,
+          })
+        : null;
+      if (value && value.severity !== "fine") blockers.push(value.reason);
+
       res.json({
         ok: true,
         out: out.toString(),
@@ -2796,6 +2825,9 @@ async function main() {
         spender,
         approvalNeeded: allowance < amountIn,
         blockers,
+        // Structured too, so the page can colour it and gate Execute rather than
+        // only printing another line of warning text.
+        value,
       });
     } catch (e) {
       res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });

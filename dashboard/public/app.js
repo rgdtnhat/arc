@@ -1938,7 +1938,7 @@ const $ = (id) => document.getElementById(id);
                 r.blockers.map((b) => esc(b)).join("<br>")
               }</div>`
             : "");
-        return { ...s, amountIn, out: r.out, blockers: r.blockers || [] };
+        return { ...s, amountIn, out: r.out, blockers: r.blockers || [], value: r.value || null };
       }
       function fmtUnitsJs(raw, dec) {
         const s = String(raw).padStart(dec + 1, "0");
@@ -1992,6 +1992,8 @@ const $ = (id) => document.getElementById(id);
         const v = $("swAmount").value.trim();
         if (v && Number(v) > 0) swapQuote().catch(() => {});
       }, 15000);
+      /** One-time override per exact trade, mirroring the AMM tab's guard. */
+      const swValueAck = new Set();
       $("swExecute").addEventListener("click", async () => {
         const q = await swapQuote();
         const msg = $("swapMsg");
@@ -2027,6 +2029,23 @@ const $ = (id) => document.getElementById(id);
           msg.style.display = "block"; msg.style.color = "var(--warn)";
           msg.textContent = `No pool can fill ${q.symIn} → ${q.symOut} at that size. Try less, or add liquidity for the pair.`;
           return;
+        }
+        /*
+         * Refuse a trade that hands back materially less than it takes.
+         *
+         * The AMM tab has had this guard for a while; the desk, routing through
+         * the very same pools, had none — and sold 0.5 USDC for 0.148 EURC
+         * without a word. One press to acknowledge, keyed to the exact trade so
+         * changing the pair or the size re-arms it.
+         */
+        if (q.value && q.value.severity === "severe") {
+          const key = `${q.tokenIn}:${q.tokenOut}:${q.amountIn}`;
+          if (!swValueAck.has(key)) {
+            swValueAck.add(key);
+            msg.style.display = "block"; msg.style.color = "var(--warn)";
+            msg.textContent = `Blocked: ${q.value.reason} Press Swap again to go ahead anyway.`;
+            return;
+          }
         }
         // 1% slippage floor.
         const minOut = (BigInt(q.out) * 99n / 100n).toString();
