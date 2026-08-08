@@ -6973,6 +6973,218 @@ async function main() {
     }
   });
 
+  /**
+   * What a proposal is actually able to change.
+   *
+   * ## Why a catalogue rather than a free-text calldata box
+   * `/api/governance/propose` has always accepted targets and calldata, which
+   * means governance *could* configure the protocol and in practice never did:
+   * writing calldata by hand is a thing nobody does, and a proposal whose call
+   * is one wrong nibble opens, campaigns, passes, and only then reverts. The
+   * vote is spent by the time anyone finds out.
+   *
+   * So the surfaces the protocol is willing to have voted on are named here,
+   * and the calldata is built from the *exported ABI* rather than from a
+   * signature string typed into this file. If a function is renamed or its
+   * arguments change, the entry stops resolving and says so — where a
+   * hand-written selector would go on encoding something that no longer exists.
+   *
+   * ## What is deliberately not here
+   * Nothing that transfers tokens, and nothing that changes ownership. Those
+   * are the two calls where a proposal that passes by surprise is unrecoverable,
+   * and a governance UI that makes them one click away is a governance UI that
+   * eventually makes them by accident.
+   */
+  type ActionParam = {
+    name: string;
+    type: "address" | "uint256" | "uint8" | "uint16" | "uint64" | "bool" | "string";
+    label: string;
+    hint?: string;
+  };
+  type ActionSpec = {
+    id: string;
+    group: string;
+    label: string;
+    /** Key in the deployment record naming the contract this calls. */
+    contract: string;
+    abi: unknown;
+    fn: string;
+    params: ActionParam[];
+    /** What passing it does, in a sentence, for the proposal body. */
+    describe: (v: Record<string, string>) => string;
+  };
+
+  const ACTIONS: ActionSpec[] = [
+    {
+      id: "emissions.setRate", group: "Emissions", label: "Set a lending emission rate",
+      contract: "tesseraEmissions", abi: tesseraEmissionsAbi, fn: "setRate",
+      params: [
+        { name: "asset", type: "address", label: "Asset" },
+        { name: "side", type: "uint8", label: "Side", hint: "0 supply · 1 borrow · 2 backstop" },
+        { name: "ratePerSecond", type: "uint256", label: "TSRA per second", hint: "in wei, 18 decimals" },
+      ],
+      describe: (v) => `Set the emission rate for ${v.asset} (side ${v.side}) to ${v.ratePerSecond} wei/second.`,
+    },
+    {
+      id: "emissions.setPaused", group: "Emissions", label: "Pause or resume lending emissions",
+      contract: "tesseraEmissions", abi: tesseraEmissionsAbi, fn: "setPaused",
+      params: [{ name: "paused", type: "bool", label: "Paused" }],
+      describe: (v) => `${v.paused === "true" ? "Pause" : "Resume"} all lending emissions.`,
+    },
+    {
+      id: "lpEmissions.setRate", group: "Emissions", label: "Set an AMM pool emission rate",
+      contract: "tesseraLpEmissions", abi: tesseraLpEmissionsAbi, fn: "setRate",
+      params: [
+        { name: "poolId", type: "uint256", label: "Pool id" },
+        { name: "ratePerSecond", type: "uint256", label: "TSRA per second", hint: "in wei, 18 decimals" },
+      ],
+      describe: (v) => `Set pool ${v.poolId}'s emission rate to ${v.ratePerSecond} wei/second.`,
+    },
+    {
+      id: "gauge.setBudget", group: "Gauge", label: "Set the emission budget",
+      contract: "tesseraGauge", abi: tesseraGaugeAbi, fn: "setBudget",
+      params: [
+        { name: "lendingPerSecond", type: "uint256", label: "Lending TSRA per second", hint: "in wei" },
+        { name: "ammPerSecond", type: "uint256", label: "AMM TSRA per second", hint: "in wei" },
+      ],
+      describe: (v) => `Split the gauge budget ${v.lendingPerSecond} wei/s to lending and ${v.ammPerSecond} wei/s to the AMM.`,
+    },
+    {
+      id: "gauge.setRewardZoneSize", group: "Gauge", label: "Set how many markets earn",
+      contract: "tesseraGauge", abi: tesseraGaugeAbi, fn: "setRewardZoneSize",
+      params: [{ name: "size", type: "uint16", label: "Markets in the reward zone" }],
+      describe: (v) => `Only the top ${v.size} markets by vote weight earn emissions.`,
+    },
+    {
+      id: "registry.setStatus", group: "Asset registry", label: "Whitelist or revoke an asset",
+      contract: "tesseraAssetRegistry", abi: tesseraAssetRegistryAbi, fn: "setStatus",
+      params: [
+        { name: "asset", type: "address", label: "Asset" },
+        { name: "status", type: "uint8", label: "Status", hint: "0 unlisted · 1 whitelisted · 2 revoked" },
+        { name: "reason", type: "string", label: "Reason", hint: "recorded on chain with the change" },
+      ],
+      describe: (v) => `Set ${v.asset}'s registry status to ${v.status}.`,
+    },
+    {
+      id: "serviceFees.setRate", group: "Service fees", label: "Set the TSRA top-up rate",
+      contract: "tesseraServiceFees", abi: tesseraServiceFeesAbi, fn: "setRate",
+      params: [
+        { name: "tsraPerUsdc", type: "uint256", label: "TSRA per USDC base unit", hint: "1e18 scale" },
+        { name: "discountBps", type: "uint16", label: "Discount for paying in TSRA", hint: "basis points, max 5000" },
+      ],
+      describe: (v) => `Price TSRA top-ups at ${v.tsraPerUsdc} with a ${Number(v.discountBps) / 100}% discount.`,
+    },
+    {
+      id: "emitter.setSinkWeight", group: "Emissions", label: "Re-weight an emission sink",
+      contract: "tesseraEmitter", abi: tesseraEmitterAbi, fn: "setSinkWeight",
+      params: [
+        { name: "index", type: "uint256", label: "Sink index" },
+        { name: "weight", type: "uint256", label: "Weight", hint: "0 retires it without losing what it is owed" },
+      ],
+      describe: (v) => `Set sink ${v.index}'s weight to ${v.weight}.`,
+    },
+    {
+      id: "keeper.setConfig", group: "Upkeep", label: "Set the keeper's bounty",
+      contract: "tesseraKeeper", abi: tesseraKeeperAbi, fn: "setConfig",
+      params: [
+        { name: "bounty", type: "uint256", label: "TSRA per round", hint: "in wei, max 1000e18" },
+        { name: "minInterval", type: "uint64", label: "Minimum seconds between rounds" },
+        { name: "dustThreshold", type: "uint256", label: "Ignore sinks below", hint: "in wei" },
+      ],
+      describe: (v) => `Pay ${v.bounty} wei per keeper round, at most every ${v.minInterval}s.`,
+    },
+    {
+      id: "oracle.setConfig", group: "Oracle", label: "Set the price feed's depth floor",
+      contract: "tesseraTwapOracle", abi: tesseraTwapOracleAbi, fn: "setConfig",
+      params: [
+        { name: "minDepth", type: "uint256", label: "Minimum pool depth", hint: "quote base units — USDC has 6 decimals" },
+        { name: "minSpacing", type: "uint64", label: "Minimum seconds between readings" },
+      ],
+      describe: (v) => `Refuse to price below ${v.minDepth} base units of depth.`,
+    },
+  ];
+
+  /** Does this deployment have the contract, and does its ABI still have the function? */
+  const resolveAction = (spec: ActionSpec): { address: Hex | null; available: boolean; why: string | null } => {
+    const address = (liveDeployment[spec.contract] as Hex | undefined) ?? null;
+    if (!address) return { address: null, available: false, why: `${spec.contract} is not deployed here` };
+    const entry = (spec.abi as { type: string; name?: string; inputs?: unknown[] }[])
+      .find((x) => x.type === "function" && x.name === spec.fn);
+    if (!entry) return { address, available: false, why: `${spec.fn} is no longer in the ABI` };
+    if ((entry.inputs?.length ?? 0) !== spec.params.length) {
+      // The case a hand-written selector would sail straight past.
+      return { address, available: false, why: `${spec.fn} takes ${entry.inputs?.length} argument(s), this form offers ${spec.params.length}` };
+    }
+    return { address, available: true, why: null };
+  };
+
+  app.get("/api/governance/actions", (_req, res) => {
+    res.json({
+      ok: true,
+      actions: ACTIONS.map((a) => {
+        const r = resolveAction(a);
+        return {
+          id: a.id, group: a.group, label: a.label, contract: a.contract,
+          address: r.address, available: r.available, unavailableBecause: r.why,
+          fn: a.fn, params: a.params,
+        };
+      }),
+    });
+  });
+
+  /**
+   * Turn a filled-in action into the call a proposal would carry.
+   *
+   * Returned rather than proposed, so the operator sees the target, the
+   * calldata and the plain-English summary before anything is opened. A vote is
+   * not the moment to discover what you asked for.
+   */
+  app.post("/api/governance/encode-action", requireOperator, (req, res) => {
+    const spec = ACTIONS.find((a) => a.id === String(req.body?.action ?? ""));
+    if (!spec) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
+    const r = resolveAction(spec);
+    if (!r.available || !r.address) { res.status(400).json({ ok: false, error: r.why ?? "action unavailable" }); return; }
+
+    const raw = (req.body?.params ?? {}) as Record<string, unknown>;
+    const values: unknown[] = [];
+    const shown: Record<string, string> = {};
+    for (const p of spec.params) {
+      const v = String(raw[p.name] ?? "").trim();
+      shown[p.name] = v;
+      if (v === "") { res.status(400).json({ ok: false, error: `${p.label} is required` }); return; }
+      try {
+        if (p.type === "address") {
+          if (!/^0x[0-9a-fA-F]{40}$/.test(v)) throw new Error("not an address");
+          values.push(v as Hex);
+        } else if (p.type === "bool") {
+          values.push(v === "true" || v === "1");
+        } else if (p.type === "string") {
+          values.push(v.slice(0, 200));
+        } else {
+          const n = BigInt(v);
+          if (n < 0n) throw new Error("negative");
+          values.push(n);
+        }
+      } catch {
+        res.status(400).json({ ok: false, error: `${p.label}: "${v}" is not a valid ${p.type}` });
+        return;
+      }
+    }
+    try {
+      const calldata = encodeFunctionData({ abi: spec.abi as never, functionName: spec.fn as never, args: values as never });
+      res.json({
+        ok: true,
+        target: r.address,
+        calldata,
+        summary: spec.describe(shown),
+        contract: spec.contract,
+        fn: spec.fn,
+      });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 200) });
+    }
+  });
+
   app.post("/api/governance/propose", requireOperator, async (req, res) => {
     if (!governorAddr) { res.status(404).json({ ok: false, error: "governor not deployed" }); return; }
     if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }

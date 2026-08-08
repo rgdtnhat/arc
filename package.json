@@ -28,7 +28,8 @@
     "pools:reset": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/reset-pools.mjs",
     "icon": "node scripts/make-token-icon.mjs",
     "shell:check": "node scripts/stamp-shell.mjs --check",
-    "shell:bump": "node scripts/stamp-shell.mjs --bump"
+    "shell:bump": "node scripts/stamp-shell.mjs --bump",
+    "smoke": "node scripts/smoke.mjs"
   },
   "overrides": {
     "adm-zip": "^0.6.0",

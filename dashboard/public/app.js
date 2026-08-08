@@ -4635,9 +4635,163 @@ const $ = (id) => document.getElementById(id);
        * what is listed. Only the visible one loads, which also stops the tab
        * from firing six loops of contract reads on arrival.
        */
+      /* ---- The proposal builder --------------------------------------------
+       *
+       * A proposal that changes something needs calldata, and calldata written
+       * by hand is calldata nobody writes — so governance here has always been
+       * able to configure the protocol and never has. This turns the surfaces
+       * the server is willing to expose into a form, and asks the server to
+       * encode each call from the contract's own ABI. The operator sees the
+       * target, the summary and the hex before anything opens; a vote is not
+       * the moment to find out what was asked.
+       */
+      let gbActions = [];
+      let gbCalls = [];
+      /** Bind only if the element is there — these live in an operator-only card. */
+      const gbOn = (el, ev, fn) => { if (el) el.addEventListener(ev, fn); };
+
+      async function loadProposalBuilder() {
+        const card = $("govBuilderCard");
+        if (!card) return;
+        // Only an operator can open a proposal, so only an operator is shown
+        // the form — rather than being offered it and refused at the end.
+        const isOp = !!(profileState && profileState.isOperator);
+        card.style.display = isOp ? "" : "none";
+        if (!isOp || gbActions.length) return;
+        try {
+          const j = await (await fetch("/api/governance/actions", { headers: authHeaders() })).json();
+          gbActions = (j.actions || []).filter((a) => a.available);
+          const sel = $("gbAction");
+          if (!sel) return;
+          sel.innerHTML = "";
+          let group = null, og = null;
+          for (const a of gbActions) {
+            if (a.group !== group) {
+              group = a.group;
+              og = document.createElement("optgroup");
+              og.label = group;
+              sel.appendChild(og);
+            }
+            const o = document.createElement("option");
+            o.value = a.id;
+            o.textContent = a.label;
+            og.appendChild(o);
+          }
+          renderBuilderParams();
+        } catch { /* the card simply stays empty rather than half-built */ }
+      }
+
+      function renderBuilderParams() {
+        const sel = $("gbAction"), box = $("gbParams");
+        if (!sel || !box) return;
+        const spec = gbActions.find((a) => a.id === sel.value);
+        box.innerHTML = "";
+        if (!spec) return;
+        for (const p of spec.params) {
+          const lab = document.createElement("label");
+          lab.textContent = p.label;
+          const input = p.type === "bool" ? document.createElement("select") : document.createElement("input");
+          input.className = "field";
+          input.dataset.param = p.name;
+          if (p.type === "bool") {
+            for (const v of ["false", "true"]) {
+              const o = document.createElement("option");
+              o.value = v; o.textContent = v;
+              input.appendChild(o);
+            }
+          } else if (p.hint) {
+            input.placeholder = p.hint;
+          }
+          lab.appendChild(input);
+          if (p.hint && p.type !== "bool") {
+            const h = document.createElement("div");
+            h.className = "kv";
+            h.style.fontSize = "11.5px";
+            h.textContent = p.hint;
+            lab.appendChild(h);
+          }
+          box.appendChild(lab);
+        }
+      }
+
+      function renderBuilderCalls() {
+        const box = $("gbCalls");
+        if (!box) return;
+        box.innerHTML = "";
+        gbCalls.forEach((c, i) => {
+          const row = document.createElement("div");
+          row.className = "kv";
+          row.style.cssText = "border:1px solid var(--line);border-radius:8px;padding:8px 10px";
+          const head = document.createElement("div");
+          head.innerHTML = "<b>" + (i + 1) + ". " + esc(c.summary) + "</b>";
+          const meta = document.createElement("div");
+          meta.style.cssText = "font-size:11.5px;color:var(--muted);margin-top:4px;word-break:break-all";
+          meta.textContent = c.contract + "." + c.fn + " → " + c.target + "\n" + c.calldata;
+          meta.style.whiteSpace = "pre-wrap";
+          row.appendChild(head);
+          row.appendChild(meta);
+          box.appendChild(row);
+        });
+      }
+
+      gbOn($("gbAction"), "change", renderBuilderParams);
+      gbOn($("gbClear"), "click", () => { gbCalls = []; renderBuilderCalls(); });
+      gbOn($("gbAdd"), "click", async () => {
+        const sel = $("gbAction"), msg = $("gbMsg");
+        if (!sel) return;
+        const params = {};
+        document.querySelectorAll("#gbParams [data-param]").forEach((el) => { params[el.dataset.param] = el.value; });
+        try {
+          const res = await postAuthed("/api/governance/encode-action", {
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ action: sel.value, params }),
+          });
+          const j = await res.json();
+          if (!j.ok) throw new Error(j.error || "could not encode that");
+          if (gbCalls.length >= 8) throw new Error("a proposal carries at most 8 calls");
+          gbCalls.push(j);
+          renderBuilderCalls();
+          if (msg) { msg.style.display = "none"; }
+        } catch (e) {
+          if (msg) { msg.style.display = "block"; msg.className = "msg err"; msg.textContent = String(e.message || e); }
+        }
+      });
+      gbOn($("gbSubmit"), "click", async () => {
+        const msg = $("gbMsg");
+        const title = ($("gbTitle") || {}).value || "";
+        const body = ($("gbBody") || {}).value || "";
+        try {
+          if (!title.trim()) throw new Error("a proposal needs a title");
+          // The calls are named in the body too, so what was voted on is
+          // legible from the proposal itself and not only from its calldata.
+          const enacts = gbCalls.length
+            ? "\n\nIf this passes:\n" + gbCalls.map((c, i) => (i + 1) + ". " + c.summary).join("\n")
+            : "";
+          const res = await postAuthed("/api/governance/propose", {
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              title: title.trim(),
+              description: body.trim() + enacts,
+              targets: gbCalls.map((c) => c.target),
+              calldatas: gbCalls.map((c) => c.calldata),
+            }),
+          });
+          const j = await res.json();
+          if (!j.ok) throw new Error(j.error || "could not open it");
+          gbCalls = [];
+          renderBuilderCalls();
+          if ($("gbTitle")) $("gbTitle").value = "";
+          if ($("gbBody")) $("gbBody").value = "";
+          if (msg) { msg.style.display = "block"; msg.className = "msg ok"; msg.textContent = "Proposal opened."; }
+          loadGovernance();
+        } catch (e) {
+          if (msg) { msg.style.display = "block"; msg.className = "msg err"; msg.textContent = String(e.message || e); }
+        }
+      });
+
       const GOV_LOADERS = {
         overview: () => loadGovernance(),
-        proposals: () => Promise.all([loadGovernance(), loadDiscussions()]),
+        proposals: () => Promise.all([loadGovernance(), loadDiscussions(), loadProposalBuilder()]),
         markets: () => Promise.all([loadGauge(), loadRegistry()]),
         delegates: () => Promise.all([loadGovernance(), loadGauge()]),
         emissions: () => Promise.all([loadEmissions(), loadLpEmissions(), loadGovernance()]),
