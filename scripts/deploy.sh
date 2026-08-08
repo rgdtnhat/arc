@@ -43,6 +43,18 @@ if [ "$avail_kb" -lt 2000000 ]; then
   warn "If the build fails, reclaim with: docker system prune -af"
 fi
 
+# A host `node_modules` is dead weight on a deploy box, and it is the first
+# thing to reclaim when disk is short. Nothing here ever reads it: the image
+# runs its own `npm install --omit=dev`, so a host install only unpacks the
+# Solidity toolchain — some 400 packages against the image's ~95 — onto the
+# disk the Docker build then needs. It is easy to end up with one by running
+# `npm ci` here, which looks like the obvious thing to do and is not.
+if [ -d node_modules ]; then
+  nm_kb=$(du -sk node_modules 2>/dev/null | awk '{print $1}')
+  warn "node_modules here is $((${nm_kb:-0} / 1024)) MB and is never used by the container."
+  warn "Free it any time with: rm -rf node_modules"
+fi
+
 # A refused checkout is the single most common reason an update does not land,
 # and pasted commands hide it. Name the files rather than the error.
 dirty=$(git --no-pager diff --name-only HEAD)
@@ -94,14 +106,36 @@ docker compose up -d --build
 ok "compose returned success"
 
 say "Checking what is actually being served"
+#
+# Ask the container, not the host.
+#
+# docker-compose.yml `expose`s 8787 rather than publishing it — only Caddy binds
+# a host port, on 80/443 — so `curl http://127.0.0.1:8787` from the host is
+# answered by nothing at all. This step used to do exactly that and then declare
+# the deploy failed on a container that was serving perfectly. The build had
+# already succeeded, so the visible result was a red STOPPED after a good
+# update, which teaches people to ignore the check.
+#
+# So: the host URL first (in case someone has published the port or set
+# APP_URL to their real domain), then from inside the compose network. The image
+# is node:22-slim — no curl, no wget — so node's own fetch does the asking.
+version_json() {
+  curl -fsS --max-time 5 "$APP_URL/api/version" 2>/dev/null && return 0
+  docker compose exec -T tessera node -e '
+    fetch("http://127.0.0.1:" + (process.env.PORT || 8787) + "/api/version")
+      .then((r) => r.text()).then((t) => process.stdout.write(t))
+      .catch(() => process.exit(1));
+  ' 2>/dev/null
+}
+
 got=""
 for _ in $(seq 1 30); do
-  got=$(curl -fsS --max-time 5 "$APP_URL/api/version" 2>/dev/null | grep -o '"shell":"[^"]*"' | cut -d'"' -f4 || true)
+  got=$(version_json | grep -o '"shell":"[^"]*"' | cut -d'"' -f4 || true)
   [ -n "$got" ] && break
   sleep 2
 done
 
-[ -n "$got" ] || die "the app did not answer $APP_URL/api/version within a minute. Try: docker compose logs --tail=80"
+[ -n "$got" ] || die "the app never answered /api/version, on the host or inside the container. Try: docker compose logs --tail=80"
 
 if [ "$got" != "$want" ]; then
   printf '\n   the repo is at %s but the server reports %s\n' "$want" "$got"
@@ -109,6 +143,6 @@ if [ "$got" != "$want" ]; then
 fi
 
 ok "server is serving $got"
-curl -fsS "$APP_URL/api/version" | sed 's/^/   /'
+version_json | sed 's/^/   /'
 printf '\n\033[32mUpdate complete.\033[0m If the page still looks unchanged, that is your browser:\n'
 printf 'close every tab of the site and reopen it — the service worker answers before the network.\n\n'

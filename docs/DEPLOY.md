@@ -20,6 +20,16 @@ That is the whole thing. It fetches, fast-forwards, rebuilds, and then **checks
 that the server is actually serving this commit** — comparing the shell version
 the app reports with the one in the repo — and exits non-zero if it is not.
 
+There is no process manager here. `pm2 restart` has never been part of this
+deployment and will report `command not found`: the app is a Docker Compose
+service with `restart: unless-stopped`, and `docker compose up -d --build`
+inside `deploy.sh` is what replaces the running container.
+
+That check asks the **container**, not the host. `docker-compose.yml` `expose`s
+8787 rather than publishing it — only Caddy binds a host port, on 80/443 — so
+`curl http://127.0.0.1:8787` on the host is answered by nothing at all. Set
+`APP_URL` to your real domain if you would rather it went through Caddy.
+
 ### Do not add `npm ci` or `npm run compile`
 
 Neither belongs on a host, and both make things worse. The image runs its own
@@ -30,6 +40,14 @@ of space. When that build fails, `restart: unless-stopped` leaves the **old
 container running** — so `docker compose logs` looks perfectly healthy and the
 site simply never changes. The ABIs are committed precisely so no host ever
 needs a compiler.
+
+`npm run build` is a third one to skip, for a different reason: it expands to
+`npm run build --workspaces --if-present` and **no workspace defines a `build`
+script**, so it does nothing at all — it just looks like it did something.
+
+If `npm ci` has already been run on the host, `node_modules` there is dead
+weight — nothing in the container ever reads it. `deploy.sh` now measures it and
+says so; reclaim the space with `rm -rf node_modules`.
 
 ### `deployments/` is a bind mount, and that matters
 
