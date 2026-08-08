@@ -6295,6 +6295,155 @@ async function main() {
   });
 
   /**
+   * Everything of yours that is sitting unclaimed, in one answer.
+   *
+   * ## Why this is not just a convenience
+   * The pieces were all already on the page — emissions on the lending tab, LP
+   * rewards on the AMM tab, bribes behind a market, a matured backstop exit
+   * three clicks into a panel. What was missing is the only question anybody
+   * actually asks, which is "is there anything". Answering it required knowing
+   * where to look, so in practice it went unanswered and rewards sat.
+   *
+   * The expiring ones are the reason this exists rather than being a nice-to-
+   * have. A backstop exit that has matured is *still absorbing losses* until
+   * it is withdrawn — somebody who queued an exit and forgot is carrying
+   * first-loss risk they believe they have left. That is not an unclaimed
+   * reward, it is an unwanted position, and nothing told them.
+   */
+  app.get("/api/claimables", async (req, res) => {
+    const user = String(req.query.user ?? "");
+    if (!/^0x[0-9a-fA-F]{40}$/.test(user)) {
+      res.status(400).json({ ok: false, error: "a wallet address is required" });
+      return;
+    }
+    const who = user as Hex;
+    watch(who);
+
+    const read = async <T,>(address: Hex, abi: unknown, fn: string, args: unknown[] = []): Promise<T | null> => {
+      try {
+        return (await client.public.readContract({
+          address, abi: abi as never, functionName: fn as never, args: args as never,
+        })) as T;
+      } catch {
+        return null;
+      }
+    };
+
+    type Item = {
+      kind: string;
+      label: string;
+      amount: string;
+      symbol: string;
+      /** Where the page should send somebody to act on it. */
+      route: string;
+      /** True when leaving it alone costs something, not merely delays it. */
+      urgent: boolean;
+      note?: string;
+    };
+    const items: Item[] = [];
+    const tsra = (liveDeployment.tesseraToken as Hex) ?? null;
+
+    // Lending + backstop emissions, and AMM LP emissions.
+    if (emissionsAddr) {
+      const total = (await read<bigint>(emissionsAddr, tesseraEmissionsAbi, "claimableTotal", [who])) ?? 0n;
+      if (total > 0n) {
+        items.push({
+          kind: "emissions", label: "Lending & backstop rewards",
+          amount: formatUnits(total, 18), symbol: "TSRA", route: "defi", urgent: false,
+        });
+      }
+      /*
+       * Balances stranded on a superseded emissions contract. These do not
+       * accrue, do not expire, and are invisible everywhere else — the current
+       * contract has never heard of them. `migrate` is permissionless, so
+       * naming it here is the only thing standing between a holder and a
+       * balance nobody would otherwise mention.
+       */
+      const prior = (await read<Hex>(emissionsAddr, tesseraEmissionsAbi, "prior")) ?? null;
+      if (prior && /^0x0{40}$/.test(prior) === false) {
+        const strandedTotal = (await read<bigint>(prior, tesseraEmissionsAbi, "claimableTotal", [who])) ?? 0n;
+        if (strandedTotal > 0n) {
+          items.push({
+            kind: "migrate", label: "Rewards left on a previous emissions contract",
+            amount: formatUnits(strandedTotal, 18), symbol: "TSRA", route: "defi", urgent: false,
+            note: "Anyone may migrate these across; they are not lost.",
+          });
+        }
+      }
+    }
+    if (lpEmissionsAddr) {
+      const total = (await read<bigint>(lpEmissionsAddr, tesseraLpEmissionsAbi, "claimableTotal", [who])) ?? 0n;
+      if (total > 0n) {
+        items.push({
+          kind: "lpEmissions", label: "AMM liquidity rewards",
+          amount: formatUnits(total, 18), symbol: "TSRA", route: "defi", urgent: false,
+        });
+      }
+    }
+
+    // Bribes on closed epochs. Only closed ones: a share of a denominator that
+    // is still moving is not a share, and the contract refuses them anyway.
+    if (gaugeAddr) {
+      const epoch = (await read<bigint>(gaugeAddr, tesseraGaugeAbi, "currentEpoch")) ?? 0n;
+      const marketCount = (await read<bigint>(gaugeAddr, tesseraGaugeAbi, "marketCount")) ?? 0n;
+      const byToken = new Map<string, bigint>();
+      // Only the epoch that just closed — older ones are a log-scan, and a
+      // digest that takes ten seconds is a digest nobody waits for.
+      const closed = epoch > 0n ? epoch - 1n : 0n;
+      if (epoch > 0n) {
+        for (let m = 0n; m < marketCount && m < 32n; m++) {
+          const count = (await read<bigint>(gaugeAddr, tesseraGaugeAbi, "bribeCount", [closed, m])) ?? 0n;
+          for (let i = 0n; i < count && i < 8n; i++) {
+            const share = (await read<bigint>(gaugeAddr, tesseraGaugeAbi, "bribeShare", [closed, m, i, who])) ?? 0n;
+            if (share === 0n) continue;
+            const info = await read<readonly [Hex, bigint, bigint, Hex]>(
+              gaugeAddr, tesseraGaugeAbi, "bribeAt", [closed, m, i]);
+            const token = info?.[0] ?? (tsra as Hex);
+            byToken.set(token, (byToken.get(token) ?? 0n) + share);
+          }
+        }
+      }
+      for (const [token, amount] of byToken) {
+        const meta = await tokenMeta(token as Hex);
+        items.push({
+          kind: "bribe", label: `Bribes from epoch ${closed}`,
+          amount: formatUnits(amount, meta.decimals), symbol: meta.symbol,
+          route: "gov", urgent: false,
+        });
+      }
+    }
+
+    // A matured backstop exit. The one that costs something to ignore.
+    if (poolDeployment) {
+      for (const a of poolDeployment.assets) {
+        const queued = (await read<bigint>(
+          poolDeployment.poolAddress, tesseraPoolAbi, "backstopQueued", [a.address as Hex, who])) ?? 0n;
+        if (queued === 0n) continue;
+        const unlockAt = Number((await read<bigint>(
+          poolDeployment.poolAddress, tesseraPoolAbi, "backstopUnlockAt", [a.address as Hex, who])) ?? 0n);
+        const ready = unlockAt > 0 && Date.now() / 1000 >= unlockAt;
+        items.push({
+          kind: "backstopExit",
+          label: ready ? `Backstop exit ready — ${a.symbol}` : `Backstop exit unlocks soon — ${a.symbol}`,
+          amount: formatUnits(queued, 18), symbol: "shares",
+          route: "defi", urgent: ready,
+          note: ready
+            ? "Until you withdraw it, this is still taking the first loss."
+            : `Unlocks ${new Date(unlockAt * 1000).toISOString()}`,
+        });
+      }
+    }
+
+    res.json({
+      ok: true,
+      user: who,
+      count: items.length,
+      urgent: items.filter((i) => i.urgent).length,
+      items,
+    });
+  });
+
+  /**
    * What the market says TSRA is worth, and whether that is worth hearing.
    *
    * The service-fee contract prices top-ups from a number an operator sets, and

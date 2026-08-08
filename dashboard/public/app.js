@@ -144,6 +144,9 @@ const $ = (id) => document.getElementById(id);
           // Governance reads a loop of contract calls, so it loads on arrival
           // rather than on every poll of every other tab.
           if (route === "agents" && typeof loadFeeCredit === "function") loadFeeCredit().catch(() => {});
+          // On arrival rather than on a poll: it is a loop of contract reads,
+          // and nothing it reports changes second to second.
+          if (route === "dashboard" && typeof loadClaimables === "function") loadClaimables().catch(() => {});
           if (route === "gov" && typeof setGovTab === "function") setGovTab(govTab);
         }
         // The document title is now the only "where am I" indicator besides the
@@ -4635,6 +4638,59 @@ const $ = (id) => document.getElementById(id);
        * what is listed. Only the visible one loads, which also stops the tab
        * from firing six loops of contract reads on arrival.
        */
+      /* ---- What is waiting for you -------------------------------------------
+       *
+       * Every one of these was already somewhere on the site. The question
+       * nobody could answer was "is there anything", because answering it meant
+       * knowing which four panels to open — so it went unasked and rewards sat.
+       *
+       * The card hides itself entirely when there is nothing, because a
+       * permanent empty box is a box people stop reading, and this needs to
+       * still be noticed on the day it says something urgent.
+       */
+      async function loadClaimables() {
+        const card = $("claimCard"), list = $("claimList");
+        if (!card || !list) return;
+        const who = String(window.__myAddress || "");
+        if (!/^0x[0-9a-fA-F]{40}$/.test(who)) { card.style.display = "none"; return; }
+        try {
+          const r = await (await fetch("/api/claimables?user=" + encodeURIComponent(who))).json();
+          if (!r || !r.ok || !r.items || !r.items.length) { card.style.display = "none"; return; }
+          card.style.display = "";
+          list.innerHTML = "";
+          for (const it of r.items) {
+            const row = document.createElement("div");
+            row.className = "kv";
+            row.style.cssText =
+              "display:flex;justify-content:space-between;gap:12px;align-items:center;" +
+              "border:1px solid var(--line);border-radius:8px;padding:9px 11px" +
+              (it.urgent ? ";border-color:var(--warn,#c47)" : "");
+            const left = document.createElement("div");
+            left.innerHTML =
+              "<b>" + esc(it.label) + "</b>" +
+              (it.note ? '<div style="font-size:11.5px;color:var(--muted);margin-top:3px">' + esc(it.note) + "</div>" : "");
+            const right = document.createElement("div");
+            right.style.cssText = "text-align:right;white-space:nowrap";
+            right.innerHTML =
+              "<div><b>" + esc(it.amount) + "</b> " + esc(it.symbol) + "</div>";
+            const go = document.createElement("button");
+            go.className = "btn ghost";
+            go.style.marginTop = "4px";
+            go.textContent = "Go";
+            go.addEventListener("click", () => navigate(it.route));
+            right.appendChild(go);
+            row.appendChild(left);
+            row.appendChild(right);
+            list.appendChild(row);
+          }
+        } catch {
+          card.style.display = "none";
+        }
+      }
+      // Bound directly rather than through the builder's helper, which is
+      // declared further down and would still be in its temporal dead zone here.
+      if ($("claimRefresh")) $("claimRefresh").addEventListener("click", () => loadClaimables());
+
       /* ---- The proposal builder --------------------------------------------
        *
        * A proposal that changes something needs calldata, and calldata written
