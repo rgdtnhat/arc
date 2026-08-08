@@ -48,6 +48,16 @@ jobs:
       - name: End-to-end — the whole loop against a throwaway chain
         run: npm run e2e
 
+      # A migration script that has never run is not a migration script. This
+      # deploys a small protocol configured away from every default, drives
+      # `redeploy:pool` at it through its real CLI, and reads the chain back:
+      # carried risk parameters, both sides of the price-guard gate, the
+      # emissions chain, an earned balance surviving the move, the freeze mask,
+      # and the `supplyFor` handoff. Without it the script silently rots — it is
+      # only ever run by hand, on the day it matters most.
+      - name: Rehearse the pool redeploy against a throwaway chain
+        run: npm run rehearse:redeploy
+
       - name: Agent unit tests (decision engine, guardian, memory, agentkit, wallet, treasury, fleet)
         run: npm test --workspace agent
 
