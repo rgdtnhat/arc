@@ -1,73 +1,77 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { withGasMargin } from "@tessera/shared";
+import { gasWithMargin, withGasMargin } from "@tessera/shared";
 
 /**
  * The wrapper exists because a fix applied per-call-site is a fix somebody
- * forgets at the eighteenth call site. So what is tested here is mostly the
- * edges: that an explicit limit still wins, that a failed estimate does not
- * turn a clear revert into an out-of-gas, and that the margin is actually
- * applied rather than the estimate passed through.
+ * forgets at the eighteenth call site. The arithmetic is tested directly; the
+ * wrapper is tested for the two things that are easy to get wrong around it —
+ * respecting a caller's own limit, and not writing anything back into the
+ * caller's object.
  */
+
+test("adds half again plus a floor to the estimate", () => {
+  assert.equal(gasWithMargin(200_000n), 350_000n);
+});
+
+test("gives a tiny estimate real headroom rather than a tiny margin", () => {
+  // 21,000 × 1.5 is 31,500 — under a single cold SSTORE's worth of slack. The
+  // floor is what makes the margin mean anything at the small end.
+  assert.ok(gasWithMargin(21_000n) >= 80_000n);
+});
+
+test("honours a caller's own ratio and floor", () => {
+  assert.equal(gasWithMargin(100_000n, { numerator: 2n, denominator: 1n, floor: 0n }), 200_000n);
+});
 
 /** A wallet client stub with just enough shape for `.extend()`. */
 function fakeWallet() {
-  const sent: Record<string, unknown>[] = [];
   const client: Record<string, unknown> = {
     account: { address: "0x1111111111111111111111111111111111111111" },
-    sent,
     extend(fn: (c: unknown) => Record<string, unknown>) {
-      return { ...client, ...fn(client), sent };
+      return { ...client, ...fn(client) };
     },
   };
   return client;
 }
 
-/**
- * `writeContract` inside the wrapper calls viem's action directly, which a stub
- * cannot intercept — so these tests assert on what the wrapper *computed* by
- * reading the args object it mutates before dispatching.
- */
-async function gasFor(estimate: bigint | Error, given?: bigint) {
+const call = async (estimate: bigint | Error, args: Record<string, unknown>) => {
   const pub = {
-    // viem's estimateContractGas is imported by the module, so it is exercised
-    // through a public client that answers the underlying request.
     request: async () => (estimate instanceof Error ? Promise.reject(estimate) : `0x${estimate.toString(16)}`),
   };
   const wallet = withGasMargin(fakeWallet() as never, pub as never);
-  const args: Record<string, unknown> = {
-    address: "0x2222222222222222222222222222222222222222",
-    abi: [{ type: "function", name: "poke", stateMutability: "nonpayable", inputs: [], outputs: [] }],
-    functionName: "poke",
-    args: [],
-    ...(given === undefined ? {} : { gas: given }),
-  };
-  // The dispatch will fail against a stub transport; the mutation happens first.
+  // The dispatch fails against a stub transport; what matters is what the
+  // wrapper did to `args` on the way there.
   await (wallet as unknown as { writeContract(a: unknown): Promise<unknown> }).writeContract(args).catch(() => {});
-  return args.gas as bigint | undefined;
-}
+};
 
-test("adds half again plus a floor to the estimate", async () => {
-  // 200,000 → 300,000 + 50,000.
-  assert.equal(await gasFor(200_000n), 350_000n);
+const baseArgs = () => ({
+  address: "0x2222222222222222222222222222222222222222",
+  abi: [{ type: "function", name: "poke", stateMutability: "nonpayable", inputs: [], outputs: [] }],
+  functionName: "poke",
+  args: [],
 });
 
-test("an explicit limit wins, because the caller knows more than we do", async () => {
-  assert.equal(await gasFor(200_000n, 123_456n), 123_456n);
-});
-
-test("leaves the limit unset when the estimate fails", async () => {
+test("never writes a limit back into the caller's arguments", async () => {
   /*
-   * A call that will not estimate will not send either. Inventing a limit here
-   * would replace a clear revert reason with an out-of-gas, which is strictly
-   * harder to debug than the error it hid.
+   * The bug this replaced. Setting `gas` on the caller's object means a retry
+   * with that same object arrives already carrying a limit, so the wrapper
+   * skips re-estimation and sends the stale figure — the "shade too small"
+   * failure it exists to prevent, on the one path where it matters most.
    */
-  assert.equal(await gasFor(new Error("execution reverted")), undefined);
+  const args = baseArgs() as Record<string, unknown>;
+  await call(200_000n, args);
+  assert.equal(args.gas, undefined);
 });
 
-test("gives a tiny estimate real headroom rather than a tiny margin", async () => {
-  // 21,000 × 1.5 is 31,500 — still under a single cold SSTORE's worth of slack.
-  // The floor is what makes the margin meaningful at the small end.
-  const g = (await gasFor(21_000n))!;
-  assert.ok(g >= 80_000n, `expected real headroom, got ${g}`);
+test("an explicit limit is left alone, because the caller knows more than we do", async () => {
+  const args = { ...baseArgs(), gas: 123_456n } as Record<string, unknown>;
+  await call(200_000n, args);
+  assert.equal(args.gas, 123_456n);
+});
+
+test("a failed estimate is not replaced with an invented limit", async () => {
+  const args = baseArgs() as Record<string, unknown>;
+  await call(new Error("execution reverted"), args);
+  assert.equal(args.gas, undefined);
 });

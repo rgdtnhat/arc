@@ -37,34 +37,54 @@ export interface GasMarginOptions {
   floor?: bigint;
 }
 
+/**
+ * The estimate plus its margin.
+ *
+ * Exported and pure so the arithmetic can be tested for what it is, rather than
+ * inferred from a mutated argument object — which is how the first version of
+ * this was checked, and which only worked *because* of the mutation bug below.
+ */
+export function gasWithMargin(estimate: bigint, opts: GasMarginOptions = {}): bigint {
+  const numerator = opts.numerator ?? 3n;
+  const denominator = opts.denominator ?? 2n;
+  const floor = opts.floor ?? 50_000n;
+  return (estimate * numerator) / denominator + floor;
+}
+
 export function withGasMargin<T extends WalletClient>(
   wallet: T,
   pub: PublicClient,
   opts: GasMarginOptions = {},
 ): T {
-  const numerator = opts.numerator ?? 3n;
-  const denominator = opts.denominator ?? 2n;
-  const floor = opts.floor ?? 50_000n;
-
   return wallet.extend((client) => ({
     async writeContract(args: Parameters<typeof writeContractAction>[1]) {
       const a = args as { gas?: bigint; account?: unknown };
-      if (a.gas === undefined) {
-        try {
-          const estimate = await estimateContractGas(pub, {
-            ...(args as object),
-            account: a.account ?? (client as { account?: unknown }).account,
-          } as never);
-          (args as { gas?: bigint }).gas = (estimate * numerator) / denominator + floor;
-        } catch {
-          /*
-           * A call that will not estimate will not send either, and inventing a
-           * limit for it would replace a clear revert reason with an
-           * out-of-gas. Let `writeContract` produce the real error.
-           */
-        }
+      if (a.gas !== undefined) return writeContractAction(client as never, args as never);
+
+      let sending = args;
+      try {
+        const estimate = await estimateContractGas(pub, {
+          ...(args as object),
+          account: a.account ?? (client as { account?: unknown }).account,
+        } as never);
+        /*
+         * A *copy*, never the caller's object.
+         *
+         * Writing the limit back into the argument the caller passed means a
+         * retry with that same object arrives with `gas` already set, so this
+         * wrapper skips re-estimation and sends the stale figure — which is
+         * exactly the "limit that was a shade too small" failure it exists to
+         * prevent, reintroduced on the one path where it matters most.
+         */
+        sending = { ...(args as object), gas: gasWithMargin(estimate, opts) } as typeof args;
+      } catch {
+        /*
+         * A call that will not estimate will not send either, and inventing a
+         * limit for it would replace a clear revert reason with an
+         * out-of-gas. Let `writeContract` produce the real error.
+         */
       }
-      return writeContractAction(client as never, args as never);
+      return writeContractAction(client as never, sending as never);
     },
   })) as unknown as T;
 }

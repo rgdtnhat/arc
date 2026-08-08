@@ -32,7 +32,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
  * The count at the time the ratchet was installed, and the only direction it
  * may move. Lower it as call sites are converted.
  */
-const BUDGET = 35;
+const BUDGET = 34;
 
 /**
  * Patterns that turn a failure into a value.
@@ -48,15 +48,29 @@ const PATTERNS = [
   { re: /\.catch\(\(\)\s*=>\s*\[\]\s*as/g, what: "catch → []" },
 ];
 
+/**
+ * Strip comments before counting.
+ *
+ * A comment that *names* the pattern counted as an instance of it, so
+ * explaining the bug in the place it used to live made the number go up — and
+ * a scanner that penalises writing about the problem is a scanner that quietly
+ * discourages the documentation. It also made a real conversion invisible: one
+ * site was replaced and the total did not move, because the note left behind
+ * matched the regex.
+ *
+ * The `//` strip skips `://` so a URL in a string is not treated as a comment.
+ * That is crude, and safe here: the only cost of a wrong strip is not counting
+ * a pattern on that line, and the patterns never appear inside URLs.
+ */
+const stripComments = (src) =>
+  src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+
 const files = [];
 const walk = (dir) => {
   for (const name of readdirSync(dir)) {
     if (name === "node_modules" || name === "dist" || name.startsWith(".")) continue;
     const full = path.join(dir, name);
     if (statSync(full).isDirectory()) walk(full);
-    // The module that replaces this pattern also *documents* it, so its own
-    // prose would count against the budget it enforces.
-    else if (name === "chain-read.ts") continue;
     else if (/\.(ts|mts|mjs|js)$/.test(name) && !/\.test\./.test(name)) files.push(full);
   }
 };
@@ -72,7 +86,7 @@ for (const dir of ["agent/src", "shared/src", "providers/src"]) {
 let total = 0;
 const byFile = new Map();
 for (const file of files) {
-  const src = readFileSync(file, "utf8");
+  const src = stripComments(readFileSync(file, "utf8"));
   let n = 0;
   for (const { re } of PATTERNS) n += (src.match(re) ?? []).length;
   if (n > 0) {

@@ -6616,7 +6616,9 @@ async function main() {
      * the page tells them they are all clear.
      */
     const unreadable: string[] = [];
+    let attempted = 0;
     const read = async <T,>(address: Hex, abi: unknown, fn: string, args: unknown[] = []): Promise<T | null> => {
+      attempted++;
       const r = await chainRead<T>(client.public, address, abi, fn, args);
       if (!r.ok) {
         unreadable.push(r.why);
@@ -7048,8 +7050,21 @@ async function main() {
      * to see, which is the one moment it must not.
      */
     if (unreadable.length) {
-      add("reads.failed", "fail",
-        `${unreadable.length} contract read(s) failed — the checks above are incomplete`,
+      /*
+       * Proportional, not absolute.
+       *
+       * A public RPC drops the occasional call, and a monitor that goes red on
+       * one of them is a monitor somebody mutes inside a week — after which it
+       * reports nothing at all, which is worse than the silence it replaced.
+       * This endpoint went 503 on exactly that: one read out of fifty timed out
+       * during a burst, everything else was fine.
+       *
+       * The signal worth paging on is not "a call failed" but "I have lost the
+       * ability to see". A quarter of the reads failing is that; one is weather.
+       */
+      const share = unreadable.length / Math.max(1, attempted);
+      add("reads.failed", share > 0.25 ? "fail" : "warn",
+        `${unreadable.length} of ${attempted} contract read(s) failed — the checks above are incomplete`,
         unreadable.length);
     }
 
@@ -7256,10 +7271,21 @@ async function main() {
       // write endpoint is a spam endpoint, and the token is the cheapest
       // available proof of being a participant rather than a passer-by.
       if (tokenAddr) {
-        const bal = (await client.public
-          .readContract({ address: tokenAddr, abi: tesseraTokenAbi, functionName: "balanceOf", args: [author as Hex] })
-          .catch(() => 0n)) as bigint;
-        if (bal === 0n) {
+        /*
+         * Fail closed, but say which failure it was.
+         *
+         * A `.catch(() => 0n)` here refuses the post either way, which is the
+         * safe direction — but it told somebody holding plenty of TSRA that
+         * they had none, and sent them off to go and earn some. "We could not
+         * check" and "you have nothing" are different sentences and only one of
+         * them is ever true.
+         */
+        const bal = await chainRead<bigint>(client.public, tokenAddr, tesseraTokenAbi, "balanceOf", [author as Hex]);
+        if (!bal.ok) {
+          res.status(503).json({ ok: false, error: "could not check your TSRA balance just now — try again in a moment" });
+          return;
+        }
+        if (bal.value === 0n) {
           res.status(403).json({ ok: false, error: "posting needs a TSRA balance — earn some by supplying or providing liquidity" });
           return;
         }
