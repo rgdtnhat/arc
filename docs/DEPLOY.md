@@ -188,6 +188,71 @@ If a quote comes back with **no route**, the answer is liquidity in the pool, no
 inventory in the router — add it on the Liquidity pool tab, where it earns a
 share of every swap fee it goes on to serve.
 
+### Replacing only the lending pool
+
+There are three ways to move onto newer pool code, and picking the wrong one is
+expensive. They are not variants of each other:
+
+| Command | Replaces | Carries the live risk config | Moves positions |
+|---|---|---|---|
+| `pools:reset` | pool + vault + AMM + router | no — its own constants | yes |
+| `redeploy:pool` | pool + emissions, and rewires guard / emitter / gauge | **yes, read off the chain** | no |
+| `migrate:pool` | nothing | n/a | yes |
+
+`redeploy:pool` is the one to reach for when the *pool* is the problem and the
+rest of the protocol is fine. It reads every collateral factor, cap, rate curve,
+price feed and e-mode assignment off the pool that is live now and reproduces
+them on the replacement, so the only thing that changes is the code. `pools:reset`
+would instead apply the constants written into that script — which are how the
+pool *started*, not how it is running after every risk tweak since.
+
+```bash
+npm run redeploy:pool                              # survey: reads only, sends nothing
+npm run redeploy:pool -- --emitter=keep --execute
+npm run migrate:pool -- --from <old> --to <new> --execute
+```
+
+Three things it will refuse to do, each for the same reason — they are decisions
+rather than steps:
+
+- **Run without `--emitter=…`.** `TesseraEmitter.lendingPool` is `immutable` and
+  the emitter sizes every reward stream from that pool's `activityUsd()`. Pointed
+  at a retired pool it reads no activity, sets every rate to zero, and stops
+  emissions **without erroring** — the pages keep rendering. `--emitter=keep`
+  accepts that knowingly.
+- **`--emitter=replace`.** `TesseraToken` mints its whole supply to the emitter
+  named in its constructor and has no `mint`, so a replacement emitter can only
+  be filled by adding it as a sink on the current one and waiting out
+  `maxRatePerSecond`. That is a schedule, not a transaction.
+- **List an asset borrowable that the price guard does not band.** The script
+  asks the guard to price the asset 50% away from its mark; if the guard accepts
+  it, nothing is checking that price and the asset stays supply-only. Band it
+  first with `setPeg`.
+
+What it deliberately does *not* seal: the old pool is frozen against new supply
+and new borrowing (`FREEZE_SUPPLY | FREEZE_BORROW`), never against withdrawal or
+repayment. Anyone the migration cannot reach — an account with debt, or one a
+partial log scan missed — has to keep being able to get out and to settle up.
+
+`TesseraVault.pool` is `immutable` too and is left alone: its depositors keep
+earning from the old pool, which still holds their capital and still accrues.
+That is safe, but it means the vault's yield is now the retired pool's yield.
+
+Rehearse the whole thing against a throwaway chain first — it is part of
+`npm run verify`, and can be run on its own:
+
+```bash
+npm run rehearse:redeploy
+```
+
+It deploys a small protocol configured away from every default, runs the real
+script at it through its real CLI, then reads the chain back: risk parameters,
+caps, curves, the guard's verdict both before and after banding, the emissions
+chain, an earned reward balance surviving the move, the freeze mask, and the
+`supplyFor` handoff. The odd numbers in the fixture are the point — a carry-over
+that silently falls back to a default shows up as a mismatch instead of agreeing
+by coincidence.
+
 ### Resetting the pools onto the new contracts
 
 `router:deploy` gets swaps working against the AMM already deployed. It does not

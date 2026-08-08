@@ -38,3 +38,4 @@ deployments/arc.history.json
 # would pay every one of them a second time.
 deployments/reset-state.json
 .qa/
+deployments/.rehearsal.json
