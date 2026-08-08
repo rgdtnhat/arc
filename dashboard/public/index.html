@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v46" />
+    <meta name="tessera-shell" content="tessera-v47" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -455,6 +455,14 @@
       .metric .k { font-size: 11px; color: var(--muted); }
       .metric .v { font-size: 17px; font-weight: 700; letter-spacing: -0.015em; }
       .kv { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12.5px; min-width: 0; }
+      /*
+       * Muted prose. `.kv` is a *row* — flex, space-between — for a label and a
+       * value, and it was being used for paragraphs too. A paragraph with any
+       * inline markup in it then became several flex items pushed apart, so
+       * "…in proposals <i>and</i> in the market vote…" rendered as three
+       * columns with the word "and" stacked one letter per line.
+       */
+      .note { color: var(--muted); font-size: 12.5px; line-height: 1.55; }
       .pill {
         border: 1px solid var(--line-strong); background: var(--panel); color: var(--muted);
         padding: 5px 11px; border-radius: 999px; font-size: 12px; white-space: nowrap;
@@ -1895,7 +1903,9 @@
                 Live market and news feeds, alongside the agent's own pay-per-call operations.
               </span>
             </div>
-            <div class="sheetTabs tabDock" id="agTabs" role="tablist" style="border-bottom:0;padding:12px 0 0;margin:0 -2px">
+            </div>
+          <div class="card compact tabDock" style="padding:10px 14px">
+            <div class="sheetTabs" id="agTabs" role="tablist" style="border-bottom:0;padding:0;margin:0">
               <button class="sheetTab active" data-agtab="operations" role="tab">
                 <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M4 16.5 9 11l3.6 3.6L20 7"/><path d="M15.4 7H20v4.6"/>
@@ -2270,7 +2280,9 @@
                 TSRA decides where the emissions go, what is listed, and who speaks for whom.
               </span>
             </div>
-            <div class="sheetTabs tabDock" id="govTabs" role="tablist" style="border-bottom:0;padding:12px 0 0;margin:0 -2px">
+            </div>
+          <div class="card compact tabDock" style="padding:10px 14px">
+            <div class="sheetTabs" id="govTabs" role="tablist" style="border-bottom:0;padding:0;margin:0">
               <button class="sheetTab active" data-govtab="overview" role="tab">
                 <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7v6c0 4.4 3.4 7.6 8 8.6 4.6-1 8-4.2 8-8.6V7Z"/></svg></span>Overview
               </button>
@@ -2554,7 +2566,7 @@
           <div class="govPane" id="gov_delegates" hidden>
           <div class="card" id="govDelegateCard">
             <h2>Delegate your TSRA</h2>
-            <div class="kv" style="margin-bottom:10px">
+            <div class="note" style="margin-bottom:10px">
               One delegation covers both venues: whoever you point at votes your weight in proposals
               <i>and</i> in the market vote above. Point it at yourself to vote your own, or at somebody who
               follows these markets more closely than you do. Your tokens never leave your wallet, and you
@@ -2615,7 +2627,7 @@
               <input id="govEmUntil" class="field" type="date" style="width:165px" />
               <button class="btn primary" id="govEmSet">Set rate</button>
             </div>
-            <div class="kv" style="margin-top:9px">
+            <div class="note" style="margin-top:9px">
               The <b>backstop</b> is the position that absorbs a write-off before any supplier is touched, so it
               carries the real risk in the pool and should carry the largest stream of the three. Paying it the
               same as a supplier prices first loss at zero, and nobody takes it.

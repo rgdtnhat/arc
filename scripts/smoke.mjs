@@ -140,6 +140,76 @@ for (const tab of ["overview", "proposals", "markets", "delegates", "emissions",
   if (shown < 20) note("governance tabs", `${tab} pane rendered ${shown} characters after 10s`);
 }
 
+/*
+ * Do the sub-tab docks actually stay put?
+ *
+ * They are `position: sticky`, which only holds *within the parent's box* — so
+ * a dock nested inside a short card scrolls away with that card and looks
+ * exactly like a dock that was never sticky at all. That is what happened on
+ * governance and the agent workspace: the bar was marked sticky, the card
+ * around it was two lines tall, and the tabs left the screen immediately.
+ * Asserting the class is present would have passed throughout; only the
+ * position after a scroll tells the truth.
+ */
+current = "sticky tab docks";
+/*
+ * Whether the sub-tab bars stay reachable while you scroll.
+ *
+ * `position: sticky` only holds *within the parent's box*, so a dock nested
+ * inside a short card scrolls away with that card and behaves exactly like a
+ * dock that was never sticky. That is what happened on governance and the agent
+ * workspace: the bar carried the class, the card around it was two lines tall,
+ * and the tabs left the screen immediately. Asserting the class was present
+ * would have passed throughout — only the position after a real scroll tells
+ * the truth.
+ *
+ * The page is given its own height rather than relying on whatever the route
+ * happens to render: the agent workspace's height depends on live feeds, so a
+ * content-dependent version of this check flipped between catching the bug and
+ * reporting "nothing to scroll" run to run. A spacer makes it deterministic and
+ * tests the one property in question.
+ */
+for (const [route, sel] of [["gov", "#govTabs"], ["agents", "#agTabs"], ["defi", "#defiTabs"]]) {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${BASE}/#/${route}`, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1500);
+
+  const bar = page.locator(sel);
+  if (!(await bar.count())) { note("sticky tab docks", `${sel} is missing`); continue; }
+  const before = await bar.first().boundingBox();
+
+  await page.evaluate((s) => {
+    const el = document.querySelector(s);
+    const pane = el?.closest(".tabPane") ?? document.body;
+    const spacer = document.createElement("div");
+    spacer.id = "__smokeSpacer";
+    spacer.style.height = "2400px";
+    pane.appendChild(spacer);
+  }, sel);
+
+  // `behavior: "instant"` matters: the page sets `scroll-behavior: smooth`, so
+  // a plain scrollTo animates and reading scrollY on the next line returns the
+  // value from before it — which is how a first attempt concluded the page
+  // "did not scroll" on every route.
+  const startY = await page.evaluate(() => window.scrollY);
+  await page.evaluate(() => window.scrollTo({ top: 1200, behavior: "instant" }));
+  await page.waitForTimeout(500);
+  const moved = (await page.evaluate(() => window.scrollY)) - startY;
+
+  const after = await bar.first().boundingBox();
+  await page.evaluate(() => document.getElementById("__smokeSpacer")?.remove());
+
+  if (moved < 400) { note("sticky tab docks", `${route} would not scroll (${moved}px)`); continue; }
+  const visible = !!after && after.y >= -1 && after.y < 844 - 20;
+  if (!visible) {
+    note(
+      "sticky tab docks",
+      `${sel} left the screen after ${moved}px (y ${Math.round(before?.y ?? -1)} → ${after ? Math.round(after.y) : "gone"})`,
+    );
+  }
+}
+await page.setViewportSize({ width: 1280, height: 800 });
+
 // The proposal builder: does picking an action actually build its form?
 current = "proposal builder";
 const builder = page.locator("#govBuilderCard");
