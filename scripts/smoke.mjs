@@ -99,6 +99,26 @@ for (const route of ROUTES) {
   current = route;
   await page.goto(`${BASE}/${route === "home" ? "#" : "#/" + route}`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(1500);
+  /*
+   * Height, not word count.
+   *
+   * `innerText` reads a zero-height element perfectly well, so this check
+   * passed for weeks on a Treasury pane that rendered *nothing*: a missing
+   * `</div>` had nested it inside the Governance pane, which is `display:none`
+   * unless you are on Governance. Text said "there is content"; the screen said
+   * otherwise, and the screen was right.
+   */
+  const box = await page.evaluate((r) => {
+    const id = "pane" + r[0].toUpperCase() + r.slice(1);
+    const pane = document.getElementById(id);
+    if (!pane) return null;
+    const b = pane.getBoundingClientRect();
+    return { h: Math.round(b.height), text: pane.innerText.trim().length };
+  }, route);
+  if (route !== "home") {
+    if (!box) note(route, `no #pane element for this route`);
+    else if (box.h < 100) note(route, `pane has ${box.h}px of height (${box.text} chars of text) — it is not on screen`);
+  }
   const visible = await page.evaluate(() => document.body.innerText.trim().length);
   if (visible < 40) note(route, `rendered only ${visible} characters of text`);
   const arrived = await page.evaluate(

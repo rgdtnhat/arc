@@ -8242,6 +8242,19 @@ async function main() {
       // Only a password-based (admin) login can change a password.
       canChangePassword: id.kind === "admin",
       isOperator: id.kind === "admin",
+      /*
+       * The account an operator's actions actually move money from.
+       *
+       * An admin session has no browser wallet, so every "your position" panel
+       * — claimable rewards, supplied balances, your share of a pool — read an
+       * empty address and rendered zero. That looks like a broken page, and it
+       * is worse than that: an operator pressing Supply *does* take a position,
+       * through the agent's key, and then cannot see it anywhere.
+       *
+       * So the operator is told which address they are acting as. It is the
+       * same one the server signs with, so the page and the chain agree.
+       */
+      actingAs: id.kind === "admin" ? ((liveDeployment.agent as Hex) ?? client.account.address) : (id.address ?? null),
     });
   });
 

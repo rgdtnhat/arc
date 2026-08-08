@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v47" />
+    <meta name="tessera-shell" content="tessera-v49" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2616,15 +2616,22 @@
               indefinitely; set one and the stream stops on its own, so a campaign cannot outlive the
               intention behind it because nobody remembered to switch it off.
             </div>
-            <div class="row-actions" style="flex-wrap:wrap">
-              <select id="govEmAsset" class="field"></select>
-              <select id="govEmSide" class="field">
+            <!-- Labelled, because an empty `type="date"` renders as an unmarked
+                 box with a chevron and nothing to say what it is. The prose above
+                 explains the end date; a form field has to explain itself where
+                 it stands. -->
+            <div class="sheetFilters" style="padding-bottom:0">
+              <label>Asset<select id="govEmAsset" class="field"></select></label>
+              <label>Side<select id="govEmSide" class="field">
                 <option value="0">Supply side</option>
                 <option value="1">Borrow side</option>
                 <option value="2">Backstop (first loss)</option>
-              </select>
-              <input id="govEmRate" class="field" inputmode="decimal" placeholder="Tokens / second" style="width:150px" />
-              <input id="govEmUntil" class="field" type="date" style="width:165px" />
+              </select></label>
+              <label>Rate<input id="govEmRate" class="field" inputmode="decimal" placeholder="Tokens / second" /></label>
+              <label>Runs until <span style="text-transform:none">(optional — empty means no end)</span>
+                <input id="govEmUntil" class="field" type="date" /></label>
+            </div>
+            <div class="row-actions" style="margin-top:10px">
               <button class="btn primary" id="govEmSet">Set rate</button>
             </div>
             <div class="note" style="margin-top:9px">
@@ -2718,7 +2725,10 @@
               <div class="msg" id="regMsg" style="display:none"></div>
             </div>
           </div>
-          </div>
+          </div><!-- /gov_registry -->
+        </div><!-- /#paneGov -->
+
+        <!-- ---------- TREASURY & SYSTEM ---------- -->
         <div class="tabPane" id="paneOther" hidden>
           <div class="card">
             <h2>Treasury &amp; faucet — working capital</h2>

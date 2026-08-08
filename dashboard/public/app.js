@@ -7178,6 +7178,19 @@ const $ = (id) => document.getElementById(id);
           const p = await (await fetch("/api/profile", { headers: authHeaders() })).json();
           if (!p.ok) throw new Error("no session");
           profileState = p;
+          /*
+           * An operator with no browser wallet still holds a position — the
+           * agent's. Without this every "yours" panel read an empty address and
+           * showed zero, so pressing Supply as an operator took a real position
+           * that the page then insisted did not exist.
+           *
+           * A connected wallet always wins: if somebody has one, that is who
+           * they are, and the operator session is only how they authenticate.
+           */
+          if (!window.__myAddress && p.actingAs) {
+            window.__myAddress = p.actingAs;
+            if (typeof loadClaimables === "function") loadClaimables().catch(() => {});
+          }
           if (wrap) wrap.style.display = "inline-block";
           $("profileLabel").textContent = p.name || (p.kind === "admin" ? "Operator" : short(p.address));
           $("profileWho").textContent = p.kind === "admin" ? "Signed in as operator" : "Wallet " + short(p.address);
