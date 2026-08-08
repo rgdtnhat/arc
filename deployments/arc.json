@@ -7,8 +7,10 @@
   "agent": "0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4",
   "provider": "0xa5b42b3Ebe7FDB187c956D310f868960015d2988",
   "deployedAt": "2026-07-17T06:22:37.721Z",
-  "tesseraPool": "0x4e7d2a132c048a09e561679f41e86fa2e898fdc2",
-  "tesseraEmissions": "0xb0527fe67263aab6471daa886e5f099d7cf4b737",
+  "tesseraPool": "0x6b11ef0b1daed7af08106bc9015cd83bdd963bfc",
+  "tesseraPoolLegacy": "0x4e7d2a132c048a09e561679f41e86fa2e898fdc2",
+  "tesseraEmissions": "0x49045fb56f86ba901c68ecfe7adb7c236daf2261",
+  "tesseraEmissionsLegacy": "0xb0527fe67263aab6471daa886e5f099d7cf4b737",
   "tesseraToken": "0x8bb6bca8cb41147844a58327603eeab433f407b0",
   "tesseraEmitter": "0x408e0522487aec34a85b97c7a01be920b555d159",
   "tesseraGovernor": "0x4e38a6ae1ff04f9cd5780f52e35dfec612e32ceb",
@@ -43,7 +45,7 @@
       "symbol": "TSRA",
       "address": "0x8BB6bCa8CB41147844A58327603Eeab433f407b0",
       "decimals": 18,
-      "borrowable": false
+      "borrowable": true
     }
   ],
   "tesseraAssetRegistry": "0x3375b12aa06449e0cc9ec369ac353e5e17f8ce34",
@@ -51,11 +53,12 @@
   "tesseraGovernorLegacy": "0x5cbd33263935471220a469527f50e47eae1fbb6e",
   "tesseraKeeper": "0xf43e9057bffd74a933e6cef36c29da3220971889",
   "tesseraProviderStake": "0xacf4dbcab0bedebfe56234f2e92ff49b794c19bc",
-  "tesseraEmissionsLegacy": "0x4574c356a57bf2daccac61e42da4d734865a34c4",
+  "tesseraEmissionsPrior": "0x4574c356a57bf2daccac61e42da4d734865a34c4",
   "tesseraKeeperLegacy": "0x00b083e1ec66006d21e37be43efa462689da9968",
   "tesseraTwapOracle": "0xa142f425a678f76690f4e2457d14dcf9ab8adc94",
   "tesseraTimelock": "0x4b8100876e377cfea66ded7d38c5fc3654dd4c1d",
   "tesseraPriceGuard": "0x8a73f2967c478a01673744d9291ba8593e0962cb",
   "tesseraOracle": "0x70F7C48a420EBF6C8eC2E57b2A73EC28A33Ba6F3",
-  "tesseraPriceGuardLegacy": "0x2809b689299974769b8b82e2884f832c986a02c0"
+  "tesseraPriceGuardLegacy": "0x2809b689299974769b8b82e2884f832c986a02c0",
+  "redeployedAt": "2026-08-08T16:13:00.000Z"
 }

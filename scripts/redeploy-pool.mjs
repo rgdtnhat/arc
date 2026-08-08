@@ -575,12 +575,24 @@ async function main() {
 
   // --- 7. what is left ------------------------------------------------------
   console.log(`\n[7] what this did not do\n`);
+  /*
+   * This paragraph used to say activity falls to zero and every rate with it.
+   * It was corrected in the header and in the `--emitter` gate, and missed
+   * here — which is the one an operator actually reads, at the end of a run
+   * they have just committed to. Measured on the live chain immediately after a
+   * real redeploy: activityUsd 2456660056 ($24.57) and currentRatePerSecond
+   * 0.0246 TSRA/s, both unchanged. The old pool keeps its deposits, and
+   * `lendingActivityUsd` measures balances rather than flow.
+   */
   console.log(
     `  emitter  ${dep.tesseraEmitter}\n` +
-      `           immutable pool address, and the TSRA supply is inside it. It will now\n` +
-      `           measure the retired pool, so activityUsd() → 0 and every emission rate\n` +
-      `           it drives falls to zero. The streams carried above keep paying only for\n` +
-      `           as long as the pot lasts. Plan the emitter replacement separately.`,
+      `           immutable pool address, and the TSRA supply is inside it. It goes on\n` +
+      `           measuring the RETIRED pool — which keeps every deposit, because the\n` +
+      `           freeze stops new supply rather than pushing anyone out, and activity is\n` +
+      `           measured as balances not flow. So emissions keep paying at today's rate.\n` +
+      `           What stops is growth: deposits into the new pool never reach the emitter,\n` +
+      `           so the rate is frozen at whatever the old pool holds. Replace it when that\n` +
+      `           starts to matter, not tonight.`,
   );
   console.log(
     `  vault    ${dep.tesseraVault ?? "(none)"}\n` +
