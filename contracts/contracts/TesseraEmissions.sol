@@ -28,6 +28,10 @@ interface IEmissionsPool {
         );
 }
 
+interface IEmissionsPrior {
+    function claimable(address user, address asset, uint8 side) external view returns (uint256);
+}
+
 interface IEmissionsERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -187,6 +191,18 @@ contract TesseraEmissions is ReentrancyGuard {
     address[] public streamedAssets;
     mapping(address => bool) private listed;
 
+    /**
+     * The contract this one replaces, if any.
+     *
+     * Set once at deployment. Anything a holder had earned there can be carried
+     * across by `migrate` — see the note on it for why a redeployment should
+     * never have cost anybody a balance in the first place.
+     */
+    IEmissionsPrior public prior;
+    /// prior => user => asset => side, so a balance can only be carried once.
+    mapping(address => mapping(address => mapping(uint8 => bool))) public migrated;
+    uint256 public totalMigrated;
+
     /// Owed and not yet paid. Lets anyone compare the promise to the balance.
     uint256 public totalOwed;
     /// Paid out over the contract's life, for the same reason.
@@ -202,8 +218,12 @@ contract TesseraEmissions is ReentrancyGuard {
     error TransferFailed();
     error NothingToClaim();
     error LengthMismatch();
+    error NoPrior();
+    error AlreadyMigrated();
 
     event OwnerSet(address indexed owner);
+    event Migrated(address indexed user, address indexed asset, uint8 indexed side, uint256 amount);
+    event PriorSet(address indexed prior);
     event RateSetterSet(address indexed setter);
     event PausedSet(bool paused);
     event RewardTokenSet(address indexed token);
@@ -238,6 +258,68 @@ contract TesseraEmissions is ReentrancyGuard {
         if (next == address(0)) revert ZeroAddress();
         owner = next;
         emit OwnerSet(next);
+    }
+
+    /**
+     * @notice Name the contract this one replaces, once.
+     *
+     * Deliberately one-way: a pointer an owner could move is a pointer they
+     * could aim at a contract that reports whatever balance they like.
+     */
+    function setPrior(address prior_) external onlyOwner {
+        if (address(prior) != address(0)) revert AlreadyMigrated();
+        if (prior_ == address(0)) revert ZeroAddress();
+        prior = IEmissionsPrior(prior_);
+        emit PriorSet(prior_);
+    }
+
+    /**
+     * @notice Carry a balance across from the contract this one replaced.
+     *
+     * This contract has been redeployed three times — for a pause, for a
+     * corrected pool address, for a third side — and each time the balances
+     * people had earned stayed behind on a contract with an empty pot. Every
+     * one of those was defensible on its own and the pattern was not: an
+     * upgrade should not cost a user their reward.
+     *
+     * Permissionless, and callable for anybody, because a migration that only
+     * the earner can trigger is a migration most people never hear about. It
+     * reads what the old contract *itself* says is owed, so nothing here
+     * depends on the operator's arithmetic, and the flag makes a second
+     * attempt a no-op rather than a doubling.
+     *
+     * The debt lands in `totalOwed` like any other, which means it is honoured
+     * out of the same pot in the same order — a migrated balance is a real
+     * claim, not an IOU with different rules.
+     */
+    function migrate(address user, address asset, uint8 side) public returns (uint256 amount) {
+        if (address(prior) == address(0)) revert NoPrior();
+        if (side > SIDE_BACKSTOP) revert BadSide();
+        if (migrated[user][asset][side]) return 0;
+        migrated[user][asset][side] = true;
+
+        // A prior that will not answer carries nothing rather than reverting,
+        // so one dead stream cannot block a batch.
+        try prior.claimable(user, asset, side) returns (uint256 owed) {
+            amount = owed;
+        } catch {
+            return 0;
+        }
+        if (amount == 0) return 0;
+
+        positions[asset][side][user].accrued += amount;
+        totalOwed += amount;
+        totalMigrated += amount;
+        emit Migrated(user, asset, side, amount);
+    }
+
+    /// @notice Carry several balances across in one transaction.
+    function migrateMany(address user, address[] calldata assets, uint8[] calldata sides)
+        external
+        returns (uint256 total)
+    {
+        if (assets.length != sides.length) revert LengthMismatch();
+        for (uint256 i = 0; i < assets.length; i++) total += migrate(user, assets[i], sides[i]);
     }
 
     /// @notice Appoint (or, with the zero address, remove) the gauge.

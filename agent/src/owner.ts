@@ -40,6 +40,27 @@ export class OwnerClient {
     return key ? new OwnerClient(chain, rpcUrl, key) : null;
   }
 
+  /**
+   * How much more gas to send than the node says is needed.
+   *
+   * `eth_estimateGas` binary-searches for a limit the call survives, and a
+   * limit that *just* survives the search is not always a limit that survives
+   * execution. The emitter is where this bites: its activity views wrap every
+   * reserve read in `try/catch`, and a `try` forwards only 63/64 of the gas
+   * remaining, so the last inner call in a chain can come up short at exactly
+   * the estimated limit while a slightly looser one sails through.
+   *
+   * Two live transactions were mined with `gasUsed` exactly equal to their
+   * limit before this existed — a retired sink weight and the keeper's first
+   * round — and both succeeded on the next attempt using *less* gas than the
+   * estimate, once there was headroom for the search to be a little wrong.
+   * Unspent gas is refunded, so the only cost of the margin is a higher
+   * up-front balance requirement.
+   */
+  private static readonly GAS_NUMERATOR = 3n;
+  private static readonly GAS_DENOMINATOR = 2n;
+  private static readonly GAS_FLOOR = 50_000n;
+
   private async send(address: Hex, abi: unknown, functionName: string, args: unknown[]): Promise<Hex> {
     const { request } = await this.pub.simulateContract({
       address,
@@ -48,9 +69,28 @@ export class OwnerClient {
       args: args as never,
       account: this.account,
     });
-    const hash = await this.wallet.writeContract(request as never);
+    const gas = await this.gasFor(address, abi, functionName, args);
+    const hash = await this.wallet.writeContract({ ...(request as object), ...(gas ? { gas } : {}) } as never);
     await confirm(this.pub, hash);
     return hash;
+  }
+
+  /** The estimate plus its margin, or null if the node will not estimate. */
+  private async gasFor(address: Hex, abi: unknown, functionName: string, args: unknown[]): Promise<bigint | null> {
+    try {
+      const est = await this.pub.estimateContractGas({
+        address,
+        abi: abi as never,
+        functionName: functionName as never,
+        args: args as never,
+        account: this.account,
+      });
+      return (est * OwnerClient.GAS_NUMERATOR) / OwnerClient.GAS_DENOMINATOR + OwnerClient.GAS_FLOOR;
+    } catch {
+      // A call that will not estimate will not send either; let `writeContract`
+      // produce the real error rather than inventing a limit for it.
+      return null;
+    }
   }
 
   /**

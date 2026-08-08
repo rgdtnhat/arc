@@ -27,6 +27,8 @@ import {
   tesseraGovernorAbi,
   tesseraTokenAbi,
   tesseraEmitterAbi,
+  tesseraKeeperAbi,
+  tesseraProviderStakeAbi,
   tesseraRateLimiterAbi,
   tesseraTabAbi,
   ARC_USDC_ADDRESS,
@@ -4934,14 +4936,18 @@ async function main() {
       for (const who of targets) {
         const stale: { asset: Hex; side: number }[] = [];
         for (const asset of assets) {
-          for (const side of [0, 1]) {
+          // Backstop (side 2) counts here as much as the other two: it carries
+          // the highest rate, and a depositor who is never checkpointed against
+          // it earns nothing at all from the side that takes the first loss.
+          for (const side of [0, 1, 2]) {
             try {
               const [, recorded] = (await client.public.readContract({
                 address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "positions", args: [asset, side, who],
               })) as readonly [bigint, bigint, bigint];
               const live = (await client.public.readContract({
                 address: poolDeployment.poolAddress, abi: tesseraPoolAbi,
-                functionName: side === 0 ? "supplyShares" : "borrowShares", args: [asset, who],
+                functionName: side === 0 ? "supplyShares" : side === 1 ? "borrowShares" : "backstopShares",
+                args: [asset, who],
               })) as bigint;
               // Nothing on either side of the comparison means nothing to do;
               // a difference means the books and the position disagree.
@@ -6214,7 +6220,162 @@ async function main() {
         gauge: (liveDeployment.tesseraGauge as Hex) ?? null,
         assetRegistry: (liveDeployment.tesseraAssetRegistry as Hex) ?? null,
         serviceFees: (liveDeployment.tesseraServiceFees as Hex) ?? null,
+        emissions: (liveDeployment.tesseraEmissions as Hex) ?? null,
+        keeper: (liveDeployment.tesseraKeeper as Hex) ?? null,
+        providerStake: (liveDeployment.tesseraProviderStake as Hex) ?? null,
       },
+    });
+  });
+
+  /**
+   * Is the protocol's upkeep actually being done?
+   *
+   * Every operational failure this codebase has had looked identical from the
+   * outside: every page rendered, every number formatted, and something that
+   * was supposed to happen on a timer had silently stopped. Rewards accrued as
+   * debts against a pot nobody had funded. Suppliers earned nothing because
+   * nobody had ever checkpointed them. A build succeeded against code that had
+   * not been pulled.
+   *
+   * None of those are detectable by asking "did the request return 200". They
+   * are detectable by asking "when did this last happen, and how long ago is
+   * too long" — which is what this endpoint is. Each check carries its own
+   * threshold and reports `ok`, `warn` or `fail`, so a monitor can page on it
+   * without knowing anything about emissions schedules.
+   *
+   * Deliberately unauthenticated: it names no balances and no addresses beyond
+   * the contracts, and an alerting endpoint that needs a login is an alerting
+   * endpoint nobody wires up.
+   */
+  app.get("/api/health/protocol", async (_req, res) => {
+    type Level = "ok" | "warn" | "fail";
+    type Check = { name: string; status: Level; detail: string; value?: number | string | null };
+    const checks: Check[] = [];
+    const add = (name: string, status: Level, detail: string, value?: number | string | null) =>
+      checks.push({ name, status, detail, value: value ?? null });
+    const nowSec = Math.floor(Date.now() / 1000);
+    const ago = (t: number) => (t <= 0 ? "never" : `${Math.floor((nowSec - t) / 60)} min ago`);
+
+    const read = async <T,>(address: Hex, abi: unknown, fn: string, args: unknown[] = []): Promise<T | null> => {
+      try {
+        return (await client.public.readContract({
+          address, abi: abi as never, functionName: fn as never, args: args as never,
+        })) as T;
+      } catch {
+        return null;
+      }
+    };
+
+    const keeperAddr = (liveDeployment.tesseraKeeper as Hex) ?? null;
+
+    // --- the emitter: is the schedule being turned? ------------------------
+    if (emitterAddr) {
+      const last = Number((await read<bigint>(emitterAddr, tesseraEmitterAbi, "lastRelease")) ?? 0n);
+      const stale = nowSec - last;
+      add(
+        "emitter.release",
+        last === 0 ? "warn" : stale > 6 * 3600 ? "fail" : stale > 3600 ? "warn" : "ok",
+        `last release ${ago(last)}`,
+        last,
+      );
+
+      // Tokens owed to sinks that have not been handed over yet. Small is
+      // normal; large and growing means nobody is distributing.
+      const count = Number((await read<bigint>(emitterAddr, tesseraEmitterAbi, "sinkCount")) ?? 0n);
+      let undelivered = 0n;
+      for (let i = 0; i < count; i++) {
+        undelivered += (await read<bigint>(emitterAddr, tesseraEmitterAbi, "pendingOf", [BigInt(i)])) ?? 0n;
+      }
+      const tokens = Number(undelivered) / 1e18;
+      add(
+        "emitter.undelivered",
+        tokens > 500 ? "fail" : tokens > 100 ? "warn" : "ok",
+        `${tokens.toFixed(2)} TSRA released but not yet handed to sinks`,
+        Number(tokens.toFixed(6)),
+      );
+    }
+
+    // --- the keeper: could somebody turn it, and did they? -----------------
+    if (keeperAddr) {
+      const preview = await read<readonly [bigint, bigint, bigint, bigint, bigint]>(
+        keeperAddr, tesseraKeeperAbi, "previewPoke");
+      const lastPoke = Number((await read<bigint>(keeperAddr, tesseraKeeperAbi, "lastPokedAt")) ?? 0n);
+      const rounds = Number((await read<bigint>(keeperAddr, tesseraKeeperAbi, "rounds")) ?? 0n);
+      if (preview) {
+        add("keeper.ready", "ok",
+          `${preview[0]} sink(s) worth ${(Number(preview[1]) / 1e18).toFixed(2)} TSRA; a round needs ${preview[4]} gas`,
+          Number(preview[0]));
+        // A tip jar that cannot pay is a keeper nobody outside will run.
+        const jar = liveDeployment.tesseraToken
+          ? (await read<bigint>(liveDeployment.tesseraToken as Hex, erc20Abi, "balanceOf", [keeperAddr])) ?? 0n
+          : 0n;
+        const bounty = (await read<bigint>(keeperAddr, tesseraKeeperAbi, "bounty")) ?? 0n;
+        const roundsLeft = bounty > 0n ? Number(jar / bounty) : 0;
+        add("keeper.bounty", roundsLeft < 10 ? "warn" : "ok",
+          `tip jar covers ${roundsLeft} more round(s)`, roundsLeft);
+      }
+      add("keeper.lastPoke", rounds === 0 ? "warn" : "ok",
+        `${rounds} round(s), last ${ago(lastPoke)}`, lastPoke);
+    }
+
+    // --- emissions: is what people are owed actually backed? ---------------
+    for (const [label, addr, abi] of [
+      ["lending", emissionsAddr, tesseraEmissionsAbi],
+      ["amm", lpEmissionsAddr, tesseraLpEmissionsAbi],
+    ] as const) {
+      if (!addr) continue;
+      const owed = (await read<bigint>(addr, abi, "totalOwed")) ?? 0n;
+      const held = liveDeployment.tesseraToken
+        ? (await read<bigint>(liveDeployment.tesseraToken as Hex, erc20Abi, "balanceOf", [addr])) ?? 0n
+        : 0n;
+      /*
+       * The failure that started all of this: a claim page that says you are
+       * owed 322 TSRA, and a contract holding none of them. Everything renders;
+       * the first person to press Claim finds out.
+       */
+      add(`emissions.${label}.backing`,
+        held >= owed ? "ok" : held * 2n >= owed ? "warn" : "fail",
+        `${(Number(held) / 1e18).toFixed(2)} TSRA held against ${(Number(owed) / 1e18).toFixed(2)} owed`,
+        owed > 0n ? Number((held * 10000n) / owed) / 100 : 100);
+
+      /*
+       * Runway is pot ÷ rate, and it ignores the fact that the emitter tops
+       * these pots up on every distribute. So a short runway is the normal
+       * resting state of a healthy contract, not a fault — a first version of
+       * this check failed at under a day and cried wolf immediately.
+       *
+       * What is a fault is a pot at zero while the streams are still running:
+       * that is accruing debt with nothing behind it, which is the exact shape
+       * of the original 322-TSRA-against-an-empty-pot failure.
+       */
+      const runway = Number((await read<bigint>(addr, abi, "runwaySeconds")) ?? 0n);
+      const rate = (await read<bigint>(addr, abi, "totalRatePerSecond")) ?? 0n;
+      const days = runway / 86400;
+      const streaming = rate > 0n;
+      add(`emissions.${label}.runway`,
+        streaming && runway === 0 ? "fail" : streaming && days < 0.25 ? "warn" : "ok",
+        !streaming
+          ? "no streams running"
+          : runway === 0
+            ? "streaming against an empty pot"
+            : `${days.toFixed(2)} day(s) before the next top-up is needed`,
+        Number(days.toFixed(3)));
+    }
+
+    // --- checkpoints: is anybody actually accruing? ------------------------
+    add("emissions.watched", "ok",
+      `${watched.size} address(es) kept settled (cap ${KEEPER_WATCH_MAX})`, watched.size);
+
+    const worst: Level = checks.some((c) => c.status === "fail")
+      ? "fail"
+      : checks.some((c) => c.status === "warn")
+        ? "warn"
+        : "ok";
+    res.status(worst === "fail" ? 503 : 200).json({
+      ok: worst !== "fail",
+      status: worst,
+      checkedAt: new Date().toISOString(),
+      checks,
     });
   });
 

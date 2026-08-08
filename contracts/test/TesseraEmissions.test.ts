@@ -455,4 +455,87 @@ describe("TesseraEmissions (rewards that cannot outrun the pot)", () => {
       expect(await f.em.read.totalRatePerSecond()).to.equal(RWD(7));
     });
   });
+
+  describe("carrying a balance across a redeployment", () => {
+    /*
+     * This contract has been redeployed three times — for a pause, a corrected
+     * pool address, a third side — and each time the balances people had
+     * earned stayed behind on a contract with an empty pot. Every one was
+     * defensible alone; the pattern was not.
+     */
+    async function withPrior() {
+      const f = await loadFixture(deployFixture);
+      // Alice earns on the old contract.
+      await f.pool.write.setShares([f.usdc.address, f.alice.account.address, 1000n, 0n]);
+      await f.pool.write.setTotals([f.usdc.address, 1000n, 0n]);
+      await f.em.write.fund([RWD(10_000)]);
+      await f.em.write.setRate([f.usdc.address, SUPPLY, RWD(1)]);
+      await f.em.write.checkpoint([f.alice.account.address, f.usdc.address, SUPPLY]);
+      await time.increase(100);
+      const owed = await f.em.read.claimable([f.alice.account.address, f.usdc.address, SUPPLY]);
+
+      const next = await hre.viem.deployContract("TesseraEmissions", [f.pool.address, f.deployer.account.address]);
+      await next.write.setRewardToken([f.reward.address]);
+      await next.write.setPrior([f.em.address]);
+      return { ...f, next, owed };
+    }
+
+    it("credits what the old contract says is owed", async () => {
+      const f = await withPrior();
+      await f.next.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY]);
+      const carried = await f.next.read.claimable([f.alice.account.address, f.usdc.address, SUPPLY]);
+      expect(carried >= f.owed).to.equal(true);
+      expect(await f.next.read.totalOwed() >= f.owed).to.equal(true);
+    });
+
+    it("pays a migrated balance out of the same pot, like any other", async () => {
+      // A migrated claim is a real claim, not an IOU with different rules.
+      const f = await withPrior();
+      await f.next.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY]);
+      await f.reward.write.approve([f.next.address, RWD(10_000)]);
+      await f.next.write.fund([RWD(1000)]);
+
+      const before = await f.reward.read.balanceOf([f.alice.account.address]);
+      const a = await hre.viem.getContractAt("TesseraEmissions", f.next.address, { client: { wallet: f.alice } });
+      await a.write.claim([[f.usdc.address], [SUPPLY]]);
+      expect(await f.reward.read.balanceOf([f.alice.account.address]) > before).to.equal(true);
+    });
+
+    it("cannot be carried twice", async () => {
+      const f = await withPrior();
+      await f.next.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY]);
+      const after = await f.next.read.totalMigrated();
+      await f.next.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY]);
+      expect(await f.next.read.totalMigrated()).to.equal(after);
+    });
+
+    it("can be triggered by anybody, for anybody", async () => {
+      // A migration only the earner can trigger is one most people never hear
+      // about.
+      const f = await withPrior();
+      const bob = await hre.viem.getContractAt("TesseraEmissions", f.next.address, { client: { wallet: f.bob } });
+      await bob.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY]);
+      expect(await f.next.read.totalMigrated() > 0n).to.equal(true);
+    });
+
+    it("refuses to have its prior repointed", async () => {
+      // A pointer an owner could move is a pointer they could aim at a
+      // contract reporting whatever balance they like.
+      const f = await withPrior();
+      await expect(f.next.write.setPrior([f.em.address])).to.be.rejected;
+    });
+
+    it("does nothing at all without a prior", async () => {
+      const f = await loadFixture(deployFixture);
+      await expect(f.em.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY])).to.be.rejected;
+    });
+
+    it("carries several streams in one transaction", async () => {
+      const f = await withPrior();
+      await f.next.write.migrateMany([
+        f.alice.account.address, [f.usdc.address, f.usdc.address], [SUPPLY, BORROW],
+      ]);
+      expect(await f.next.read.totalMigrated() > 0n).to.equal(true);
+    });
+  });
 });
