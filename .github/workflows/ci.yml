@@ -34,6 +34,13 @@ jobs:
       - name: Shell version agrees across sw.js and index.html
         run: npm run shell:check
 
+      # A ratchet, not a gate. The most expensive bug in this project is a
+      # failed contract read rendering as a confident zero; this holds the count
+      # of remaining sites and fails in both directions, so converting one and
+      # forgetting to record it is caught too.
+      - name: No new reads collapse a failure into a value
+        run: npm run reads:check
+
       - name: Agent unit tests (decision engine, guardian, memory, agentkit, wallet, treasury, fleet)
         run: npm test --workspace agent
 

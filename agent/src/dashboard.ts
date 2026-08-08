@@ -63,6 +63,7 @@ import {
   DELEVERAGE_TARGET,
 } from "./keeper.js";
 import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
+import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import { proposeFromSources, actionable as actionablePrices, roundsToTarget } from "./price-push.js";
 import { rankListings, decodeFindResult, endpointAllowed, type Listing } from "./discovery.js";
@@ -6607,14 +6608,21 @@ async function main() {
     const who = user as Hex;
     watch(who);
 
+    /*
+     * "Nothing is waiting for you" and "we could not find out" are different
+     * answers, and this digest is the one place a person checks *instead of*
+     * opening four panels. Silently reporting the first when the second is true
+     * is how somebody's matured backstop exit goes on absorbing losses while
+     * the page tells them they are all clear.
+     */
+    const unreadable: string[] = [];
     const read = async <T,>(address: Hex, abi: unknown, fn: string, args: unknown[] = []): Promise<T | null> => {
-      try {
-        return (await client.public.readContract({
-          address, abi: abi as never, functionName: fn as never, args: args as never,
-        })) as T;
-      } catch {
+      const r = await chainRead<T>(client.public, address, abi, fn, args);
+      if (!r.ok) {
+        unreadable.push(r.why);
         return null;
       }
+      return r.value;
     };
 
     type Item = {
@@ -6727,6 +6735,10 @@ async function main() {
       user: who,
       count: items.length,
       urgent: items.filter((i) => i.urgent).length,
+      // An empty list with failures behind it is not "all clear", and the page
+      // says so rather than showing a reassuring blank.
+      partial: unreadable.length > 0,
+      unreadable,
       items,
     });
   });
@@ -6835,14 +6847,26 @@ async function main() {
     const nowSec = Math.floor(Date.now() / 1000);
     const ago = (t: number) => (t <= 0 ? "never" : `${Math.floor((nowSec - t) / 60)} min ago`);
 
+    /*
+     * Every read that did not work, kept rather than swallowed.
+     *
+     * This is the endpoint where collapsing a failed read into a zero is worst.
+     * A monitor exists to be believed; one that reports green because it could
+     * not ask the question is more dangerous than no monitor at all, since it
+     * actively suppresses the alarm somebody would otherwise raise by hand.
+     *
+     * So failures accumulate here and turn into a `fail` check of their own at
+     * the bottom. Everything downstream can keep using a plain value, and the
+     * endpoint as a whole can still never claim health it did not verify.
+     */
+    const unreadable: string[] = [];
     const read = async <T,>(address: Hex, abi: unknown, fn: string, args: unknown[] = []): Promise<T | null> => {
-      try {
-        return (await client.public.readContract({
-          address, abi: abi as never, functionName: fn as never, args: args as never,
-        })) as T;
-      } catch {
+      const r = await chainRead<T>(client.public, address, abi, fn, args);
+      if (!r.ok) {
+        unreadable.push(r.why);
         return null;
       }
+      return r.value;
     };
 
     const keeperAddr = (liveDeployment.tesseraKeeper as Hex) ?? null;
@@ -6964,6 +6988,21 @@ async function main() {
     add("emissions.watched", "ok",
       `${watched.size} address(es) kept settled (cap ${KEEPER_WATCH_MAX})`, watched.size);
 
+    /*
+     * A read that failed is itself a finding, and a failing one.
+     *
+     * Without this, every check above whose input could not be read would have
+     * quietly used a zero and reported whatever a zero implies — "last release:
+     * never", "0.00 TSRA undelivered", "0 sinks ready" — all of which look like
+     * calm. The endpoint would go green precisely when it had lost its ability
+     * to see, which is the one moment it must not.
+     */
+    if (unreadable.length) {
+      add("reads.failed", "fail",
+        `${unreadable.length} contract read(s) failed — the checks above are incomplete`,
+        unreadable.length);
+    }
+
     const worst: Level = checks.some((c) => c.status === "fail")
       ? "fail"
       : checks.some((c) => c.status === "warn")
@@ -6974,6 +7013,8 @@ async function main() {
       status: worst,
       checkedAt: new Date().toISOString(),
       checks,
+      // Named, not just counted: "which read failed" is the whole diagnosis.
+      unreadable,
     });
   });
 

@@ -29,7 +29,8 @@
     "icon": "node scripts/make-token-icon.mjs",
     "shell:check": "node scripts/stamp-shell.mjs --check",
     "shell:bump": "node scripts/stamp-shell.mjs --bump",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "reads:check": "node scripts/check-reads.mjs"
   },
   "overrides": {
     "adm-zip": "^0.6.0",
