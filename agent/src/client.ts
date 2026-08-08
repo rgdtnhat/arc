@@ -17,6 +17,7 @@ import {
   erc20Abi,
   PaymentStatus,
   pacedHttp,
+  withGasMargin,
 } from "@tessera/shared";
 import { confirm } from "./confirm.js";
 import { encodePacked, keccak256 } from "viem";
@@ -65,11 +66,19 @@ export class TesseraClient {
       // it at the canonical address) — far fewer round-trips, much faster loads.
       batch: { multicall: true },
     });
-    this.wallet = createWalletClient({
-      account: cfg.account,
-      chain: cfg.chain,
-      transport: pacedHttp(cfg.rpcUrl),
-    });
+    /*
+     * Wrapped, so every write through this client carries a gas margin. This
+     * RPC's estimate has come back a shade short twice, and these are the
+     * calls that lose money when they revert — see shared/src/gas.ts.
+     */
+    this.wallet = withGasMargin(
+      createWalletClient({
+        account: cfg.account,
+        chain: cfg.chain,
+        transport: pacedHttp(cfg.rpcUrl),
+      }),
+      this.public as never,
+    );
   }
 
   /** Time the NEXT block will see (seconds). Prefer the pending block: on dev

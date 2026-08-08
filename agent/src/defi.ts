@@ -15,6 +15,7 @@ import {
   tesseraFeeCollectorAbi,
   erc20Abi,
   pacedHttp,
+  withGasMargin,
 } from "@tessera/shared";
 import { confirm } from "./confirm.js";
 
@@ -34,7 +35,10 @@ export class VaultClient {
     readonly asset: Hex,
   ) {
     this.public = createPublicClient({ chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl), batch: { multicall: true } });
-    this.wallet = createWalletClient({ account: cfg.account, chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl) });
+    this.wallet = withGasMargin(
+      createWalletClient({ account: cfg.account, chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl) }),
+      this.public as never,
+    );
   }
 
   private async ensureApproval(min: bigint) {
@@ -139,7 +143,10 @@ export class RouterClient {
     readonly router: Hex,
   ) {
     this.public = createPublicClient({ chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl), batch: { multicall: true } });
-    this.wallet = createWalletClient({ account: cfg.account, chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl) });
+    this.wallet = withGasMargin(
+      createWalletClient({ account: cfg.account, chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl) }),
+      this.public as never,
+    );
   }
 
   /** The best route the router can find, and what it would pay out. */
@@ -269,7 +276,10 @@ export class AmmClient {
     readonly amm: Hex,
   ) {
     this.public = createPublicClient({ chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl), batch: { multicall: true } });
-    this.wallet = createWalletClient({ account: cfg.account, chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl) });
+    this.wallet = withGasMargin(
+      createWalletClient({ account: cfg.account, chain: cfg.chain, transport: pacedHttp(cfg.rpcUrl) }),
+      this.public as never,
+    );
   }
 
   private a(functionName: string, args: unknown[] = []) {

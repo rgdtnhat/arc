@@ -8,7 +8,7 @@ import {
   type PublicClient,
   type WalletClient,
 } from "viem";
-import { tesseraPoolAbi, erc20Abi, pacedHttp } from "@tessera/shared";
+import { tesseraPoolAbi, erc20Abi, pacedHttp, withGasMargin } from "@tessera/shared";
 import { confirm } from "./confirm.js";
 
 /**
@@ -89,11 +89,19 @@ export class TesseraPoolClient {
       // Batch the per-asset reserve/position reads into one multicall3 call.
       batch: { multicall: true },
     });
-    this.wallet = createWalletClient({
-      account: cfg.account,
-      chain: cfg.chain,
-      transport: pacedHttp(cfg.rpcUrl),
-    });
+    /*
+     * Wrapped, so every write through this client carries a gas margin. This
+     * RPC's estimate has come back a shade short twice, and these are the
+     * calls that lose money when they revert — see shared/src/gas.ts.
+     */
+    this.wallet = withGasMargin(
+      createWalletClient({
+        account: cfg.account,
+        chain: cfg.chain,
+        transport: pacedHttp(cfg.rpcUrl),
+      }),
+      this.public as never,
+    );
   }
 
   private async ensureApproval(asset: Hex, min: bigint): Promise<void> {

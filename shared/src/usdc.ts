@@ -11,7 +11,26 @@ export function formatUsdc(amount: bigint): string {
   return formatUnits(amount, USDC_DECIMALS);
 }
 
-/** Minimal ERC-20 ABI used to read/transfer/approve USDC. */
+/**
+ * The ERC-20 surface this codebase actually reads.
+ *
+ * It used to be four functions — the ones the escrow needed — and that was a
+ * trap, because reaching for a fifth does not fail loudly. viem matches by
+ * name, finds nothing, and the call errors in a way every `.catch` in the
+ * building turns into a plausible value. `symbol` was missing once and
+ * `tokenMeta` rendered a contract address where a ticker belonged; `totalSupply`
+ * was missing this week and the oracle's circulating-supply figure would have
+ * silently read null.
+ *
+ * So the metadata trio and `totalSupply` are here now. They are cheap — an ABI
+ * entry is a few bytes of TypeScript and no on-chain cost — and their absence
+ * is expensive in exactly the way this codebase keeps paying for.
+ *
+ * `symbol` and `name` are typed as `string`. A handful of very old tokens
+ * return `bytes32` instead and will fail to decode; that is the correct
+ * outcome here, since a caller that silently guessed would be back to the
+ * original problem.
+ */
 export const erc20Abi = [
   {
     type: "function",
@@ -39,6 +58,27 @@ export const erc20Abi = [
       { name: "amount", type: "uint256" },
     ],
     outputs: [{ name: "", type: "bool" }],
+  },
+  {
+    type: "function",
+    name: "totalSupply",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "symbol",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "string" }],
+  },
+  {
+    type: "function",
+    name: "name",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "string" }],
   },
   {
     type: "function",

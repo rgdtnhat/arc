@@ -1,6 +1,7 @@
 export * from "./chain.js";
 export * from "./transport.js";
 export * from "./usdc.js";
+export * from "./gas.js";
 export * from "./protocol.js";
 export * from "./abi.js";
 export * from "./bytecode.js";
