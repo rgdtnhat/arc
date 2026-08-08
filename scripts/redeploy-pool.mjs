@@ -323,13 +323,34 @@ async function main() {
   console.log(`\n[2] does the price guard actually band anything?\n`);
   const guard = config.global.priceGuard;
   const guarded = [];
+  const unreadable = [];
   if (guard && guard !== "0x0000000000000000000000000000000000000000") {
     for (const a of config.assets) {
-      const [wouldAccept] = await must(
-        `the guard's opinion of a bad ${a.symbol} price`,
-        guard, tesseraPriceGuardAbi, "check", [a.address, (a.price * 3n) / 2n],
-      );
-      if (wouldAccept) console.log(`  ✗ ${a.symbol.padEnd(7)} a mark 50% high is accepted — unbanded`);
+      /*
+       * This one read is allowed to fail, and failure means "no".
+       *
+       * Every other read here uses `must`, because a configuration value the
+       * chain did not give us must never be guessed. This is different: the
+       * answer is only ever used to *widen* what the new pool allows, so an
+       * unknown verdict has a safe reading — leave the asset as the old pool
+       * had it. Aborting instead means a throttled RPC on an asset that was
+       * already borrowable, and whose verdict therefore changes nothing, kills
+       * a 25-transaction migration before it starts. That happened.
+       */
+      let verdict;
+      try {
+        [verdict] = await pub.readContract({
+          address: guard, abi: tesseraPriceGuardAbi, functionName: "check",
+          args: [a.address, (a.price * 3n) / 2n],
+        });
+      } catch (e) {
+        unreadable.push(a.symbol);
+        console.log(
+          `  ?  ${a.symbol.padEnd(7)} could not ask the guard — ${String(e?.shortMessage ?? e?.message).slice(0, 70)}`,
+        );
+        continue;
+      }
+      if (verdict) console.log(`  ✗ ${a.symbol.padEnd(7)} a mark 50% high is accepted — unbanded`);
       else { guarded.push(a.symbol); console.log(`  ✓ ${a.symbol.padEnd(7)} a mark 50% high is refused`); }
     }
   } else {
@@ -344,9 +365,27 @@ async function main() {
      */
     a.promote = !a.borrowable && guarded.includes(a.symbol);
     if (!a.borrowable && !a.promote) {
-      console.log(`  note   ${a.symbol} stays supply-only — band it on the guard (setPeg) to list it borrowable`);
+      console.log(
+        unreadable.includes(a.symbol)
+          ? `  note   ${a.symbol} stays supply-only — the guard could not be asked, and an unread verdict is not a yes`
+          : `  note   ${a.symbol} stays supply-only — band it on the guard (setPeg) to list it borrowable`,
+      );
     }
     if (a.promote) console.log(`  note   ${a.symbol} will be listed borrowable, because the guard bands it`);
+  }
+  /*
+   * One case still deserves a stop: the asset this run exists to promote could
+   * not be checked. Carrying on would retire a pool and deploy its replacement
+   * without doing the thing it was for, and the operator would find out at the
+   * end.
+   */
+  if (EXECUTE && unreadable.length && config.assets.some((a) => !a.borrowable && unreadable.includes(a.symbol))) {
+    throw new Error(
+      `The guard could not be asked about ${unreadable.join(", ")}, and one of those is supply-only.\n` +
+      `  Promoting it is the point of this run, so it stops rather than deploying a pool that\n` +
+      `  changes nothing. The usual cause is RPC throttling — wait a minute and re-run; the\n` +
+      `  survey (no --execute) is free and will tell you when the guard answers again.`,
+    );
   }
 
   // --- 3. deploy and configure ----------------------------------------------

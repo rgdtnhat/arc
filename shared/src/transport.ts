@@ -87,20 +87,40 @@ function dedup<T>(key: string | null, fn: () => Promise<T>): Promise<T> {
   return p;
 }
 
-function isThrottle(err: unknown): boolean {
+/**
+ * Is this the node saying "slow down", in whatever words it chose?
+ *
+ * The list is phrase-matched rather than code-matched because public RPCs
+ * disagree about both. Arc's says **"Request exceeds defined limit"**, which
+ * contains neither "rate limit" nor "request limit" nor a JSON-RPC error code
+ * this recognised — so it was classified as a permanent failure and never
+ * retried once. That is not a cosmetic miss: every read in the app goes through
+ * here, and an unretried throttle surfaces as whatever the caller does with a
+ * hard failure. It aborted a pool migration at the first asset whose turn came
+ * up after the budget ran out, and the message named that asset, so it read as
+ * a problem with cirBTC's price rather than with the connection.
+ *
+ * `exceed*` + `limit` is the general form of the same sentence, and is what
+ * catches the next RPC that words it differently again.
+ */
+export function isThrottle(err: unknown): boolean {
   const s = String((err as { message?: string })?.message ?? err ?? "").toLowerCase();
   return (
     s.includes("request limit") ||
     s.includes("rate limit") ||
     s.includes("ratelimit") ||
     s.includes("too many requests") ||
+    s.includes("quota") ||
+    s.includes("throttl") ||
+    // "Request exceeds defined limit", "exceeded the limit", "exceeds limits"…
+    (/exceed/.test(s) && /limit/.test(s)) ||
     s.includes("429") ||
     s.includes("-32005") ||
     s.includes("-32097")
   );
 }
 
-function isTransient(err: unknown): boolean {
+export function isTransient(err: unknown): boolean {
   const s = String((err as { message?: string })?.message ?? err ?? "").toLowerCase();
   return (
     isThrottle(err) ||
