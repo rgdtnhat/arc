@@ -53,5 +53,7 @@
   "tesseraEmissionsLegacy": "0x4574c356a57bf2daccac61e42da4d734865a34c4",
   "tesseraKeeperLegacy": "0x00b083e1ec66006d21e37be43efa462689da9968",
   "tesseraTwapOracle": "0xa142f425a678f76690f4e2457d14dcf9ab8adc94",
-  "tesseraTimelock": "0x4b8100876e377cfea66ded7d38c5fc3654dd4c1d"
+  "tesseraTimelock": "0x4b8100876e377cfea66ded7d38c5fc3654dd4c1d",
+  "tesseraPriceGuard": "0x8a73f2967c478a01673744d9291ba8593e0962cb",
+  "tesseraPriceGuardLegacy": "0x2809b689299974769b8b82e2884f832c986a02c0"
 }

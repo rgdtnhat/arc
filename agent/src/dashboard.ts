@@ -7065,6 +7065,41 @@ async function main() {
       }
     }
 
+    /*
+     * Is the price guard guarding, or just wired?
+     *
+     * Every borrow limit and every liquidation threshold is computed from a
+     * mark the operator pushes by hand, and the guard is the only thing between
+     * a typo and a re-marked pool. It was wired, enabled, and enforcing nothing
+     * on all four assets — two feeds off, two with an average of zero, which
+     * the old check treated as a pass. Nothing said so, because "a guard is
+     * configured" and "a guard would refuse a bad price" look identical from
+     * outside.
+     *
+     * So this asks the guard the only question that matters: would you actually
+     * reject something? A price half again the current mark is a plain error on
+     * any asset, and a guard that accepts it is not guarding that asset.
+     */
+    const guardAddr = (liveDeployment.tesseraPriceGuard as Hex) ?? null;
+    if (guardAddr && poolDeployment) {
+      let unguarded: string[] = [];
+      for (const a of poolDeployment.assets) {
+        const mark = await read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "price", [a.address as Hex]);
+        if (mark === null || mark === 0n) continue;
+        const probe = (mark * 3n) / 2n; // +50%: nobody re-marks by half honestly
+        const checked = await read<readonly [boolean, bigint, bigint]>(
+          guardAddr, tesseraPriceGuardAbi, "check", [a.address as Hex, probe]);
+        if (checked === null) continue;
+        if (checked[0]) unguarded.push(a.symbol);
+      }
+      add("pool.priceGuard",
+        unguarded.length === poolDeployment.assets.length ? "fail" : unguarded.length ? "warn" : "ok",
+        unguarded.length
+          ? `${unguarded.join(", ")} would accept a mark 50% off — unguarded in practice`
+          : "every asset's mark is banded",
+        poolDeployment.assets.length - unguarded.length);
+    }
+
     // --- checkpoints: is anybody actually accruing? ------------------------
     add("emissions.watched", "ok",
       `${watched.size} address(es) kept settled (cap ${KEEPER_WATCH_MAX})`, watched.size);

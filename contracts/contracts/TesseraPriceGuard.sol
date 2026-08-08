@@ -52,6 +52,30 @@ interface IGuardErc20 {
 contract TesseraPriceGuard {
     struct Feed {
         bool enabled;
+        /**
+         * @notice A fixed USD reference, at the pool's 1e8 price scale.
+         *
+         * Set for an asset whose price is not a market question. USDC is the
+         * clearest case: it is the reserve *and* the gas token, and there is no
+         * pool that prices it against anything — it is the quote side of every
+         * pair, so asking the AMM what a dollar is worth is circular. A peg is
+         * the honest reference, and banding around it catches the fat finger
+         * and the stale mark just as well as an average would.
+         *
+         * Zero means "use the AMM average", which is the original behaviour.
+         */
+        uint256 pegUsd;
+        /**
+         * @notice Refuse the price when no reference can be produced.
+         *
+         * The default is off, and that is not an oversight — it is the
+         * behaviour that already shipped, and turning it on for an asset whose
+         * reference comes from a thin pool would block every price update the
+         * moment that pool got thinner. It belongs on for pegged assets, where
+         * a reference can always be computed, and it is a per-feed choice so
+         * that is exactly where it can be put.
+         */
+        bool requireReference;
         uint256 poolId;
         /// @notice The other asset in that pool, whose own USD price anchors the
         ///         conversion. In practice USDC.
@@ -95,6 +119,8 @@ contract TesseraPriceGuard {
     mapping(address => Feed) public feeds;
 
     event FeedSet(address indexed asset, uint256 poolId, address quote, uint16 maxDeviationBps, uint32 minWindow);
+    event PegSet(address indexed asset, uint256 pegUsd, uint16 maxDeviationBps);
+    event RequireReferenceSet(address indexed asset, bool required);
     event MinLiquiditySet(address indexed asset, uint256 minQuoteLiquidity);
     event FeedCleared(address indexed asset);
     event Synced(address indexed asset, uint256 cumulative, uint64 at);
@@ -142,6 +168,8 @@ contract TesseraPriceGuard {
         (uint256 cum, , ) = amm.observe(poolId, asset);
         feeds[asset] = Feed({
             enabled: true,
+            pegUsd: 0,
+            requireReference: false,
             poolId: poolId,
             quote: quote,
             maxDeviationBps: maxDeviationBps,
@@ -151,6 +179,36 @@ contract TesseraPriceGuard {
             snapAt: uint64(block.timestamp)
         });
         emit FeedSet(asset, poolId, quote, maxDeviationBps, minWindow);
+    }
+
+    /**
+     * @notice Band an asset around a fixed USD price rather than a market one.
+     *
+     * For assets whose price is not in question — a stablecoin, and above all
+     * the gas token, which is the quote side of every pair and so cannot be
+     * priced by the AMM at all without circularity.
+     *
+     * This fails closed by construction: the reference is always available, so
+     * there is no state in which the check quietly passes for want of a number.
+     * That is the difference between a guard and a decoration, and it is only
+     * safe to insist on here because a peg cannot go missing the way a thin
+     * pool's average can.
+     */
+    function setPeg(address asset, uint256 pegUsd, uint16 maxDeviationBps) external onlyOwner {
+        require(pegUsd > 0, "peg");
+        require(maxDeviationBps > 0 && maxDeviationBps <= 5_000, "deviation");
+        Feed storage f = feeds[asset];
+        f.enabled = true;
+        f.pegUsd = pegUsd;
+        f.requireReference = true;
+        f.maxDeviationBps = maxDeviationBps;
+        emit PegSet(asset, pegUsd, maxDeviationBps);
+    }
+
+    /// @notice Insist that a feed produce a reference, or refuse the price.
+    function setRequireReference(address asset, bool required) external onlyOwner {
+        feeds[asset].requireReference = required;
+        emit RequireReferenceSet(asset, required);
     }
 
     /// @notice Raise or lower the depth floor without resetting the window.
@@ -252,8 +310,20 @@ contract TesseraPriceGuard {
     {
         Feed storage f = feeds[asset];
         if (!f.enabled) return (true, 0, 0);
-        (uint256 avg, ) = twapUsd(asset);
-        if (avg == 0) return (true, 0, 0);
+        // A peg is a reference that cannot go missing, so it is preferred over
+        // an average that can.
+        uint256 avg = f.pegUsd;
+        if (avg == 0) (avg, ) = twapUsd(asset);
+        /*
+         * No reference. Historically this waved the price through, which meant
+         * a guard could be wired, enabled, and enforcing nothing — which is
+         * exactly what the live deployment turned out to be doing on every one
+         * of its four assets. Failing open is still the default, because
+         * failing closed on a thin-pool feed would block price updates the
+         * moment the pool thinned; `requireReference` is how an operator says
+         * they would rather refuse than guess.
+         */
+        if (avg == 0) return (!f.requireReference, 0, 0);
         uint256 diff = usdPrice > avg ? usdPrice - avg : avg - usdPrice;
         deviationBps = (diff * 10_000) / avg;
         return (deviationBps <= f.maxDeviationBps, avg, deviationBps);
@@ -276,6 +346,7 @@ contract TesseraPriceGuard {
         enabled = f.enabled;
         maxDeviationBps = f.maxDeviationBps;
         (referencePrice, window) = twapUsd(asset);
+        if (f.pegUsd != 0) referencePrice = f.pegUsd;
         poolPrice = address(lendingPool) == address(0) ? 0 : lendingPool.price(asset);
         if (referencePrice > 0 && poolPrice > 0) {
             uint256 diff = poolPrice > referencePrice ? poolPrice - referencePrice : referencePrice - poolPrice;
