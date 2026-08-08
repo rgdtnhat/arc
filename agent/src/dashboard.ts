@@ -7036,6 +7036,35 @@ async function main() {
         consulted?.[3] ? 1 : 0);
     }
 
+    /*
+     * The one state where the live pool's backstop bug bites.
+     *
+     * The deployed bytecode predates the guard: when a write-off takes the last
+     * of a pot, the old shares survive as claims on nothing and the *next*
+     * deposit mints against them. The loss does not fall on the pot — it is
+     * only a dollar — it falls on whoever deposits next, and it scales with
+     * their deposit rather than with what was lost. 1,000 USDC into a wiped pot
+     * came back as 76.92 in the test that found it.
+     *
+     * Redeploying the pool to fix that means migrating every position, which is
+     * a larger risk than the bug while the pot is this small. Detecting the
+     * state is the cheap half: it cannot arise silently if something is
+     * watching for it, and a wiped pot with shares outstanding is a stop-
+     * depositing signal, not a wait-and-see one.
+     */
+    if (poolDeployment) {
+      for (const a of poolDeployment.assets) {
+        const bal = await read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "backstopBalance", [a.address as Hex]);
+        const shares = await read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "backstopTotalShares", [a.address as Hex]);
+        if (bal === null || shares === null) continue;
+        if (bal === 0n && shares > 0n) {
+          add(`backstop.${a.symbol}.wiped`, "fail",
+            `${a.symbol} backstop is empty with ${shares} shares outstanding — a deposit now would be diluted by claims worth nothing. Do not deposit until this pool is replaced.`,
+            0);
+        }
+      }
+    }
+
     // --- checkpoints: is anybody actually accruing? ------------------------
     add("emissions.watched", "ok",
       `${watched.size} address(es) kept settled (cap ${KEEPER_WATCH_MAX})`, watched.size);
