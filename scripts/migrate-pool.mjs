@@ -48,6 +48,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { arcTestnet, erc20Abi, tesseraPoolAbi, pacedHttp, formatUsdc } from "@tessera/shared";
 import { planMigration, affordability, verifyMigration } from "../agent/src/migrate.ts";
 import { ArchiveScanner } from "../agent/src/archive-chain.ts";
+import { mergeDeployment } from "../agent/src/deployment.ts";
 
 const RPC = process.env.ARC_RPC_URL ?? "https://rpc.testnet.arc.network";
 const PACE_MS = Number(process.env.TESSERA_PACE_MS ?? 6000);
@@ -64,13 +65,38 @@ const deployer = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
 const pub = createPublicClient({ chain: arcTestnet, transport: pacedHttp(RPC), batch: { multicall: true } });
 const wallet = createWalletClient({ account: deployer, chain: arcTestnet, transport: pacedHttp(RPC) });
 
+/*
+ * The same merge the app uses, not a simpler one that disagrees with it.
+ *
+ * This used to return whichever file it found first, so a host with an
+ * `arc.local.json` got that file *whole*. On this deployment the local record
+ * predates TSRA's listing and carries three assets where the committed record
+ * carries four — which meant a migration planned from it would have walked past
+ * every TSRA supplier in silence and then reported success. An asset dropped
+ * from the plan is not a smaller migration, it is people left behind in a pool
+ * about to be retired.
+ *
+ * `mergeDeployment` is what `agent/src/deployment.ts` serves the dashboard
+ * from: the committed file is the base, the local file wins only for keys it
+ * names in `overrides`, and keys the committed file has never heard of are
+ * taken regardless. One rule, one place.
+ */
 function readDeployment() {
-  for (const name of ["arc.local.json", "arc.json"]) {
+  const read = (name) => {
     try {
       return JSON.parse(readFileSync(new URL(`../deployments/${name}`, import.meta.url), "utf8"));
-    } catch { /* next */ }
+    } catch {
+      return null;
+    }
+  };
+  const { merged, ignored } = mergeDeployment(read("arc.json"), read("arc.local.json"));
+  if (ignored.length) {
+    console.warn(
+      `⚠  arc.local.json disagrees on ${ignored.join(", ")} without claiming ${ignored.length === 1 ? "it" : "them"} in\n` +
+      `   "overrides", so the committed record wins — the same rule the app follows.\n`,
+    );
   }
-  return {};
+  return merged;
 }
 
 const send = async (address, abi, functionName, args) => {
@@ -120,8 +146,20 @@ const fmt = (v, dp) => (Number(v) / 10 ** dp).toLocaleString(undefined, { maximu
 
 async function main() {
   const dep = readDeployment();
-  const oldPool = (argOf("--from") ?? dep.tesseraPool)?.toLowerCase();
-  const newPool = argOf("--to")?.toLowerCase();
+  /*
+   * The source is the *retired* pool, and after a redeploy that is no longer
+   * `tesseraPool`.
+   *
+   * `redeploy:pool --execute` rewrites the record: `tesseraPool` becomes the
+   * replacement and the pool it superseded is filed under `tesseraPoolLegacy`.
+   * Defaulting `--from` to `tesseraPool` therefore pointed this script at the
+   * destination the moment it was most likely to be run — right after a
+   * redeploy — so it would scan the new pool, find the positions it was about
+   * to create, and report the whole migration as already done. Nothing lost,
+   * but a convincing way to believe you had migrated when you had not.
+   */
+  const oldPool = (argOf("--from") ?? dep.tesseraPoolLegacy ?? dep.tesseraPool)?.toLowerCase();
+  const newPool = (argOf("--to") ?? (dep.tesseraPoolLegacy ? dep.tesseraPool : undefined))?.toLowerCase();
   const assets = (dep.poolAssets ?? []).map((a) => ({ ...a, address: a.address.toLowerCase() }));
 
   if (!oldPool) throw new Error("No source pool: pass --from, or record tesseraPool in deployments/arc.json");
@@ -148,10 +186,29 @@ async function main() {
     if (!looksLikeAddress(value)) {
       throw new Error(
         `${flag} ${value} is not an address.\n` +
-        `  It needs 0x followed by 40 hex characters. "0xNEW" in the instructions is a\n` +
-        `  placeholder — substitute the address that \`npm run pool:arc -- --fresh\` printed.`,
+        `  It needs 0x followed by 40 hex characters. A value ending in "…" is a\n` +
+        `  shortened address copied out of a console or a chat message — paste the\n` +
+        `  whole forty-two characters, or leave the flag off entirely and let the\n` +
+        `  deployment record supply it.`,
       );
     }
+  }
+  /*
+   * Migrating a pool into itself.
+   *
+   * Reachable two ways: passing the same address twice, or omitting `--from`
+   * before this script learned to prefer `tesseraPoolLegacy`. It is not
+   * destructive — every position reads as already in place — but it prints a
+   * clean bill of health for a migration that never happened, which is the one
+   * output nobody double-checks.
+   */
+  if (oldPool && newPool && oldPool === newPool) {
+    throw new Error(
+      `--from and --to are the same pool (${oldPool}).\n` +
+      `  Every position would read as already migrated and the run would report success\n` +
+      `  without moving anything. After a redeploy the source is "tesseraPoolLegacy" in\n` +
+      `  the deployment record and the destination is "tesseraPool".`,
+    );
   }
   for (const [label, addr] of [["source pool", oldPool], ["destination pool", newPool]]) {
     if (!addr) continue;
@@ -166,7 +223,9 @@ async function main() {
   }
 
   console.log(`\nSource pool  ${oldPool}`);
-  console.log(`Destination  ${newPool ?? "(none — pass --to 0x… ; deploy one with `npm run pool:arc -- --fresh` first)"}`);
+  console.log(
+    `Destination  ${newPool ?? "(none — run `npm run redeploy:pool -- --emitter=keep --execute` first, or pass --to)"}`,
+  );
   console.log(`Assets       ${assets.map((a) => a.symbol).join(", ")}`);
   console.log(`Mode         ${EXECUTE ? "EXECUTE — this sends transactions" : "dry run — nothing will be sent"}\n`);
 

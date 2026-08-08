@@ -227,8 +227,17 @@ pool *started*, not how it is running after every risk tweak since.
 ```bash
 npm run redeploy:pool                              # survey: reads only, sends nothing
 npm run redeploy:pool -- --emitter=keep --execute
-npm run migrate:pool -- --from <old> --to <new> --execute
+npm run migrate:pool -- --execute
 ```
+
+No addresses to copy in the third line, deliberately. `redeploy:pool --execute`
+rewrites the deployment record — `tesseraPool` becomes the replacement, the pool
+it superseded is filed under `tesseraPoolLegacy` — and `migrate:pool` reads both
+from there. Passing them by hand is where a shortened address like `0x4e7d2a13…`
+gets pasted out of a console and fails at the twentieth transaction; the flags
+still work if you need them, and a value ending in `…` is now rejected by name.
+Running it before the redeploy, with no legacy pool recorded, still requires
+`--to`.
 
 Three things it will refuse to do, each for the same reason — they are decisions
 rather than steps:
