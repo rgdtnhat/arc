@@ -202,7 +202,19 @@ const $ = (id) => document.getElementById(id);
       const HOLD_VENUES = {
         Lending: { kind: "lending", series: "toLending", label: "lending pool" },
         Vault: { kind: "vault", series: "toVault", label: "vault" },
-        Swap: { kind: "swap", series: "toSwap", label: "AMM pools" },
+        /*
+         * The swap card asks "who earns from it", and the honest answer is the
+         * liquidity providers — so it reads the AMM's holders, not the router's.
+         *
+         * `kind: "swap"` returns an empty set by design: the router holds
+         * nothing, because it takes the input, routes it and pays the output out
+         * in one transaction. That was rendered as a table with headers and no
+         * rows directly beneath a paragraph explaining there was no leaderboard
+         * — which reads as a panel that failed to load rather than one with
+         * nothing to say. The people the paragraph points at are exactly the
+         * ones `kind: "amm"` lists, so it lists them here.
+         */
+        Swap: { kind: "amm", series: "toSwap", label: "AMM pools" },
         Amm: { kind: "amm", series: "toSwap", label: "AMM pools" },
       };
       const HOLD_SIZES = [5, 10, 25, 50];
@@ -2581,7 +2593,25 @@ const $ = (id) => document.getElementById(id);
         const host = $("feeChart");
         if (!host) return;
         if (!daily || !daily.length) {
-          host.innerHTML = `<div class="feeChartEmpty">No fees distributed yet — the chart fills in once the first split runs.</div>`;
+          /*
+           * Say where the money would have come from, not just that there isn't
+           * any.
+           *
+           * "No fees distributed yet" is true and useless — it reads like a
+           * panel that failed. The collector's income is the pool's
+           * reserve-factor cut of *borrower interest* plus the vault's
+           * performance fee on *its* yield, and both are zero while nothing is
+           * borrowed. That is a fact about the market, not about the chart, and
+           * naming it turns a dead panel into an explanation.
+           */
+          const ln = window.__lending;
+          const borrowed = ln && ln.account && ln.account.borrowedUsd;
+          const idle = borrowed != null && Number(borrowed) === 0;
+          host.innerHTML =
+            `<div class="feeChartEmpty">Nothing has been collected yet, so there is nothing to split. ` +
+            `The app's revenue is the pool's cut of <b>borrower interest</b> and the vault's fee on its yield` +
+            (idle ? `, and nothing is borrowed right now` : ``) +
+            `. The chart fills in from the first allocation onward.</div>`;
           return;
         }
         const max = Math.max(...daily.map((d) => d.total)) || 1;

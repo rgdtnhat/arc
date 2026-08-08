@@ -28,11 +28,23 @@
  *   · `TesseraVault.pool`          — left alone; reported, not touched
  *
  * The emitter is the one that matters. It sizes the whole emission schedule
- * from `activityUsd()`, read off the pool it was born with. Point the app at a
- * new pool and leave the emitter alone and it goes on measuring a pool nobody
- * uses: activity falls to zero, `currentRatePerSecond` falls to zero, and every
- * reward stream in the protocol quietly stops. Nothing errors. The pages keep
- * rendering.
+ * from `activityUsd()`, read off the pool it was born with.
+ *
+ * How badly that bites depends entirely on what happens to the old pool, and an
+ * earlier version of this comment got it wrong in the alarming direction. It
+ * said activity falls to zero and every reward stream stops. That is true of a
+ * migration that *drains* the old pool — and this repo's does not.
+ * `migrate:pool` re-creates positions with `supplyFor`, funded by the operator,
+ * and leaves every original deposit sitting where it is. `lendingActivityUsd`
+ * measures supplied + borrowed *balances*, a stock rather than a flow, so the
+ * retired pool goes on reporting the same activity it reported yesterday and
+ * the emitter goes on releasing at the same rate.
+ *
+ * What is actually lost is growth: deposits into the *new* pool never reach the
+ * emitter, so the emission rate is frozen at whatever the old pool held on the
+ * day it was retired. Real, but survivable, and fixable later by replacing the
+ * emitter. Worth stating precisely, because "emissions stop" and "emissions
+ * stop growing" argue for very different decisions.
  *
  * And it cannot simply be redeployed, because `TesseraToken` mints the entire
  * supply to the emitter named in *its* constructor and has no `mint`. Moving
@@ -178,10 +190,13 @@ async function main() {
     throw new Error(
       "Refusing to execute without --emitter=keep or --emitter=replace.\n\n" +
         "  TesseraEmitter.lendingPool is immutable and it sizes every reward stream from\n" +
-        "  that pool's activity. Left pointed at the retired pool it reads no activity,\n" +
-        "  sets every rate to zero, and stops emissions without erroring.\n\n" +
-        "  --emitter=keep     accept that, and re-point it later by redeploying the\n" +
-        "                     emitter and draining the old one through a sink.\n" +
+        "  that pool's activity — supplied + borrowed balances, a stock rather than a flow.\n" +
+        "  Because migrate:pool re-creates positions with supplyFor and leaves the old\n" +
+        "  pool's deposits untouched, the retired pool keeps reporting the same activity\n" +
+        "  and emissions keep paying. What stops is growth: deposits into the new pool\n" +
+        "  never reach the emitter, so the rate is frozen at what the old pool held.\n\n" +
+        "  --emitter=keep     accept a frozen emission rate, and replace the emitter\n" +
+        "                     later by adding a successor as a sink and draining to it.\n" +
         "  --emitter=replace  not automated: TesseraToken minted the whole supply to the\n" +
         "                     current emitter and has no mint, so the supply can only\n" +
         "                     leave at maxRatePerSecond. This script will refuse.",
