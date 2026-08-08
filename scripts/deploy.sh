@@ -45,10 +45,33 @@ fi
 
 # A refused checkout is the single most common reason an update does not land,
 # and pasted commands hide it. Name the files rather than the error.
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  printf '\n   These tracked files have local changes:\n'
-  git --no-pager diff --name-only HEAD | sed 's/^/     /'
-  die "the pull would be refused. Keep them (git stash) or drop them (git checkout -- <file>), then re-run."
+dirty=$(git --no-pager diff --name-only HEAD)
+if [ -n "$dirty" ]; then
+  # `deployments/` is special: docker-compose bind-mounts it over the image's
+  # copy, so the container reads these files from the host — and the app itself
+  # writes into that directory. A tracked file inside a mount the app can write
+  # is how one stale record blocks every future pull *and* keeps being served
+  # after a clean rebuild. The committed record is authoritative for addresses
+  # (see the merge rule in agent/src/deployment.ts), so the local edit can go —
+  # but it is backed up first, because "safe to discard" is a judgement and the
+  # cost of being wrong should not be somebody's only copy.
+  other=$(printf '%s\n' "$dirty" | grep -v '^deployments/' || true)
+  if [ -n "$other" ]; then
+    printf '\n   These tracked files have local changes:\n'
+    printf '%s\n' "$other" | sed 's/^/     /'
+    die "the pull would be refused. Keep them (git stash) or drop them (git checkout -- <file>), then re-run."
+  fi
+
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  backup="deployments/.superseded-$stamp"
+  mkdir -p "$backup"
+  printf '\n'
+  printf '%s\n' "$dirty" | while read -r f; do
+    [ -n "$f" ] || continue
+    cp -a "$f" "$backup/$(basename "$f")"
+    warn "$f had local changes — copied to $backup/, taking the committed version"
+  done
+  printf '%s\n' "$dirty" | xargs -r git checkout --
 fi
 ok "working tree is clean"
 

@@ -31,6 +31,27 @@ container running** — so `docker compose logs` looks perfectly healthy and the
 site simply never changes. The ABIs are committed precisely so no host ever
 needs a compiler.
 
+### `deployments/` is a bind mount, and that matters
+
+`docker-compose.yml` mounts `./deployments:/app/deployments`, so the container
+reads those files **from the host**, shadowing the copy baked into the image.
+Two consequences that together produce the most confusing failure this project
+has had:
+
+- A stale `deployments/arc.json` on the host goes on being served after a
+  perfectly clean rebuild. The image is current; the file it reads is not.
+- Because `arc.json` is *tracked*, any local edit to it makes every future pull
+  abort with "Your local changes would be overwritten by merge" — and if the
+  commands were not chained, that abort scrolls past and the rebuild proceeds
+  on the old commit.
+
+`deploy.sh` handles this: a local change under `deployments/` is copied to
+`deployments/.superseded-<timestamp>/` and the committed version is taken. The
+committed record is authoritative for addresses anyway — see the merge rule in
+`agent/src/deployment.ts` — so this only discards something already superseded,
+and it keeps a copy regardless. A local change to anything *else* still stops
+the script, because that is a decision only you can make.
+
 ### Why a script rather than a list of commands
 
 A list pasted into a terminal runs every line whether or not the previous one
