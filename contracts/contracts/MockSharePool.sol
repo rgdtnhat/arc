@@ -24,6 +24,15 @@ contract MockSharePool {
         borrowShares[asset][user] = borrow;
     }
 
+    /// The backstop side: first loss, and the reason it earns more.
+    mapping(address => mapping(address => uint256)) public backstopShares;
+    mapping(address => uint256) public backstopTotalShares;
+
+    function setBackstop(address asset, address user, uint256 shares, uint256 total) external {
+        backstopShares[asset][user] = shares;
+        backstopTotalShares[asset] = total;
+    }
+
     function setTotals(address asset, uint256 supply, uint256 borrow) external {
         totalSupplyShares[asset] = supply;
         totalBorrowShares[asset] = borrow;

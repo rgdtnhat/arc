@@ -144,12 +144,7 @@ const $ = (id) => document.getElementById(id);
           // Governance reads a loop of contract calls, so it loads on arrival
           // rather than on every poll of every other tab.
           if (route === "agents" && typeof loadFeeCredit === "function") loadFeeCredit().catch(() => {});
-          if (route === "gov" && typeof loadGovernance === "function") {
-            loadGovernance().catch(() => {});
-            if (typeof loadGauge === "function") loadGauge().catch(() => {});
-            if (typeof loadRegistry === "function") loadRegistry().catch(() => {});
-            if (typeof loadDiscussions === "function") loadDiscussions().catch(() => {});
-          }
+          if (route === "gov" && typeof setGovTab === "function") setGovTab(govTab);
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -491,6 +486,7 @@ const $ = (id) => document.getElementById(id);
           // The full address, not a truncation. This is the card that answers
           // "which wallet is this?", and half an address answers it halfway.
           $("myWalletAddr").textContent = addr;
+          if (typeof loadMyAssets === "function") loadMyAssets().catch(() => {});
         })();
         if ($("myWalletCopy") && !$("myWalletCopy").dataset.wired) {
           $("myWalletCopy").dataset.wired = "1";
@@ -1524,13 +1520,13 @@ const $ = (id) => document.getElementById(id);
           if (!em || !em.configured) return;
           // Only the streams with something in them: claiming an empty one
           // costs gas and reverts the whole call.
-          const rows = (em.assets || []).filter(
-            (a) => BigInt(a.claimableSupply || "0") > 0n || BigInt(a.claimableBorrow || "0") > 0n,
-          );
+          // All three sides: supply, borrow, and the backstop that takes first
+          // loss and is paid the most for it.
           const assets = [], sides = [];
-          for (const a of rows) {
+          for (const a of em.assets || []) {
             if (BigInt(a.claimableSupply || "0") > 0n) { assets.push(a.address); sides.push(0); }
             if (BigInt(a.claimableBorrow || "0") > 0n) { assets.push(a.address); sides.push(1); }
+            if (BigInt(a.claimableBackstop || "0") > 0n) { assets.push(a.address); sides.push(2); }
           }
           if (!assets.length) {
             const m = $("lnEmMsg");
@@ -4561,6 +4557,108 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
+      /* ---- The wallet's assets ----------------------------------------------
+       *
+       * Five at a time, sliced server-side. The browser could fetch every
+       * balance and cut locally, and for four assets that is the same thing —
+       * the reason not to is that one `balanceOf` per asset per poll from every
+       * open tab is a load that grows with the product and lands on a throttled
+       * public RPC. The totals still count everything, because a summary of
+       * only the visible page would be wrong in a way nobody would catch.
+       */
+      const ASSET_PAGE = 5;
+      let assetSize = ASSET_PAGE;
+      let assetPage = 1;
+      let assetPaged = false;
+
+      async function loadMyAssets() {
+        const host = $("myAssetRows");
+        if (!host) return;
+        const who = String(window.__myAddress || "");
+        if (!/^0x[0-9a-fA-F]{40}$/.test(who)) { host.innerHTML = ""; return; }
+        try {
+          const size = assetPaged ? ASSET_PAGE : assetSize;
+          const r = await (await fetch(
+            `/api/wallet/assets?user=${encodeURIComponent(who)}&page=${assetPage}&size=${size}`)).json();
+          if (!r || !r.ok) { host.innerHTML = ""; return; }
+
+          host.innerHTML = (r.assets || []).length
+            ? r.assets.map((a) =>
+                `<tr><td>${a.isProtocolToken ? '<span class="tsraIcon"></span> ' : ""}<b>${esc(a.symbol)}</b>` +
+                `<div class="muted" style="font-size:10.5px">${a.priceUsd > 0 ? "$" + esc(a.priceUsd.toLocaleString(undefined, { maximumFractionDigits: 4 })) : "no mark"}</div></td>` +
+                `<td class="num mono">${esc(a.balance)}</td>` +
+                `<td class="num mono">${a.valueUsd == null ? "—" : "$" + esc(a.valueUsd.toFixed(2))}</td></tr>`).join("")
+            : emptyRow(3, "Nothing held in the assets this deployment knows about.");
+
+          const pager = $("myAssetPager");
+          if (pager) {
+            pager.style.display = r.total > ASSET_PAGE ? "" : "none";
+            $("myAssetMore").style.display = assetPaged || assetSize >= r.total ? "none" : "";
+            $("myAssetAll").style.display = assetPaged ? "none" : "";
+            $("myAssetPrev").style.display = assetPaged ? "" : "none";
+            $("myAssetNext").style.display = assetPaged ? "" : "none";
+            $("myAssetPrev").disabled = r.page <= 1;
+            $("myAssetNext").disabled = r.page >= r.pages;
+            $("myAssetPage").textContent = assetPaged
+              ? `page ${r.page} of ${r.pages}`
+              : `${(r.assets || []).length} of ${r.total}`;
+          }
+          $("myAssetNote").textContent =
+            `${r.heldCount} of ${r.total} assets held · about $${r.totalUsd.toFixed(2)} in total` +
+            // Never present a partial total as the whole picture.
+            (r.unpriced && r.unpriced.length
+              ? ` (${r.unpriced.join(", ")} ${r.unpriced.length === 1 ? "has" : "have"} no mark, so ${r.unpriced.length === 1 ? "it is" : "they are"} not counted)`
+              : "");
+        } catch {
+          host.innerHTML = "";
+        }
+      }
+
+      if ($("myAssetMore")) {
+        $("myAssetMore").addEventListener("click", () => { assetSize += ASSET_PAGE; loadMyAssets(); });
+      }
+      if ($("myAssetAll")) {
+        $("myAssetAll").addEventListener("click", () => { assetPaged = true; assetPage = 1; loadMyAssets(); });
+      }
+      if ($("myAssetPrev")) {
+        $("myAssetPrev").addEventListener("click", () => { if (assetPage > 1) { assetPage--; loadMyAssets(); } });
+      }
+      if ($("myAssetNext")) {
+        $("myAssetNext").addEventListener("click", () => { assetPage++; loadMyAssets(); });
+      }
+      setInterval(() => { if (typeof loadMyAssets === "function") loadMyAssets().catch(() => {}); }, 30000);
+
+      /* ---- Governance sub-tabs ---------------------------------------------
+       *
+       * Six jobs that were eleven cards in one column: reading a result,
+       * casting a market vote, choosing a delegate, setting a rate, deciding
+       * what is listed. Only the visible one loads, which also stops the tab
+       * from firing six loops of contract reads on arrival.
+       */
+      const GOV_LOADERS = {
+        overview: () => loadGovernance(),
+        proposals: () => Promise.all([loadGovernance(), loadDiscussions()]),
+        markets: () => Promise.all([loadGauge(), loadRegistry()]),
+        delegates: () => Promise.all([loadGovernance(), loadGauge()]),
+        emissions: () => Promise.all([loadEmissions(), loadLpEmissions(), loadGovernance()]),
+        registry: () => loadRegistry(),
+      };
+      let govTab = "overview";
+
+      function setGovTab(tab) {
+        govTab = tab;
+        for (const key of Object.keys(GOV_LOADERS)) {
+          const pane = $("gov_" + key);
+          if (pane) pane.hidden = key !== tab;
+        }
+        document.querySelectorAll("[data-govtab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.govtab === tab));
+        const load = GOV_LOADERS[tab];
+        if (load) Promise.resolve(load()).catch(() => {});
+      }
+      document.querySelectorAll("[data-govtab]").forEach((b) =>
+        b.addEventListener("click", () => setGovTab(b.dataset.govtab)));
+
       /* ---- Which build is serving this page --------------------------------
        *
        * Two versions, deliberately, because they fail apart. The server's is
@@ -5207,6 +5305,7 @@ const $ = (id) => document.getElementById(id);
 
           $("gaRuleNote").textContent = (window.__registry && window.__registry.rule) || "";
           renderGaugeRows(r);
+          renderGaugePct();
           renderDelegates(r);
 
           // Applying is only offered when there is actually a closed, unapplied
@@ -5280,25 +5379,127 @@ const $ = (id) => document.getElementById(id);
         );
       }
 
-      /* ---- The delegate directory ------------------------------------------ */
+      /* ---- The delegate directory ------------------------------------------
+       *
+       * Ten by default, heaviest first, because a directory people scroll is a
+       * directory nobody reads past the top of. "Show more" doubles it, "Show
+       * all" pages — all three are slices of one already-fetched list, so none
+       * of them costs the server anything beyond the poll it was doing anyway.
+       */
+      const DELEGATE_PAGE = 10;
+      let delegateShown = DELEGATE_PAGE;
+      let delegatePaged = false;
+      let delegatePage = 1;
+
       function renderDelegates(r) {
         const host = $("govDelegateList");
         if (!host) return;
-        const list = r.delegates || [];
-        host.innerHTML = list.length
-          ? list.map((d) =>
+        // Heaviest first: the weight is what a delegator is actually choosing.
+        const list = (r.delegates || []).slice()
+          .sort((a, b) => Number(b.votingPower) - Number(a.votingPower));
+
+        let slice, label;
+        if (delegatePaged) {
+          const pages = Math.max(1, Math.ceil(list.length / DELEGATE_PAGE));
+          if (delegatePage > pages) delegatePage = pages;
+          slice = list.slice((delegatePage - 1) * DELEGATE_PAGE, delegatePage * DELEGATE_PAGE);
+          label = `${(delegatePage - 1) * DELEGATE_PAGE + 1}–${Math.min(delegatePage * DELEGATE_PAGE, list.length)} of ${list.length}`;
+        } else {
+          slice = list.slice(0, delegateShown);
+          label = `${slice.length} of ${list.length}`;
+        }
+
+        host.innerHTML = slice.length
+          ? slice.map((d) =>
               `<tr><td><b>${esc(d.name)}</b>${d.isYou ? ' <span class="tag ok" style="font-size:10px">you</span>' : ""}` +
               `${d.active ? "" : ' <span class="tag warn" style="font-size:10px">stepped down</span>'}` +
               `<div class="muted" style="font-size:11px">${esc(d.statement || "")}</div>` +
-              `<div class="muted mono" style="font-size:10.5px">${esc(d.address)}</div></td>` +
+              `<div class="row-actions" style="gap:6px;margin-top:3px">` +
+              `<span class="muted mono" style="font-size:10.5px">${esc(shortAddr(d.address))}</span>` +
+              `<button class="btn" style="padding:1px 7px;font-size:10.5px" ` +
+              `data-copy-addr="${esc(d.address)}">Copy</button></div></td>` +
               `<td class="num mono">${esc(d.votingPower)}</td>` +
               `<td class="num"><button class="btn" style="padding:2px 8px;font-size:11px" ` +
-              `data-delegate-to="${esc(d.address)}">Delegate to them</button></td></tr>`)
+              `data-delegate-to="${esc(d.address)}">Delegate</button></td></tr>`)
             .join("")
           : emptyRow(3, "Nobody has listed themselves yet.");
+
         host.querySelectorAll("[data-delegate-to]").forEach((b) =>
           b.addEventListener("click", () => delegateTo(b.dataset.delegateTo)),
         );
+        host.querySelectorAll("[data-copy-addr]").forEach((b) =>
+          b.addEventListener("click", () => copyAddress(b, b.dataset.copyAddr)),
+        );
+
+        const pager = $("govDelegatePager");
+        if (pager) {
+          pager.style.display = list.length > DELEGATE_PAGE ? "" : "none";
+          $("govDelegateMore").style.display = delegatePaged || delegateShown >= list.length ? "none" : "";
+          $("govDelegateAll").style.display = delegatePaged ? "none" : "";
+          const pages = Math.max(1, Math.ceil(list.length / DELEGATE_PAGE));
+          $("govDelegatePrev").style.display = delegatePaged ? "" : "none";
+          $("govDelegateNext").style.display = delegatePaged ? "" : "none";
+          $("govDelegatePrev").disabled = delegatePage <= 1;
+          $("govDelegateNext").disabled = delegatePage >= pages;
+          $("govDelegatePage").textContent = label;
+        }
+      }
+
+      if ($("govDelegateMore")) {
+        $("govDelegateMore").addEventListener("click", () => {
+          delegateShown += DELEGATE_PAGE;
+          if (window.__gauge) renderDelegates(window.__gauge);
+        });
+      }
+      if ($("govDelegateAll")) {
+        $("govDelegateAll").addEventListener("click", () => {
+          delegatePaged = true; delegatePage = 1;
+          if (window.__gauge) renderDelegates(window.__gauge);
+        });
+      }
+      if ($("govDelegatePrev")) {
+        $("govDelegatePrev").addEventListener("click", () => {
+          if (delegatePage > 1) { delegatePage--; renderDelegates(window.__gauge); }
+        });
+      }
+      if ($("govDelegateNext")) {
+        $("govDelegateNext").addEventListener("click", () => {
+          delegatePage++; renderDelegates(window.__gauge);
+        });
+      }
+
+      /**
+       * Copy an address, and say so on the button itself.
+       *
+       * `navigator.clipboard` needs a secure context and is refused outright by
+       * some in-app browsers, so the fallback is a hidden textarea — an address
+       * you cannot copy is an address you have to retype, which is how people
+       * delegate to the wrong wallet.
+       */
+      async function copyAddress(btn, addr) {
+        const was = btn.textContent;
+        let done = false;
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(addr);
+            done = true;
+          }
+        } catch { /* fall through */ }
+        if (!done) {
+          try {
+            const ta = document.createElement("textarea");
+            ta.value = addr;
+            ta.setAttribute("readonly", "");
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            done = document.execCommand("copy");
+            document.body.removeChild(ta);
+          } catch { done = false; }
+        }
+        btn.textContent = done ? "Copied" : "Copy failed";
+        setTimeout(() => { btn.textContent = was; }, 1400);
       }
 
       async function delegateTo(to) {
@@ -5345,6 +5546,47 @@ const $ = (id) => document.getElementById(id);
         for (const b of bytes) hex += b.toString(16).padStart(2, "0");
         const words = Math.ceil(bytes.length / 32) * 64;
         return encUint(bytes.length) + hex.padEnd(words, "0");
+      }
+
+      /* The slider is the unit the question is really in: not "how many tokens
+         on this market" but "how much of what I have, spread across the board".
+         The per-market boxes stay, for anybody who wants to be exact. */
+      function gaugeBudgetRaw() {
+        const r = window.__gauge;
+        if (!r || !r.you) return 0n;
+        const used = (r.markets || []).reduce((t, m) => t + BigInt(m.yourVotesRaw || "0"), 0n);
+        return BigInt(r.you.availableRaw || "0") + used;
+      }
+      function renderGaugePct() {
+        const el = $("gaPct");
+        if (!el) return;
+        const pct = Number(el.value);
+        $("gaPctLabel").textContent = `${pct}%`;
+        const total = gaugeBudgetRaw();
+        const use = (total * BigInt(pct)) / 100n;
+        $("gaPctNote").textContent = total === 0n
+          ? "You have no delegated TSRA to vote with yet."
+          : `Casting ${fmtUnitsStr(use, 18)} of ${fmtUnitsStr(total, 18)} TSRA. ` +
+            `Leave a market empty to skip it — whatever you fill in is split in the ratio you type.`;
+      }
+      if ($("gaPct")) $("gaPct").addEventListener("input", renderGaugePct);
+      if ($("gaMax")) {
+        $("gaMax").addEventListener("click", () => {
+          $("gaPct").value = "100";
+          renderGaugePct();
+          // Max means all of it, spread evenly over the eligible markets that
+          // are still open — otherwise "max" leaves the boxes empty and the
+          // button does nothing visible.
+          const r = window.__gauge;
+          if (!r) return;
+          const open = (r.markets || []).filter((m) => m.active && m.eligible);
+          if (!open.length) return;
+          const each = gaugeBudgetRaw() / BigInt(open.length);
+          document.querySelectorAll(".gaVote").forEach((el) => {
+            const m = open.find((x) => String(x.id) === el.dataset.market);
+            el.value = m ? fmtUnitsStr(each, 18) : "";
+          });
+        });
       }
 
       if ($("gaSubmit")) {
@@ -8037,8 +8279,10 @@ const $ = (id) => document.getElementById(id);
       if (typeof loadBuild === "function") loadBuild().catch(() => {});
       setInterval(() => { if (typeof loadBuild === "function") loadBuild().catch(() => {}); }, 60000);
       setInterval(() => {
-        if ($("paneGov") && !$("paneGov").hidden && typeof loadGovernance === "function") loadGovernance().catch(() => {});
-        if ($("paneGov") && !$("paneGov").hidden && typeof loadGauge === "function") loadGauge().catch(() => {});
+        if ($("paneGov") && !$("paneGov").hidden && typeof GOV_LOADERS !== "undefined") {
+          const load = GOV_LOADERS[govTab];
+          if (load) Promise.resolve(load()).catch(() => {});
+        }
       }, 20000);
       window.addEventListener("focus", () => tick());
       window.addEventListener("online", () => tick());

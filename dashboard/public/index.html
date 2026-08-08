@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v43" />
+    <meta name="tessera-shell" content="tessera-v44" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1171,8 +1171,14 @@
                 <span><b style="color:var(--text)">Yield vault</b> — 80% held liquid by contract floor; the app's fee touches yield only, never principal.</span>
                 <span><b style="color:var(--text)">Swap</b> — routed through AMM pool liquidity, priced by the pool.</span>
                 <span><b style="color:var(--text)">Liquidity pools (AMM)</b> — provide liquidity, keep at least 50% of every swap fee.</span>
+                <span><b style="color:var(--text)">Backstop</b> — deposit to absorb a write-off before any supplier is touched, and earn the largest emission of the three sides for taking that first loss.</span>
+                <span><span class="tsraIcon"></span> <b style="color:var(--text)">TSRA</b> — a hundred billion, minted once and locked behind the protocol's own activity. Supply it, pair it, swap it, back the pool with it, or pay the agent's fees in it at a discount.</span>
+                <span><b style="color:var(--text)">Emissions</b> — TSRA streams to lenders, borrowers, the backstop and liquidity providers, at rates a vote sets and an operator can pause without disturbing what anybody has already earned.</span>
+                <span><b style="color:var(--text)">Governance</b> — proposals that carry real calls, a vote roll naming every voter, and a discussion stage before anything reaches a ballot.</span>
+                <span><b style="color:var(--text)">Market votes</b> — holders point the emissions at the markets they want paid; only the top few are funded, and anyone can attach an incentive to a market they want chosen.</span>
+                <span><b style="color:var(--text)">Asset registry</b> — rewards reach only whitelisted assets, so a vote cannot direct the budget at a token somebody minted this morning.</span>
                 <span><b style="color:var(--text)">Agent workspace</b> — live news, FX, crypto, stocks, commodities and derived market analysis.</span>
-                <span><b style="color:var(--text)">Operator controls</b> — fee allocation, notices, price feeds, contract history and fund recovery.</span>
+                <span><b style="color:var(--text)">Operator controls</b> — fee allocation, emission rates and pauses, notices, price feeds, contract history and fund recovery.</span>
               </div>
             </div>
           </div>
@@ -1222,6 +1228,22 @@
                 <button class="btn" id="myWalletCopy" style="padding:3px 9px;font-size:11px">Copy</button>
               </div>
               <div class="kv" style="margin-top:8px"><span>Signed in with this address. Self-custody actions spend from here.</span></div>
+
+              <!-- Five by default. "More" adds five, "All" pages — and the
+                   slicing happens on the server, so a wallet holding fifty
+                   tokens costs the same per poll as one holding five. -->
+              <div class="tblWrap auto" style="margin-top:14px"><table class="data" style="min-width:0">
+                <thead><tr><th>Asset</th><th class="num">Balance</th><th class="num">Value</th></tr></thead>
+                <tbody id="myAssetRows"></tbody>
+              </table></div>
+              <div class="row-actions" id="myAssetPager" style="margin-top:10px;flex-wrap:wrap;display:none">
+                <button class="btn" id="myAssetMore">Show more</button>
+                <button class="btn" id="myAssetAll">Show all</button>
+                <button class="btn" id="myAssetPrev">‹</button>
+                <span class="kv" id="myAssetPage"></span>
+                <button class="btn" id="myAssetNext">›</button>
+              </div>
+              <div class="kv" id="myAssetNote" style="margin-top:8px"></div>
             </div>
 
             <div class="card">
@@ -2230,6 +2252,40 @@
         <!-- ---------- OTHER ---------- -->
         <!-- ---------- GOVERNANCE ---------- -->
         <div class="tabPane" id="paneGov" hidden>
+          <!-- Eleven cards in one column was a wall. Each of these is a
+               different job — reading a result, casting a market vote, choosing
+               a delegate, setting a rate, deciding what is listed — and stacking
+               them meant every one of them was buried under the others. -->
+          <div class="card compact">
+            <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+              <h2 style="margin:0">🏛 Governance</h2>
+              <span style="font-size:12.5px;color:var(--muted)">
+                TSRA decides where the emissions go, what is listed, and who speaks for whom.
+              </span>
+            </div>
+            <div class="sheetTabs tabDock" id="govTabs" role="tablist" style="border-bottom:0;padding:12px 0 0;margin:0 -2px">
+              <button class="sheetTab active" data-govtab="overview" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7v6c0 4.4 3.4 7.6 8 8.6 4.6-1 8-4.2 8-8.6V7Z"/></svg></span>Overview
+              </button>
+              <button class="sheetTab" data-govtab="proposals" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h9l4 4v14H6Z"/><path d="M14 3v5h5"/><path d="M9 12h7M9 16h7"/></svg></span>Proposals
+              </button>
+              <button class="sheetTab" data-govtab="markets" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9M10 19V4M16 19v-7M22 19H2"/></svg></span>Market votes
+              </button>
+              <button class="sheetTab" data-govtab="delegates" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0"/><path d="M16 8h5M18.5 5.5v5"/></svg></span>Delegates
+              </button>
+              <button class="sheetTab" data-govtab="emissions" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7Z"/></svg></span>Emissions
+              </button>
+              <button class="sheetTab" data-govtab="registry" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="1.4"/><circle cx="14" cy="12" r="1.4"/><circle cx="10" cy="18" r="1.4"/></svg></span>Asset registry
+              </button>
+            </div>
+          </div>
+
+          <div class="govPane" id="gov_overview">
           <div class="card">
             <h2>🏛 Governance — TSRA decides where the emissions go</h2>
             <div style="font-size:12.5px;color:var(--muted)">
@@ -2258,7 +2314,107 @@
             </div>
             <div class="msg" id="govMsg" style="display:none"></div>
           </div>
+          <div class="card">
+            <h2>The lock</h2>
+            <div class="kv" style="margin-bottom:10px">
+              The whole supply was minted straight into the emitter, and comes out in proportion to how
+              much the pools are used — not on a calendar. Idle protocol, no emission. The rate constants
+              are immutable, so nobody can wind the release forward.
+            </div>
+            <div class="metrics tight">
+              <div class="metric"><div class="k">Still locked</div><div class="v" id="govLocked">—</div></div>
+              <div class="metric"><div class="k">Measured activity</div><div class="v" id="govActivity">—</div></div>
+              <div class="metric"><div class="k">Emitting now</div><div class="v" id="govRate">—</div></div>
+              <div class="metric"><div class="k">Lasts</div><div class="v" id="govLasts">—</div></div>
+            </div>
+            <div class="tblWrap auto" style="margin-top:12px"><table class="data" style="min-width:0">
+              <thead><tr><th>Sink</th><th class="num">Weight</th><th class="num">Owed</th></tr></thead>
+              <tbody id="govSinks"></tbody>
+            </table></div>
+          </div>
+          </div>
 
+          <div class="govPane" id="gov_proposals" hidden>
+          <div class="card" id="govDiscussionsCard">
+            <h2>Discussions — before it becomes a vote</h2>
+            <div class="kv" id="govDiscussionNote" style="margin-bottom:10px"></div>
+            <div id="govDiscussions" style="display:flex;flex-direction:column;gap:12px"></div>
+            <div class="row-actions" style="flex-wrap:wrap;margin-top:12px">
+              <input id="govDiscTitle" class="field" placeholder="What are you proposing?" style="min-width:280px" />
+            </div>
+            <textarea id="govDiscBody" class="field" placeholder="The case for it, and what it would change"
+              style="width:100%;min-height:80px;margin-top:8px"></textarea>
+            <div class="row-actions" style="margin-top:8px">
+              <button class="btn" id="govDiscPost">Open a discussion</button>
+              <span class="kv">Signed by your wallet, so authorship can be checked.</span>
+            </div>
+            <div class="msg" id="govDiscMsg" style="display:none"></div>
+          </div>
+          <div class="card" id="govProposalsCard">
+            <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
+              <h2 style="margin:0">Proposals</h2>
+              <div class="row-actions">
+                <select id="govFilter" class="field">
+                  <option value="all">All</option>
+                  <option value="open">Open for voting</option>
+                  <option value="passed">Passed</option>
+                  <option value="failed">Did not pass</option>
+                  <option value="mine">You can vote</option>
+                </select>
+              </div>
+            </div>
+            <div id="govProposals" style="display:flex;flex-direction:column;gap:12px;margin-top:12px"></div>
+            <div class="row-actions" id="govPager" style="justify-content:center;margin-top:12px;display:none">
+              <button class="btn" id="govPrev">‹</button>
+              <span class="kv" id="govPageLabel"></span>
+              <button class="btn" id="govNext">›</button>
+            </div>
+          </div>
+          <div class="card" id="govDetailCard" style="display:none">
+            <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
+              <h2 style="margin:0" id="govDetailTitle">Proposal</h2>
+              <button class="btn" id="govDetailBack">‹ Back to proposals</button>
+            </div>
+            <div class="kv" id="govDetailMeta" style="margin-top:8px"></div>
+            <div class="kv" id="govDetailBody" style="margin-top:10px;white-space:pre-wrap"></div>
+
+            <h3 style="font-size:13px;margin:18px 0 8px">Final result</h3>
+            <div id="govDetailBars"></div>
+            <div class="kv" id="govDetailQuorum" style="margin-top:10px"></div>
+
+            <div id="govDetailActionsWrap" style="display:none;margin-top:16px">
+              <h3 style="font-size:13px;margin:0 0 8px">What it carries</h3>
+              <div class="tblWrap auto"><table class="data" style="min-width:0">
+                <thead><tr><th>#</th><th>Target</th><th>Call</th></tr></thead>
+                <tbody id="govDetailActions"></tbody>
+              </table></div>
+            </div>
+
+            <h3 style="font-size:13px;margin:18px 0 8px" id="govVotesHeading">Votes</h3>
+            <div class="kv" id="govVotesNote" style="margin-bottom:8px;display:none"></div>
+            <div class="tblWrap auto"><table class="data" style="min-width:0">
+              <thead><tr><th>Account</th><th class="num">Vote</th><th class="num">Weight</th><th class="num">% of cast</th></tr></thead>
+              <tbody id="govVotesRows"></tbody>
+            </table></div>
+          </div>
+          <div class="card" id="govCreateCard" style="display:none">
+            <h2>Open a proposal</h2>
+            <div class="kv" style="margin-bottom:10px">
+              Operator only. Voting opens immediately and the snapshot is the previous block, so nobody
+              can arrange their weight after seeing the question.
+            </div>
+            <input id="govTitle" class="field" placeholder="Title" style="width:100%;margin-bottom:8px" />
+            <textarea id="govBody" class="field" placeholder="What is being proposed, and why"
+              style="width:100%;min-height:90px;margin-bottom:8px"></textarea>
+            <div class="row-actions">
+              <button class="btn primary" id="govPropose">Open proposal</button>
+              <span class="kv">Signalling only — this form carries no on-chain calls.</span>
+            </div>
+            <div class="msg" id="govCreateMsg" style="display:none"></div>
+          </div>
+          </div>
+
+          <div class="govPane" id="gov_markets" hidden>
           <div class="card" id="govGaugeCard" style="display:none">
             <h2><span class="tsraIcon" aria-hidden="true"></span> Market votes — where this epoch's rewards go</h2>
             <div style="font-size:12.5px;color:var(--muted)">
@@ -2293,6 +2449,15 @@
               </tr></thead>
               <tbody id="gaRows"></tbody>
             </table></div>
+            <!-- Typing a token amount per market is the wrong unit for the
+                 question people are actually answering, which is "how much of
+                 what I have". The slider sets the total; the board splits it. -->
+            <div class="row-actions" style="margin-top:14px;flex-wrap:wrap;gap:10px">
+              <label class="kv" style="min-width:110px">Use <b id="gaPctLabel">100%</b> of my weight</label>
+              <input id="gaPct" type="range" min="1" max="100" value="100" style="flex:1;min-width:180px" />
+              <button class="btn" id="gaMax">Max</button>
+            </div>
+            <div class="kv" id="gaPctNote" style="margin-top:4px"></div>
             <div class="row-actions" style="margin-top:12px;flex-wrap:wrap">
               <button class="btn primary" id="gaSubmit">Cast my vote</button>
               <button class="btn" id="gaClear">Take my weight back</button>
@@ -2301,42 +2466,6 @@
             </div>
             <div class="msg" id="gaMsg" style="display:none"></div>
           </div>
-
-          <div class="card" id="govDelegateCard">
-            <h2>Delegate your TSRA</h2>
-            <div class="kv" style="margin-bottom:10px">
-              One delegation covers both venues: whoever you point at votes your weight in proposals
-              <i>and</i> in the market vote above. Point it at yourself to vote your own, or at somebody who
-              follows these markets more closely than you do. Your tokens never leave your wallet, and you
-              can move the delegation at any time.
-            </div>
-            <div class="row-actions" style="flex-wrap:wrap">
-              <input id="govDelegateTo" class="field" placeholder="0x… (leave empty for yourself)" style="min-width:330px" />
-              <button class="btn primary" id="govDelegateSet">Delegate</button>
-              <span class="kv" id="govDelegateCurrent"></span>
-            </div>
-            <div class="msg" id="govDelegateMsg" style="display:none"></div>
-
-            <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
-              <b style="font-size:13px">Delegates</b>
-              <div class="kv" style="margin:3px 0 9px">
-                Anyone may list themselves here, and appearing on the list confers nothing — the voting power
-                shown is read from the token, and your delegation stays yours to move at any time. It is a
-                directory, not an endorsement: a curated list of "trusted community members" would be a list
-                whose trust comes from whoever curates it.
-              </div>
-              <div class="tblWrap auto"><table class="data" style="min-width:0">
-                <thead><tr><th>Delegate</th><th class="num">Voting power</th><th class="num"></th></tr></thead>
-                <tbody id="govDelegateList"></tbody>
-              </table></div>
-              <div class="row-actions" style="flex-wrap:wrap;margin-top:10px">
-                <input id="govDelegateName" class="field" placeholder="Your name" style="width:170px" />
-                <input id="govDelegateStatement" class="field" placeholder="What you will vote for" style="min-width:280px" />
-                <button class="btn" id="govDelegateRegister">List me as a delegate</button>
-              </div>
-            </div>
-          </div>
-
           <div class="card" id="govBribeCard" style="display:none">
             <h2>Add an incentive</h2>
             <div class="kv" style="margin-bottom:10px">
@@ -2352,129 +2481,6 @@
             </div>
             <div class="msg" id="gaBribeMsg" style="display:none"></div>
           </div>
-
-          <div class="card" id="govDiscussionsCard">
-            <h2>Discussions — before it becomes a vote</h2>
-            <div class="kv" id="govDiscussionNote" style="margin-bottom:10px"></div>
-            <div id="govDiscussions" style="display:flex;flex-direction:column;gap:12px"></div>
-            <div class="row-actions" style="flex-wrap:wrap;margin-top:12px">
-              <input id="govDiscTitle" class="field" placeholder="What are you proposing?" style="min-width:280px" />
-            </div>
-            <textarea id="govDiscBody" class="field" placeholder="The case for it, and what it would change"
-              style="width:100%;min-height:80px;margin-top:8px"></textarea>
-            <div class="row-actions" style="margin-top:8px">
-              <button class="btn" id="govDiscPost">Open a discussion</button>
-              <span class="kv">Signed by your wallet, so authorship can be checked.</span>
-            </div>
-            <div class="msg" id="govDiscMsg" style="display:none"></div>
-          </div>
-
-          <div class="card" id="govProposalsCard">
-            <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
-              <h2 style="margin:0">Proposals</h2>
-              <div class="row-actions">
-                <select id="govFilter" class="field">
-                  <option value="all">All</option>
-                  <option value="open">Open for voting</option>
-                  <option value="passed">Passed</option>
-                  <option value="failed">Did not pass</option>
-                  <option value="mine">You can vote</option>
-                </select>
-              </div>
-            </div>
-            <div id="govProposals" style="display:flex;flex-direction:column;gap:12px;margin-top:12px"></div>
-            <div class="row-actions" id="govPager" style="justify-content:center;margin-top:12px;display:none">
-              <button class="btn" id="govPrev">‹</button>
-              <span class="kv" id="govPageLabel"></span>
-              <button class="btn" id="govNext">›</button>
-            </div>
-          </div>
-
-          <div class="card" id="govDetailCard" style="display:none">
-            <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
-              <h2 style="margin:0" id="govDetailTitle">Proposal</h2>
-              <button class="btn" id="govDetailBack">‹ Back to proposals</button>
-            </div>
-            <div class="kv" id="govDetailMeta" style="margin-top:8px"></div>
-            <div class="kv" id="govDetailBody" style="margin-top:10px;white-space:pre-wrap"></div>
-
-            <h3 style="font-size:13px;margin:18px 0 8px">Final result</h3>
-            <div id="govDetailBars"></div>
-            <div class="kv" id="govDetailQuorum" style="margin-top:10px"></div>
-
-            <div id="govDetailActionsWrap" style="display:none;margin-top:16px">
-              <h3 style="font-size:13px;margin:0 0 8px">What it carries</h3>
-              <div class="tblWrap auto"><table class="data" style="min-width:0">
-                <thead><tr><th>#</th><th>Target</th><th>Call</th></tr></thead>
-                <tbody id="govDetailActions"></tbody>
-              </table></div>
-            </div>
-
-            <h3 style="font-size:13px;margin:18px 0 8px" id="govVotesHeading">Votes</h3>
-            <div class="kv" id="govVotesNote" style="margin-bottom:8px;display:none"></div>
-            <div class="tblWrap auto"><table class="data" style="min-width:0">
-              <thead><tr><th>Account</th><th class="num">Vote</th><th class="num">Weight</th><th class="num">% of cast</th></tr></thead>
-              <tbody id="govVotesRows"></tbody>
-            </table></div>
-          </div>
-
-          <div class="card" id="govCreateCard" style="display:none">
-            <h2>Open a proposal</h2>
-            <div class="kv" style="margin-bottom:10px">
-              Operator only. Voting opens immediately and the snapshot is the previous block, so nobody
-              can arrange their weight after seeing the question.
-            </div>
-            <input id="govTitle" class="field" placeholder="Title" style="width:100%;margin-bottom:8px" />
-            <textarea id="govBody" class="field" placeholder="What is being proposed, and why"
-              style="width:100%;min-height:90px;margin-bottom:8px"></textarea>
-            <div class="row-actions">
-              <button class="btn primary" id="govPropose">Open proposal</button>
-              <span class="kv">Signalling only — this form carries no on-chain calls.</span>
-            </div>
-            <div class="msg" id="govCreateMsg" style="display:none"></div>
-          </div>
-
-          <div class="card" id="govEmissionsCard" style="display:none">
-            <h2>Emission rates — what each market pays</h2>
-            <div class="kv" style="margin-bottom:10px">
-              Operator only. A rate is in reward units per second across every share on that side, so the
-              APY a supplier sees falls as more of them arrive. Leave the end date empty to run
-              indefinitely; set one and the stream stops on its own, so a campaign cannot outlive the
-              intention behind it because nobody remembered to switch it off.
-            </div>
-            <div class="row-actions" style="flex-wrap:wrap">
-              <select id="govEmAsset" class="field"></select>
-              <select id="govEmSide" class="field">
-                <option value="0">Supply side</option>
-                <option value="1">Borrow side</option>
-              </select>
-              <input id="govEmRate" class="field" inputmode="decimal" placeholder="Tokens / second" style="width:150px" />
-              <input id="govEmUntil" class="field" type="date" style="width:165px" />
-              <button class="btn primary" id="govEmSet">Set rate</button>
-            </div>
-            <div class="kv" id="govEmBudget" style="margin-top:9px"></div>
-            <div class="msg" id="govEmMsg" style="display:none"></div>
-
-            <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
-              <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
-                <div>
-                  <b style="font-size:13px">Pause emissions</b>
-                  <div class="kv" style="margin-top:3px">
-                    Stops every stream at once without touching a rate, so resuming brings back exactly the
-                    schedule that was running. The paused seconds are skipped rather than banked. Claims keep
-                    working while paused — what people have already earned is theirs.
-                  </div>
-                </div>
-                <div class="row-actions">
-                  <span class="tag" id="govEmPausedTag">running</span>
-                  <button class="btn" id="govEmPause">Pause lending</button>
-                  <button class="btn" id="govLpPause">Pause liquidity</button>
-                </div>
-              </div>
-              <div class="msg" id="govPauseMsg" style="display:none"></div>
-            </div>
-          </div>
-
           <div class="card" id="govGaugeAdminCard" style="display:none">
             <h2>Market vote settings</h2>
             <div class="kv" style="margin-bottom:10px">
@@ -2512,7 +2518,102 @@
             </div>
             <div class="msg" id="gaAdminMsg" style="display:none"></div>
           </div>
+          </div>
 
+          <div class="govPane" id="gov_delegates" hidden>
+          <div class="card" id="govDelegateCard">
+            <h2>Delegate your TSRA</h2>
+            <div class="kv" style="margin-bottom:10px">
+              One delegation covers both venues: whoever you point at votes your weight in proposals
+              <i>and</i> in the market vote above. Point it at yourself to vote your own, or at somebody who
+              follows these markets more closely than you do. Your tokens never leave your wallet, and you
+              can move the delegation at any time.
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap">
+              <input id="govDelegateTo" class="field" placeholder="0x… (leave empty for yourself)" style="min-width:330px" />
+              <button class="btn primary" id="govDelegateSet">Delegate</button>
+              <span class="kv" id="govDelegateCurrent"></span>
+            </div>
+            <div class="msg" id="govDelegateMsg" style="display:none"></div>
+
+            <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+              <b style="font-size:13px">Delegates</b>
+              <div class="kv" style="margin:3px 0 9px">
+                Anyone may list themselves here, and appearing on the list confers nothing — the voting power
+                shown is read from the token, and your delegation stays yours to move at any time. It is a
+                directory, not an endorsement: a curated list of "trusted community members" would be a list
+                whose trust comes from whoever curates it.
+              </div>
+              <div class="tblWrap auto"><table class="data" style="min-width:0">
+                <thead><tr><th>Delegate</th><th class="num">Voting power</th><th class="num"></th></tr></thead>
+                <tbody id="govDelegateList"></tbody>
+              </table></div>
+              <div class="row-actions" id="govDelegatePager" style="margin-top:10px;flex-wrap:wrap;display:none">
+                <button class="btn" id="govDelegateMore">Show more</button>
+                <button class="btn" id="govDelegateAll">Show all</button>
+                <button class="btn" id="govDelegatePrev">‹</button>
+                <span class="kv" id="govDelegatePage"></span>
+                <button class="btn" id="govDelegateNext">›</button>
+              </div>
+              <div class="row-actions" style="flex-wrap:wrap;margin-top:10px">
+                <input id="govDelegateName" class="field" placeholder="Your name" style="width:170px" />
+                <input id="govDelegateStatement" class="field" placeholder="What you will vote for" style="min-width:280px" />
+                <button class="btn" id="govDelegateRegister">List me as a delegate</button>
+              </div>
+            </div>
+          </div>
+          </div>
+
+          <div class="govPane" id="gov_emissions" hidden>
+          <div class="card" id="govEmissionsCard" style="display:none">
+            <h2>Emission rates — what each market pays</h2>
+            <div class="kv" style="margin-bottom:10px">
+              Operator only. A rate is in reward units per second across every share on that side, so the
+              APY a supplier sees falls as more of them arrive. Leave the end date empty to run
+              indefinitely; set one and the stream stops on its own, so a campaign cannot outlive the
+              intention behind it because nobody remembered to switch it off.
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap">
+              <select id="govEmAsset" class="field"></select>
+              <select id="govEmSide" class="field">
+                <option value="0">Supply side</option>
+                <option value="1">Borrow side</option>
+                <option value="2">Backstop (first loss)</option>
+              </select>
+              <input id="govEmRate" class="field" inputmode="decimal" placeholder="Tokens / second" style="width:150px" />
+              <input id="govEmUntil" class="field" type="date" style="width:165px" />
+              <button class="btn primary" id="govEmSet">Set rate</button>
+            </div>
+            <div class="kv" style="margin-top:9px">
+              The <b>backstop</b> is the position that absorbs a write-off before any supplier is touched, so it
+              carries the real risk in the pool and should carry the largest stream of the three. Paying it the
+              same as a supplier prices first loss at zero, and nobody takes it.
+            </div>
+            <div class="kv" id="govEmBudget" style="margin-top:9px"></div>
+            <div class="msg" id="govEmMsg" style="display:none"></div>
+
+            <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+              <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">
+                <div>
+                  <b style="font-size:13px">Pause emissions</b>
+                  <div class="kv" style="margin-top:3px">
+                    Stops every stream at once without touching a rate, so resuming brings back exactly the
+                    schedule that was running. The paused seconds are skipped rather than banked. Claims keep
+                    working while paused — what people have already earned is theirs.
+                  </div>
+                </div>
+                <div class="row-actions">
+                  <span class="tag" id="govEmPausedTag">running</span>
+                  <button class="btn" id="govEmPause">Pause lending</button>
+                  <button class="btn" id="govLpPause">Pause liquidity</button>
+                </div>
+              </div>
+              <div class="msg" id="govPauseMsg" style="display:none"></div>
+            </div>
+          </div>
+          </div>
+
+          <div class="govPane" id="gov_registry" hidden>
           <div class="card" id="govRegistryCard">
             <h2>Asset registry — what the protocol has listed</h2>
             <div class="kv" id="govRegistryRule" style="margin-bottom:6px"></div>
@@ -2574,27 +2675,7 @@
               <div class="msg" id="regMsg" style="display:none"></div>
             </div>
           </div>
-
-          <div class="card">
-            <h2>The lock</h2>
-            <div class="kv" style="margin-bottom:10px">
-              The whole supply was minted straight into the emitter, and comes out in proportion to how
-              much the pools are used — not on a calendar. Idle protocol, no emission. The rate constants
-              are immutable, so nobody can wind the release forward.
-            </div>
-            <div class="metrics tight">
-              <div class="metric"><div class="k">Still locked</div><div class="v" id="govLocked">—</div></div>
-              <div class="metric"><div class="k">Measured activity</div><div class="v" id="govActivity">—</div></div>
-              <div class="metric"><div class="k">Emitting now</div><div class="v" id="govRate">—</div></div>
-              <div class="metric"><div class="k">Lasts</div><div class="v" id="govLasts">—</div></div>
-            </div>
-            <div class="tblWrap auto" style="margin-top:12px"><table class="data" style="min-width:0">
-              <thead><tr><th>Sink</th><th class="num">Weight</th><th class="num">Owed</th></tr></thead>
-              <tbody id="govSinks"></tbody>
-            </table></div>
           </div>
-        </div>
-
         <div class="tabPane" id="paneOther" hidden>
           <div class="card">
             <h2>Treasury &amp; faucet — working capital</h2>

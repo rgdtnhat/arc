@@ -8,10 +8,10 @@
   "provider": "0xa5b42b3Ebe7FDB187c956D310f868960015d2988",
   "deployedAt": "2026-07-17T06:22:37.721Z",
   "tesseraPool": "0x4e7d2a132c048a09e561679f41e86fa2e898fdc2",
-  "tesseraEmissions": "0x7e9e268f8da37cb0cc6eee361d6f50b1d09449db",
+  "tesseraEmissions": "0x4574c356a57bf2daccac61e42da4d734865a34c4",
   "tesseraToken": "0x8bb6bca8cb41147844a58327603eeab433f407b0",
   "tesseraEmitter": "0x408e0522487aec34a85b97c7a01be920b555d159",
-  "tesseraGovernor": "0x5cbd33263935471220a469527f50e47eae1fbb6e",
+  "tesseraGovernor": "0x4e38a6ae1ff04f9cd5780f52e35dfec612e32ceb",
   "tesseraVault": "0x936ed194bf4b1f5d44e60e75e2d7b3655dba652a",
   "tesseraRouter": "0x2edb172e3364d167eae1a3b7ba1fa4c8ccdcd5d1",
   "tesseraAmm": "0x8b3ae0eb103653c4bce4d4dbff062ad7c9c9ada0",
@@ -37,8 +37,15 @@
       "address": "0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF",
       "decimals": 8,
       "borrowable": true
+    },
+    {
+      "symbol": "TSRA",
+      "address": "0x8BB6bCa8CB41147844A58327603Eeab433f407b0",
+      "decimals": 18,
+      "borrowable": false
     }
   ],
   "tesseraAssetRegistry": "0x3375b12aa06449e0cc9ec369ac353e5e17f8ce34",
-  "tesseraGaugeLegacy": "0x7aa76a02ae084d947ccdfda27bbf4704993de996"
+  "tesseraGaugeLegacy": "0x7aa76a02ae084d947ccdfda27bbf4704993de996",
+  "tesseraGovernorLegacy": "0x5cbd33263935471220a469527f50e47eae1fbb6e"
 }

@@ -114,6 +114,7 @@ contract TesseraGovernor is ReentrancyGuard {
 
     event ProposalCreated(uint256 indexed id, address indexed proposer, string title, uint64 voteStart, uint64 voteEnd);
     event VoteCast(uint256 indexed id, address indexed voter, uint8 support, uint256 weight);
+    event VoteWithdrawn(uint256 indexed id, address indexed voter, uint256 weight);
     event ProposalExecuted(uint256 indexed id);
     event ProposalCancelled(uint256 indexed id);
     event AdminSet(address indexed admin);
@@ -200,17 +201,59 @@ contract TesseraGovernor is ReentrancyGuard {
         if (support > ABSTAIN) revert BadSupport(support);
         Proposal storage p = _proposals[id];
         if (p.cancelled || block.timestamp < p.voteStart || block.timestamp > p.voteEnd) revert NotActive(id);
-        if (hasVoted[id][msg.sender]) revert AlreadyVoted();
 
         uint256 weight = token.getPastVotes(msg.sender, p.snapshotBlock);
         if (weight == 0) revert NoVotingPower();
 
+        // Changing a vote replaces rather than adds: the old weight comes off
+        // before the new goes on. Refusing a second vote looked safer and was
+        // not — it left somebody who voted early and then read the discussion
+        // stuck with an opinion they no longer held, and it bought nothing,
+        // because weight is a snapshot and changing a vote cannot conjure any.
+        // The property worth protecting is that nobody counts twice, and
+        // subtracting first is what protects it.
+        if (hasVoted[id][msg.sender]) {
+            uint8 was = voteOf[id][msg.sender];
+            if (was == support) revert AlreadyVoted(); // nothing to change
+            _remove(p, was, weight);
+        }
         hasVoted[id][msg.sender] = true;
         voteOf[id][msg.sender] = support;
         if (support == FOR) p.forVotes += uint128(weight);
         else if (support == AGAINST) p.againstVotes += uint128(weight);
         else p.abstainVotes += uint128(weight);
         emit VoteCast(id, msg.sender, support, weight);
+    }
+
+    /**
+     * @notice Take a vote back entirely, while voting is still open.
+     *
+     * Distinct from abstaining: an abstention is a position and counts toward
+     * the quorum; withdrawing is the absence of one. Somebody who decides they
+     * should not be weighing in at all should not be forced to keep propping up
+     * the turnout that makes the result binding.
+     *
+     * Nothing is escrowed here, and never was. A vote reads a past balance, it
+     * does not take one — the tokens stay in the holder's wallet for the whole
+     * vote, spendable throughout, with nothing to return at the end.
+     */
+    function withdrawVote(uint256 id) external {
+        if (id >= _proposals.length) revert BadProposal(id);
+        Proposal storage p = _proposals[id];
+        if (p.cancelled || block.timestamp < p.voteStart || block.timestamp > p.voteEnd) revert NotActive(id);
+        if (!hasVoted[id][msg.sender]) revert NoVotingPower();
+
+        uint256 weight = token.getPastVotes(msg.sender, p.snapshotBlock);
+        _remove(p, voteOf[id][msg.sender], weight);
+        hasVoted[id][msg.sender] = false;
+        voteOf[id][msg.sender] = 0;
+        emit VoteWithdrawn(id, msg.sender, weight);
+    }
+
+    function _remove(Proposal storage p, uint8 support, uint256 weight) internal {
+        if (support == FOR) p.forVotes -= uint128(weight);
+        else if (support == AGAINST) p.againstVotes -= uint128(weight);
+        else p.abstainVotes -= uint128(weight);
     }
 
     // --- results --------------------------------------------------------------

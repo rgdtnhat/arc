@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mergeDeployment, explorerFrom } from "../src/deployment.js";
+import { mergeDeployment, explorerFrom, normaliseAssets } from "../src/deployment.js";
 
 /**
  * The rule that decides which contracts a running server talks to.
@@ -92,4 +92,51 @@ test("treats a blank explorer variable as unset", () => {
   assert.equal(explorerFrom(undefined), "https://testnet.arcscan.app");
   assert.equal(explorerFrom("not-a-url"), "https://testnet.arcscan.app");
   assert.equal(explorerFrom("https://scan.example/"), "https://scan.example");
+});
+
+/**
+ * The asset list is the other thing a deployment record carries, and the one
+ * that took a panel down: viem throws on a mismatched checksum, so a single
+ * mistyped capital did not degrade one row — it 500'd the whole endpoint.
+ */
+test("accepts an address whose checksum is wrong rather than throwing on it", () => {
+  const warnings: string[] = [];
+  // The exact value that broke it: a lowercase b where a capital belonged.
+  const out = normaliseAssets(
+    [{ symbol: "TSRA", address: "0x8bB6bCa8CB41147844A58327603Eeab433f407b0", decimals: 18 }],
+    (m) => warnings.push(m),
+  );
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.address, "0x8bb6bca8cb41147844a58327603eeab433f407b0");
+  assert.deepEqual(warnings, []);
+});
+
+test("drops something that is not an address, and says which", () => {
+  // Dropping one row beats carrying it to the loop where it explodes.
+  const warnings: string[] = [];
+  const out = normaliseAssets(
+    [
+      { symbol: "USDC", address: "0x3600000000000000000000000000000000000000", decimals: 6 },
+      { symbol: "OOPS", address: "not-an-address", decimals: 18 },
+      { symbol: "SHORT", address: "0x1234", decimals: 18 },
+    ],
+    (m) => warnings.push(m),
+  );
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.symbol, "USDC");
+  assert.equal(warnings.length, 2);
+  assert.ok(warnings[0]!.includes("OOPS"));
+});
+
+test("keeps the fields it does not own", () => {
+  const out = normaliseAssets([
+    { symbol: "TSRA", address: "0x8BB6bCa8CB41147844A58327603Eeab433f407b0", decimals: 18, borrowable: false },
+  ]);
+  assert.equal(out[0]!.borrowable, false);
+  assert.equal(out[0]!.decimals, 18);
+});
+
+test("survives a record with no asset list at all", () => {
+  assert.deepEqual(normaliseAssets(undefined), []);
+  assert.deepEqual(normaliseAssets("nonsense"), []);
 });

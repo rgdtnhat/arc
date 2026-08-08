@@ -205,9 +205,11 @@ describe("TesseraEmissions (rewards that cannot outrun the pot)", () => {
     await expect(a.write.sweep([f.alice.account.address, 1n])).to.be.rejected;
   });
 
-  it("rejects a side that is neither supply nor borrow", async () => {
+  it("rejects a side that is none of the three", async () => {
+    // Supply, borrow and backstop. Anything past those is a typo, and a typo
+    // that silently opened a fourth stream would emit into nothing.
     const f = await loadFixture(deployFixture);
-    await expect(f.em.write.setRate([f.usdc.address, 2, 1n])).to.be.rejected;
+    await expect(f.em.write.setRate([f.usdc.address, 3, 1n])).to.be.rejected;
     await expect(f.em.write.accrue([f.usdc.address, 7])).to.be.rejected;
   });
 
@@ -381,5 +383,76 @@ describe("TesseraEmissions (rewards that cannot outrun the pot)", () => {
     const f = await loadFixture(deployFixture);
     await f.em.write.setRates([f.usdc.address, RWD(1), RWD(2)]);
     expect(await f.em.read.totalRatePerSecond()).to.equal(RWD(3));
+  });
+
+  describe("the backstop side", () => {
+    it("pays a backstop depositor from its own stream", async () => {
+      /*
+       * A backstop depositor is not a supplier with extra steps: when a
+       * position goes underwater faster than it can be liquidated, their pot
+       * absorbs the write-off before any supplier is touched. Paying them from
+       * the same stream as the supply side would price first-loss at zero.
+       */
+      const f = await loadFixture(deployFixture);
+      const BACKSTOP = 2;
+      await f.pool.write.setBackstop([f.usdc.address, f.alice.account.address, 1000n, 1000n]);
+
+      await f.em.write.fund([RWD(10_000)]);
+      await f.em.write.setRate([f.usdc.address, BACKSTOP, RWD(1)]);
+      await f.em.write.checkpoint([f.alice.account.address, f.usdc.address, BACKSTOP]);
+      await time.increase(100);
+
+      const due = await f.em.read.claimable([f.alice.account.address, f.usdc.address, BACKSTOP]);
+      expect(due > RWD(98)).to.equal(true);
+      const a = await f.emAs(f.alice);
+      await a.write.claim([[f.usdc.address], [BACKSTOP]]);
+      expect(await f.reward.read.balanceOf([f.alice.account.address]) > RWD(98)).to.equal(true);
+    });
+
+    it("keeps the three sides completely separate", async () => {
+      const f = await loadFixture(deployFixture);
+      const BACKSTOP = 2;
+      await f.pool.write.setShares([f.usdc.address, f.alice.account.address, 1000n, 0n]);
+      await f.pool.write.setTotals([f.usdc.address, 1000n, 0n]);
+      await f.pool.write.setBackstop([f.usdc.address, f.bob.account.address, 1000n, 1000n]);
+
+      await f.em.write.fund([RWD(100_000)]);
+      // The backstop earns more for the same shares — that is the whole point.
+      await f.em.write.setRate([f.usdc.address, SUPPLY, RWD(1)]);
+      await f.em.write.setRate([f.usdc.address, BACKSTOP, RWD(3)]);
+      await f.em.write.checkpoint([f.alice.account.address, f.usdc.address, SUPPLY]);
+      await f.em.write.checkpoint([f.bob.account.address, f.usdc.address, BACKSTOP]);
+      await time.increase(1000);
+
+      const supplier = await f.em.read.claimable([f.alice.account.address, f.usdc.address, SUPPLY]);
+      const backer = await f.em.read.claimable([f.bob.account.address, f.usdc.address, BACKSTOP]);
+      expect(backer > supplier * 2n).to.equal(true);
+      // And neither leaks into the other's side.
+      expect(await f.em.read.claimable([f.alice.account.address, f.usdc.address, BACKSTOP])).to.equal(0n);
+      expect(await f.em.read.claimable([f.bob.account.address, f.usdc.address, SUPPLY])).to.equal(0n);
+    });
+
+    it("stops paying somebody who has pulled their backstop", async () => {
+      const f = await loadFixture(deployFixture);
+      const BACKSTOP = 2;
+      await f.pool.write.setBackstop([f.usdc.address, f.alice.account.address, 1000n, 1000n]);
+      await f.em.write.fund([RWD(10_000)]);
+      await f.em.write.setRate([f.usdc.address, BACKSTOP, RWD(1)]);
+      await f.em.write.checkpoint([f.alice.account.address, f.usdc.address, BACKSTOP]);
+      await time.increase(100);
+
+      await f.pool.write.setBackstop([f.usdc.address, f.alice.account.address, 0n, 1000n]);
+      const atExit = await f.em.read.claimable([f.alice.account.address, f.usdc.address, BACKSTOP]);
+      await time.increase(10_000);
+      expect(await f.em.read.claimable([f.alice.account.address, f.usdc.address, BACKSTOP])).to.equal(atExit);
+    });
+
+    it("counts all three sides in the totals an operator reads", async () => {
+      const f = await loadFixture(deployFixture);
+      await f.em.write.setRate([f.usdc.address, SUPPLY, RWD(1)]);
+      await f.em.write.setRate([f.usdc.address, BORROW, RWD(2)]);
+      await f.em.write.setRate([f.usdc.address, 2, RWD(4)]);
+      expect(await f.em.read.totalRatePerSecond()).to.equal(RWD(7));
+    });
   });
 });

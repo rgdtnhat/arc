@@ -33,6 +33,43 @@ export interface DeploymentMerge {
   localOnly: string[];
 }
 
+/**
+ * Repair the asset list a deployment record carries.
+ *
+ * viem checksums every address it is handed and throws on a mismatched one, so
+ * a single mistyped capital in `poolAssets` does not degrade one row — it
+ * throws inside whatever loop touches it and takes the whole panel down with a
+ * 500. One did exactly that: TSRA went in with a bad checksum and the emissions
+ * endpoint stopped answering entirely, while the wallet list quietly reported a
+ * balance of zero for a wallet holding 658 of them.
+ *
+ * Lower-casing is enough, because viem accepts an all-lowercase address as
+ * unchecksummed and validates the rest. An entry that is not an address at all
+ * is dropped and named, rather than carried to the place it will explode.
+ */
+export function normaliseAssets(
+  assets: unknown,
+  warn: (msg: string) => void = () => {},
+): { address: string; symbol: string; decimals: number; borrowable?: boolean }[] {
+  if (!Array.isArray(assets)) return [];
+  const out: { address: string; symbol: string; decimals: number; borrowable?: boolean }[] = [];
+  for (const a of assets) {
+    const addr = String((a as { address?: unknown })?.address ?? "");
+    const symbol = String((a as { symbol?: unknown })?.symbol ?? "");
+    if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) {
+      warn(`dropping asset ${symbol || "(unnamed)"}: "${addr}" is not an address`);
+      continue;
+    }
+    out.push({
+      ...(a as object),
+      address: addr.toLowerCase(),
+      symbol: symbol || `${addr.slice(0, 6)}…`,
+      decimals: Number((a as { decimals?: unknown })?.decimals ?? 6),
+    } as { address: string; symbol: string; decimals: number; borrowable?: boolean });
+  }
+  return out;
+}
+
 /** Fields that describe the merge itself, not the deployment. */
 const META = new Set(["overrides", "explorer"]);
 

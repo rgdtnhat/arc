@@ -2,7 +2,7 @@ import express from "express";
 import path from "node:path";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
-import { mergeDeployment, explorerFrom } from "./deployment.js";
+import { mergeDeployment, explorerFrom, normaliseAssets } from "./deployment.js";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
 import { verifyMessage, verifyTypedData, formatUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
@@ -180,6 +180,11 @@ const liveDeployment = (() => {
   const base = read("arc.json");
   const local = read("arc.local.json");
   const { merged, applied, ignored } = mergeDeployment(base, local);
+  // A mistyped capital in one asset address used to throw inside every loop
+  // that touched the list, taking whole panels down with a 500.
+  if (merged.poolAssets) {
+    merged.poolAssets = normaliseAssets(merged.poolAssets, (m) => console.log(`[deployment] ${m}`));
+  }
   if (applied.length) console.log(`[deployment] local override in effect for ${applied.join(", ")}`);
   if (ignored.length) {
     console.log(
@@ -5026,7 +5031,7 @@ async function main() {
   /* ---- Pool emissions -------------------------------------------------- */
 
   const emissionsAddr = (liveDeployment.tesseraEmissions as Hex) ?? null;
-  const SIDE = { supply: 0, borrow: 1 } as const;
+  const SIDE = { supply: 0, borrow: 1, backstop: 2 } as const;
 
   /**
    * Rewards, per reserve and per side, as an APR the page can put next to the
@@ -5091,18 +5096,40 @@ async function main() {
       const rows = await Promise.all(
         assets.map(async (a) => {
           const dec = BigInt(Number(a.decimals ?? 6));
-          const [supplyRate, borrowRate, reserve] = await Promise.all([
+          const [supplyRate, borrowRate, backstopRate, reserve, backstopTotal] = await Promise.all([
             read<readonly [bigint, bigint, bigint, bigint]>("streams", [a.address, SIDE.supply]),
             read<readonly [bigint, bigint, bigint, bigint]>("streams", [a.address, SIDE.borrow]),
+            // A deployment on the older contract has no third side; it reports
+            // nothing rather than failing the whole row.
+            read<readonly [bigint, bigint, bigint, bigint]>("streams", [a.address, SIDE.backstop])
+              .catch(() => [0n, 0n, 0n, 0n] as const),
             client.public.readContract({
               address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "reserves", args: [a.address],
             }) as Promise<readonly unknown[]>,
+            client.public
+              .readContract({
+                address: poolDeployment.poolAddress, abi: tesseraPoolAbi,
+                functionName: "backstopBalance", args: [a.address],
+              })
+              .then((v) => v as bigint)
+              .catch(() => 0n),
           ]);
           const assetPriceE8 = reserve[PRICE_IX] as bigint;
           const supplied = reserve[9] as bigint;
           const borrowed = reserve[11] as bigint;
 
-          /** Yearly emission value over the side's value, as a percentage. */
+          /**
+           * Yearly emission value over the side's value, as a percentage.
+           *
+           * Null above `APR_CEILING`, and that is not a display nicety. A side
+           * holding dust divides a real emission by almost nothing, and the
+           * arithmetic is correct: the backstop showed 5,360,395% the moment
+           * its stream was set against an empty pot. Nobody can earn that —
+           * the first meaningful deposit collapses it — so printing it is a
+           * promise the protocol cannot keep. Saying "not yet" is the true
+           * answer, and the rate is still reported beside it.
+           */
+          const APR_CEILING = 10_000;
           const apr = (ratePerSecond: bigint, sideAssets: bigint): number | null => {
             if (ratePerSecond === 0n) return 0;
             if (rewardPriceE8 === 0n || assetPriceE8 === 0n || sideAssets === 0n) return null;
@@ -5112,32 +5139,42 @@ async function main() {
             const yearlyUsd = (ratePerSecond * YEAR * rewardPriceE8) / rewardUnit;
             const sideUsd = (sideAssets * assetPriceE8) / 10n ** dec;
             if (sideUsd === 0n) return null;
-            return Number((yearlyUsd * 1_000_000n) / sideUsd) / 10_000;
+            const pct = Number((yearlyUsd * 1_000_000n) / sideUsd) / 10_000;
+            return pct > APR_CEILING ? null : pct;
           };
 
           const mine = who
             ? await Promise.all([
                 read<bigint>("claimable", [who, a.address, SIDE.supply]),
                 read<bigint>("claimable", [who, a.address, SIDE.borrow]),
+                read<bigint>("claimable", [who, a.address, SIDE.backstop]).catch(() => 0n),
               ])
-            : [0n, 0n];
+            : [0n, 0n, 0n];
 
           return {
             address: a.address,
             symbol: a.symbol,
             supplyRatePerSecond: supplyRate[0].toString(),
             borrowRatePerSecond: borrowRate[0].toString(),
+            backstopRatePerSecond: backstopRate[0].toString(),
             supplyEndsAt: Number(supplyRate[3] ?? 0n),
             borrowEndsAt: Number(borrowRate[3] ?? 0n),
             supplyApr: apr(supplyRate[0], supplied),
             borrowApr: apr(borrowRate[0], borrowed),
+            // Measured against the backstop pot rather than the supply side:
+            // it is a different pool of money taking a different risk, and
+            // dividing by the wrong denominator is how a headline rate lies.
+            backstopApr: apr(backstopRate[0], backstopTotal),
+            backstopSize: fmtUnits(backstopTotal, Number(a.decimals ?? 6)),
             claimableSupply: mine[0].toString(),
             claimableBorrow: mine[1].toString(),
+            claimableBackstop: mine[2].toString(),
           };
         }),
       );
 
-      const claimable = rows.reduce((t, r) => t + BigInt(r.claimableSupply) + BigInt(r.claimableBorrow), 0n);
+      const claimable = rows.reduce(
+        (t, r) => t + BigInt(r.claimableSupply) + BigInt(r.claimableBorrow) + BigInt(r.claimableBackstop), 0n);
       res.json({
         ok: true,
         deployed: true,
@@ -6040,6 +6077,105 @@ async function main() {
   });
 
   /** Open a proposal. Operator only — an open queue is mostly spam. */
+  /**
+   * Every asset a wallet holds, priced, paged.
+   *
+   * ## Why the server pages this rather than the browser
+   * The browser could fetch every balance and slice locally, and for four
+   * assets that is what it amounts to. The reason not to is that this endpoint
+   * is what a wallet with fifty tokens hits: one `balanceOf` per asset per
+   * poll, from every open tab, is a load that grows with the product's success
+   * and lands entirely on a throttled public RPC. Slicing first means the work
+   * is bounded by what is on screen rather than by what somebody owns.
+   *
+   * The totals are computed across everything regardless, because a balance
+   * summary that only counted the visible page would be wrong in a way nobody
+   * would catch.
+   */
+  app.get("/api/wallet/assets", async (req, res) => {
+    try {
+      const user = String(req.query.user ?? "");
+      if (!/^0x[0-9a-fA-F]{40}$/.test(user)) {
+        res.status(400).json({ ok: false, error: "which address?" });
+        return;
+      }
+      const who = user as Hex;
+      const page = Math.max(1, Number(req.query.page ?? 1) || 1);
+      // Capped: "all" from a client is still a request the server has to size.
+      const size = Math.min(100, Math.max(1, Number(req.query.size ?? 5) || 5));
+
+      // Everything the deployment knows about, plus the protocol's own token
+      // even before it is a listed reserve.
+      const known = new Map<string, { address: Hex; symbol: string; decimals: number }>();
+      for (const a of poolDeployment?.assets ?? []) {
+        known.set(a.address.toLowerCase(), {
+          address: a.address as Hex, symbol: a.symbol, decimals: Number(a.decimals ?? 6),
+        });
+      }
+      if (liveDeployment.tesseraToken) {
+        const t = (liveDeployment.tesseraToken as Hex).toLowerCase();
+        if (!known.has(t)) known.set(t, { address: liveDeployment.tesseraToken as Hex, symbol: "TSRA", decimals: 18 });
+      }
+      const all = [...known.values()];
+
+      const priceOf = async (addr: Hex): Promise<number> => {
+        if (!poolDeployment) return 0;
+        return client.public
+          .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [addr] })
+          .then((v) => Number(v as bigint) / 1e8)
+          .catch(() => 0);
+      };
+
+      const rows = await Promise.all(
+        all.map(async (a) => {
+          const raw = (await client.public
+            .readContract({ address: a.address, abi: erc20Abi, functionName: "balanceOf", args: [who] })
+            .catch(() => 0n)) as bigint;
+          const price = await priceOf(a.address);
+          const amount = Number(raw) / 10 ** a.decimals;
+          return {
+            address: a.address,
+            symbol: a.symbol,
+            decimals: a.decimals,
+            balance: fmtUnits(raw, a.decimals),
+            balanceRaw: raw.toString(),
+            priceUsd: price,
+            valueUsd: price > 0 ? amount * price : null,
+            // The protocol's own token gets its mark; the rest fall back to
+            // whatever the pool prices them at.
+            isProtocolToken: Boolean(liveDeployment.tesseraToken)
+              && a.address.toLowerCase() === (liveDeployment.tesseraToken as string).toLowerCase(),
+          };
+        }),
+      );
+
+      // Largest holding first, then anything unpriced, then empties — so the
+      // first page is the part of the wallet that matters.
+      rows.sort((x, y) => (y.valueUsd ?? -1) - (x.valueUsd ?? -1) || Number(y.balanceRaw) - Number(x.balanceRaw));
+
+      const held = rows.filter((r) => BigInt(r.balanceRaw) > 0n);
+      const totalUsd = rows.reduce((t, r) => t + (r.valueUsd ?? 0), 0);
+      const pages = Math.max(1, Math.ceil(rows.length / size));
+
+      res.json({
+        ok: true,
+        address: who,
+        page: Math.min(page, pages),
+        size,
+        pages,
+        total: rows.length,
+        heldCount: held.length,
+        totalUsd,
+        // Whether anything is missing a mark, so the page can say the total is
+        // partial rather than quietly understating it.
+        unpriced: rows.filter((r) => r.valueUsd === null).map((r) => r.symbol),
+        assets: rows.slice((Math.min(page, pages) - 1) * size, Math.min(page, pages) * size),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   /**
    * Which build is actually running.
    *

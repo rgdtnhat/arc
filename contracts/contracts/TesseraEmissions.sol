@@ -6,6 +6,8 @@ import "./ReentrancyGuard.sol";
 interface IEmissionsPool {
     function supplyShares(address asset, address user) external view returns (uint256);
     function borrowShares(address asset, address user) external view returns (uint256);
+    function backstopShares(address asset, address user) external view returns (uint256);
+    function backstopTotalShares(address asset) external view returns (uint256);
     function reserves(address asset)
         external
         view
@@ -90,6 +92,19 @@ contract TesseraEmissions is ReentrancyGuard {
     uint8 public constant SIDE_SUPPLY = 0;
     /// Borrow side of a reserve.
     uint8 public constant SIDE_BORROW = 1;
+    /**
+     * The backstop: first loss, and paid for it.
+     *
+     * A backstop depositor is not a supplier with extra steps. When a position
+     * goes underwater faster than it can be liquidated, their pot absorbs the
+     * write-off before any supplier is touched — so they are the reason the
+     * supply side stays whole, and the only honest way to price that is a
+     * larger share of the emissions than either of the other two sides gets.
+     *
+     * It accrues against `backstopShares`, which move only on deposit and exit,
+     * exactly like the other two.
+     */
+    uint8 public constant SIDE_BACKSTOP = 2;
 
     /// Reward-per-share is carried at 1e18 so small rates against large share
     /// counts do not truncate to nothing.
@@ -243,8 +258,7 @@ contract TesseraEmissions is ReentrancyGuard {
         if (paused == next) return;
         uint256 n = streamedAssets.length;
         for (uint256 i = 0; i < n; i++) {
-            _accrue(streamedAssets[i], SIDE_SUPPLY);
-            _accrue(streamedAssets[i], SIDE_BORROW);
+            for (uint8 side = SIDE_SUPPLY; side <= SIDE_BACKSTOP; side++) _accrue(streamedAssets[i], side);
         }
         paused = next;
         emit PausedSet(next);
@@ -287,7 +301,7 @@ contract TesseraEmissions is ReentrancyGuard {
 
     function _setRate(address asset, uint8 side, uint256 ratePerSecond, uint64 endsAt) internal {
         if (asset == address(0)) revert ZeroAddress();
-        if (side > SIDE_BORROW) revert BadSide();
+        if (side > SIDE_BACKSTOP) revert BadSide();
         if (ratePerSecond > MAX_RATE_PER_SECOND) revert RateTooHigh(ratePerSecond, MAX_RATE_PER_SECOND);
         if (address(rewardToken) == address(0)) revert RewardTokenNotSet();
 
@@ -350,7 +364,7 @@ contract TesseraEmissions is ReentrancyGuard {
 
     /// @notice Bring a stream's index up to the current block.
     function accrue(address asset, uint8 side) public {
-        if (side > SIDE_BORROW) revert BadSide();
+        if (side > SIDE_BACKSTOP) revert BadSide();
         _accrue(asset, side);
     }
 
@@ -388,11 +402,13 @@ contract TesseraEmissions is ReentrancyGuard {
     }
 
     function _totalShares(address asset, uint8 side) internal view returns (uint256) {
+        if (side == SIDE_BACKSTOP) return pool.backstopTotalShares(asset);
         (, , , , , , , , uint256 totalSupplyShares, , uint256 totalBorrowShares, , ) = pool.reserves(asset);
         return side == SIDE_SUPPLY ? totalSupplyShares : totalBorrowShares;
     }
 
     function _userShares(address asset, uint8 side, address user) internal view returns (uint256) {
+        if (side == SIDE_BACKSTOP) return pool.backstopShares(asset, user);
         return side == SIDE_SUPPLY ? pool.supplyShares(asset, user) : pool.borrowShares(asset, user);
     }
 
@@ -401,7 +417,7 @@ contract TesseraEmissions is ReentrancyGuard {
      *         anyone — see the accrual note on why that matters.
      */
     function checkpoint(address user, address asset, uint8 side) public {
-        if (side > SIDE_BORROW) revert BadSide();
+        if (side > SIDE_BACKSTOP) revert BadSide();
         _accrue(asset, side);
         Position storage p = positions[asset][side][user];
         Stream storage s = streams[asset][side];
@@ -484,7 +500,7 @@ contract TesseraEmissions is ReentrancyGuard {
      * disagreed with the settlement would be worse than no preview.
      */
     function claimable(address user, address asset, uint8 side) public view returns (uint256) {
-        if (side > SIDE_BORROW) return 0;
+        if (side > SIDE_BACKSTOP) return 0;
         Stream storage s = streams[asset][side];
         Position storage p = positions[asset][side][user];
 
@@ -512,8 +528,9 @@ contract TesseraEmissions is ReentrancyGuard {
     function claimableTotal(address user) external view returns (uint256 total) {
         uint256 n = streamedAssets.length;
         for (uint256 i = 0; i < n; i++) {
-            total += claimable(user, streamedAssets[i], SIDE_SUPPLY);
-            total += claimable(user, streamedAssets[i], SIDE_BORROW);
+            for (uint8 side = SIDE_SUPPLY; side <= SIDE_BACKSTOP; side++) {
+                total += claimable(user, streamedAssets[i], side);
+            }
         }
     }
 
@@ -522,7 +539,7 @@ contract TesseraEmissions is ReentrancyGuard {
         if (paused) return 0; // paused is not "slow", it is "stopped"
         uint256 n = streamedAssets.length;
         for (uint256 i = 0; i < n; i++) {
-            for (uint8 side = SIDE_SUPPLY; side <= SIDE_BORROW; side++) {
+            for (uint8 side = SIDE_SUPPLY; side <= SIDE_BACKSTOP; side++) {
                 Stream storage s = streams[streamedAssets[i]][side];
                 // An expired stream is not an outflow, so it must not shorten
                 // the runway of the ones still running.

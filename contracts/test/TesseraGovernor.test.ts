@@ -108,12 +108,84 @@ describe("TesseraGovernor (a result the admin cannot decline to enact)", () => {
     expect(await f.gov.read.state([0n])).to.equal(S.Defeated);
   });
 
-  it("refuses a second vote from the same address", async () => {
+  it("lets a voter change their mind, replacing rather than adding", async () => {
+    /*
+     * Refusing a second vote looked safer and was not: it left somebody who
+     * voted early and then read the discussion stuck with an opinion they no
+     * longer held. What has to hold is that nobody counts twice, which is a
+     * property of subtracting the old weight before adding the new — not of
+     * refusing outright.
+     */
     const f = await loadFixture(deployFixture);
     await f.gov.write.propose(proposal());
     const a = await f.govAs(f.alice);
     await a.write.castVote([0n, FOR]);
+    await a.write.castVote([0n, AGAINST]);
+
+    const info = await f.gov.read.proposalInfo([0n]);
+    expect(info[5]).to.equal(0n); // for: emptied
+    expect(info[6]).to.equal(T(600)); // against: her whole weight, once
+  });
+
+  it("refuses a re-vote that changes nothing", async () => {
+    const f = await loadFixture(deployFixture);
+    await f.gov.write.propose(proposal());
+    const a = await f.govAs(f.alice);
+    await a.write.castVote([0n, FOR]);
+    await expect(a.write.castVote([0n, FOR])).to.be.rejected;
+  });
+
+  it("lets a voter withdraw entirely, which is not the same as abstaining", async () => {
+    // An abstention counts toward the quorum; withdrawing is the absence of a
+    // position, and must not go on propping up the turnout.
+    const f = await loadFixture(deployFixture);
+    await f.gov.write.propose(proposal());
+    const a = await f.govAs(f.alice);
+    await a.write.castVote([0n, FOR]);
+    await a.write.withdrawVote([0n]);
+
+    const info = await f.gov.read.proposalInfo([0n]);
+    expect(info[5] + info[6] + info[7]).to.equal(0n);
+    expect(await f.gov.read.hasVoted([0n, f.alice.account.address])).to.equal(false);
+  });
+
+  it("turns a passing proposal into a defeated one when enough weight leaves", async () => {
+    const f = await loadFixture(deployFixture);
+    await f.gov.write.propose(proposal());
+    const a = await f.govAs(f.alice);
+    await a.write.castVote([0n, FOR]); // 600 of 1000, over the 200 quorum
+    await a.write.withdrawVote([0n]);
+    await time.increase(3 * DAY + 1);
+    expect(await f.gov.read.state([0n])).to.equal(S.Defeated);
+  });
+
+  it("refuses a withdrawal from somebody who never voted", async () => {
+    const f = await loadFixture(deployFixture);
+    await f.gov.write.propose(proposal());
+    const b = await f.govAs(f.bob);
+    await expect(b.write.withdrawVote([0n])).to.be.rejected;
+  });
+
+  it("refuses a change once voting has closed", async () => {
+    const f = await loadFixture(deployFixture);
+    await f.gov.write.propose(proposal());
+    const a = await f.govAs(f.alice);
+    await a.write.castVote([0n, FOR]);
+    await time.increase(3 * DAY + 10);
     await expect(a.write.castVote([0n, AGAINST])).to.be.rejected;
+    await expect(a.write.withdrawVote([0n])).to.be.rejected;
+  });
+
+  it("never takes custody of a voter's tokens", async () => {
+    // The thing people assume a vote does. It does not: weight is read from a
+    // past block, so there is nothing escrowed and nothing to give back.
+    const f = await loadFixture(deployFixture);
+    const before = await f.token.read.balanceOf([f.alice.account.address]);
+    await f.gov.write.propose(proposal());
+    const a = await f.govAs(f.alice);
+    await a.write.castVote([0n, FOR]);
+    expect(await f.token.read.balanceOf([f.alice.account.address])).to.equal(before);
+    expect(await f.token.read.balanceOf([f.gov.address])).to.equal(0n);
   });
 
   it("cannot be voted with weight acquired after the question was asked", async () => {
