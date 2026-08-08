@@ -1537,14 +1537,43 @@ const $ = (id) => document.getElementById(id);
             m.textContent = "Nothing has accrued to claim yet.";
             return;
           }
+          const btn = $("lnEmClaim");
+          const m = $("lnEmMsg");
+          /*
+           * Not in self-custody? Claim as the app wallet, server-side.
+           *
+           * This used to refuse outright — "rewards are paid to whoever earned
+           * them, so this needs your own wallet" — which is true of a browser
+           * session and false of this one. In an operator session the figure
+           * above was read for `actingAs`, the app wallet, so the balance being
+           * refused is the app wallet's own. `claim` takes no recipient: it
+           * pays `msg.sender`, so the server signing as the agent pays the
+           * agent and cannot touch anybody else's reward.
+           */
           if (!selfMode()) {
-            const m = $("lnEmMsg");
-            m.style.display = "block"; m.style.color = "var(--warn)";
-            m.textContent = "Rewards are paid to whoever earned them, so this needs your own wallet. " +
-              "Switch on \"Use my own wallet\".";
+            btn.disabled = true;
+            m.style.display = "block"; m.style.color = "var(--muted)";
+            m.textContent = "Claiming to the app wallet…";
+            try {
+              const r = await (await postJson("/api/lending/emissions/claim", {})).json();
+              if (r.ok) {
+                const dp = (em.reward && em.reward.decimals) || 18;
+                const paid = (Number(r.paid) / 10 ** dp).toFixed(6).replace(/\.?0+$/, "");
+                m.style.color = "var(--good)";
+                m.textContent = `Claimed ${paid} ${em.reward.symbol} to ${String(r.to).slice(0, 10)}… ` +
+                  `— tx ${String(r.txHash).slice(0, 12)}…`;
+              } else {
+                m.style.color = "var(--warn)";
+                m.textContent = `Claim failed: ${r.error}`;
+              }
+            } catch {
+              m.style.color = "var(--warn)";
+              m.textContent = "Claim request failed.";
+            }
+            btn.disabled = false;
+            loadEmissions();
             return;
           }
-          const btn = $("lnEmClaim");
           btn.disabled = true;
           await selfCustody("lnEmMsg", `claim ${em.yourClaimable} ${em.reward.symbol}`, async (from, cfg) =>
             sendTx(
@@ -6121,12 +6150,26 @@ const $ = (id) => document.getElementById(id);
             govMsg("amEmMsg", "Nothing has accrued to claim yet.", "var(--warn)");
             return;
           }
+          const btn = $("amEmClaim");
+          // Same as the lending claim: an operator session is already looking
+          // at the app wallet's own figure, and `claim` pays `msg.sender`.
           if (!selfMode()) {
-            govMsg("amEmMsg", "Rewards are paid to whoever earned them, so this needs your own wallet. " +
-              "Switch on \"Use my own wallet\".", "var(--warn)");
+            btn.disabled = true;
+            govMsg("amEmMsg", "Claiming to the app wallet…", "var(--muted)");
+            try {
+              const r = await (await postJson("/api/amm/emissions/claim", {})).json();
+              if (r.ok) {
+                const dp = (em.reward && em.reward.decimals) || 18;
+                const paid = (Number(r.paid) / 10 ** dp).toFixed(6).replace(/\.?0+$/, "");
+                govMsg("amEmMsg",
+                  `Claimed ${paid} ${em.reward.symbol} to ${String(r.to).slice(0, 10)}… — tx ${String(r.txHash).slice(0, 12)}…`,
+                  "var(--good)");
+              } else govMsg("amEmMsg", `Claim failed: ${r.error}`, "var(--warn)");
+            } catch { govMsg("amEmMsg", "Claim request failed.", "var(--warn)"); }
+            btn.disabled = false;
+            loadLpEmissions();
             return;
           }
-          const btn = $("amEmClaim");
           btn.disabled = true;
           await selfCustody("amEmMsg", `claim ${em.yourClaimable} ${em.reward.symbol}`, async (from, cfg) =>
             // claim(uint256[]): one dynamic array, so the head is a single

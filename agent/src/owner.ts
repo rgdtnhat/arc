@@ -27,9 +27,9 @@ export class OwnerClient {
   constructor(
     private readonly chain: Chain,
     rpcUrl: string,
-    privateKey: Hex,
+    signer: Hex | Account,
   ) {
-    this.account = privateKeyToAccount(privateKey);
+    this.account = typeof signer === "string" ? privateKeyToAccount(signer) : signer;
     this.pub = createPublicClient({ chain, transport: pacedHttp(rpcUrl), batch: { multicall: true } });
     this.wallet = createWalletClient({ account: this.account, chain, transport: pacedHttp(rpcUrl) });
   }
@@ -38,6 +38,21 @@ export class OwnerClient {
   static fromEnv(chain: Chain, rpcUrl: string): OwnerClient | null {
     const key = process.env.DEPLOYER_PRIVATE_KEY as Hex | undefined;
     return key ? new OwnerClient(chain, rpcUrl, key) : null;
+  }
+
+  /**
+   * The same signing machinery, driven by an account that is not the deployer.
+   *
+   * Not every call the server makes on a user's behalf is owner-gated. The app
+   * wallet claims its *own* rewards, supplies its *own* liquidity — ordinary
+   * calls where the only thing that matters is which address is `msg.sender`.
+   * Those still want the gas margin and the receipt check in this class, and
+   * they must go through the `Account` the rest of the app already built, so a
+   * `WALLET_MODE=circle` deployment keeps signing through Circle rather than
+   * quietly falling back to a raw key.
+   */
+  static forAccount(chain: Chain, rpcUrl: string, account: Account): OwnerClient {
+    return new OwnerClient(chain, rpcUrl, account);
   }
 
   /**

@@ -444,6 +444,17 @@ async function main() {
   if (owner) console.log(`🔑 Owner ops enabled via deployer ${owner.account.address}`);
   else console.log("🔑 Owner ops disabled (no DEPLOYER_PRIVATE_KEY) — App Config saves locally only");
 
+  /*
+   * The same signing machinery, as the app wallet rather than the deployer.
+   *
+   * For calls where `msg.sender` *is* the point — claiming the rewards this
+   * wallet earned — the deployer is the wrong key: a different address with a
+   * different position, which reverts `NothingToClaim` in a way that reads as a
+   * permissions failure. Built from `agentAccount` so `WALLET_MODE=circle` keeps
+   * signing through Circle.
+   */
+  const agentSigner = OwnerClient.forAccount(chain, rpcUrl, agentAccount);
+
   // Guardian policy: one-shot/CI runs auto-approve so they don't block on a human.
   const policy = {
     ...AGENT_POLICY,
@@ -5356,6 +5367,83 @@ async function main() {
     }
   });
 
+  /**
+   * The app wallet claims the rewards the app wallet earned.
+   *
+   * The dashboard used to refuse this outright — "rewards are paid to whoever
+   * earned them, so this needs your own wallet" — and that reasoning is sound
+   * for a browser session, where you obviously cannot claim a stranger's
+   * balance. It was wrong for an operator session, because there the panel is
+   * *already* showing the app wallet's own figure: `actingAs` resolves to the
+   * agent, which is the address that holds the pool position, so the number on
+   * screen was earned by the very key this server signs with.
+   *
+   * `claim` takes no recipient. It checkpoints `msg.sender` and transfers to
+   * `msg.sender`, so the only question is who signs — and signing as the agent
+   * pays the agent. Nothing here can move somebody else's reward.
+   *
+   * Signed by the agent rather than `owner`: the deployer is a different
+   * address with a different (probably empty) position, and claiming as it
+   * would revert `NothingToClaim` while looking like a permissions problem.
+   */
+  app.post("/api/lending/emissions/claim", requireOperator, async (req, res) => {
+    if (!emissionsAddr) { res.status(404).json({ ok: false, error: "emissions not deployed" }); return; }
+    try {
+      const who = agentAccount.address as Hex;
+      const reward = (await client.public.readContract({
+        address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "rewardToken",
+      })) as Hex;
+      if (!reward || reward === "0x0000000000000000000000000000000000000000") {
+        res.status(400).json({ ok: false, error: "no reward token is set on the emissions contract" });
+        return;
+      }
+
+      /*
+       * Only the streams with something in them. `claim` reverts the whole call
+       * when the total is zero, and an empty stream in the list costs gas to
+       * checkpoint for nothing — so the set is computed from what the chain
+       * says is owed, not from what the page last rendered.
+       */
+      const assets: Hex[] = [];
+      const sides: number[] = [];
+      for (const a of poolDeployment?.assets ?? []) {
+        for (const side of [0, 1, 2]) {
+          const owed = (await client.public.readContract({
+            address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "claimable",
+            args: [who, a.address as Hex, side],
+          })) as bigint;
+          if (owed > 0n) { assets.push(a.address as Hex); sides.push(side); }
+        }
+      }
+      if (!assets.length) {
+        res.status(400).json({ ok: false, error: `nothing has accrued to ${who} yet` });
+        return;
+      }
+
+      const before = (await client.public.readContract({
+        address: reward, abi: erc20Abi, functionName: "balanceOf", args: [who],
+      })) as bigint;
+      const txHash = await agentSigner.write(emissionsAddr, tesseraEmissionsAbi, "claim", [assets, sides]);
+      // What actually arrived, not what was owed. A pot short of the full debt
+      // pays out what it has, and reporting the ask as the answer would be a
+      // number nobody received.
+      const after = (await client.public.readContract({
+        address: reward, abi: erc20Abi, functionName: "balanceOf", args: [who],
+      })) as bigint;
+      const paid = after > before ? after - before : 0n;
+
+      logTx(req, {
+        category: "defi", action: "emissions-claim", status: "success", txHash,
+        detail: `${paid} to ${who} across ${assets.length} stream(s)`,
+      });
+      invalidateAll();
+      res.json({ ok: true, txHash, paid: paid.toString(), to: who, streams: assets.length });
+    } catch (e) {
+      logTx(req, { category: "defi", action: "emissions-claim", status: "failed", detail: friendlyError(e) });
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   /* ---- AMM liquidity emissions ----------------------------------------- */
 
   const lpEmissionsAddr = (liveDeployment.tesseraLpEmissions as Hex) ?? null;
@@ -5535,6 +5623,63 @@ async function main() {
       logTx(req, { category: "defi", action: "lp-emissions-fund", status: "success", txHash, detail: String(amount) });
       res.json({ ok: true, txHash });
     } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * The app wallet claims its liquidity rewards. See the lending twin above —
+   * the reasoning and the constraint are identical: `claim` pays `msg.sender`,
+   * the agent is the address holding the LP shares, and the deployer is not.
+   */
+  app.post("/api/amm/emissions/claim", requireOperator, async (req, res) => {
+    if (!lpEmissionsAddr) { res.status(404).json({ ok: false, error: "AMM emissions not deployed" }); return; }
+    try {
+      const who = agentAccount.address as Hex;
+      const reward = (await client.public.readContract({
+        address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "rewardToken",
+      })) as Hex;
+      if (!reward || reward === "0x0000000000000000000000000000000000000000") {
+        res.status(400).json({ ok: false, error: "no reward token is set on the AMM emissions contract" });
+        return;
+      }
+
+      // Only the pools with something owed — `claim` reverts on a zero total.
+      const count = Number(await client.public.readContract({
+        address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "streamedPoolCount",
+      }));
+      const ids: bigint[] = [];
+      for (let i = 0; i < count; i++) {
+        const poolId = (await client.public.readContract({
+          address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "streamedPools", args: [BigInt(i)],
+        })) as bigint;
+        const owed = (await client.public.readContract({
+          address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "claimable", args: [who, poolId],
+        })) as bigint;
+        if (owed > 0n) ids.push(poolId);
+      }
+      if (!ids.length) {
+        res.status(400).json({ ok: false, error: `nothing has accrued to ${who} yet` });
+        return;
+      }
+
+      const before = (await client.public.readContract({
+        address: reward, abi: erc20Abi, functionName: "balanceOf", args: [who],
+      })) as bigint;
+      const txHash = await agentSigner.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "claim", [ids]);
+      const after = (await client.public.readContract({
+        address: reward, abi: erc20Abi, functionName: "balanceOf", args: [who],
+      })) as bigint;
+      const paid = after > before ? after - before : 0n;
+
+      logTx(req, {
+        category: "defi", action: "lp-emissions-claim", status: "success", txHash,
+        detail: `${paid} to ${who} across ${ids.length} pool(s)`,
+      });
+      invalidateAll();
+      res.json({ ok: true, txHash, paid: paid.toString(), to: who, pools: ids.length });
+    } catch (e) {
+      logTx(req, { category: "defi", action: "lp-emissions-claim", status: "failed", detail: friendlyError(e) });
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
