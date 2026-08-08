@@ -62,6 +62,7 @@ import {
   DELEVERAGE_TRIGGER,
   DELEVERAGE_TARGET,
 } from "./keeper.js";
+import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import { proposeFromSources, actionable as actionablePrices, roundsToTarget } from "./price-push.js";
 import { rankListings, decodeFindResult, endpointAllowed, type Listing } from "./discovery.js";
@@ -6293,6 +6294,292 @@ async function main() {
         providerStake: (liveDeployment.tesseraProviderStake as Hex) ?? null,
       },
     });
+  });
+
+  /* ---- The treasury autopilot ------------------------------------------- */
+
+  /**
+   * The agent looking after its own position without being asked.
+   *
+   * ## The shape, and why
+   * Every judgement here lives in `autopilot.ts` as a pure function over plain
+   * numbers, tested against a table without a chain. This endpoint reads the
+   * chain, hands those numbers over, and does nothing but carry out what comes
+   * back. That split is not tidiness: this is the one part of the system that
+   * spends money with nobody watching, so the reasoning has to be arguable on
+   * paper before it is trusted with a key.
+   *
+   * ## Off by default
+   * `TESSERA_AUTOPILOT=on` and nothing else turns it on. An autopilot that
+   * ships enabled is an autopilot that runs on somebody's deployment before
+   * they have read what it does.
+   *
+   * ## Plan and act are the same code
+   * `?dry=1` runs every decision and returns them without sending anything.
+   * The alternative — a preview path and a real path — is two implementations
+   * that drift, and the one that drifts is always the one you did not read.
+   */
+  const AUTOPILOT = {
+    enabled: String(process.env.TESSERA_AUTOPILOT ?? "").toLowerCase() === "on",
+    lastRunAt: 0,
+    runs: 0,
+    limits: {
+      minIntervalMs: Math.max(60_000, Number(process.env.TESSERA_AUTOPILOT_INTERVAL_MS ?? 30 * 60_000)),
+      maxActionsPerRun: 4,
+    },
+    /** Share of each claim to compound, in bps. Zero switches compounding off. */
+    compoundBps: Math.min(10_000, Math.max(0, Number(process.env.TESSERA_AUTOPILOT_COMPOUND_BPS ?? 2_500))),
+    /** Largest backstop position it may build, in whole reward tokens. */
+    backstopCap: BigInt(Math.max(0, Number(process.env.TESSERA_AUTOPILOT_BACKSTOP_CAP ?? 1_000))) * 10n ** 18n,
+    /** How many times the gas cost a claim must be worth. */
+    gasMultiple: Math.max(1, Number(process.env.TESSERA_AUTOPILOT_GAS_MULTIPLE ?? 3)),
+  };
+
+  /**
+   * What one whole TSRA is worth, in cents — or null.
+   *
+   * Null is a real answer and the important one. The oracle is currently
+   * declining to price a one-dollar pool, and `planClaim` treats "no price" as
+   * a reason to wait rather than a gap to fill with the operator's parameter:
+   * a reward that is not claimed keeps accruing and loses nothing, whereas a
+   * claim made on a guessed valuation is a decision nobody recorded.
+   */
+  const rewardCents = async (): Promise<{ cents: number | null; source: string }> => {
+    const oracleAddr = (liveDeployment.tesseraTwapOracle as Hex) ?? null;
+    if (!oracleAddr) return { cents: null, source: "no oracle deployed" };
+    try {
+      const [raw, , , usable] = (await client.public.readContract({
+        address: oracleAddr, abi: tesseraTwapOracleAbi, functionName: "consult", args: [1800n],
+      })) as readonly [bigint, bigint, bigint, boolean];
+      if (!usable || raw === 0n) return { cents: null, source: "the oracle is declining to price this pool" };
+      // Raw is USDC base units per TSRA base unit at 1e18. One whole TSRA is
+      // 1e18 base units, so raw is also USDC-base-units per whole token — and
+      // USDC has 6 decimals, so cents is raw / 1e4.
+      return { cents: Number(raw) / 1e4, source: "AMM time-weighted average" };
+    } catch {
+      return { cents: null, source: "the oracle could not be read" };
+    }
+  };
+
+  app.post("/api/autopilot/run", requireOperator, async (req, res) => {
+    const dry = String(req.query.dry ?? req.body?.dry ?? "") === "1";
+    const gate = mayRun({
+      now: Date.now(), lastRunAt: AUTOPILOT.lastRunAt,
+      enabled: AUTOPILOT.enabled || dry, limits: AUTOPILOT.limits,
+    });
+    // A dry run is allowed to ignore the interval — it changes nothing, and
+    // being unable to ask "what would you do" until the cooldown expires is
+    // the opposite of what an operator needs.
+    if (!gate.ok && !dry) {
+      res.status(429).json({ ok: false, error: gate.reason, retryInSeconds: gate.retryInSeconds });
+      return;
+    }
+    if (!emissionsAddr || !poolDeployment) {
+      res.status(404).json({ ok: false, error: "emissions or pool not deployed here" });
+      return;
+    }
+
+    const me = client.account.address as Hex;
+
+    /**
+     * Send from the agent's own key, never the operator's.
+     *
+     * The first live run got this wrong and it is worth spelling out, because
+     * it reverted for an incidental reason and would otherwise have gone
+     * unnoticed. Every action here is scoped to `msg.sender`: `claim` credits
+     * the caller, `vote` spends the caller's delegated weight,
+     * `backstopDeposit` opens the caller's position. The plans above are all
+     * computed from the *agent's* balances. Routing the transactions through
+     * the operator key — which is what `owner.write` does, and what this did —
+     * meant deciding from one account's position and acting on another's.
+     *
+     * It failed with NoVotingPower only because the deployer happens to hold
+     * no delegated weight. Had it held any, the autopilot would have cast
+     * somebody else's votes according to the agent's reasoning and reported
+     * success. None of these calls need an owner: they are permissionless and
+     * self-scoped, which is exactly why the agent can be trusted with them.
+     */
+    const asAgent = async (address: Hex, abi: unknown, fn: string, args: unknown[]): Promise<Hex> => {
+      const est = await client.public
+        .estimateContractGas({ address, abi: abi as never, functionName: fn as never, args: args as never, account: client.account })
+        .catch(() => 500_000n);
+      const hash = await client.wallet.writeContract({
+        address, abi: abi as never, functionName: fn as never, args: args as never,
+        account: client.account, chain: client.wallet.chain,
+        // Same margin as OwnerClient, for the same reason: this RPC's estimate
+        // comes back a shade short on calls that fan out through try/catch.
+        gas: (est * 3n) / 2n + 50_000n,
+      } as never);
+      const receipt = await client.public.waitForTransactionReceipt({ hash });
+      if (receipt.status !== "success") throw new Error(`${fn} reverted (${hash})`);
+      return hash;
+    };
+    const steps: { step: string; action: string; amount?: string; reason: string; txHash?: string }[] = [];
+    const record = (step: string, d: { action: string; reason: string }, amount?: bigint, txHash?: string) =>
+      steps.push({ step, action: d.action, reason: d.reason, ...(amount !== undefined ? { amount: amount.toString() } : {}), ...(txHash ? { txHash } : {}) });
+
+    try {
+      const { cents, source } = await rewardCents();
+
+      // 1) Claim, if the reward is worth more than claiming it costs.
+      const claimable = (await client.public.readContract({
+        address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "claimableTotal", args: [me],
+      })) as bigint;
+      /*
+       * Gas is USDC on Arc, so a claim's cost is directly comparable to the
+       * reward's value with no conversion — which is the one thing that makes
+       * this comparison honest rather than a unit muddle.
+       */
+      const gasPrice = await client.public.getGasPrice().catch(() => 0n);
+      const CLAIM_GAS = 350_000n;
+      const gasCents = Number((gasPrice * CLAIM_GAS) / 10_000n) / 1e2;
+
+      const claim = planClaim({
+        claimable, rewardCentsPerToken: cents, decimals: 18,
+        gasCents, multiple: AUTOPILOT.gasMultiple,
+      });
+      record("claim", claim, claim.amount);
+
+      let claimed = 0n;
+      if (claim.action === "act" && !dry) {
+        // Claim every stream the agent has a position in; the contract skips
+        // the ones with nothing owed.
+        const assets: Hex[] = [];
+        const sides: number[] = [];
+        for (const a of poolDeployment.assets) {
+          for (const side of [0, 1, 2]) {
+            const owed = (await client.public.readContract({
+              address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "claimable",
+              args: [me, a.address as Hex, side],
+            }).catch(() => 0n)) as bigint;
+            if (owed > 0n) { assets.push(a.address as Hex); sides.push(side); }
+          }
+        }
+        if (assets.length) {
+          const txHash = await asAgent(emissionsAddr, tesseraEmissionsAbi, "claim", [assets, sides]);
+          claimed = claim.amount;
+          steps[steps.length - 1].txHash = txHash;
+        }
+      } else if (claim.action === "act") {
+        claimed = claim.amount; // so the dry run can plan the next step honestly
+      }
+
+      // 2) Compound a share of it into the backstop.
+      const usdcAsset = poolDeployment.assets.find((a) => a.address.toLowerCase() === ARC_USDC_ADDRESS.toLowerCase());
+      const positionNow = usdcAsset
+        ? ((await client.public.readContract({
+            address: poolDeployment.poolAddress, abi: tesseraPoolAbi,
+            functionName: "backstopShares", args: [usdcAsset.address as Hex, me],
+          }).catch(() => 0n)) as bigint)
+        : 0n;
+      const compound = planCompound({
+        claimed, positionNow, shareBps: AUTOPILOT.compoundBps,
+        cap: AUTOPILOT.backstopCap, minMove: 10n ** 18n,
+      });
+      record("compound", compound, compound.amount);
+      /*
+       * Deliberately not executed yet, and said out loud rather than silently
+       * skipped. The rewards are TSRA and the backstop takes the reserve asset,
+       * so compounding means a swap — through a USDC/TSRA pool holding one
+       * dollar. Routing a treasury through that would move the price against
+       * itself far more than the yield is worth, and the honest answer today
+       * is that the leg does not exist. It becomes a two-line change the moment
+       * the oracle stops declining to price that pool, which is the same
+       * condition, measured.
+       */
+      if (compound.action === "act") {
+        steps[steps.length - 1].reason +=
+          " — not executed: this needs a TSRA→reserve swap, and the only pool is too thin to route a treasury through";
+        steps[steps.length - 1].action = "hold";
+      }
+
+      // 3) Point its own gauge weight at the markets it actually supplies.
+      const gaugeAddress = (liveDeployment.tesseraGauge as Hex) ?? null;
+      if (gaugeAddress) {
+        const count = Number((await client.public.readContract({
+          address: gaugeAddress, abi: tesseraGaugeAbi, functionName: "marketCount",
+        }).catch(() => 0n)) as bigint);
+        const markets: { id: number; votes: bigint; eligible: boolean; mine: boolean }[] = [];
+        for (let id = 0; id < count && id < 32; id++) {
+          const assetsOf = (await client.public.readContract({
+            address: gaugeAddress, abi: tesseraGaugeAbi, functionName: "marketAssets", args: [BigInt(id)],
+          }).catch(() => [] as Hex[])) as Hex[];
+          const eligible = (await client.public.readContract({
+            address: gaugeAddress, abi: tesseraGaugeAbi, functionName: "eligible", args: [BigInt(id)],
+          }).catch(() => false)) as boolean;
+          // "Mine" means a supply position in every asset the market names —
+          // a market the agent is only half in is not one it has a stake in.
+          let mine = assetsOf.length > 0;
+          for (const asset of assetsOf) {
+            const shares = (await client.public.readContract({
+              address: poolDeployment.poolAddress, abi: tesseraPoolAbi,
+              functionName: "supplyShares", args: [asset, me],
+            }).catch(() => 0n)) as bigint;
+            if (shares === 0n) { mine = false; break; }
+          }
+          markets.push({ id, votes: 0n, eligible, mine });
+        }
+        /*
+         * Ask the gauge, not the token.
+         *
+         * `getVotes` is weight *now*; the gauge spends weight as it stood at
+         * the epoch's snapshot block, and subtracts what has already been
+         * allocated this epoch. Planning against the first and acting on the
+         * second is the same "decide on one number, act on another" mistake as
+         * signing with the wrong key — it cost a second reverted vote here,
+         * because the agent delegated after an earlier voter had already fixed
+         * the snapshot and so held 25 TSRA with no say in this epoch at all.
+         *
+         * `availableWeight` is the number the contract will actually use.
+         */
+        const weight = (await client.public.readContract({
+          address: gaugeAddress, abi: tesseraGaugeAbi,
+          functionName: "availableWeight", args: [me],
+        }).catch(() => 0n)) as bigint;
+
+        const vote = planVote(markets, { hasWeight: weight > 0n });
+        steps.push({
+          step: "vote", action: vote.action, reason: vote.reason,
+          ...(vote.allocations.length ? { amount: vote.allocations.map((a) => `#${a.id}:${a.bps}`).join(" ") } : {}),
+        });
+        if (vote.action === "act" && !dry) {
+          const txHash = await asAgent(gaugeAddress, tesseraGaugeAbi, "vote", [
+            vote.allocations.map((a) => BigInt(a.id)),
+            vote.allocations.map((a) => BigInt(a.bps)),
+          ]);
+          steps[steps.length - 1].txHash = txHash;
+        }
+      }
+
+      if (!dry) {
+        AUTOPILOT.lastRunAt = Date.now();
+        AUTOPILOT.runs += 1;
+        const acted = steps.filter((s) => s.action === "act" && s.txHash).length;
+        if (acted) {
+          logTx(req, {
+            category: "agent", action: "autopilot", status: "success",
+            detail: `${acted} action(s): ${steps.filter((s) => s.txHash).map((s) => s.step).join(", ")}`,
+          });
+        }
+      }
+
+      res.json({
+        ok: true,
+        dry,
+        enabled: AUTOPILOT.enabled,
+        runs: AUTOPILOT.runs,
+        price: { centsPerTsra: cents, source },
+        limits: {
+          compoundBps: AUTOPILOT.compoundBps,
+          backstopCap: AUTOPILOT.backstopCap.toString(),
+          gasMultiple: AUTOPILOT.gasMultiple,
+          minIntervalMs: AUTOPILOT.limits.minIntervalMs,
+        },
+        steps,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300), steps });
+    }
   });
 
   /**
