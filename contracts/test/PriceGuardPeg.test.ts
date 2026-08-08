@@ -103,6 +103,37 @@ describe("TesseraPriceGuard — pegged references", () => {
     await expect(f.guard.write.setPeg([f.usdc.address, 0n, 200])).to.be.rejected;
   });
 
+  it("will not open borrowing on an asset whose mark nobody is checking", async () => {
+    /*
+     * Borrowing is the side of the book that lets somebody take an asset *out*
+     * of the pool. Against a hand-set price with no guard on it, that is the
+     * whole recipe: move the mark, borrow the float, walk away. So enabling is
+     * conditional on the guard actually refusing something for that asset.
+     */
+    const f = await loadFixture(deployFixture);
+    await expect(f.pool.write.setBorrowable([f.other.address, true])).to.be.rejected;
+
+    await f.guard.write.setPeg([f.other.address, P(10), 500]);
+    await f.pool.write.setBorrowable([f.other.address, true]);
+    const r = await f.pool.read.reserves([f.other.address]);
+    expect(r[1]).to.equal(true);
+  });
+
+  it("closing borrowing needs no guard, because less is always allowed", async () => {
+    // Same reasoning as the freeze exemption: reducing what the pool will do
+    // cannot be the dangerous direction.
+    const f = await loadFixture(deployFixture);
+    await f.pool.write.setBorrowable([f.usdc.address, false]);
+    const r = await f.pool.read.reserves([f.usdc.address]);
+    expect(r[1]).to.equal(false);
+  });
+
+  it("refuses to touch a reserve that was never listed", async () => {
+    const f = await loadFixture(deployFixture);
+    const [, stranger] = await hre.viem.getWalletClients();
+    await expect(f.pool.write.setBorrowable([stranger.account.address, false])).to.be.rejected;
+  });
+
   it("only the owner sets a peg or flips the requirement", async () => {
     const f = await loadFixture(deployFixture);
     const [, stranger] = await hre.viem.getWalletClients();

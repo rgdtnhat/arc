@@ -23,6 +23,7 @@
 import { createPublicClient, parseAbiItem, type Chain, type Hex, type PublicClient } from "viem";
 import { tesseraPoolAbi, tesseraVaultAbi, tesseraAmmAbi, erc20Abi, pacedHttp } from "@tessera/shared";
 import { HolderIndex, mergeAddresses, type IndexProgress } from "./holder-index.js";
+import { describeError } from "./chain-read.js";
 
 /** The events that reveal a holder. Balances always come from live reads. */
 const EVENTS = {
@@ -211,7 +212,19 @@ export class HolderReader {
       })
       .catch((err) => ({
         ...emptyReport(kind),
-        note: `Could not read holders: ${err instanceof Error ? err.message : String(err)}`,
+        /*
+         * The first line, not the whole thing.
+         *
+         * A viem error's `message` carries the full request body, the raw
+         * calldata and a docs link — hundreds of characters of hex. This note
+         * is rendered straight into the page, so a throttled RPC put a wall of
+         * machine output on screen where a sentence belonged. `describeError`
+         * is the same shortener the read layer uses; a rate limit is worth
+         * saying in words, since it is the one a person can act on by waiting.
+         */
+        note: /rate limit|exceeds defined limit|429/i.test(String(err))
+          ? "Could not read holders: the network is rate-limiting us. This usually clears on its own — try again shortly."
+          : `Could not read holders: ${describeError(err)}`,
       }))
       .finally(() => this.scans.delete(key));
     this.scans.set(key, job);

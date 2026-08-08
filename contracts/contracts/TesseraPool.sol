@@ -398,6 +398,7 @@ contract TesseraPool is ReentrancyGuard {
     mapping(address => mapping(address => uint256)) public borrowShares; // asset => user => shares
 
     event ReserveAdded(address indexed asset, uint16 cFactor, uint16 liqFactor, uint16 lFactor, bool borrowable);
+    event BorrowableSet(address indexed asset, bool borrowable);
     event RiskParamsSet(address indexed asset, uint16 cFactor, uint16 liqFactor, uint16 lFactor);
     event EmodeCategorySet(uint8 indexed category, uint16 cFactor, uint16 liqFactor, uint16 lFactor, string label);
     event EmodeAssetSet(address indexed asset, uint8 category);
@@ -456,6 +457,7 @@ contract TesseraPool is ReentrancyGuard {
     error ActionFrozen();
     error BadOracle();
     error UnknownReserve();
+    error PriceNotGuarded(address asset);
     error NotBorrowable();
     error InsufficientLiquidity();
     error Unhealthy();
@@ -698,6 +700,33 @@ contract TesseraPool is ReentrancyGuard {
         r.liqFactor = liqFactor;
         r.lFactor = lFactor;
         emit RiskParamsSet(asset, cFactor, liqFactor, lFactor);
+    }
+
+    /**
+     * @notice Open or close borrowing of a listed reserve.
+     *
+     * `borrowable` was fixed at `addReserve` and had no setter, so the only way
+     * to open borrowing on an already-listed asset was to deploy another pool
+     * and migrate every position. That is a large price for a boolean.
+     *
+     * Enabling requires the asset's mark to be guarded. Borrowing is the side
+     * of the book that lets somebody *take* an asset out of the pool, and doing
+     * that against a hand-set price nobody is checking is how a thin token gets
+     * drained: move the mark, borrow the float, walk away. Closing borrowing
+     * needs no such check — reducing what the pool will do is always allowed,
+     * for the same reason freezing is.
+     */
+    function setBorrowable(address asset, bool on) external onlyOwner {
+        Reserve storage r = reserves[asset];
+        if (!r.enabled) revert UnknownReserve();
+        if (on && priceGuard != address(0)) {
+            // A guard that would accept a mark half again the current one is
+            // not guarding this asset, whatever it is configured to do.
+            (bool wouldAccept, , ) = IPriceGuard(priceGuard).check(asset, (r.price * 3) / 2);
+            if (wouldAccept) revert PriceNotGuarded(asset);
+        }
+        r.borrowable = on;
+        emit BorrowableSet(asset, on);
     }
 
     /**
