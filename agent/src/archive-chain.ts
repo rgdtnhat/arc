@@ -44,6 +44,34 @@ export interface ArchiveScan {
   assets: { address: string; symbol: string; decimals: number }[];
 }
 
+/**
+ * How far along a scan is, for callers that have a human waiting.
+ *
+ * The scan walks up to a few hundred windowed `getLogs` calls backwards through
+ * a contract's whole history, and on a throttled public RPC each one can sit in
+ * a retry backoff for seconds. In a server that is invisible and fine. On a
+ * command line it is several minutes of a completely silent terminal, which
+ * reads as a hung process — and a hung-looking process gets killed, which is
+ * how a migration ends up half-scanned.
+ */
+export interface ScanProgress {
+  /** Windows requested so far, and the ceiling before the scan gives up. */
+  windows: number;
+  maxWindows: number;
+  /** The window just read, and the block the scan stops at. */
+  from: bigint;
+  to: bigint;
+  floor: bigint;
+  /** Distinct addresses found so far. */
+  found: number;
+  /** True once a window has been thrown away — the scan will be partial. */
+  partial: boolean;
+}
+
+export interface ScanOptions {
+  onProgress?: (p: ScanProgress) => void;
+}
+
 export class ArchiveScanner {
   readonly public: PublicClient;
 
@@ -52,7 +80,12 @@ export class ArchiveScanner {
   }
 
   /** Collect the distinct `user`/`provider` addresses from an event, in windows. */
-  private async holderAddresses(address: Hex, event: (typeof EVENTS)[keyof typeof EVENTS], field: string) {
+  private async holderAddresses(
+    address: Hex,
+    event: (typeof EVENTS)[keyof typeof EVENTS],
+    field: string,
+    opts: ScanOptions = {},
+  ) {
     const latest = await this.public.getBlockNumber();
     // Start at the contract's own creation block. A fixed lookback is a few
     // days on a fast chain, so anything older reads as "no holders" — which is
@@ -84,6 +117,9 @@ export class ArchiveScanner {
         // pretending otherwise is how someone gets left out of a payout.
         partial = true;
       }
+      // Reported after the window rather than before, so the count reflects
+      // work actually done and a caller can tell a slow scan from a stuck one.
+      opts.onProgress?.({ windows, maxWindows: MAX_WINDOWS, from, to, floor, found: found.size, partial });
       if (from === 0n) break;
       to = from - 1n;
     }
@@ -91,8 +127,12 @@ export class ArchiveScanner {
   }
 
   /** Retired lending pool: every supplier and what they can still withdraw. */
-  async scanPool(pool: Hex, assets: { address: Hex; symbol: string; decimals: number }[]): Promise<ArchiveScan> {
-    const { addresses, block, partial } = await this.holderAddresses(pool, EVENTS.poolSupply, "user");
+  async scanPool(
+    pool: Hex,
+    assets: { address: Hex; symbol: string; decimals: number }[],
+    opts: ScanOptions = {},
+  ): Promise<ArchiveScan> {
+    const { addresses, block, partial } = await this.holderAddresses(pool, EVENTS.poolSupply, "user", opts);
     if (!addresses.length) return { holders: [], block, partial, assets };
     const calls = addresses.flatMap((who) =>
       assets.map(

@@ -230,8 +230,41 @@ async function main() {
   console.log(`Mode         ${EXECUTE ? "EXECUTE — this sends transactions" : "dry run — nothing will be sent"}\n`);
 
   // 1) Who has ever supplied to the old pool.
+  /*
+   * Say what is happening, because this step is the long one.
+   *
+   * There is no way to enumerate a Solidity mapping, so the supplier set comes
+   * from event logs — and Arc caps `eth_getLogs` at ten thousand blocks, so the
+   * pool's whole history is walked in windows, backwards, up to a few hundred
+   * of them. On a throttled public RPC each window can sit in a retry backoff
+   * for seconds. It used to print nothing at all between the header and the
+   * result: several minutes of dead terminal, which reads as a hung process
+   * rather than a working one. A hung-looking process gets killed, and a
+   * half-scanned migration leaves people behind — the exact failure the scan
+   * exists to prevent.
+   */
+  console.log("Scanning the old pool's history for suppliers.");
+  console.log("  Arc caps eth_getLogs at 10k blocks, so this walks the pool's whole life in");
+  console.log("  windows. On a throttled RPC it can take several minutes. Progress below.\n");
   const scanner = new ArchiveScanner(arcTestnet, RPC);
-  const scan = await scanner.scanPool(oldPool, assets);
+  const started = Date.now();
+  let lastLine = 0;
+  const scan = await scanner.scanPool(oldPool, assets, {
+    onProgress: (p) => {
+      // Every window would be hundreds of lines in a log file; every tenth (and
+      // always the first) is enough to prove it is moving.
+      if (p.windows !== 1 && p.windows - lastLine < 10) return;
+      lastLine = p.windows;
+      const left = p.from > p.floor ? p.from - p.floor : 0n;
+      const secs = Math.round((Date.now() - started) / 1000);
+      console.log(
+        `  window ${String(p.windows).padStart(3)}/${p.maxWindows}  ` +
+          `at block ${p.from}  ${left} to go  ` +
+          `${p.found} address(es)  ${secs}s${p.partial ? "  ⚠ a window was refused" : ""}`,
+      );
+    },
+  });
+  console.log("");
   const users = [...new Set((scan.holders ?? []).map((h) => (h.address ?? h).toLowerCase()))];
   if (scan.partial) {
     console.warn(
