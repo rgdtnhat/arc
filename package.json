@@ -30,7 +30,8 @@
     "shell:check": "node scripts/stamp-shell.mjs --check",
     "shell:bump": "node scripts/stamp-shell.mjs --bump",
     "smoke": "node scripts/smoke.mjs",
-    "reads:check": "node scripts/check-reads.mjs"
+    "reads:check": "node scripts/check-reads.mjs",
+    "e2e": "node scripts/e2e.mjs"
   },
   "overrides": {
     "adm-zip": "^0.6.0",

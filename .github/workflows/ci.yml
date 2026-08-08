@@ -41,6 +41,13 @@ jobs:
       - name: No new reads collapse a failure into a value
         run: npm run reads:check
 
+      # The missing middle. Unit tests cover pure functions and the browser smoke
+      # test never signs anything; both of the autopilot's worst bugs lived in
+      # the wiring between a decision and the chain, and only a real transaction
+      # would have found them.
+      - name: End-to-end — the whole loop against a throwaway chain
+        run: npm run e2e
+
       - name: Agent unit tests (decision engine, guardian, memory, agentkit, wallet, treasury, fleet)
         run: npm test --workspace agent
 

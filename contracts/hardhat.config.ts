@@ -31,6 +31,12 @@ const config: HardhatUserConfig = {
     },
   },
   networks: {
+    /*
+     * The end-to-end harness starts a node on a port it picks per run, so the
+     * network it targets has to be told rather than hard-coded — a fixed 8545
+     * silently reused a leftover node and tested the wrong contracts.
+     */
+    e2e: { url: process.env.E2E_RPC ?? "http://127.0.0.1:8545" },
     arcTestnet: {
       url: ARC_RPC_URL,
       chainId: 5042002,
