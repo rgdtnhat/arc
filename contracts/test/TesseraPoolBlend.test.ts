@@ -244,6 +244,151 @@ describe("TesseraPool — Blend backstop", () => {
     expect(await pool.read.borrowBalance([usdc.address, bob.account.address])).to.equal(0n);
   });
 
+  it("shares a loss across backstop depositors in proportion, and prices new money at the new level", async () => {
+    /*
+     * The share-accounting property nobody notices until it is wrong.
+     *
+     * A loss reduces `backstopBalance` and touches no share count, so every
+     * existing depositor's claim shrinks by the same fraction — that is what
+     * makes first-loss capital *shared* rather than a queue where whoever
+     * withdraws first is whole and the last one out is wiped.
+     *
+     * The other half matters just as much and pulls the opposite way: somebody
+     * depositing *after* the loss must buy shares at the reduced price, so they
+     * neither inherit a loss that predates them nor dilute the people who
+     * absorbed it. Get that backwards and the backstop becomes a thing you only
+     * ever want to enter immediately after a default.
+     */
+    const f = await loadFixture(deployFixture);
+    const { deployer, alice, bob, liquidator, usdc, cbtc, pool, as, fundAndApprove } = f;
+    await pool.write.setBackstopTakeRate([2000]);
+    await withBorrower(f, USDC("18000"));
+
+    /*
+     * Two depositors, deliberately unequal, so "pro rata" and "equal" cannot
+     * both pass — and between them holding more than the debt, so the write-off
+     * dents the pot rather than emptying it. Emptying it is a different case
+     * with a different answer, two tests down.
+     */
+    await fundAndApprove(deployer, USDC("18000"), 0n);
+    await pool.write.backstopDeposit([usdc.address, USDC("18000")]);
+    await fundAndApprove(liquidator, USDC("6000"), 0n);
+    await (await as(liquidator)).write.backstopDeposit([usdc.address, USDC("6000")]);
+
+    const bigBefore = await pool.read.backstopBalanceOf([usdc.address, deployer.account.address]);
+    const smallBefore = await pool.read.backstopBalanceOf([usdc.address, liquidator.account.address]);
+    expect(bigBefore > smallBefore * 2n).to.equal(true);
+
+    // Bob's collateral evaporates and the write-off eats into the pot.
+    await pool.write.setPrice([cbtc.address, 1n]);
+    await (await as(alice)).write.clearBadDebt([bob.account.address, usdc.address]);
+
+    const bigAfter = await pool.read.backstopBalanceOf([usdc.address, deployer.account.address]);
+    const smallAfter = await pool.read.backstopBalanceOf([usdc.address, liquidator.account.address]);
+    expect(bigAfter < bigBefore, "the large depositor took a loss").to.equal(true);
+    expect(smallAfter < smallBefore, "so did the small one").to.equal(true);
+
+    /*
+     * Same fraction, both of them. Compared as a cross-product so this asserts
+     * the ratio rather than two independently-plausible numbers, and with a
+     * tolerance of one base unit for integer division.
+     */
+    const lhs = bigAfter * smallBefore;
+    const rhs = smallAfter * bigBefore;
+    const diff = lhs > rhs ? lhs - rhs : rhs - lhs;
+    expect(diff <= bigBefore + smallBefore).to.equal(true);
+
+    // A newcomer buys in at the post-loss price: 1,000 in, about 1,000 back.
+    // (This write-off only dented the pot; the wipe case is the next test.)
+    await fundAndApprove(bob, USDC("1000"), 0n);
+    await (await as(bob)).write.backstopDeposit([usdc.address, USDC("1000")]);
+    const fresh = await pool.read.backstopBalanceOf([usdc.address, bob.account.address]);
+    expect(fresh <= USDC("1000"), "did not inherit the loss").to.equal(true);
+    expect(fresh > USDC("999"), "and was not handed a discount either").to.equal(true);
+  });
+
+  it("refuses a deposit into a backstop that has been drained to nothing", async () => {
+    /*
+     * The bug this test was written to find, and did.
+     *
+     * A write-off big enough to take the *last* of the pot leaves the shares
+     * behind as claims on nothing. The old deposit path minted against them, so
+     * 1,000 USDC into a wiped backstop came back as 76.92 — a 92% loss, taken
+     * silently, at the moment of deposit, from somebody whose only mistake was
+     * arriving after a default.
+     */
+    const f = await loadFixture(deployFixture);
+    const { deployer, alice, bob, usdc, cbtc, pool, as, fundAndApprove } = f;
+    await pool.write.setBackstopTakeRate([2000]);
+    await withBorrower(f, USDC("18000"));
+
+    // Less first-loss capital than there is debt, so the write-off takes it all.
+    await fundAndApprove(deployer, USDC("5000"), 0n);
+    await pool.write.backstopDeposit([usdc.address, USDC("5000")]);
+    await pool.write.setPrice([cbtc.address, 1n]);
+    await (await as(alice)).write.clearBadDebt([bob.account.address, usdc.address]);
+    expect(await pool.read.backstopBalance([usdc.address])).to.equal(0n);
+
+    await fundAndApprove(bob, USDC("1000"), 0n);
+    await expect((await as(bob)).write.backstopDeposit([usdc.address, USDC("1000")])).to.be.rejected;
+  });
+
+  it("reopens a wiped backstop through a donation, in favour of whoever took the loss", async () => {
+    /*
+     * The way back. `fundBackstop` adds to the pot without minting shares, so
+     * it accrues to the holders who absorbed the loss rather than to whoever
+     * arrives next — the right people, in the right order — and it restores a
+     * share price the contract can price a new deposit against.
+     */
+    const f = await loadFixture(deployFixture);
+    const { deployer, alice, bob, usdc, cbtc, pool, as, fundAndApprove } = f;
+    await pool.write.setBackstopTakeRate([2000]);
+    await withBorrower(f, USDC("18000"));
+
+    await fundAndApprove(deployer, USDC("5000"), 0n);
+    await pool.write.backstopDeposit([usdc.address, USDC("5000")]);
+    await pool.write.setPrice([cbtc.address, 1n]);
+    await (await as(alice)).write.clearBadDebt([bob.account.address, usdc.address]);
+
+    // A donation revives it, and lands on the wiped-out holder.
+    await fundAndApprove(deployer, USDC("2000"), 0n);
+    await pool.write.fundBackstop([usdc.address, USDC("2000")]);
+    const restored = await pool.read.backstopBalanceOf([usdc.address, deployer.account.address]);
+    expect(restored > 0n, "the donation reached the holder who took the loss").to.equal(true);
+
+    // And deposits work again, at the revived price.
+    await fundAndApprove(bob, USDC("1000"), 0n);
+    await (await as(bob)).write.backstopDeposit([usdc.address, USDC("1000")]);
+    const fresh = await pool.read.backstopBalanceOf([usdc.address, bob.account.address]);
+    expect(fresh > USDC("999") && fresh <= USDC("1000")).to.equal(true);
+  });
+
+  it("keeps queued-but-unwithdrawn capital in the firing line", async () => {
+    /*
+     * `queueBackstopExit` reduces what `stakeOf`-style views report, and the
+     * contract's own note says the shares keep absorbing losses until they are
+     * actually withdrawn. If that were not true, the exit queue would be a way
+     * to see a default coming and step out of the way while still being counted
+     * as cover right up to the moment it mattered.
+     */
+    const f = await loadFixture(deployFixture);
+    const { deployer, alice, bob, usdc, cbtc, pool, as, fundAndApprove } = f;
+    await pool.write.setBackstopTakeRate([2000]);
+    await withBorrower(f, USDC("18000"));
+
+    await fundAndApprove(deployer, USDC("9000"), 0n);
+    await pool.write.backstopDeposit([usdc.address, USDC("9000")]);
+    const shares = await pool.read.backstopShares([usdc.address, deployer.account.address]);
+    await pool.write.queueBackstopExit([usdc.address, shares]); // heading for the door
+
+    const before = await pool.read.backstopBalanceOf([usdc.address, deployer.account.address]);
+    await pool.write.setPrice([cbtc.address, 1n]);
+    await (await as(alice)).write.clearBadDebt([bob.account.address, usdc.address]);
+
+    const after = await pool.read.backstopBalanceOf([usdc.address, deployer.account.address]);
+    expect(after < before, "queuing an exit did not dodge the loss").to.equal(true);
+  });
+
   it("refuses to write off a position that still has collateral", async () => {
     const f = await loadFixture(deployFixture);
     const { alice, bob, usdc, cbtc, pool, as } = f;

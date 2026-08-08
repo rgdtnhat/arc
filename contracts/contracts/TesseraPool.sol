@@ -466,6 +466,8 @@ contract TesseraPool is ReentrancyGuard {
     error BadFillPercent();
     error HealthOutOfBand();
     error StillLocked();
+    /// The backstop has been drained to nothing while shares are still outstanding.
+    error BackstopWipedOut();
     error FlashLoanNotRepaid(uint256 owed, uint256 got);
     error UnknownCategory();
     error PriceOutOfBand(uint256 given, uint256 referencePrice, uint256 deviationBps);
@@ -1393,7 +1395,27 @@ contract TesseraPool is ReentrancyGuard {
         if (!reserves[asset].enabled) revert UnknownReserve();
         _accrue(asset);
         uint256 total = backstopTotalShares[asset];
-        uint256 shares = total == 0 || backstopBalance[asset] == 0
+        /*
+         * A pot drained to nothing cannot price a new deposit.
+         *
+         * Bad debt reduces `backstopBalance` and touches no share count, which
+         * is exactly right while anything is left — every holder's claim shrinks
+         * by the same fraction. Take the last of it and the shares survive as
+         * claims on nothing, and the next depositor mints against them: 1,000
+         * USDC into a wiped pot came back as 76.92, a 92% loss taken silently at
+         * the moment of deposit. Found by testing the case rather than by
+         * anybody losing money to it.
+         *
+         * Refusing is the honest answer. Retiring the dead shares properly needs
+         * a per-holder epoch, and this contract has 455 bytes of headroom left,
+         * so the accounting stays as it is and the door is shut instead.
+         *
+         * The way back is `fundBackstop`: a donation revives the pot without
+         * minting shares, so it accrues to the holders who absorbed the loss —
+         * which is the right people, in the right order.
+         */
+        if (total != 0 && backstopBalance[asset] == 0) revert BackstopWipedOut();
+        uint256 shares = total == 0
             ? amount
             : (amount * total) / backstopBalance[asset];
         if (shares == 0) revert ZeroAmount();
