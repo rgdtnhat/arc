@@ -1235,6 +1235,39 @@ async function main() {
           .catch(() => null)
       : null;
 
+    /*
+     * The account summary, or an honest reconstruction of it.
+     *
+     * `accountData` is one aggregate call that walks *every* listed reserve, so
+     * a single asset the risk oracle cannot price takes the whole thing down —
+     * and with it `account`, `ready`, and the entire Lending panel, which then
+     * sits on "reading current values from the network…" forever while the
+     * per-asset reads beside it are all perfectly healthy. That happened live:
+     * TSRA was listed on the pool but never configured on the oracle, so
+     * `riskPrice` reverted `NoUsablePrice(TSRA)` and blanked a working market.
+     *
+     * The per-asset reads survive that, because they are isolated. So when the
+     * aggregate fails, the two figures that can be rebuilt from them are —
+     * supplied and borrowed, priced at the pool's own marks — and the two that
+     * genuinely cannot are reported as unavailable rather than guessed at. A
+     * borrow limit is the oracle's job and inventing one would quote somebody a
+     * headroom the contract will refuse.
+     */
+    const derived = !acct
+      ? (() => {
+          const sum = (pick: (a: (typeof assets)[number]) => string) =>
+            assets.reduce((t, a) => {
+              const qty = Number(pick(a));
+              const px = Number(a.priceUsd);
+              return Number.isFinite(qty) && Number.isFinite(px) ? t + qty * px : t;
+            }, 0);
+          return {
+            suppliedUsd: sum((a) => a.position?.supplied ?? "0").toFixed(2),
+            borrowedUsd: sum((a) => a.position?.borrowed ?? "0").toFixed(2),
+          };
+        })()
+      : null;
+
     const account = acct
       ? {
           suppliedUsd: fmtUsd(acct.supplyValue),
@@ -1259,8 +1292,31 @@ async function main() {
                 ? "liquidity"
                 : "collateral",
           healthFactor: hf > 10n ** 30n ? "∞" : (Number(hf) / 1e18).toFixed(2),
+          degraded: false,
+          why: null as string | null,
         }
-      : lastLending?.account ?? null;
+      : lastLending?.account ??
+        (derived
+          ? {
+              suppliedUsd: derived.suppliedUsd,
+              borrowedUsd: derived.borrowedUsd,
+              // Null, not zero. These come from the oracle the aggregate call
+              // could not reach, and a zero here reads as "no headroom" while a
+              // fabricated number reads as headroom that is not there.
+              borrowLimitUsd: null,
+              liquidationLimitUsd: null,
+              headroomUsd: null,
+              borrowableNowUsd: null,
+              poolLiquidityUsd: borrowableLiquidityUsd.toFixed(2),
+              limitedBy: "unknown",
+              healthFactor: null,
+              degraded: true,
+              why:
+                "The pool's account summary could not be read — usually one listed asset " +
+                "the risk oracle has no price for. Reserves and your per-asset positions " +
+                "below are live; the borrow limit and health factor are not.",
+            }
+          : null);
 
     // Same rule as the AMM: an operator can shorten the list, but never past a
     // reserve the caller holds a position in.

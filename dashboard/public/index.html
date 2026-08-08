@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v50" />
+    <meta name="tessera-shell" content="tessera-v51" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1343,6 +1343,11 @@
               Pool not deployed yet — run <span class="mono">npm run pool:arc</span> to create the
               USDC / EURC / cirBTC reserves. Live values appear here automatically once it's on-chain.
             </div>
+            <!-- Shown only when the pool's aggregate account read failed. The
+                 reserves and per-asset positions below are still live; the
+                 borrow limit and health factor are the oracle's answer and it
+                 did not give one, so they read "n/a" and this says why. -->
+            <div class="note" id="lnDegraded" style="display:none;margin-bottom:12px;color:var(--warn)"></div>
             <div class="metrics tight" style="margin-bottom:14px">
               <div class="metric"><div class="k">Supplied</div><div class="v" id="lnSupplied">—</div></div>
               <div class="metric"><div class="k">Borrowed</div><div class="v" id="lnBorrowed">—</div></div>

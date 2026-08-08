@@ -732,22 +732,37 @@ const $ = (id) => document.getElementById(id);
           // three lines belong to the signer, and refreshMyPositions marks them
           // as theirs — so the poll must not paint over them, which is exactly
           // what "Supplied $0.00" next to "your position: 1 USDC" was.
-          setUnlessMine("lnSupplied", "$" + ln.account.suppliedUsd);
-          setUnlessMine("lnBorrowed", "$" + ln.account.borrowedUsd);
-          setUnlessMine("lnLimit", "$" + ln.account.borrowLimitUsd);
+          /*
+           * A missing figure prints as "n/a", never as $0.00.
+           *
+           * When the pool's aggregate account read fails — one listed asset the
+           * risk oracle cannot price is enough — the server rebuilds supplied
+           * and borrowed from the per-asset positions and sends null for the
+           * borrow limit and health factor, because those are the oracle's
+           * answer and it did not give one. "$0.00" there reads as "no
+           * headroom" and "0.00" health reads as about to be liquidated; both
+           * are alarming claims to make up.
+           */
+          const usd = (v) => (v == null ? "n/a" : "$" + v);
+          setUnlessMine("lnSupplied", usd(ln.account.suppliedUsd));
+          setUnlessMine("lnBorrowed", usd(ln.account.borrowedUsd));
+          setUnlessMine("lnLimit", usd(ln.account.borrowLimitUsd));
           // Only shown when the pool exposes it. An older pool returns null and
           // the field says so rather than repeating the borrow limit as if the
           // two lines were the same.
           if ($("lnLiqLimit")) {
             $("lnLiqLimit").textContent = ln.account.liquidationLimitUsd
               ? "$" + ln.account.liquidationLimitUsd
-              : "n/a on this pool";
+              : ln.account.degraded
+                ? "n/a"
+                : "n/a on this pool";
           }
           // The collateral limit alone reads as a promise the pool may not be
           // able to keep — a $66,500 limit against $100 of lendable USDC. Show
           // what can actually be drawn, and say which constraint binds.
           if ($("lnBorrowable")) {
-            $("lnBorrowable").textContent = "$" + (ln.account.borrowableNowUsd ?? "0.00");
+            $("lnBorrowable").textContent =
+              ln.account.borrowableNowUsd == null ? "n/a" : "$" + ln.account.borrowableNowUsd;
             const by = ln.account.limitedBy;
             const note = $("lnLimitedBy");
             if (note) {
@@ -760,7 +775,13 @@ const $ = (id) => document.getElementById(id);
               note.style.color = by === "liquidity" ? "var(--warn)" : "var(--muted)";
             }
           }
-          $("lnHealth").textContent = ln.account.healthFactor;
+          $("lnHealth").textContent = ln.account.healthFactor ?? "n/a";
+          // Say why, once, above the numbers — a panel full of "n/a" with no
+          // explanation is the same dead end as a blank one.
+          if ($("lnDegraded")) {
+            $("lnDegraded").style.display = ln.account.degraded ? "" : "none";
+            $("lnDegraded").textContent = ln.account.why || "";
+          }
           window.__lending = ln;
           const sel = $("lnAsset");
           // Hidden reserves drop out of the picker, but only for people who
@@ -1560,8 +1581,10 @@ const $ = (id) => document.getElementById(id);
                 const dp = (em.reward && em.reward.decimals) || 18;
                 const paid = (Number(r.paid) / 10 ** dp).toFixed(6).replace(/\.?0+$/, "");
                 m.style.color = "var(--good)";
-                m.textContent = `Claimed ${paid} ${em.reward.symbol} to ${String(r.to).slice(0, 10)}… ` +
-                  `— tx ${String(r.txHash).slice(0, 12)}…`;
+                // innerHTML, so the hash is a link rather than twelve characters
+                // of a hash nobody can do anything with.
+                m.innerHTML = `Claimed ${esc(paid)} ${esc(em.reward.symbol)} to ${esc(String(r.to).slice(0, 10))}… ` +
+                  `— view on Arcscan: ${txLink(r.txHash)}`;
               } else {
                 m.style.color = "var(--warn)";
                 m.textContent = `Claim failed: ${r.error}`;
@@ -6161,9 +6184,12 @@ const $ = (id) => document.getElementById(id);
               if (r.ok) {
                 const dp = (em.reward && em.reward.decimals) || 18;
                 const paid = (Number(r.paid) / 10 ** dp).toFixed(6).replace(/\.?0+$/, "");
-                govMsg("amEmMsg",
-                  `Claimed ${paid} ${em.reward.symbol} to ${String(r.to).slice(0, 10)}… — tx ${String(r.txHash).slice(0, 12)}…`,
-                  "var(--good)");
+                // `govMsg` writes textContent, which would print the anchor as
+                // markup. The receipt carries a link, so it goes in directly.
+                const el = $("amEmMsg");
+                el.style.display = "block"; el.style.color = "var(--good)";
+                el.innerHTML = `Claimed ${esc(paid)} ${esc(em.reward.symbol)} to ${esc(String(r.to).slice(0, 10))}… ` +
+                  `— view on Arcscan: ${txLink(r.txHash)}`;
               } else govMsg("amEmMsg", `Claim failed: ${r.error}`, "var(--warn)");
             } catch { govMsg("amEmMsg", "Claim request failed.", "var(--warn)"); }
             btn.disabled = false;
