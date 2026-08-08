@@ -48,6 +48,7 @@ const assetRegistry = readArtifact("TesseraAssetRegistry");
 const keeper = readArtifact("TesseraKeeper");
 const providerStake = readArtifact("TesseraProviderStake");
 const twapOracle = readArtifact("TesseraTwapOracle");
+const backstop = readArtifact("TesseraBackstop");
 
 const outDir = path.resolve(root, "..", "shared", "src");
 fs.mkdirSync(outDir, { recursive: true });
@@ -84,7 +85,8 @@ const abiTs =
   `export const tesseraAssetRegistryAbi = ${JSON.stringify(assetRegistry.abi)} as const;\n` +
   `export const tesseraKeeperAbi = ${JSON.stringify(keeper.abi)} as const;\n` +
   `export const tesseraProviderStakeAbi = ${JSON.stringify(providerStake.abi)} as const;\n` +
-  `export const tesseraTwapOracleAbi = ${JSON.stringify(twapOracle.abi)} as const;\n`;
+  `export const tesseraTwapOracleAbi = ${JSON.stringify(twapOracle.abi)} as const;\n` +
+  `export const tesseraBackstopAbi = ${JSON.stringify(backstop.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
 
 // Bytecode is only needed to deploy the mock locally from a plain viem script.
@@ -120,7 +122,8 @@ const bytecodeTs =
   `export const tesseraAssetRegistryBytecode = "${assetRegistry.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraKeeperBytecode = "${keeper.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraProviderStakeBytecode = "${providerStake.bytecode}" as \`0x\${string}\`;\n` +
-  `export const tesseraTwapOracleBytecode = "${twapOracle.bytecode}" as \`0x\${string}\`;\n`;
+  `export const tesseraTwapOracleBytecode = "${twapOracle.bytecode}" as \`0x\${string}\`;\n` +
+  `export const tesseraBackstopBytecode = "${backstop.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);
 
 console.log("[export-abi] wrote shared/src/abi.ts and shared/src/bytecode.ts");
