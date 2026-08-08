@@ -54,6 +54,15 @@ contract TesseraTimelock {
     uint64 public constant GRACE_PERIOD = 14 days;
 
     address public owner;
+    /**
+     * May cancel a queued action, and may do nothing else.
+     *
+     * Zero means no veto, which is a real configuration and not a mistake — a
+     * timelock whose only protection is the delay is still a timelock. Set at
+     * construction and changeable only through the queue, so appointing a
+     * guardian is itself announced.
+     */
+    address public guardian;
     uint64 public delay;
 
     struct Action {
@@ -76,6 +85,7 @@ contract TesseraTimelock {
     event DelaySet(uint64 delay);
     event InstantSet(bytes4 indexed selector, bool allowed);
     event OwnerSet(address indexed owner);
+    event GuardianSet(address indexed guardian);
 
     error NotOwner();
     error NotSelf();
@@ -100,10 +110,11 @@ contract TesseraTimelock {
         _;
     }
 
-    constructor(address owner_, uint64 delay_, bytes4[] memory instantSelectors) {
+    constructor(address owner_, address guardian_, uint64 delay_, bytes4[] memory instantSelectors) {
         if (owner_ == address(0)) revert ZeroAddress();
         if (delay_ < MIN_DELAY || delay_ > MAX_DELAY) revert BadDelay();
         owner = owner_;
+        guardian = guardian_;
         delay = delay_;
         // Seeded at construction rather than added later, because the list has
         // to be right before this contract owns anything — and afterwards it can
@@ -113,6 +124,7 @@ contract TesseraTimelock {
             emit InstantSet(instantSelectors[i], true);
         }
         emit OwnerSet(owner_);
+        emit GuardianSet(guardian_);
         emit DelaySet(delay_);
     }
 
@@ -132,8 +144,22 @@ contract TesseraTimelock {
         emit Queued(id, target, bytes4(data), eta, data);
     }
 
-    /// @notice Run a matured action.
-    function execute(uint256 id) external onlyOwner returns (bytes memory result) {
+    /**
+     * @notice Run a matured action.
+     *
+     * Permissionless, and that is load-bearing rather than generous. Once this
+     * timelock is owned by the governor, `onlyOwner` would mean a passed
+     * proposal could queue a change and then need a *second* proposal to run
+     * it — a delay mechanism that quietly requires two votes for every one
+     * decision, which nobody would use twice.
+     *
+     * Queuing is the privileged act, because queuing is where the decision is
+     * made and where the announcement everybody reacts to is published.
+     * Execution afterwards is mechanical: the delay has elapsed, the guardian
+     * did not veto, and the call is exactly the one that was announced. There
+     * is nothing left for an access check to protect.
+     */
+    function execute(uint256 id) external returns (bytes memory result) {
         Action storage a = actions[id];
         if (a.target == address(0)) revert NoAction();
         if (a.executed) revert AlreadyExecuted();
@@ -148,8 +174,21 @@ contract TesseraTimelock {
         emit Executed(id, a.target, bytes4(a.data));
     }
 
-    /// @notice Drop a queued action before it matures, or after.
-    function cancel(uint256 id) external onlyOwner {
+    /**
+     * @notice Drop a queued action before it matures, or after.
+     *
+     * The guardian may cancel and may do nothing else — it cannot queue, it
+     * cannot execute, it cannot change the delay or appoint its successor.
+     * That asymmetry is the whole design: the worst a captured guardian can do
+     * is stop things from happening, which is recoverable by replacing it,
+     * while the worst an unchecked timelock can do is enact a proposal nobody
+     * noticed in time, which is not.
+     *
+     * It is a veto, not an approval. Nothing waits on the guardian; a change
+     * it ignores goes through on schedule.
+     */
+    function cancel(uint256 id) external {
+        if (msg.sender != owner && msg.sender != guardian) revert NotOwner();
         Action storage a = actions[id];
         if (a.target == address(0)) revert NoAction();
         if (a.executed) revert AlreadyExecuted();
@@ -217,6 +256,18 @@ contract TesseraTimelock {
     // call to this contract and wait. Weakening the timelock is itself subject
     // to the timelock, which is the property that makes the rest of it mean
     // anything.
+
+    /**
+     * @notice Appoint or remove the guardian.
+     *
+     * `onlySelf`, so it goes through the queue like everything else: a veto
+     * that could be removed instantly is not a veto, and one that could be
+     * handed to an attacker instantly is worse than none.
+     */
+    function setGuardian(address guardian_) external onlySelf {
+        guardian = guardian_;
+        emit GuardianSet(guardian_);
+    }
 
     function setDelay(uint64 delay_) external onlySelf {
         if (delay_ < MIN_DELAY || delay_ > MAX_DELAY) revert BadDelay();

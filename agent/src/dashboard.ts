@@ -30,6 +30,7 @@ import {
   tesseraKeeperAbi,
   tesseraProviderStakeAbi,
   tesseraTwapOracleAbi,
+  tesseraTimelockAbi,
   tesseraRateLimiterAbi,
   tesseraTabAbi,
   ARC_USDC_ADDRESS,
@@ -7288,7 +7289,7 @@ async function main() {
    * calldata and the plain-English summary before anything is opened. A vote is
    * not the moment to discover what you asked for.
    */
-  app.post("/api/governance/encode-action", requireOperator, (req, res) => {
+  app.post("/api/governance/encode-action", requireOperator, async (req, res) => {
     const spec = ACTIONS.find((a) => a.id === String(req.body?.action ?? ""));
     if (!spec) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
     const r = resolveAction(spec);
@@ -7320,12 +7321,53 @@ async function main() {
       }
     }
     try {
-      const calldata = encodeFunctionData({ abi: spec.abi as never, functionName: spec.fn as never, args: values as never });
+      const inner = encodeFunctionData({ abi: spec.abi as never, functionName: spec.fn as never, args: values as never });
+
+      /*
+       * Route through the timelock when the target answers to it.
+       *
+       * The asset registry is owned by the timelock now, so a proposal calling
+       * it directly would pass a vote and then revert with "not owner" — the
+       * worst possible moment to find out. Rather than tagging each entry by
+       * hand and hoping the tag is kept up to date, the owner is *read* and the
+       * call wrapped when it turns out to be the timelock. Anything moved
+       * behind the lock later starts being wrapped without this code changing.
+       *
+       * The delay then applies on top of the vote: passing queues the change,
+       * and it becomes executable — by anyone — once the announcement has been
+       * public long enough for the guardian, and everybody else, to react.
+       */
+      const timelockAddr = (liveDeployment.tesseraTimelock as Hex | undefined) ?? null;
+      let target = r.address;
+      let calldata = inner;
+      let timelocked = false;
+      if (timelockAddr) {
+        const targetOwner = await client.public
+          .readContract({ address: r.address, abi: spec.abi as never, functionName: "owner" as never })
+          .catch(() => null);
+        if (String(targetOwner ?? "").toLowerCase() === timelockAddr.toLowerCase()) {
+          calldata = encodeFunctionData({
+            abi: tesseraTimelockAbi, functionName: "queue", args: [r.address, inner],
+          });
+          target = timelockAddr;
+          timelocked = true;
+        }
+      }
+
+      const delay = timelocked && timelockAddr
+        ? Number((await client.public.readContract({
+            address: timelockAddr, abi: tesseraTimelockAbi, functionName: "delay",
+          }).catch(() => 0n)) as bigint)
+        : 0;
+
       res.json({
         ok: true,
-        target: r.address,
+        target,
         calldata,
-        summary: spec.describe(shown),
+        timelocked,
+        delaySeconds: delay,
+        summary: spec.describe(shown)
+          + (timelocked ? ` Queued through the timelock — executable ${(delay / 3600).toFixed(0)}h after this passes.` : ""),
         contract: spec.contract,
         fn: spec.fn,
       });

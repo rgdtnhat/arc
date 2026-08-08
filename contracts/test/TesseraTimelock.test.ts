@@ -14,7 +14,7 @@ const DAY = 24 * HOUR;
  * only moves when it is supposed to.
  */
 async function deployFixture() {
-  const [operator, alice, stranger] = await hre.viem.getWalletClients();
+  const [operator, alice, stranger, guardian] = await hre.viem.getWalletClients();
 
   const usdc = await hre.viem.deployContract("MockUSDC");
   const pool = await hre.viem.deployContract("TesseraPool", [operator.account.address]);
@@ -26,6 +26,7 @@ async function deployFixture() {
 
   const timelock = await hre.viem.deployContract("TesseraTimelock", [
     operator.account.address,
+    guardian.account.address,
     BigInt(DAY),
     [FREEZE, FREEZE_MANY],
   ]);
@@ -43,7 +44,7 @@ async function deployFixture() {
   const as = (who: any) =>
     hre.viem.getContractAt("TesseraTimelock", timelock.address, { client: { wallet: who } });
 
-  return { operator, alice, stranger, usdc, pool, timelock, call, selfCall, as, FREEZE, FREEZE_MANY };
+  return { operator, alice, stranger, usdc, pool, timelock, call, selfCall, as, FREEZE, FREEZE_MANY, guardian };
 }
 
 describe("TesseraTimelock (owner powers that announce themselves)", () => {
@@ -205,7 +206,7 @@ describe("TesseraTimelock (owner powers that announce themselves)", () => {
     expect(getAddress(await timelock.read.owner())).to.equal(getAddress(stranger.account.address));
   });
 
-  it("keeps every entry point away from anyone but the operator", async () => {
+  it("keeps every deciding entry point away from anyone but the operator", async () => {
     const { usdc, pool, timelock, call, as, stranger } = await loadFixture(deployFixture);
     const s = await as(stranger);
     await expect(s.write.queue([pool.address, call("setPrice", [usdc.address, PRICE])])).to.be.rejected;
@@ -213,8 +214,58 @@ describe("TesseraTimelock (owner powers that announce themselves)", () => {
 
     await timelock.write.queue([pool.address, call("setPrice", [usdc.address, 2n * PRICE])]);
     await time.increase(DAY + 1);
-    await expect(s.write.execute([1n])).to.be.rejected;
     await expect(s.write.cancel([1n])).to.be.rejected;
+  });
+
+  it("lets anyone run a matured action, because the deciding was done at queue time", async () => {
+    /*
+     * Deliberately open. Once a governor owns this, an owner-only `execute`
+     * would mean a passed proposal queues a change and then needs a *second*
+     * proposal to run it — two votes for one decision. By the time an action
+     * matures the announcement has been public for the whole delay and the
+     * guardian has declined to veto; there is nothing left to gate.
+     */
+    const { usdc, pool, timelock, call, as, stranger } = await loadFixture(deployFixture);
+    await timelock.write.queue([pool.address, call("setPrice", [usdc.address, 2n * PRICE])]);
+    await time.increase(DAY + 1);
+    const s = await as(stranger);
+    await s.write.execute([1n]);
+    const r = await pool.read.reserves([usdc.address]);
+    expect(r[7]).to.equal(2n * PRICE);
+  });
+
+  it("lets the guardian veto a queued change", async () => {
+    const { usdc, pool, timelock, call, as, guardian } = await loadFixture(deployFixture);
+    await timelock.write.queue([pool.address, call("setPrice", [usdc.address, 2n * PRICE])]);
+    const g = await as(guardian);
+    await g.write.cancel([1n]);
+    await time.increase(DAY + 1);
+    await expect(timelock.write.execute([1n])).to.be.rejected;
+  });
+
+  it("gives the guardian a veto and nothing else", async () => {
+    /*
+     * The asymmetry is the design. The worst a captured guardian can do is
+     * stop things happening, which is fixed by replacing it; the worst an
+     * unchecked timelock can do is enact something nobody noticed in time,
+     * which is not fixable at all.
+     */
+    const { usdc, pool, timelock, call, as, guardian } = await loadFixture(deployFixture);
+    const g = await as(guardian);
+    await expect(g.write.queue([pool.address, call("setPrice", [usdc.address, PRICE])])).to.be.rejected;
+    await expect(g.write.runInstant([pool.address, call("setFrozen", [usdc.address, 1])])).to.be.rejected;
+    await expect(g.write.setGuardian([guardian.account.address])).to.be.rejected;
+    void timelock;
+  });
+
+  it("subjects appointing a guardian to its own delay", async () => {
+    // A veto that could be removed instantly is not a veto, and one that could
+    // be handed to an attacker instantly is worse than having none.
+    const { timelock, selfCall, stranger } = await loadFixture(deployFixture);
+    await timelock.write.queue([timelock.address, selfCall("setGuardian", [stranger.account.address])]);
+    await time.increase(DAY + 1);
+    await timelock.write.execute([1n]);
+    expect((await timelock.read.guardian()).toLowerCase()).to.equal(stranger.account.address.toLowerCase());
   });
 
   it("rejects a delay outside the bounds at construction", async () => {
