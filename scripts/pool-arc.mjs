@@ -869,7 +869,10 @@ async function main() {
     const h = await dWallet.deployContract({
       abi: tesseraTimelockAbi,
       bytecode: tesseraTimelockBytecode,
-      args: [deployer.address, 86400n, [FREEZE_SEL, FREEZE_MANY_SEL]],
+      // The guardian starts as the deployer: a veto is only useful if somebody
+      // holds it, and appointing a separate one is a governance decision that
+      // now has to go through the queue anyway.
+      args: [deployer.address, deployer.address, 86400n, [FREEZE_SEL, FREEZE_MANY_SEL]],
       account: deployer,
       chain: arcTestnet,
     });
