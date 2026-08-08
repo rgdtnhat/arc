@@ -51,5 +51,6 @@
   "tesseraKeeper": "0xf43e9057bffd74a933e6cef36c29da3220971889",
   "tesseraProviderStake": "0xacf4dbcab0bedebfe56234f2e92ff49b794c19bc",
   "tesseraEmissionsLegacy": "0x4574c356a57bf2daccac61e42da4d734865a34c4",
-  "tesseraKeeperLegacy": "0x00b083e1ec66006d21e37be43efa462689da9968"
+  "tesseraKeeperLegacy": "0x00b083e1ec66006d21e37be43efa462689da9968",
+  "tesseraTwapOracle": "0xa142f425a678f76690f4e2457d14dcf9ab8adc94"
 }

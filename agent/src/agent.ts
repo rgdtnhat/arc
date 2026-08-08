@@ -49,6 +49,25 @@ export interface AgentConfig {
    * asset, in preference order. Empty means USDC or nothing.
    */
   fundingAssets?: { address: Hex; symbol: string }[];
+  /**
+   * Charge the buyer's service credit for a call that settled.
+   *
+   * Until this existed the fee credit contract had exactly one caller: an
+   * operator endpoint somebody had to remember to POST to. A pay-per-use
+   * protocol whose own fee is collected by hand is a pay-per-use protocol in
+   * the demo sense only.
+   *
+   * It is a callback rather than a client the agent owns, because who gets
+   * billed is a deployment question — the run should not have to know whether
+   * there is a fee contract, whether an account has been nominated, or what
+   * the rate is. Returning null means "not charged", which is the normal case
+   * on a deployment with no fee account configured.
+   *
+   * Failures here must never unwind a settlement. The provider has been paid
+   * and the buyer has their answer; a fee that could reverse that would make
+   * the fee more important than the trade.
+   */
+  chargeCredit?: (settledUsdc: bigint, memo: string) => Promise<Hex | null>;
   onEvent?: (e: AgentEvent) => void;
 }
 
@@ -126,6 +145,35 @@ export class TesseraAgent {
       txUrl: e.txHash && this.cfg.explorer ? arcscanTx(e.txHash) : undefined,
     };
     this.cfg.onEvent?.(evt);
+  }
+
+  /**
+   * Bill the protocol's own fee for a call that settled.
+   *
+   * Deliberately after the settle event rather than before it: the event is the
+   * record that the trade happened, and it should not be gated on a fee. A
+   * charge that reverts — no credit, no fee account, contract paused — is
+   * reported and dropped. Nothing about it can undo the settlement, because
+   * the money has already moved and the buyer already has what they bought.
+   */
+  private async chargeForSettlement(amount: bigint, name: string, resource: string): Promise<void> {
+    if (!this.cfg.chargeCredit) return;
+    try {
+      const txHash = await this.cfg.chargeCredit(amount, `${name} · ${resource}`);
+      if (!txHash) return;
+      this.emit({
+        level: "pay",
+        resource,
+        message: `Protocol fee charged to service credit`,
+        txHash,
+      });
+    } catch (e) {
+      this.emit({
+        level: "skip",
+        resource,
+        message: `Service credit not charged (${String(e).slice(0, 80)}) — the call still settled`,
+      });
+    }
   }
 
   /** Discover what providers are selling, with live on-chain reputation. */
@@ -502,6 +550,7 @@ export class TesseraAgent {
           message: `Verified (${quality.reason}) — released ${formatUsdc(svc.price)} USDC to provider`,
           txHash: settleTx,
         });
+        await this.chargeForSettlement(svc.price, svc.name, svc.resource);
       } else {
         const refundTx = await this.cfg.client.refund(paymentId);
         entry.status = "refunded";

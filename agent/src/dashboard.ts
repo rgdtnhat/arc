@@ -29,6 +29,7 @@ import {
   tesseraEmitterAbi,
   tesseraKeeperAbi,
   tesseraProviderStakeAbi,
+  tesseraTwapOracleAbi,
   tesseraRateLimiterAbi,
   tesseraTabAbi,
   ARC_USDC_ADDRESS,
@@ -456,6 +457,55 @@ async function main() {
     onEvent: (message) => pushEvent({ source: "agent", ts: Date.now(), level: "info", message } as UiEvent),
   });
 
+  /**
+   * The protocol's own fee, drawn automatically as calls settle.
+   *
+   * ## Why it is opt-in rather than on by default
+   * Billing needs an account to bill. On this deployment there is no single
+   * obvious one — the agent runs on behalf of whoever is driving it, and
+   * guessing at a buyer's address to take money from would be worse than not
+   * charging. So it charges `TESSERA_FEE_ACCOUNT` and nothing happens without
+   * one, which is also what makes it safe to leave wired up on every run.
+   *
+   * ## Why it never throws
+   * A settlement that has happened cannot be un-happened, and a fee that could
+   * make a completed trade look failed would be a fee that matters more than
+   * the trade. Every reason not to charge — no account, no contract, no credit,
+   * no deployer key — returns null and the run carries on.
+   */
+  const FEE_ACCOUNT = (() => {
+    const v = String(process.env.TESSERA_FEE_ACCOUNT ?? "").trim();
+    return /^0x[0-9a-fA-F]{40}$/.test(v) ? (v as Hex) : null;
+  })();
+  /** Basis points of each settled call taken as protocol fee. */
+  const FEE_BPS = (() => {
+    const v = Number(process.env.TESSERA_FEE_BPS ?? 100);
+    return Number.isFinite(v) && v >= 0 && v <= 1_000 ? Math.floor(v) : 100;
+  })();
+
+  const chargeServiceCredit = async (settled: bigint, memo: string): Promise<Hex | null> => {
+    const feesAddr = (liveDeployment.tesseraServiceFees as Hex) ?? null;
+    if (!feesAddr || !FEE_ACCOUNT || !owner || FEE_BPS === 0) return null;
+    const fee = (settled * BigInt(FEE_BPS)) / 10_000n;
+    // Below a base unit there is nothing to take, and a zero-value spend would
+    // revert on the contract's own zero-amount guard.
+    if (fee === 0n) return null;
+    try {
+      const have = (await client.public.readContract({
+        address: feesAddr, abi: tesseraServiceFeesAbi, functionName: "creditOf", args: [FEE_ACCOUNT],
+      })) as bigint;
+      // Charging more than the buyer holds reverts; skipping says so instead.
+      if (have < fee) {
+        console.warn(`[fees] ${FEE_ACCOUNT.slice(0, 10)}… has ${fmtUnits(have, 6)} credit, needs ${fmtUnits(fee, 6)} — not charged`);
+        return null;
+      }
+      return await owner.write(feesAddr, tesseraServiceFeesAbi, "spend", [FEE_ACCOUNT, fee, memo.slice(0, 120)]);
+    } catch (e) {
+      console.warn(`[fees] charge skipped: ${String(e).slice(0, 120)}`);
+      return null;
+    }
+  };
+
   const agent = new TesseraAgent({
     client,
     providersBaseUrl: `http://127.0.0.1:${PROVIDERS_PORT}`,
@@ -473,6 +523,7 @@ async function main() {
     fundingAssets: ((liveDeployment.poolAssets as { symbol: string; address: string }[] | undefined) ?? [])
       .filter((a) => a.address.toLowerCase() !== ARC_USDC_ADDRESS.toLowerCase())
       .map((a) => ({ address: a.address as Hex, symbol: a.symbol })),
+    chargeCredit: (settled, memo) => chargeServiceCredit(settled, memo),
     onEvent: (e) => pushEvent({ ...e, source: "agent" }),
   });
   console.log(`🛡  Guardian policy: ${describePolicy(policy)}${policy.autoApprove ? " (auto-approve mode)" : ""}`);
@@ -5027,6 +5078,22 @@ async function main() {
       // Funding the pots is only half of it: somebody has to be earning from
       // them, and nobody is until they are checkpointed at least once.
       await settleStale();
+
+      /*
+       * Advance the price feed. A TWAP is only as good as its checkpoints, and
+       * a feed with two readings a week apart averages a week — which is not a
+       * price, it is a memory. `update` is permissionless and rejects readings
+       * closer together than its own spacing, so calling it on every round
+       * costs a revert at worst.
+       */
+      const oracleAddr = (liveDeployment.tesseraTwapOracle as Hex) ?? null;
+      if (oracleAddr) {
+        try {
+          await owner.write(oracleAddr, tesseraTwapOracleAbi, "update", []);
+        } catch {
+          /* too soon, or the pool is gone — neither is worth a log line every round */
+        }
+      }
     } catch (e) {
       console.error(`[emitter] keeper round failed: ${String(e).slice(0, 140)}`);
     } finally {
@@ -6228,6 +6295,81 @@ async function main() {
   });
 
   /**
+   * What the market says TSRA is worth, and whether that is worth hearing.
+   *
+   * The service-fee contract prices top-ups from a number an operator sets, and
+   * says so in its own comment. Reading the AMM instead is the obvious fix and
+   * is only half a fix: the live USDC/TSRA pool holds about a dollar, and an
+   * average taken over a dollar of depth is a number anybody can choose for the
+   * price of a rounding error — while looking exactly like a market rate.
+   *
+   * So this reports the oracle's answer *and* its refusal, side by side with
+   * the operator's parameter, rather than quietly picking one. Today the
+   * honest answer is "not deep enough to price", and the page can say that.
+   */
+  app.get("/api/oracle/tsra", async (_req, res) => {
+    const oracleAddr = (liveDeployment.tesseraTwapOracle as Hex) ?? null;
+    const feesAddr = (liveDeployment.tesseraServiceFees as Hex) ?? null;
+    if (!oracleAddr) {
+      res.json({ ok: true, deployed: false, note: "No TWAP oracle on this deployment." });
+      return;
+    }
+    const read = async <T,>(address: Hex, abi: unknown, fn: string, args: unknown[] = []): Promise<T | null> => {
+      try {
+        return (await client.public.readContract({
+          address, abi: abi as never, functionName: fn as never, args: args as never,
+        })) as T;
+      } catch {
+        return null;
+      }
+    };
+    const window = Math.max(600, Number(_req.query.window ?? 1800));
+    const consulted = await read<readonly [bigint, bigint, bigint, boolean]>(
+      oracleAddr, tesseraTwapOracleAbi, "consult", [BigInt(window)]);
+    const minDepth = (await read<bigint>(oracleAddr, tesseraTwapOracleAbi, "minDepth")) ?? 0n;
+    const lastAt = Number((await read<bigint>(oracleAddr, tesseraTwapOracleAbi, "lastUpdatedAt")) ?? 0n);
+    const count = Number((await read<bigint>(oracleAddr, tesseraTwapOracleAbi, "count")) ?? 0n);
+    const manual = feesAddr
+      ? (await read<bigint>(feesAddr, tesseraServiceFeesAbi, "tsraPerUsdc")) ?? 0n
+      : 0n;
+
+    /*
+     * The oracle's raw units are quote-base per token-base at 1e18. Turning
+     * that into dollars-per-TSRA is *12 orders of magnitude* of decimal
+     * adjustment (TSRA 18, USDC 6) plus the 1e18 scale, and the conversion is
+     * done here, once, rather than in three places on the page.
+     */
+    const rawPrice = consulted?.[0] ?? 0n;
+    const usdPerTsra = rawPrice > 0n ? Number(rawPrice) / 1e6 : null;
+    const depth = consulted?.[2] ?? 0n;
+    const usable = consulted?.[3] ?? false;
+
+    res.json({
+      ok: true,
+      deployed: true,
+      address: oracleAddr,
+      usable,
+      // Named so a caller cannot mistake "we have a price" for "you may use it".
+      reason: usable
+        ? null
+        : count < 2
+          ? "not enough readings yet"
+          : depth < minDepth
+            ? `pool holds ${(Number(depth) / 1e6).toFixed(2)} USDC against a ${(Number(minDepth) / 1e6).toLocaleString()} USDC floor — too thin to price`
+            : "no window long enough yet",
+      price: { raw: rawPrice.toString(), usdPerTsra },
+      windowSeconds: Number(consulted?.[1] ?? 0n),
+      requestedWindow: window,
+      depthUsdc: Number(depth) / 1e6,
+      minDepthUsdc: Number(minDepth) / 1e6,
+      readings: count,
+      lastUpdatedAt: lastAt,
+      // The parameter the fee contract actually charges against today.
+      operatorRate: { tsraPerUsdc: manual.toString(), usdPerTsra: manual > 0n ? 1e30 / Number(manual) : null },
+    });
+  });
+
+  /**
    * Is the protocol's upkeep actually being done?
    *
    * Every operational failure this codebase has had looked identical from the
@@ -6360,6 +6502,25 @@ async function main() {
             ? "streaming against an empty pot"
             : `${days.toFixed(2)} day(s) before the next top-up is needed`,
         Number(days.toFixed(3)));
+    }
+
+    // --- the price feed ----------------------------------------------------
+    const oracleAddr = (liveDeployment.tesseraTwapOracle as Hex) ?? null;
+    if (oracleAddr) {
+      const lastAt = Number((await read<bigint>(oracleAddr, tesseraTwapOracleAbi, "lastUpdatedAt")) ?? 0n);
+      const stale = nowSec - lastAt;
+      add("oracle.freshness",
+        lastAt === 0 ? "warn" : stale > 6 * 3600 ? "fail" : stale > 3600 ? "warn" : "ok",
+        `last reading ${ago(lastAt)}`, lastAt);
+      const consulted = await read<readonly [bigint, bigint, bigint, boolean]>(
+        oracleAddr, tesseraTwapOracleAbi, "consult", [1800n]);
+      // Declining to price a thin pool is correct behaviour, not a fault — so
+      // this reports the state without raising an alarm about it.
+      add("oracle.usable", "ok",
+        consulted?.[3]
+          ? `pricing off ${(Number(consulted[2]) / 1e6).toFixed(0)} USDC of depth`
+          : `declining to price — ${(Number(consulted?.[2] ?? 0n) / 1e6).toFixed(2)} USDC of depth`,
+        consulted?.[3] ? 1 : 0);
     }
 
     // --- checkpoints: is anybody actually accruing? ------------------------
