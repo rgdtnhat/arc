@@ -31,7 +31,8 @@
     "shell:bump": "node scripts/stamp-shell.mjs --bump",
     "smoke": "node scripts/smoke.mjs",
     "reads:check": "node scripts/check-reads.mjs",
-    "e2e": "node scripts/e2e.mjs"
+    "e2e": "node scripts/e2e.mjs",
+    "verify": "npm run compile && npm run abi:check -- --compiled && npm run shell:check && npm run reads:check && npm test --workspace contracts && npm test --workspace agent && npm run e2e"
   },
   "overrides": {
     "adm-zip": "^0.6.0",
