@@ -6793,6 +6793,39 @@ async function main() {
     const depth = consulted?.[2] ?? 0n;
     const usable = consulted?.[3] ?? false;
 
+    /*
+     * How much TSRA exists outside the emitter, and so how much could ever
+     * reach a pool. On this deployment that is about 1,500 of 100 billion.
+     *
+     * `erc20Abi` has no `totalSupply` — it is the four functions the escrow
+     * needs — so this reads the token's own ABI. The same gap once made
+     * `tokenMeta` report an address where a symbol should be.
+     */
+    const tokenAddr = (liveDeployment.tesseraToken as Hex) ?? null;
+    const emitterFor = (liveDeployment.tesseraEmitter as Hex) ?? null;
+    const totalSupply = tokenAddr ? await read<bigint>(tokenAddr, tesseraTokenAbi, "totalSupply") : null;
+    const lockedInEmitter = tokenAddr && emitterFor
+      ? await read<bigint>(tokenAddr, tesseraTokenAbi, "balanceOf", [emitterFor])
+      : null;
+    const circulating = totalSupply !== null && lockedInEmitter !== null ? totalSupply - lockedInEmitter : null;
+    const liquidity = {
+      circulatingTsra: circulating === null ? null : formatUnits(circulating, 18),
+      lockedInEmitter: lockedInEmitter === null ? null : formatUnits(lockedInEmitter, 18),
+      shortfallUsdc: depth >= minDepth ? 0 : Number(minDepth - depth) / 1e6,
+      /*
+       * The distinction that matters. Seeding a pool is a treasury operation;
+       * unlocking the supply to seed it with is a decision about the emission
+       * schedule. Saying which one is blocking is the whole value of this field.
+       */
+      blockedBy:
+        depth >= minDepth
+          ? null
+          : circulating !== null && lockedInEmitter !== null && lockedInEmitter > circulating * 1000n
+            ? "the emission schedule — nearly all TSRA is still locked in the emitter, so there is not enough in circulation to seed this pool at any price"
+            : "available liquidity — there is circulating TSRA, it is just not in this pool",
+    };
+
+
     res.json({
       ok: true,
       deployed: true,
@@ -6806,6 +6839,23 @@ async function main() {
           : depth < minDepth
             ? `pool holds ${(Number(depth) / 1e6).toFixed(2)} USDC against a ${(Number(minDepth) / 1e6).toLocaleString()} USDC floor — too thin to price`
             : "no window long enough yet",
+      /*
+       * Why the pool is thin, not just that it is.
+       *
+       * "1.00 USDC of depth against a 25,000 floor" reads like something an
+       * operator should go and fix, and the obvious fix — seed the pool — is
+       * impossible: 99.99999% of TSRA is still locked in the emitter's vesting
+       * schedule, so the entire circulating supply is a rounding error against
+       * what the floor needs. Reaching it is a decision about the emission
+       * schedule, not a treasury operation, and the difference is invisible
+       * unless this endpoint says so.
+       *
+       * The temptation, which this deliberately does not take, is to lower the
+       * floor until the oracle answers. That would turn a correct refusal into
+       * a confident price drawn from a dollar of liquidity — exactly the
+       * failure the floor exists to prevent.
+       */
+      supply: liquidity,
       price: { raw: rawPrice.toString(), usdPerTsra },
       windowSeconds: Number(consulted?.[1] ?? 0n),
       requestedWindow: window,
