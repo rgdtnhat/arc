@@ -153,6 +153,16 @@ const textIn = async (sel, ms = 10_000) => {
 for (const tab of ["overview", "proposals", "markets", "delegates", "emissions", "registry"]) {
   const btn = page.locator(`[data-govtab="${tab}"]`);
   if (!(await btn.count())) { note("governance tabs", `no tab button for ${tab}`); continue; }
+  /*
+   * A tab the operator alone can see is not a broken tab.
+   *
+   * `emissions` holds one operator-only card, so signed out it is hidden
+   * entirely rather than opening onto an empty room. This run is signed out, so
+   * a hidden button is the correct result and clicking it would test a state no
+   * visitor can reach. A *visible* tab still has to render something — that is
+   * the assertion worth keeping, and it is what caught this in the first place.
+   */
+  if (!(await btn.first().isVisible())) continue;
   await btn.first().click();
   const pane = page.locator(`#gov_${tab}`);
   if (!(await pane.count())) { note("governance tabs", `no pane for ${tab}`); continue; }

@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v52" />
+    <meta name="tessera-shell" content="tessera-v53" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1070,7 +1070,8 @@
           <p class="lead">
             Tessera turns an ordinary <b>HTTP 402</b> into a trustless, per-call purchase settled in
             USDC on Arc. An AI agent can pay a service it has never met — and get its money back
-            automatically if that service breaks its promise.
+            automatically if that service breaks its promise. Around that sits a full money market,
+            an AMM, a rewards token and the governance that steers it.
           </p>
           <div class="heroCtas">
             <button class="btn primary" id="heroStart" style="padding:12px 24px;font-size:15px">Launch the app →</button>
@@ -1085,28 +1086,109 @@
           </div>
         </section>
 
+        <!--
+          Four sections, in the order the app's own navigation puts them, so
+          somebody who reads this page and then opens the dashboard finds the
+          same shape. Every card links to the panel that actually does the
+          thing — a feature list nobody can reach from is a brochure.
+        -->
         <section id="features">
           <div class="sectionHead reveal">
-            <h2>Everything in one settlement layer</h2>
-            <p>Escrowed payments, a money market, a yield vault and an AMM-backed swap — all denominated in USDC on Arc.</p>
+            <h2>Agentic payments</h2>
+            <p>The original problem: letting an agent buy from a stranger, per call, with neither side trusting the other.</p>
           </div>
           <div class="featGrid">
             <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">🔐</div><h3>Programmable escrow</h3>
               <p>Payment locks before delivery and releases only when the response passes an integrity and quality check.</p></div>
             <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">↩️</div><h3>SLA auto-refund</h3>
               <p>Miss the deadline or return junk and the agent reclaims its USDC automatically — enforced by the contract, not goodwill.</p></div>
-            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">⭐</div><h3>On-chain reputation</h3>
-              <p>Every settlement and failure is recorded against the provider, with bonded stake slashed on a breach.</p></div>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">⭐</div><h3>Reputation &amp; bonded stake</h3>
+              <p>Every settlement and failure is recorded against the provider, and a breach slashes the USDC they put up.</p></div>
             <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">⚡</div><h3>Nanopayment tabs</h3>
               <p>One deposit, then hundreds of off-chain signed vouchers at zero gas, settled in a single transaction.</p></div>
-            <div class="feat reveal" data-goto="defi#lendingCard" role="link" tabindex="0"><div class="ico">🏦</div><h3>Lending &amp; borrowing</h3>
-              <p>Supply USDC, EURC or cirBTC for yield, or borrow against collateral with health-factor liquidation.</p></div>
-            <div class="feat reveal" data-goto="defi#vaultCard" role="link" tabindex="0"><div class="ico">🏛</div><h3>Yield vault</h3>
-              <p>Deposit USDC and earn the pool's APR automatically, with a large liquid reserve kept for instant exits.</p></div>
-            <div class="feat reveal" data-goto="defi#swapCard" role="link" tabindex="0"><div class="ico">🔁</div><h3>Swap</h3>
-              <p>Oracle-priced swaps between every pool asset, with the rate and both balances shown before you commit.</p></div>
             <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">🛡</div><h3>Guardian policy</h3>
               <p>A spending cap keeps the agent autonomous for small buys and escalates anything larger to a human co-signer.</p></div>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">🧠</div><h3>Trust memory &amp; billing inbox</h3>
+              <p>The agent remembers who burned it, pays invoices from names it trusts and declines the rest, unattended.</p></div>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">⧉</div><h3>Sell your own services</h3>
+              <p>List a paid endpoint in the marketplace and take the same escrowed, reputation-backed payments the agent does.</p></div>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">⚖</div><h3>Escrow as a service</h3>
+              <p>Two strangers who have nothing to do with the agent can settle a trade through the same contract.</p></div>
+          </div>
+        </section>
+
+        <section>
+          <div class="sectionHead reveal">
+            <h2>DeFi — the money the agent works with</h2>
+            <p>A money market, a vault, an AMM and a swap desk, all USDC-denominated, all reachable from your own wallet.</p>
+          </div>
+          <div class="featGrid">
+            <div class="feat reveal" data-goto="defi#lendingCard" role="link" tabindex="0"><div class="ico">🏦</div><h3>Lending &amp; borrowing</h3>
+              <p>Supply USDC, EURC, cirBTC or TSRA for yield, or borrow against collateral. Separate borrow and liquidation
+                 thresholds leave a buffer instead of putting the two on the same line.</p></div>
+            <div class="feat reveal" data-goto="defi#lendingCard" role="link" tabindex="0"><div class="ico">📈</div><h3>Reactive interest curve</h3>
+              <p>A three-slope kinked curve with a modifier that drifts toward the target utilisation, so rates answer demand
+                 rather than waiting for an operator.</p></div>
+            <div class="feat reveal" data-goto="defi#lendingCard" role="link" tabindex="0"><div class="ico">🛟</div><h3>First-loss backstop</h3>
+              <p>Deposit cover that is paid a share of borrower interest and is the first balance a bad debt is written
+                 against — priced risk, not a promise.</p></div>
+            <div class="feat reveal" data-goto="defi#vaultCard" role="link" tabindex="0"><div class="ico">🏛</div><h3>Yield vault</h3>
+              <p>Deposit USDC and earn the pool's APR automatically. An 80% liquid floor is a contract constant no admin can
+                 lower, so most of it is always redeemable.</p></div>
+            <div class="feat reveal" data-goto="defi#ammCard" role="link" tabindex="0"><div class="ico">🌊</div><h3>Liquidity pools</h3>
+              <p>Provide to a pool and keep <b>50% of every swap fee</b> — a floor written into the contract. Withdrawals stay
+                 open even while a pool is frozen.</p></div>
+            <div class="feat reveal" data-goto="defi#swapCard" role="link" tabindex="0"><div class="ico">🔁</div><h3>Swap</h3>
+              <p>Routed through the pools' own reserves, so no external oracle can be moved against you. The rate and both
+                 balances are shown before you commit.</p></div>
+            <div class="feat reveal" data-goto="defi#feesCard" role="link" tabindex="0"><div class="ico">◪</div><h3>App fees, split in public</h3>
+              <p>What the protocol earns is divided between the agent, the pool, the vault and the AMM on a published
+                 schedule, and every allocation is on the chart.</p></div>
+            <div class="feat reveal" data-goto="defi#lendingCard" role="link" tabindex="0"><div class="ico">🎯</div><h3>Guarded prices</h3>
+              <p>A price guard bands every mark, a risk oracle marks collateral low and debt high, and an outflow limiter caps
+                 how fast the pool can be drained.</p></div>
+          </div>
+        </section>
+
+        <section>
+          <div class="sectionHead reveal">
+            <h2><span class="tsraIcon" aria-hidden="true"></span> TSRA — earned, not sold</h2>
+            <p>A fixed supply released against measured activity, paid to the people carrying the protocol's risk.</p>
+          </div>
+          <div class="featGrid">
+            <div class="feat reveal" data-goto="gov" role="link" tabindex="0"><div class="ico">🔒</div><h3>Fixed supply, no mint</h3>
+              <p>The whole supply exists after the constructor returns and there is no function that creates another unit.
+                 Fixed by absence, not by policy.</p></div>
+            <div class="feat reveal" data-goto="gov#govEmissionsCard" role="link" tabindex="0"><div class="ico">⏳</div><h3>Released against activity</h3>
+              <p>The emitter sizes each second's release from real supplied and borrowed value, under a hard rate ceiling — so
+                 an empty protocol emits nothing.</p></div>
+            <div class="feat reveal" data-goto="defi#lendingCard" role="link" tabindex="0"><div class="ico">🎁</div><h3>Every side is paid</h3>
+              <p>Suppliers, borrowers, backstop depositors and liquidity providers all accrue, and claim to their own wallet
+                 whenever they like.</p></div>
+            <div class="feat reveal" data-goto="agents" role="link" tabindex="0"><div class="ico">💳</div><h3>Pays for the agent's work</h3>
+              <p>Buy prepaid credit for the agent's services in USDC, or in TSRA at a discount — the token has a job beyond
+                 being held.</p></div>
+          </div>
+        </section>
+
+        <section>
+          <div class="sectionHead reveal">
+            <h2>Governance — who decides</h2>
+            <p>Token holders steer the rewards, the listings and the treasury. Voting weight is delegated stake, not a balance snapshot anyone can borrow.</p>
+          </div>
+          <div class="featGrid">
+            <div class="feat reveal" data-goto="gov#govGaugeCard" role="link" tabindex="0"><div class="ico">🗳</div><h3>Vote where rewards go</h3>
+              <p>Each epoch the gauge splits emissions across markets by vote. Weight spent is weight committed, and the split
+                 is enacted on-chain, not by an operator.</p></div>
+            <div class="feat reveal" data-goto="gov#govProposalsCard" role="link" tabindex="0"><div class="ico">📜</div><h3>Proposals &amp; timelock</h3>
+              <p>Anything that changes the protocol goes through a proposal, a vote and a delay — long enough for anyone who
+                 disagrees to get out first.</p></div>
+            <div class="feat reveal" data-goto="gov#govRegistryCard" role="link" tabindex="0"><div class="ico">📋</div><h3>Asset registry</h3>
+              <p>What the protocol lists is a vote, and the register keeps the assets it turned down as well as the ones it
+                 took.</p></div>
+            <div class="feat reveal" data-goto="gov#govDelegateCard" role="link" tabindex="0"><div class="ico">🤝</div><h3>Delegation</h3>
+              <p>Tokens carry no weight until they are delegated — to yourself or to somebody who shows up. The panel measures
+                 both and offers the fix.</p></div>
           </div>
         </section>
 

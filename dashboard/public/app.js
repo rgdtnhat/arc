@@ -193,6 +193,20 @@ const $ = (id) => document.getElementById(id);
       const DEFI_CARD_TAB = {
         lendingCard: "lending", vaultCard: "vault", swapCard: "swap", ammCard: "amm", feesCard: "fees",
       };
+      /*
+       * The same map for governance, and for the same reason.
+       *
+       * `scrollIntoView` on a hidden element does nothing, so a deep link into a
+       * card that lives inside a closed sub-tab lands the reader on whichever
+       * tab happened to be open — the link appears to work and quietly goes
+       * somewhere else. Every governance card the landing page points at needs
+       * its pane opened first.
+       */
+      const GOV_CARD_TAB = {
+        govProposalsCard: "proposals", govDetailCard: "proposals", govCreateCard: "proposals",
+        govDiscussionsCard: "proposals", govGaugeCard: "markets", govBribeCard: "markets",
+        govDelegateCard: "delegates", govEmissionsCard: "emissions", govRegistryCard: "registry",
+      };
       const DEFI_TAB_KEY = "tessera_defi_tab";
       let defiTab = "lending";
 
@@ -282,6 +296,7 @@ const $ = (id) => document.getElementById(id);
         // before the scroll — `scrollIntoView` on a `hidden` element does
         // nothing, which would land the user on whichever tab was already open.
         if (anchor && DEFI_CARD_TAB[anchor]) setDefiTab(DEFI_CARD_TAB[anchor], { scroll: false });
+        if (anchor && GOV_CARD_TAB[anchor]) setGovTab(GOV_CARD_TAB[anchor]);
         requestAnimationFrame(() => {
           const el = anchor && $(anchor);
           if (el) {
@@ -2637,8 +2652,7 @@ const $ = (id) => document.getElementById(id);
           btn.disabled = true;
           try {
             const r = await (await postAuthed("/api/fees/allocate")).json();
-            feeMsg(r.ok ? `distributed ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`,
-              r.ok ? "var(--good)" : "var(--warn)");
+            showReceipt("feeMsg", r.ok, r.ok ? "distributed" : `failed: ${r.error}`, r.txHash);
             if (r.ok) loadFees();
           } catch { feeMsg("request failed", "var(--warn)"); }
           finally { btn.disabled = false; }
@@ -2651,8 +2665,7 @@ const $ = (id) => document.getElementById(id);
           try {
             const raw = toRaw(human, 6); // the collector's asset is USDC
             const r = await (await postAuthed(`/api/fees/withdraw?amount=${raw}`)).json();
-            feeMsg(r.ok ? `withdrew ${human} USDC ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`,
-              r.ok ? "var(--good)" : "var(--warn)");
+            showReceipt("feeMsg", r.ok, r.ok ? `withdrew ${human} USDC` : `failed: ${r.error}`, r.txHash);
             if (r.ok) { $("feeWithdrawAmount").value = ""; loadFees(); }
           } catch { feeMsg("request failed", "var(--warn)"); }
           finally { btn.disabled = false; }
@@ -3203,8 +3216,7 @@ const $ = (id) => document.getElementById(id);
         const post = async (path, query, label) => {
           try {
             const r = await (await postAuthed(path + (query ? "?" + query : ""))).json();
-            bsShow(r.ok ? `${label} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`,
-                   r.ok ? "var(--good)" : "var(--warn)");
+            showReceipt("backstopMsg", r.ok, r.ok ? label : `failed: ${r.error}`, r.txHash);
             if (r.ok) { $("bsAmount").value = ""; loadBackstop(); afterTx(); }
           } catch {
             bsShow("request failed", "var(--warn)");
@@ -3343,8 +3355,7 @@ const $ = (id) => document.getElementById(id);
           if (!/^0x[0-9a-fA-F]{40}$/.test(user())) return auShow("Enter a borrower address first.", "var(--warn)");
           try {
             const r = await (await postJson(path, body)).json();
-            auShow(r.ok ? `${label} ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`,
-                   r.ok ? "var(--good)" : "var(--warn)");
+            showReceipt("auctionMsg", r.ok, r.ok ? label : `failed: ${r.error}`, r.txHash);
             if (r.ok) { loadAuction(); afterTx(); }
           } catch {
             auShow("request failed", "var(--warn)");
@@ -3859,9 +3870,7 @@ const $ = (id) => document.getElementById(id);
                 poolId: q.poolId, tokenIn: q.tokenIn, tokenOut: q.tokenOut, amountIn: q.amountIn, minOut,
               })
             ).json();
-            msg.style.display = "block";
-            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
-            msg.textContent = r.ok ? `swapped ✓ — tx ${String(r.txHash).slice(0, 12)}…` : `failed: ${r.error}`;
+            showReceipt("ammMsg", r.ok, r.ok ? "swapped" : `failed: ${r.error}`, r.txHash);
           } catch {
             msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = "request failed";
           } finally { btn.disabled = false; afterTx(); }
@@ -4054,11 +4063,7 @@ const $ = (id) => document.getElementById(id);
           try {
             const body = adding ? { poolId: p.id, amounts } : { poolId: p.id, shares };
             const r = await (await postJson(`/api/amm/${adding ? "add" : "remove"}`, body)).json();
-            msg.style.display = "block";
-            msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
-            msg.textContent = r.ok
-              ? `${adding ? "added" : "withdrew"} liquidity ✓ — tx ${String(r.txHash).slice(0, 12)}…`
-              : `failed: ${r.error}`;
+            showReceipt("ammMsg", r.ok, r.ok ? `${adding ? "added" : "withdrew"} liquidity` : `failed: ${r.error}`, r.txHash);
           } catch {
             msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = "request failed";
           } finally { btn.disabled = false; afterTx(); }
@@ -4538,6 +4543,28 @@ const $ = (id) => document.getElementById(id);
         const base = explorerBase();
         return `<a href="${esc(base)}/tx/${esc(h)}" target="_blank" rel="noopener" style="text-decoration:underline">${label || esc(h.slice(0, 10)) + "…"}</a>`;
       }
+      /**
+       * One receipt, everywhere, with the hash always clickable.
+       *
+       * Six panels each grew their own version of this line, and every one of
+       * them wrote `textContent` with `hash.slice(0, 12)` — twelve characters of
+       * a transaction and nothing to do with them. The information the user
+       * actually wants after signing is "did it land", and that lives on the
+       * explorer. A shared helper means the next panel gets it right without
+       * anyone remembering to.
+       *
+       * `esc` on the label, `txLink` on the hash: the only markup that reaches
+       * innerHTML is the anchor this function builds.
+       */
+      function showReceipt(id, ok, label, txHash) {
+        const el = $(id);
+        if (!el) return;
+        el.style.display = "block";
+        el.style.color = ok ? "var(--good)" : "var(--warn)";
+        if (ok) el.innerHTML = `${esc(label)} ✓ — view on Arcscan: ${txLink(txHash)}`;
+        else el.textContent = label;
+      }
+
       function setMine(id, text) {
         const el = $(id);
         if (!el) return;
@@ -4616,7 +4643,27 @@ const $ = (id) => document.getElementById(id);
               : `Hold ${sym} — earned by supplying or borrowing — to take part.`;
 
           $("govCreateCard").style.display = r.canPropose && adminId ? "" : "none";
-          $("govEmissionsCard").style.display = r.canPropose && adminId ? "" : "none";
+          const emOperator = Boolean(r.canPropose && adminId);
+          $("govEmissionsCard").style.display = emOperator ? "" : "none";
+          /*
+           * The Emissions tab holds exactly one card, and that card is operator
+           * only — so for everybody else the tab opened onto nothing at all. Not
+           * a slow pane, not a failed fetch: a permanently empty room with a
+           * button in the navigation inviting people into it. The smoke test
+           * called it (0 characters after 10s) and it was right.
+           *
+           * A tab nobody but the operator can ever see content in does not
+           * belong in a public tab bar, so it is hidden rather than filled with
+           * an apology. If the tab was the one open when the page loaded — the
+           * choice is remembered across sessions — the view falls back to the
+           * overview instead of leaving the reader staring at a blank pane with
+           * no tab highlighted.
+           */
+          const emTab = document.querySelector('[data-govtab="emissions"]');
+          if (emTab) {
+            emTab.style.display = emOperator ? "" : "none";
+            if (!emOperator && govTab === "emissions") setGovTab("overview");
+          }
 
           renderProposals(r);
 
