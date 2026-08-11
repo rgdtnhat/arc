@@ -1446,12 +1446,10 @@ const $ = (id) => document.getElementById(id);
         }
         const t = $("lnMarketTitle");
         if (t) t.textContent = lnMarketSide === "supply" ? "Assets to supply" : "Assets to borrow";
-        // Both tabs now lead with the wallet balance and carry the position or
-        // the lendable depth underneath, so the header says the same thing on
-        // each. It used to read "Available" on the borrow tab, which stopped
-        // describing the column the moment that column changed.
+        // The column is the market's size on both tabs, so the header is the
+        // same on both.
         const c = $("lnMarketCol");
-        if (c) c.textContent = "Wallet balance";
+        if (c) c.textContent = "Supplied / borrowed";
         // Point the action panel at the same side, so the two agree.
         const act = $("lnAction");
         if (act) {
@@ -1519,26 +1517,26 @@ const $ = (id) => document.getElementById(id);
 
             // Supply side shows what you could put in; borrow side what the
             // reserve can actually lend. Those are different questions.
-            const key = String(a.address || "").toLowerCase();
-            const mine = window.__myBal[key];
             /*
-             * Wallet balance on both tabs, and what you already hold beside it.
+             * The market's totals, not yours.
              *
-             * Supply showed the wallet and Borrow showed the reserve's cash, so
-             * a borrower could not see what they had to repay with without
-             * switching tabs, and neither tab said how much of the asset was
-             * already supplied or owed. Both are the numbers somebody is
-             * deciding against, so both are on the row.
+             * This table is the index somebody reads to decide *where* to put
+             * money, and for that the question is how big each market is and how
+             * much of it is lent out — not what happens to be in the reader's
+             * wallet, which they already know, and not their own position, which
+             * the panel below states in full. Two attempts at this column both
+             * answered a personal question in a table asking a market one.
+             *
+             * `cash` is what is lendable now and `borrows` is what is out on
+             * loan, so supplied is the sum: every deposit is in one or the other.
              */
-            const wallet = mine !== undefined && mine !== null
-              ? fmtUnitsStr(BigInt(mine), dec)
-              : (a.position && a.position.wallet) || "—";
-            const amount = wallet;
-            const yours = side === "supply"
-              ? (a.position && a.position.supplied) || "0"
-              : (a.position && a.position.borrowed) || "0";
-            const yoursLabel = side === "supply" ? "supplied" : "borrowed";
-            const liquidity = fmtUnitsStr(cash, dec);
+            const borrowsRaw = a.reserve ? Number(a.reserve.borrows) : 0;
+            const cashNum = Number(fmtUnitsStr(cash, dec).replace(/,/g, "")) || 0;
+            const suppliedTotal = cashNum + borrowsRaw;
+            const fmtQty = (v) =>
+              v >= 1000 ? v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+                : v > 0 ? v.toLocaleString(undefined, { maximumFractionDigits: 6 })
+                : "0";
 
             const rate = side === "supply" ? a.reserve && a.reserve.supplyApr : a.reserve && a.reserve.borrowApr;
             const em = emissionApr(a.address, side);
@@ -1563,13 +1561,8 @@ const $ = (id) => document.getElementById(id);
               `<tr data-market="${esc(a.symbol)}" style="cursor:pointer${disabled ? ";opacity:.55" : ""}">` +
               `<td><b>${esc(a.symbol)}</b>${a.enabled === false ? ' <span class="tag warn" style="font-size:10px">unavailable</span>' : ""}` +
               `<div class="muted" style="font-size:11px">$${esc(a.priceUsd)}</div></td>` +
-              `<td class="num mono">${esc(amount)}` +
-              (Number(yours) > 0
-                ? `<div class="muted" style="font-size:11px">${esc(yours)} ${esc(yoursLabel)}</div>`
-                : side === "borrow"
-                  ? `<div class="muted" style="font-size:11px">${esc(liquidity)} lendable</div>`
-                  : "") +
-              `</td>` +
+              `<td class="num mono">${esc(fmtQty(suppliedTotal))}` +
+              `<div class="muted" style="font-size:11px">${esc(fmtQty(borrowsRaw))} borrowed</div></td>` +
               `<td class="num"><b>${esc(rate ?? "—")}%</b>${badge}</td>` +
               `<td class="num muted">›</td></tr>`
             );
@@ -1594,6 +1587,14 @@ const $ = (id) => document.getElementById(id);
       };
 
       /** Rewards: what is streaming, and what this wallet can take. */
+      /*
+       * Reachable from the page, so the reward card can be driven against a
+       * doctored payload in a browser check. The card's most important states —
+       * a balance the pot cannot cover, a pot that can — depend on live figures
+       * that move underneath a test, and waiting for one to reappear is not a
+       * test of anything.
+       */
+      window.loadEmissions = loadEmissions;
       async function loadEmissions() {
         const card = $("lnEmissions");
         if (!card) return;
@@ -1632,16 +1633,34 @@ const $ = (id) => document.getElementById(id);
            * the card, so they are stated rather than implied.
            */
           if ($("lnEmBacking")) {
-            const owed = Number(r.reward.owed ?? "0");
+            /*
+             * What a claim would pay *you*, not a protocol-wide ratio.
+             *
+             * The first version of this compared the pot against `totalOwed` —
+             * every address's booked debt — and reported the ratio as though it
+             * were the haircut each claimant takes. It is not how the contract
+             * works. `claim` sums the caller's own accrued balance and pays
+             * `min(that, pot)`: whoever claims first is paid in full up to
+             * whatever is in the pot, and only the shortfall stays accrued. A
+             * protocol-wide percentage answers a question nobody asked and
+             * reads as "you will get 0%", which is both wrong and discouraging
+             * — claiming is exactly what you should do.
+             *
+             * Your share of a stream is proportional to your share of the
+             * market, unchanged: rewards accrue as shares x (index - yourIndex).
+             * The pot only limits how much of an accrued balance can be paid
+             * out today.
+             */
+            const yours = Number(r.yourClaimable ?? "0");
             const held = Number(r.reward.balance ?? "0");
-            const short = owed > held;
+            const short = yours > held;
             $("lnEmBacking").style.display = short ? "" : "none";
             if (short) {
-              const pct = owed > 0 ? Math.floor((held / owed) * 100) : 0;
+              const pays = held.toLocaleString(undefined, { maximumFractionDigits: 6 });
               $("lnEmBacking").textContent =
-                `The pot holds ${r.reward.balance} ${r.reward.symbol} against ${r.reward.owed} already earned across ` +
-                `everyone. A claim pays what is there — about ${pct}% of a balance right now — and the rest stays owed ` +
-                `until the pot is refilled.`;
+                `The pot holds ${pays} ${r.reward.symbol} and you have earned more than that, so claiming now pays ` +
+                `${pays} and leaves the rest accrued — it is not lost, and claiming again once the pot refills pays ` +
+                `the remainder. Claims are first come, first served.`;
             }
           }
           // Say it in the panel too: an APR next to a paused market is a lie
