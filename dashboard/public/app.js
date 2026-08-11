@@ -1613,7 +1613,18 @@ const $ = (id) => document.getElementById(id);
           }
           card.style.display = "";
           card.dataset.everShown = "1";
-          $("lnEmAmount").textContent = r.yourClaimable ?? "0";
+          /*
+           * The headline is what a claim would *pay*, not what has been earned.
+           *
+           * `claim` transfers `min(your accrued, the pot)`. Printing the
+           * accrued figure made the card offer 652,609 TSRA over a button,
+           * against a pot holding 262 — and a claim that paid the 262 was still
+           * reported as success, so the number on screen was a promise the
+           * protocol had no way to keep. The payable figure is the honest one
+           * to put next to a button labelled Claim; the earned total is still
+           * shown, as what stays owed.
+           */
+          $("lnEmAmount").textContent = r.yourPayable ?? r.yourClaimable ?? "0";
           $("lnEmSymbol").textContent = r.reward.symbol;
           const runway = r.reward.runwayDays;
           $("lnEmNote").textContent =
@@ -1621,7 +1632,9 @@ const $ = (id) => document.getElementById(id);
             (runway == null ? " · nothing streaming" : ` · about ${runway.toFixed(1)} days left at the current rates`) +
             (r.reward.priced ? "" : " · no market price for the reward, so rows show a rate rather than an APY") +
             `. Paid out all time: ${r.reward.claimedAllTime}.`;
-          $("lnEmClaim").disabled = !(BigInt(r.yourClaimableRaw || "0") > 0n);
+          // Nothing payable means the claim reverts, so the button says so by
+          // being off rather than by failing after a signature.
+          $("lnEmClaim").disabled = !(BigInt(r.yourPayableRaw ?? r.yourClaimableRaw ?? "0") > 0n);
           /*
            * Say when the pot cannot cover what has been earned.
            *
@@ -1656,11 +1669,14 @@ const $ = (id) => document.getElementById(id);
             const short = yours > held;
             $("lnEmBacking").style.display = short ? "" : "none";
             if (short) {
-              const pays = held.toLocaleString(undefined, { maximumFractionDigits: 6 });
+              const fmt = (n) => n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+              // The headline is now the payable figure, so this says where the
+              // difference went rather than contradicting the number above it.
               $("lnEmBacking").textContent =
-                `The pot holds ${pays} ${r.reward.symbol} and you have earned more than that, so claiming now pays ` +
-                `${pays} and leaves the rest accrued — it is not lost, and claiming again once the pot refills pays ` +
-                `the remainder. Claims are first come, first served.`;
+                `The figure above is what the pot can pay today. You have earned ${fmt(yours)} ${r.reward.symbol} in ` +
+                `total; the pot holds ${fmt(held)}, so a claim now pays ${fmt(held)} and the remaining ` +
+                `${fmt(Math.max(0, yours - held))} stays accrued — it is not lost, and claiming again once the pot ` +
+                `refills pays it. Claims are first come, first served.`;
             }
           }
           // Say it in the panel too: an APR next to a paused market is a lie
@@ -1753,7 +1769,21 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           btn.disabled = true;
-          await selfCustody("lnEmMsg", `claim ${em.yourClaimable} ${em.reward.symbol}`, async (from, cfg) =>
+          /*
+           * Label the receipt with what will arrive, not what is owed.
+           *
+           * `selfCustody` prints this string back with "confirmed ✓" once the
+           * transaction lands, so passing the accrued balance produced "claim
+           * 653800.646537702511044422 TSRA confirmed ✓" for a transfer of 262
+           * — a true statement about the transaction wrapped around a false one
+           * about the money. The pot bounds the payment, so the pot bounds the
+           * sentence.
+           */
+          const shortPot = BigInt(em.yourPayableRaw ?? em.yourClaimableRaw ?? "0") < BigInt(em.yourClaimableRaw ?? "0");
+          const claimLabel =
+            `claim ${em.yourPayable ?? em.yourClaimable} ${em.reward.symbol}` +
+            (shortPot ? " (all the pot can pay today — the rest stays owed)" : "");
+          await selfCustody("lnEmMsg", claimLabel, async (from, cfg) =>
             sendTx(
               from, cfg.emissions,
               // claim(address[],uint8[]): two dynamic arrays, so the head holds
@@ -6522,7 +6552,9 @@ const $ = (id) => document.getElementById(id);
           if (!window.__lpEmissions) { if (!card.dataset.everShown) card.style.display = "none"; return; }
           card.style.display = "";
           card.dataset.everShown = "1";
-          $("amEmAmount").textContent = r.yourClaimable ?? "0";
+          // What a claim would pay, not what has been earned — see the lending
+          // twin for why the two must not be conflated over a Claim button.
+          $("amEmAmount").textContent = r.yourPayable ?? r.yourClaimable ?? "0";
           $("amEmSymbol").textContent = r.reward.symbol;
           $("amEmNote").textContent =
             (r.paused
@@ -6556,13 +6588,20 @@ const $ = (id) => document.getElementById(id);
            * control out and leaving the reader to guess whether it is broken.
            */
           const owed = BigInt(r.yourClaimableRaw || "0");
+          const payable = BigInt(r.yourPayableRaw ?? r.yourClaimableRaw ?? "0");
           const holdsShares = (r.pools || []).some((p) => Number(p.yourShares) > 0);
-          $("amEmClaim").disabled = !(owed > 0n);
+          // A claim that can pay nothing reverts, so the button is off and the
+          // note says which of the two reasons applies.
+          $("amEmClaim").disabled = !(payable > 0n);
           if ($("amEmWhy")) {
-            $("amEmWhy").style.display = owed > 0n ? "none" : "";
-            $("amEmWhy").textContent = holdsShares
-              ? "Nothing has accrued yet — rewards build up per second against the shares you hold."
-              : "You hold no liquidity in these pools, so nothing is accruing. Add liquidity below to start earning.";
+            $("amEmWhy").style.display = payable > 0n ? "none" : "";
+            $("amEmWhy").textContent =
+              owed > 0n
+                ? `You have earned ${r.yourClaimable} ${r.reward.symbol}, but the reward pot is empty, so a claim ` +
+                  "would pay nothing right now. It stays owed and is claimable as soon as the pot is funded."
+                : holdsShares
+                  ? "Nothing has accrued yet — rewards build up per second against the shares you hold."
+                  : "You hold no liquidity in these pools, so nothing is accruing. Add liquidity below to start earning.";
           }
           const lpBtn = $("govLpPause");
           if (lpBtn) lpBtn.textContent = r.paused ? "Resume liquidity" : "Pause liquidity";
@@ -6617,7 +6656,12 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           btn.disabled = true;
-          await selfCustody("amEmMsg", `claim ${em.yourClaimable} ${em.reward.symbol}`, async (from, cfg) =>
+          // What will arrive, not what is owed — see the lending twin.
+          const shortPot = BigInt(em.yourPayableRaw ?? em.yourClaimableRaw ?? "0") < BigInt(em.yourClaimableRaw ?? "0");
+          const claimLabel =
+            `claim ${em.yourPayable ?? em.yourClaimable} ${em.reward.symbol}` +
+            (shortPot ? " (all the pot can pay today — the rest stays owed)" : "");
+          await selfCustody("amEmMsg", claimLabel, async (from, cfg) =>
             // claim(uint256[]): one dynamic array, so the head is a single
             // offset to the length word.
             sendTx(from, cfg.lpEmissions, callData(cfg.selectors.lpClaim, encUint(32), encArray(ids))),

@@ -5461,8 +5461,21 @@ async function main() {
           // and printing 1e77 days helps nobody.
           runwayDays: runway > 10n ** 12n ? null : Number(runway) / 86_400,
         },
+        /*
+         * Two different numbers, and the page needs both.
+         *
+         * `yourClaimable` is what has been *earned* — the contract's books.
+         * `yourPayable` is what a claim would actually hand over right now:
+         * `min(earned, pot)`, because that is literally what `claim` computes.
+         * Showing only the first turned the card into a promise the protocol
+         * could not keep — 652,609 TSRA offered against a pot of 262 — so the
+         * headline reads the payable figure and the earned one is stated
+         * beside it as what stays owed.
+         */
         yourClaimable: fmtUnits(claimable, rewardMeta.decimals),
         yourClaimableRaw: claimable.toString(),
+        yourPayable: fmtUnits(claimable < held ? claimable : held, rewardMeta.decimals),
+        yourPayableRaw: (claimable < held ? claimable : held).toString(),
         assets: rows,
       });
     } catch (e) {
@@ -5784,8 +5797,11 @@ async function main() {
           claimedAllTime: fmtUnits(claimed, rewardMeta.decimals),
           runwayDays: runway > 10n ** 12n ? null : Number(runway) / 86_400,
         },
+        // Earned, and what a claim would actually pay — see the lending twin.
         yourClaimable: fmtUnits(claimable, rewardMeta.decimals),
         yourClaimableRaw: claimable.toString(),
+        yourPayable: fmtUnits(claimable < held ? claimable : held, rewardMeta.decimals),
+        yourPayableRaw: (claimable < held ? claimable : held).toString(),
         pools: rows,
       });
     } catch (e) {
