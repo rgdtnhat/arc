@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v53" />
+    <meta name="tessera-shell" content="tessera-v54" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1848,6 +1848,9 @@
                 <button class="btn primary" id="amEmClaim">Claim</button>
               </div>
               <div class="kv" id="amEmNote" style="margin-top:8px"></div>
+              <!-- Why the Claim button is greyed out, when it is. A disabled
+                   control with no explanation reads as broken. -->
+              <div class="note" id="amEmWhy" style="display:none;margin-top:6px;color:var(--warn)"></div>
               <div class="tblWrap auto" style="margin-top:10px"><table class="data" style="min-width:0">
                 <thead><tr><th>Pool</th><th class="num">Rate</th><th class="num">Your share</th><th class="num">Earned</th></tr></thead>
                 <tbody id="amEmRows"></tbody>
@@ -2728,6 +2731,41 @@
             </div>
             <div class="kv" id="govEmBudget" style="margin-top:9px"></div>
             <div class="msg" id="govEmMsg" style="display:none"></div>
+
+            <!-- What is running right now, on both venues.
+                 The form above sets a rate but never showed one, so an operator
+                 had to remember what they last typed or read it off another tab.
+                 Every row loads itself into the form, which is what "edit" means
+                 here: the current value is the starting point, not a blank box. -->
+            <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">
+              <b style="font-size:13px">Rates running now</b>
+              <div class="kv" style="margin-top:3px">Edit puts the row's current rate into the form above, so a change starts from what is there rather than from nothing.</div>
+              <div class="tblWrap auto" style="margin-top:9px"><table class="data" style="min-width:0">
+                <thead><tr>
+                  <th>Market</th><th>Side</th><th class="num">Per second</th><th class="num">Per day</th><th></th>
+                </tr></thead>
+                <tbody id="govEmLiveRows"></tbody>
+              </table></div>
+            </div>
+
+            <!-- The AMM's own streams. Same contract shape, different venue, and
+                 it had no editor at all — the rates were set once by script and
+                 unreachable from the app afterwards. -->
+            <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">
+              <b style="font-size:13px">Liquidity pool emissions</b>
+              <div class="kv" style="margin-top:3px">
+                One stream per AMM pool, paid to liquidity providers in proportion to their share. The rate is
+                per second across the whole pool, so a provider's share of it falls as more liquidity arrives.
+              </div>
+              <div class="sheetFilters" style="padding-bottom:0;margin-top:9px">
+                <label>Pool<select id="govLpPool" class="field"></select></label>
+                <label>Rate<input id="govLpRate" class="field" inputmode="decimal" placeholder="Tokens / second" /></label>
+              </div>
+              <div class="row-actions" style="margin-top:10px">
+                <button class="btn primary" id="govLpSet">Set pool rate</button>
+              </div>
+              <div class="msg" id="govLpMsg" style="display:none"></div>
+            </div>
 
             <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
               <div class="row-actions" style="justify-content:space-between;flex-wrap:wrap">

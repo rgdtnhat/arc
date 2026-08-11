@@ -1534,8 +1534,16 @@ const $ = (id) => document.getElementById(id);
           const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
           const r = await (await fetch("/api/lending/emissions" + q)).json();
           window.__emissions = r && r.ok ? r : null;
-          if (!r || !r.ok || !r.deployed || !r.configured) { card.style.display = "none"; renderMarket(); return; }
+          // Same rule as the AMM card: once it has shown something it stays,
+          // rather than blinking out on every throttled poll and coming back
+          // whenever the RPC next answers.
+          if (!r || !r.ok || !r.deployed || !r.configured) {
+            if (!card.dataset.everShown) card.style.display = "none";
+            renderMarket();
+            return;
+          }
           card.style.display = "";
+          card.dataset.everShown = "1";
           $("lnEmAmount").textContent = r.yourClaimable ?? "0";
           $("lnEmSymbol").textContent = r.reward.symbol;
           const runway = r.reward.runwayDays;
@@ -1560,8 +1568,9 @@ const $ = (id) => document.getElementById(id);
           const btn = $("govEmPause");
           if (btn) btn.textContent = r.paused ? "Resume lending" : "Pause lending";
           renderMarket();
+          renderLiveRates();
         } catch {
-          card.style.display = "none";
+          if (!card.dataset.everShown) card.style.display = "none";
         }
       }
 
@@ -2282,12 +2291,29 @@ const $ = (id) => document.getElementById(id);
         }
         body.innerHTML = assets
           .map((a) => {
-            const empty = !parseFloat(a.liquidity);
+            /*
+             * "Not read yet" and "read, and it is zero" are different answers.
+             *
+             * `!parseFloat(x)` is true for undefined, null, "" and "0" alike, so
+             * a snapshot that had not landed yet rendered as a red "no pool
+             * depth — add liquidity to trade it" on every asset. The AMM
+             * snapshot is served from cache and refreshed in the background, so
+             * that state is reached on every cold load and after every throttled
+             * refresh — the panel was accusing the pools of being empty while it
+             * was still finding out. All four have depth right now.
+             */
+            const n = Number(a.liquidity);
+            const unread = a.liquidity == null || a.liquidity === "" || !Number.isFinite(n);
+            const empty = !unread && n === 0;
+            const tag = unread
+              ? `<span class="tag">reading depth…</span>`
+              : empty
+                ? `<span class="tag warn">no pool depth — add liquidity to trade it</span>`
+                : `<span class="tag ok">routable</span>`;
             return (
               `<tr><td><b>${esc(a.symbol)}</b></td>` +
-              `<td class="num ${empty ? "down" : ""}">${esc(a.liquidity)}</td>` +
-              `<td><span class="tag ${empty ? "warn" : "ok"}">` +
-              `${empty ? "no pool depth — add liquidity to trade it" : "routable"}</span></td></tr>`
+              `<td class="num ${empty ? "down" : ""}">${unread ? "—" : esc(a.liquidity)}</td>` +
+              `<td>${tag}</td></tr>`
             );
           })
           .join("");
@@ -5452,6 +5478,111 @@ const $ = (id) => document.getElementById(id);
         });
       }
 
+      /**
+       * What is streaming right now, on both venues, with a way back into the form.
+       *
+       * The editor set rates and never showed one, so an operator had to
+       * remember what they last typed — or read it off a different tab and
+       * retype it, which is how a digit gets dropped from a number denominated
+       * in wei per second. Each row loads its own current value into the form,
+       * because "edit" should start from what is there.
+       */
+      function renderLiveRates() {
+        const body = $("govEmLiveRows");
+        if (!body) return;
+        const em = window.__emissions;
+        const lp = window.__lpEmissions;
+        const dec = (em && em.reward && Number(em.reward.decimals)) || 18;
+        const sym = (em && em.reward && em.reward.symbol) || "TSRA";
+        const per = (raw) => {
+          const n = Number(raw) / 10 ** dec;
+          return { sec: n, day: n * 86400 };
+        };
+        const rows = [];
+        for (const a of (em && em.assets) || []) {
+          // The payload names each side rather than indexing them, so the map is
+          // written out instead of guessed at — an off-by-one here would show an
+          // operator the backstop's rate and set the supply side's.
+          const bySide = [
+            [0, "Supply", a.supplyRatePerSecond],
+            [1, "Borrow", a.borrowRatePerSecond],
+            [2, "Backstop", a.backstopRatePerSecond],
+          ];
+          for (const [side, label, raw] of bySide) {
+            if (raw == null) continue;
+            const v = per(raw);
+            // Every side is listed, including the zeroes: a market paying
+            // nothing is a fact an operator needs, and hiding it makes the
+            // table look like the whole schedule when it is only part of it.
+            rows.push(
+              `<tr><td><b>${esc(a.symbol)}</b></td><td>${label}</td>` +
+              `<td class="num mono">${esc(String(raw))}</td>` +
+              `<td class="num">${v.day > 0 ? `<span class="tsraIcon"></span> ${esc(v.day.toFixed(4))}` : "—"}</td>` +
+              `<td class="num"><button class="btn" data-emedit="${esc(a.address)}|${side}|${esc(String(raw))}" style="padding:3px 10px;font-size:11px">Edit</button></td></tr>`,
+            );
+          }
+        }
+        for (const p of (lp && lp.pools) || []) {
+          const v = per(p.ratePerSecond);
+          rows.push(
+            `<tr><td><b>${esc(p.name)}</b><div class="muted" style="font-size:11px">AMM pool ${esc(String(p.poolId))}</div></td>` +
+            `<td>Liquidity</td><td class="num mono">${esc(String(p.ratePerSecond))}</td>` +
+            `<td class="num">${v.day > 0 ? `<span class="tsraIcon"></span> ${esc(v.day.toFixed(4))}` : "—"}</td>` +
+            `<td class="num"><button class="btn" data-lpedit="${esc(String(p.poolId))}|${esc(String(p.ratePerSecond))}" style="padding:3px 10px;font-size:11px">Edit</button></td></tr>`,
+          );
+        }
+        body.innerHTML = rows.length ? rows.join("") : emptyRow(5, `No streams configured. Rates are in ${esc(sym)} per second.`);
+
+        const fill = (id, value) => {
+          const el = $(id);
+          if (!el) return;
+          el.value = (Number(value) / 10 ** dec).toString();
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          el.focus();
+        };
+        body.querySelectorAll("[data-emedit]").forEach((b) =>
+          b.addEventListener("click", () => {
+            const [asset, side, raw] = b.dataset.emedit.split("|");
+            $("govEmAsset").value = asset;
+            $("govEmSide").value = side;
+            fill("govEmRate", raw);
+          }));
+        body.querySelectorAll("[data-lpedit]").forEach((b) =>
+          b.addEventListener("click", () => {
+            const [poolId, raw] = b.dataset.lpedit.split("|");
+            $("govLpPool").value = poolId;
+            fill("govLpRate", raw);
+          }));
+      }
+
+      /*
+       * The AMM's streams had no editor at all.
+       *
+       * `/api/amm/emissions/rate` has existed the whole time; nothing in the app
+       * called it, so liquidity rates were set once by a script and then
+       * unreachable — an operator could pause the venue but not retune it.
+       */
+      if ($("govLpSet")) {
+        $("govLpSet").addEventListener("click", async () => {
+          const poolId = Number($("govLpPool").value);
+          const lp = window.__lpEmissions;
+          const dec = (lp && lp.reward && Number(lp.reward.decimals)) || 18;
+          const typed = ($("govLpRate").value || "").trim();
+          const parsed = parseAmount(typed, dec);
+          // Zero stops a stream, which is a real instruction rather than an error.
+          const raw = typed === "0" ? "0" : parsed.raw;
+          if (raw == null) { govMsg("govLpMsg", parsed.error || "Enter a rate.", "var(--warn)"); return; }
+          if (!Number.isInteger(poolId)) { govMsg("govLpMsg", "Pick a pool.", "var(--warn)"); return; }
+          try {
+            const r = await (await postJson("/api/amm/emissions/rate", { poolId, ratePerSecond: String(raw) })).json();
+            if (r.ok) {
+              showReceipt("govLpMsg", true, `pool ${poolId} now pays ${typed} per second`, r.txHash);
+              loadLpEmissions();
+            } else govMsg("govLpMsg", r.error || "failed", "var(--warn)");
+          } catch { govMsg("govLpMsg", "Request failed.", "var(--warn)"); }
+        });
+      }
+
       /* ---- Asset registry ---------------------------------------------------
        *
        * What is listed, and what listing something else would take. The one
@@ -6209,8 +6340,19 @@ const $ = (id) => document.getElementById(id);
           const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
           const r = await (await fetch("/api/amm/emissions" + q)).json();
           window.__lpEmissions = r && r.ok && r.deployed && r.configured ? r : null;
-          if (!window.__lpEmissions) { card.style.display = "none"; return; }
+          /*
+           * Hide it only if it has never had anything to show.
+           *
+           * This used to hide the card on any poll that came back unconfigured,
+           * and the catch below hid it on any poll that failed — so on a
+           * throttled RPC the claim box vanished mid-session and stayed gone
+           * until a poll happened to succeed. A panel that disappears reads as a
+           * feature being taken away, not as a slow network. Once it has
+           * rendered, it stays: slightly stale beats absent.
+           */
+          if (!window.__lpEmissions) { if (!card.dataset.everShown) card.style.display = "none"; return; }
           card.style.display = "";
+          card.dataset.everShown = "1";
           $("amEmAmount").textContent = r.yourClaimable ?? "0";
           $("amEmSymbol").textContent = r.reward.symbol;
           $("amEmNote").textContent =
@@ -6233,11 +6375,38 @@ const $ = (id) => document.getElementById(id);
                 );
               }).join("")
             : emptyRow(4, "No pools.");
-          $("amEmClaim").disabled = !(BigInt(r.yourClaimableRaw || "0") > 0n);
+          /*
+           * A disabled button with no explanation is the same dead end as a
+           * blank panel. Nothing accrues to an address holding no LP shares, and
+           * saying so — with the way to change it — is more use than greying the
+           * control out and leaving the reader to guess whether it is broken.
+           */
+          const owed = BigInt(r.yourClaimableRaw || "0");
+          const holdsShares = (r.pools || []).some((p) => Number(p.yourShares) > 0);
+          $("amEmClaim").disabled = !(owed > 0n);
+          if ($("amEmWhy")) {
+            $("amEmWhy").style.display = owed > 0n ? "none" : "";
+            $("amEmWhy").textContent = holdsShares
+              ? "Nothing has accrued yet — rewards build up per second against the shares you hold."
+              : "You hold no liquidity in these pools, so nothing is accruing. Add liquidity below to start earning.";
+          }
           const lpBtn = $("govLpPause");
           if (lpBtn) lpBtn.textContent = r.paused ? "Resume liquidity" : "Pause liquidity";
+          // The pool picker in the operator's rate editor, kept in step with
+          // whatever pools actually exist rather than hard-coded.
+          const sel = $("govLpPool");
+          if (sel) {
+            const want = (r.pools || []).map((p) => `${p.poolId}:${p.name}`).join(",");
+            if (sel.dataset.pools !== want) {
+              const keep = sel.value;
+              sel.innerHTML = (r.pools || []).map((p) => `<option value="${esc(String(p.poolId))}">${esc(p.name)}</option>`).join("");
+              sel.dataset.pools = want;
+              if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+            }
+          }
+          renderLiveRates();
         } catch {
-          card.style.display = "none";
+          if (!card.dataset.everShown) card.style.display = "none";
         }
       }
 
