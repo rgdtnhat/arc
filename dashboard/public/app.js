@@ -3931,7 +3931,8 @@ const $ = (id) => document.getElementById(id);
           if (!balances) {
             say(selfMode()
               ? "Could not read your wallet balances — check your wallet is connected to Arc."
-              : "Max fills from your own wallet. Switch on \"Use my own wallet\" first.");
+              : "Could not read the app wallet's balances yet — the lending panel supplies them, " +
+                "so give it a moment and try again.");
             return;
           }
           const raws = p.assets.map((a, i) => {
@@ -3988,8 +3989,40 @@ const $ = (id) => document.getElementById(id);
         });
 
         /** The connected wallet's balance of each pool asset (self-custody only). */
+        /**
+         * Whose balances "Max" should fill from.
+         *
+         * This only ever read the browser wallet, so in an operator session it
+         * returned null and the button answered "switch on Use my own wallet" —
+         * advice that is wrong for that session. An operator's deposit spends
+         * the **app wallet**, and `amLpExec` sends it server-side through
+         * `/api/amm/add`; refusing to size it from that wallet's balances told
+         * the operator to change modes in order to do the thing they were
+         * already doing.
+         *
+         * The balances are already on the page: the lending snapshot carries
+         * `position.wallet` per asset for the app wallet, and the AMM's assets
+         * are the same four. An asset the snapshot has never heard of returns
+         * null for the whole set rather than a zero, because a zero here silently
+         * sizes a deposit at nothing.
+         */
+        function appWalletBalances(p) {
+          const ln = window.__lending;
+          if (!ln || !ln.assets) return null;
+          const by = new Map(ln.assets.map((a) => [String(a.address).toLowerCase(), a]));
+          const out = [];
+          for (const a of p.assets) {
+            const row = by.get(String(a.address).toLowerCase());
+            const bal = row && row.position && row.position.wallet;
+            if (bal == null) return null;
+            out.push(String(bal));
+          }
+          return out;
+        }
+
         async function amWalletBalances(p) {
-          if (!selfMode() || !eth()) return null;
+          if (!selfMode()) return appWalletBalances(p);
+          if (!eth()) return null;
           try {
             const cfg = await loadDefiConfig();
             const [from] = await eth().request({ method: "eth_accounts" });
