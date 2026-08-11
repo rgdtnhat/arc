@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v55" />
+    <meta name="tessera-shell" content="tessera-v56" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1486,6 +1486,10 @@
                 <button class="btn primary" id="lnEmClaim">Claim</button>
               </div>
               <div class="kv" id="lnEmNote" style="margin-top:8px"></div>
+              <!-- Shown only when the contract owes more than it holds. `claim`
+                   pays min(owed, held), so that gap is the difference between a
+                   figure and a payment. -->
+              <div class="note" id="lnEmBacking" style="display:none;margin-top:6px;color:var(--warn)"></div>
               <div class="msg" id="lnEmMsg" style="display:none"></div>
             </div>
 

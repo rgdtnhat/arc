@@ -427,6 +427,19 @@ const $ = (id) => document.getElementById(id);
             loadHolders(key, { refresh: true });
             loadVenueChart(key);
           }
+          /*
+           * The reward panels move with a deposit too, and nothing was
+           * re-reading them.
+           *
+           * Adding liquidity creates the LP shares that emissions accrue
+           * against, so the moment after the transaction is exactly when the
+           * card is most wrong — and it was still saying "you hold no liquidity
+           * in these pools, so nothing is accruing" to somebody who had just
+           * put some in. The reads are live rather than cached, so a re-read is
+           * all it needed.
+           */
+          if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {});
+          if (typeof loadEmissions === "function") loadEmissions().catch(() => {});
         }, 4000);
       }
 
@@ -1485,23 +1498,55 @@ const $ = (id) => document.getElementById(id);
             // reserve can actually lend. Those are different questions.
             const key = String(a.address || "").toLowerCase();
             const mine = window.__myBal[key];
-            const amount = side === "supply"
-              ? (mine !== undefined && mine !== null ? fmtUnitsStr(BigInt(mine), dec) : (a.position && a.position.wallet) || "—")
-              : fmtUnitsStr(cash, dec);
+            /*
+             * Wallet balance on both tabs, and what you already hold beside it.
+             *
+             * Supply showed the wallet and Borrow showed the reserve's cash, so
+             * a borrower could not see what they had to repay with without
+             * switching tabs, and neither tab said how much of the asset was
+             * already supplied or owed. Both are the numbers somebody is
+             * deciding against, so both are on the row.
+             */
+            const wallet = mine !== undefined && mine !== null
+              ? fmtUnitsStr(BigInt(mine), dec)
+              : (a.position && a.position.wallet) || "—";
+            const amount = wallet;
+            const yours = side === "supply"
+              ? (a.position && a.position.supplied) || "0"
+              : (a.position && a.position.borrowed) || "0";
+            const yoursLabel = side === "supply" ? "supplied" : "borrowed";
+            const liquidity = fmtUnitsStr(cash, dec);
 
             const rate = side === "supply" ? a.reserve && a.reserve.supplyApr : a.reserve && a.reserve.borrowApr;
             const em = emissionApr(a.address, side);
+            /*
+             * The reward badge carries its number.
+             *
+             * It used to fall back to a bare "rewards" whenever the APR came
+             * back null, which happened for every asset here because the rate
+             * was so far above the deposit base that the yearly figure blew
+             * past the server's ceiling. A tag with no figure reads as a
+             * calculation that failed. The server now caps rather than blanks,
+             * so ">10,000%" can be shown for what it is.
+             */
             const badge = em
               ? em.unpriced
-                ? `<div><span class="tag ok" style="font-size:10px"><span class="tsraIcon"></span> rewards</span></div>`
-                : `<div><span class="tag ok" style="font-size:10px"><span class="tsraIcon"></span> +${esc(Number(em.apr).toFixed(2))}%</span></div>`
+                ? `<div><span class="tag ok" style="font-size:10px"><span class="tsraIcon"></span> rewards · unpriced</span></div>`
+                : `<div><span class="tag ok" style="font-size:10px"><span class="tsraIcon"></span> ` +
+                  `${Number(em.apr) >= 10000 ? "&gt;10,000" : esc(Number(em.apr).toFixed(2))}%</span></div>`
               : "";
             const disabled = side === "borrow" && !a.borrowable;
             return (
               `<tr data-market="${esc(a.symbol)}" style="cursor:pointer${disabled ? ";opacity:.55" : ""}">` +
               `<td><b>${esc(a.symbol)}</b>${a.enabled === false ? ' <span class="tag warn" style="font-size:10px">unavailable</span>' : ""}` +
               `<div class="muted" style="font-size:11px">$${esc(a.priceUsd)}</div></td>` +
-              `<td class="num mono">${esc(amount)}</td>` +
+              `<td class="num mono">${esc(amount)}` +
+              (Number(yours) > 0
+                ? `<div class="muted" style="font-size:11px">${esc(yours)} ${esc(yoursLabel)}</div>`
+                : side === "borrow"
+                  ? `<div class="muted" style="font-size:11px">${esc(liquidity)} lendable</div>`
+                  : "") +
+              `</td>` +
               `<td class="num"><b>${esc(rate ?? "—")}%</b>${badge}</td>` +
               `<td class="num muted">›</td></tr>`
             );
@@ -1553,6 +1598,29 @@ const $ = (id) => document.getElementById(id);
             (r.reward.priced ? "" : " · no market price for the reward, so rows show a rate rather than an APY") +
             `. Paid out all time: ${r.reward.claimedAllTime}.`;
           $("lnEmClaim").disabled = !(BigInt(r.yourClaimableRaw || "0") > 0n);
+          /*
+           * Say when the pot cannot cover what has been earned.
+           *
+           * `claim` pays min(owed, held), so a contract that owes more than it
+           * holds pays everybody a fraction and leaves the rest booked. The
+           * panel was showing 62,668 TSRA claimable beside "Pot: 0 TSRA · about
+           * 0.0 days left" and letting the reader work out for themselves that
+           * those two facts are in tension. They are the most important thing on
+           * the card, so they are stated rather than implied.
+           */
+          if ($("lnEmBacking")) {
+            const owed = Number(r.reward.owed ?? "0");
+            const held = Number(r.reward.balance ?? "0");
+            const short = owed > held;
+            $("lnEmBacking").style.display = short ? "" : "none";
+            if (short) {
+              const pct = owed > 0 ? Math.floor((held / owed) * 100) : 0;
+              $("lnEmBacking").textContent =
+                `The pot holds ${r.reward.balance} ${r.reward.symbol} against ${r.reward.owed} already earned across ` +
+                `everyone. A claim pays what is there — about ${pct}% of a balance right now — and the rest stays owed ` +
+                `until the pot is refilled.`;
+            }
+          }
           // Say it in the panel too: an APR next to a paused market is a lie
           // the rate itself cannot tell you about.
           if (r.paused) {

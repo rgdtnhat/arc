@@ -5283,7 +5283,18 @@ async function main() {
             const sideUsd = (sideAssets * assetPriceE8) / 10n ** dec;
             if (sideUsd === 0n) return null;
             const pct = Number((yearlyUsd * 1_000_000n) / sideUsd) / 10_000;
-            return pct > APR_CEILING ? null : pct;
+            /*
+             * A number above the ceiling is reported as the ceiling, not as
+             * nothing.
+             *
+             * Returning null made the UI render a bare "rewards" tag with no
+             * figure, which reads as "we could not work it out". The truth is
+             * the opposite — the rate is so far above the deposit base that the
+             * yearly figure is meaningless as a forecast — and ">10,000%" says
+             * that, where silence says nothing at all. The caller can tell the
+             * two apart because the value is capped rather than absent.
+             */
+            return pct > APR_CEILING ? APR_CEILING : pct;
           };
 
           const mine = who
