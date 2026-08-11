@@ -1446,18 +1446,41 @@ const $ = (id) => document.getElementById(id);
         }
         const t = $("lnMarketTitle");
         if (t) t.textContent = lnMarketSide === "supply" ? "Assets to supply" : "Assets to borrow";
+        // Both tabs now lead with the wallet balance and carry the position or
+        // the lendable depth underneath, so the header says the same thing on
+        // each. It used to read "Available" on the borrow tab, which stopped
+        // describing the column the moment that column changed.
         const c = $("lnMarketCol");
-        if (c) c.textContent = lnMarketSide === "supply" ? "Wallet balance" : "Available";
+        if (c) c.textContent = "Wallet balance";
         // Point the action panel at the same side, so the two agree.
         const act = $("lnAction");
         if (act) {
           act.value = lnMarketSide === "supply" ? "supply" : "borrow";
           act.dispatchEvent(new Event("change"));
         }
-        renderMarket();
+        /*
+         * Guarded, because this is now called during evaluation to paint the
+         * default tab — and `renderMarket` is assigned to `window` further down
+         * the file, so the bare identifier is still in its dead zone at that
+         * point. The first poll renders the table a moment later regardless;
+         * what this call is for is the highlight, and that is already done
+         * above. The same guard is used at the other early call site.
+         */
+        if (typeof renderMarket === "function") renderMarket();
       }
       if ($("lnTabSupply")) $("lnTabSupply").addEventListener("click", () => setMarketSide("supply"));
       if ($("lnTabBorrow")) $("lnTabBorrow").addEventListener("click", () => setMarketSide("borrow"));
+      /*
+       * Paint the default the same way a click does.
+       *
+       * `lnMarketSide` starts at "supply" and the table duly opened on the
+       * supply side — but `setMarketSide` was only ever reached from a click, so
+       * on first paint neither button carried `primary` and the tab that *was*
+       * selected looked like the tab that was not. Calling it once here keeps
+       * one code path deciding what "selected" looks like, instead of the markup
+       * carrying a duplicate of that answer for someone to forget to update.
+       */
+      setMarketSide(lnMarketSide);
 
       /** Emission APR for one asset and side, or null when it cannot be valued. */
       function emissionApr(address, side) {
