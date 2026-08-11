@@ -1664,15 +1664,24 @@ const $ = (id) => document.getElementById(id);
             }
           }
           // Say it in the panel too: an APR next to a paused market is a lie
-          // the rate itself cannot tell you about.
+          // the rate itself cannot tell you about. And say *why* it is paused —
+          // an automatic stop is a different fact from an operator's, and the
+          // reader's next question ("when does it come back?") only has an
+          // answer for one of them.
           if (r.paused) {
             $("lnEmNote").textContent =
-              "Paused — nothing is accruing right now. What you have already earned is still yours and still claimable. " +
+              (r.guard && r.guard.byGuard
+                ? "Paused automatically because the reward pot ran out — emission stops rather than booking rewards " +
+                  "nobody could claim, and restarts on its own once the pot is funded. "
+                : "Paused — nothing is accruing right now. ") +
+              "What you have already earned is still yours and still claimable. " +
               $("lnEmNote").textContent;
           }
           const tag = $("govEmPausedTag");
           if (tag) {
-            tag.textContent = r.paused ? "paused" : "running";
+            // An operator deciding whether to resume needs to know the guard
+            // will simply stop it again while the pot is still empty.
+            tag.textContent = r.paused ? (r.guard && r.guard.byGuard ? "auto-paused: pot empty" : "paused") : "running";
             tag.className = r.paused ? "tag warn" : "tag ok";
           }
           const btn = $("govEmPause");
@@ -6516,7 +6525,12 @@ const $ = (id) => document.getElementById(id);
           $("amEmAmount").textContent = r.yourClaimable ?? "0";
           $("amEmSymbol").textContent = r.reward.symbol;
           $("amEmNote").textContent =
-            (r.paused ? "Paused — nothing is accruing right now. What you have already earned is still claimable. " : "") +
+            (r.paused
+              ? (r.guard && r.guard.byGuard
+                  ? "Paused automatically because the reward pot ran out — it restarts on its own once the pot is funded. "
+                  : "Paused — nothing is accruing right now. ") +
+                "What you have already earned is still claimable. "
+              : "") +
             `Pot: ${r.reward.balance} ${r.reward.symbol}` +
             (r.reward.runwayDays == null ? " · nothing streaming" : ` · about ${r.reward.runwayDays.toFixed(1)} days left at the current rates`) +
             `. Paid out all time: ${r.reward.claimedAllTime}.`;

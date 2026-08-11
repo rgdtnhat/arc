@@ -63,6 +63,7 @@ import {
   DELEVERAGE_TARGET,
 } from "./keeper.js";
 import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
+import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emissions-guard.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import { proposeFromSources, actionable as actionablePrices, roundsToTarget } from "./price-push.js";
@@ -5242,6 +5243,49 @@ async function main() {
   const emissionsAddr = (liveDeployment.tesseraEmissions as Hex) ?? null;
   const SIDE = { supply: 0, borrow: 1, backstop: 2 } as const;
 
+  /*
+   * Who paused the emission, remembered across restarts.
+   *
+   * The pot guard further down stops a stream whose pot has run dry and starts
+   * it again when somebody refills — but only ever its own pause. Telling the
+   * two apart needs a memory the contract does not keep (`paused` is one bit
+   * and says nothing about who set it), and it has to survive a container
+   * rebuild: a forgotten flag would either strand the guard's own pause forever
+   * or, worse, let a restart adopt an operator's pause and undo it. Both pause
+   * endpoints clear it, because a human touching the switch takes ownership of
+   * it from that moment.
+   */
+  type GuardVenue = "lending" | "lp";
+  interface GuardRecord {
+    /** True only while the pause currently in force is the guard's. */
+    byGuard: boolean;
+    /** When it acted, epoch ms. */
+    since: number | null;
+    /** The sentence the panel shows. */
+    reason: string;
+  }
+  const guardFile = statePath(".tessera-emissions-guard.json");
+  const guardState: Record<GuardVenue, GuardRecord> = {
+    lending: { byGuard: false, since: null, reason: "" },
+    lp: { byGuard: false, since: null, reason: "" },
+  };
+  try {
+    const raw = JSON.parse(readFileSync(guardFile, "utf8")) as Partial<Record<GuardVenue, GuardRecord>>;
+    for (const venue of ["lending", "lp"] as const) {
+      if (raw?.[venue] && typeof raw[venue]!.byGuard === "boolean") guardState[venue] = raw[venue]!;
+    }
+  } catch {
+    /* first run */
+  }
+  const setGuardFlag = (venue: GuardVenue, byGuard: boolean, reason: string) => {
+    guardState[venue] = { byGuard, since: byGuard ? Date.now() : null, reason };
+    try {
+      writeFileSync(guardFile, JSON.stringify(guardState, null, 2) + "\n");
+    } catch (e) {
+      console.error(`[emissions-guard] could not persist: ${String(e).slice(0, 120)}`);
+    }
+  };
+
   /**
    * Rewards, per reserve and per side, as an APR the page can put next to the
    * interest rate.
@@ -5402,6 +5446,9 @@ async function main() {
         address: emissionsAddr,
         canSet: Boolean(owner),
         paused,
+        // Whose pause this is. "Paused" on its own reads as an operator's
+        // decision, and an automatic one has to say what would undo it.
+        guard: { ...guardState.lending, settings: guardSettings },
         reward: {
           address: rewardToken,
           symbol: rewardMeta.symbol,
@@ -5432,14 +5479,27 @@ async function main() {
       const side = Number(req.body?.side ?? 0);
       const rate = BigInt(String(req.body?.ratePerSecond ?? "0"));
       if (!/^0x[0-9a-fA-F]{40}$/.test(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
-      if (side !== 0 && side !== 1) { res.status(400).json({ ok: false, error: "side must be 0 (supply) or 1 (borrow)" }); return; }
+      /*
+       * Three sides, not two.
+       *
+       * The backstop was added to the pool, to `TesseraEmissions` — whose
+       * `_setRate` takes `side <= SIDE_BACKSTOP` — and to this panel's own
+       * dropdown, but the check here was left behind at two. So the one side
+       * that carries first loss, and therefore the one that most needs a rate
+       * on it, was the only side an operator could not set, and the refusal
+       * came from the server rather than from the chain.
+       */
+      if (side !== 0 && side !== 1 && side !== 2) {
+        res.status(400).json({ ok: false, error: "side must be 0 (supply), 1 (borrow) or 2 (backstop)" });
+        return;
+      }
       const endsAt = BigInt(String(req.body?.endsAt ?? "0"));
       const txHash = endsAt > 0n
         ? await owner.write(emissionsAddr, tesseraEmissionsAbi, "setRateUntil", [asset, side, rate, endsAt])
         : await owner.write(emissionsAddr, tesseraEmissionsAbi, "setRate", [asset, side, rate]);
       logTx(req, {
         category: "defi", action: "emissions-rate", status: "success", txHash,
-        detail: `${asset} ${side === 0 ? "supply" : "borrow"} -> ${rate}/s${endsAt > 0n ? ` until ${endsAt}` : ""}`,
+        detail: `${asset} ${side === 0 ? "supply" : side === 1 ? "borrow" : "backstop"} -> ${rate}/s${endsAt > 0n ? ` until ${endsAt}` : ""}`,
       });
       res.json({ ok: true, txHash });
     } catch (e) {
@@ -5490,6 +5550,9 @@ async function main() {
     try {
       const next = Boolean(req.body?.paused);
       const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "setPaused", [next]);
+      // A human touched the switch, so the switch is theirs: the pot guard will
+      // neither claim this pause nor undo it.
+      setGuardFlag("lending", false, next ? "paused by an operator" : "resumed by an operator");
       logTx(req, {
         category: "defi", action: "emissions-pause", status: "success", txHash,
         detail: next ? "paused" : "resumed",
@@ -5550,6 +5613,29 @@ async function main() {
       }
       if (!assets.length) {
         res.status(400).json({ ok: false, error: `nothing has accrued to ${who} yet` });
+        return;
+      }
+
+      /*
+       * An empty pot is not a failure, and must not be reported as one.
+       *
+       * `claim` pays `min(owed, held)` and reverts `NothingToClaim` when that
+       * comes to zero — so claiming against a drained contract fails with a
+       * message about the transaction rather than about the pot, and on a busy
+       * RPC what surfaced was "the Arc network is rate-limiting us right now",
+       * which sends the reader to look at entirely the wrong thing. Reading the
+       * balance first costs one call and turns it into a sentence that is true.
+       */
+      const potHeld = (await client.public.readContract({
+        address: reward, abi: erc20Abi, functionName: "balanceOf", args: [emissionsAddr],
+      })) as bigint;
+      if (potHeld === 0n) {
+        res.status(400).json({
+          ok: false,
+          error:
+            "the reward pot is empty, so a claim would pay nothing right now — what you have earned stays owed and " +
+            "is claimable as soon as the pot is funded",
+        });
         return;
       }
 
@@ -5688,6 +5774,7 @@ async function main() {
         address: lpEmissionsAddr,
         canSet: Boolean(owner),
         paused,
+        guard: { ...guardState.lp, settings: guardSettings },
         reward: {
           address: rewardToken,
           symbol: rewardMeta.symbol,
@@ -5732,6 +5819,7 @@ async function main() {
     try {
       const next = Boolean(req.body?.paused);
       const txHash = await owner.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "setPaused", [next]);
+      setGuardFlag("lp", false, next ? "paused by an operator" : "resumed by an operator");
       logTx(req, {
         category: "defi", action: "lp-emissions-pause", status: "success", txHash,
         detail: next ? "paused" : "resumed",
@@ -5796,6 +5884,20 @@ async function main() {
         return;
       }
 
+      // Same as the lending twin: an empty pot gets said, not thrown.
+      const potHeld = (await client.public.readContract({
+        address: reward, abi: erc20Abi, functionName: "balanceOf", args: [lpEmissionsAddr],
+      })) as bigint;
+      if (potHeld === 0n) {
+        res.status(400).json({
+          ok: false,
+          error:
+            "the liquidity reward pot is empty, so a claim would pay nothing right now — what you have earned stays " +
+            "owed and is claimable as soon as the pot is funded",
+        });
+        return;
+      }
+
       const before = (await client.public.readContract({
         address: reward, abi: erc20Abi, functionName: "balanceOf", args: [who],
       })) as bigint;
@@ -5816,6 +5918,133 @@ async function main() {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
+
+  /* ---- The pot guard ---------------------------------------------------- */
+
+  /**
+   * Stop emitting when the pot runs out; start again when it is refilled.
+   *
+   * Both emissions contracts keep accruing at whatever rate is set whether or
+   * not they hold a single reward token, and `claim` pays `min(owed, held)`.
+   * That is right for a claim — nothing is stranded, nothing is misreported —
+   * but it makes an unfunded rate a fiction: the card says you have earned
+   * 62,322 TSRA, the pot says zero, and every passing second grows the first
+   * number and not the second. This keeps the promise and the money in step, so
+   * a claimable figure on the page is always backed by tokens that exist.
+   *
+   * A pause cannot touch anything already earned — both contracts are explicit
+   * that claims keep working while paused — so the only thing being stopped is
+   * the creation of new, unpayable debt.
+   *
+   * The decision itself lives in `emissions-guard.ts`, where it is argued
+   * against a table of numbers. This half only reads the chain, carries out
+   * what it is told, and remembers that it was the one who acted.
+   */
+  const GUARD_MS = Math.max(60_000, Number(process.env.TESSERA_EMISSIONS_GUARD_MS ?? 5 * 60_000));
+  const guardSettings: GuardSettings = {
+    // Two ticks of headroom: the guard has to be able to trip *before* the
+    // emission it is watching outruns the balance, not one interval after.
+    pauseBelowSeconds: Math.max(DEFAULT_GUARD.pauseBelowSeconds, Math.ceil((GUARD_MS / 1000) * 2)),
+    resumeRunwaySeconds: Math.max(DEFAULT_GUARD.resumeRunwaySeconds, Math.ceil((GUARD_MS / 1000) * 8)),
+  };
+
+  /** What the streams would emit per second if running — see `PotSnapshot`. */
+  const scheduledRate = async (venue: GuardVenue, addr: Hex): Promise<bigint> => {
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    // An expired stream is not an outflow, so it must not count against runway.
+    const live = (s: readonly [bigint, bigint, bigint, bigint]) => (s[3] !== 0n && s[3] <= now ? 0n : s[0]);
+    let total = 0n;
+    if (venue === "lending") {
+      const n = (await client.public.readContract({
+        address: addr, abi: tesseraEmissionsAbi, functionName: "streamedAssetCount",
+      })) as bigint;
+      for (let i = 0n; i < n; i++) {
+        const asset = (await client.public.readContract({
+          address: addr, abi: tesseraEmissionsAbi, functionName: "streamedAssets", args: [i],
+        })) as Hex;
+        for (const side of [0, 1, 2]) {
+          total += live((await client.public.readContract({
+            address: addr, abi: tesseraEmissionsAbi, functionName: "streams", args: [asset, side],
+          })) as readonly [bigint, bigint, bigint, bigint]);
+        }
+      }
+      return total;
+    }
+    const n = (await client.public.readContract({
+      address: addr, abi: tesseraLpEmissionsAbi, functionName: "streamedPoolCount",
+    })) as bigint;
+    for (let i = 0n; i < n; i++) {
+      const poolId = (await client.public.readContract({
+        address: addr, abi: tesseraLpEmissionsAbi, functionName: "streamedPools", args: [i],
+      })) as bigint;
+      total += live((await client.public.readContract({
+        address: addr, abi: tesseraLpEmissionsAbi, functionName: "streams", args: [poolId],
+      })) as readonly [bigint, bigint, bigint, bigint]);
+    }
+    return total;
+  };
+
+  const guardSweep = async (venue: GuardVenue, addr: Hex | null) => {
+    if (!addr || !owner) return;
+    const abi = venue === "lending" ? tesseraEmissionsAbi : tesseraLpEmissionsAbi;
+    const reward = (await client.public.readContract({
+      address: addr, abi, functionName: "rewardToken",
+    })) as Hex;
+    // No reward token means no rate can have been set, so there is nothing to
+    // guard and nothing that could be owed.
+    if (!reward || reward === "0x0000000000000000000000000000000000000000") return;
+
+    const [held, owed, paused] = await Promise.all([
+      client.public.readContract({ address: reward, abi: erc20Abi, functionName: "balanceOf", args: [addr] }) as Promise<bigint>,
+      client.public.readContract({ address: addr, abi, functionName: "totalOwed" }) as Promise<bigint>,
+      client.public.readContract({ address: addr, abi, functionName: "paused" }) as Promise<boolean>,
+    ]);
+
+    // Reconcile the memory against the chain before deciding anything. An
+    // operator who resumed by hand has taken the switch back, and the flag must
+    // not outlive the pause it described.
+    if (!paused && guardState[venue].byGuard) setGuardFlag(venue, false, "resumed outside the guard");
+
+    const decision = decideEmissionsGuard(
+      { held, owed, ratePerSecond: await scheduledRate(venue, addr), paused, pausedByGuard: guardState[venue].byGuard },
+      guardSettings,
+    );
+    if (decision.action === "none") return;
+
+    const next = decision.action === "pause";
+    const txHash = await owner.write(addr, abi, "setPaused", [next]);
+    setGuardFlag(venue, next, decision.reason);
+    const label = venue === "lending" ? "lending" : "liquidity";
+    console.log(`[emissions-guard] ${next ? "paused" : "resumed"} ${label} emissions — ${decision.reason} ${txHash}`);
+    try {
+      txlog.record({
+        actor: agentAccount.address as string,
+        category: "defi",
+        action: venue === "lending" ? "emissions-guard" : "lp-emissions-guard",
+        status: "success",
+        txHash,
+        detail: `${next ? "paused" : "resumed"}: ${decision.reason}`,
+      });
+    } catch {
+      /* losing the log line must not undo the action it describes */
+    }
+  };
+
+  let guardBusy = false;
+  setInterval(async () => {
+    if (process.env.TESSERA_EMISSIONS_GUARD === "off") return;
+    if (guardBusy || !owner) return;
+    guardBusy = true;
+    try {
+      await guardSweep("lending", emissionsAddr);
+      await guardSweep("lp", lpEmissionsAddr);
+    } catch (e) {
+      // A pot that will not answer is not a reason to act. Try again next tick.
+      console.error(`[emissions-guard] sweep failed: ${String(e).slice(0, 160)}`);
+    } finally {
+      guardBusy = false;
+    }
+  }, GUARD_MS).unref();
 
   /* ---- Agent service fees: USDC or TSRA -------------------------------- */
 
