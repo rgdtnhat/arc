@@ -1974,6 +1974,23 @@ const $ = (id) => document.getElementById(id);
          * cannot be borrowed, or a pool with no free cash.
          */
         let why = "";
+        /*
+         * Name the cap that binds, not just its value.
+         *
+         * A third constraint was invisible: the outflow limiter meters every
+         * borrow and withdraw against a per-asset budget that refills over an
+         * hour. It capped a borrow at 11.105 USDC while the row above showed
+         * 545 of cash and the account had headroom for both — so the number
+         * looked arbitrary, and anything above it reverted with an error the
+         * pool's own ABI cannot decode.
+         */
+        const bound = a.limitedBy && a.limitedBy[action];
+        if (bound === "outflow" && a.outflowBudget != null) {
+          why = ` — capped by the outflow limiter, which will release ${a.outflowBudget} ${a.symbol} ` +
+            `this hour and refills steadily`;
+        } else if (bound === "liquidity" && action === "borrow") {
+          why = " — capped by the cash in the reserve, not by your collateral";
+        }
         if (String(max) === "0" || Number(String(max).replace(/,/g, "")) === 0) {
           const cash = BigInt((a.reserve && a.reserve.cashRaw) || "0");
           if (action === "borrow") {

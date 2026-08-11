@@ -1054,6 +1054,44 @@ async function main() {
     // panels sat empty; a single round-trip removes that whole failure mode.
     const bulk = await pool.readAll(poolDeployment.assets.map((a) => a.address));
     const byAsset = new Map(bulk.perAsset.map((p) => [p.asset.toLowerCase(), p]));
+
+    /*
+     * How much the outflow limiter will let out of each asset right now.
+     *
+     * A third constraint on a borrow, and the one nothing was reading. The
+     * limiter meters every borrow and every withdraw against a per-asset budget
+     * that refills over a period — so a max computed from collateral headroom
+     * and pool cash alone can be several hundred times what the transaction will
+     * actually be allowed to move. Live: "max borrow: 545.769751 USDC" while the
+     * bucket held 11.105, and every attempt above that reverted
+     * `RateLimited(asset, wanted, available)` — a revert with no ABI on the pool,
+     * so the app could only say the contract had rejected it.
+     *
+     * `available` is the refilled level rather than the stored one, so it is the
+     * number a transaction sent this second is measured against. An asset the
+     * limiter does not meter answers with uint256 max, which caps nothing.
+     */
+    const limiterAddr = (await pool.public
+      .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "rateLimiter" })
+      .catch(() => null)) as Hex | null;
+    const outflowBudget = new Map<string, bigint>();
+    if (limiterAddr && limiterAddr !== "0x0000000000000000000000000000000000000000") {
+      await Promise.all(
+        poolDeployment.assets.map(async (a) => {
+          const v = await pool.public
+            .readContract({ address: limiterAddr, abi: tesseraRateLimiterAbi, functionName: "available", args: [a.address as Hex] })
+            .catch(() => null);
+          /*
+           * An unmetered asset answers `type(uint256).max`, which is the
+           * limiter's way of saying "no cap". Stored as-is it caps nothing —
+           * correct — but it also reaches the UI as a sixty-digit budget, so it
+           * is dropped instead: absent means unmetered everywhere downstream.
+           */
+          const UNMETERED = (1n << 256n) - 1n;
+          if (typeof v === "bigint" && v !== UNMETERED) outflowBudget.set(a.address.toLowerCase(), v);
+        }),
+      );
+    }
     const acct = bulk.account;
     const hf = acct?.healthFactor ?? 0n;
     // Remaining USD borrow headroom against the account's collateral (1e8 scale).
@@ -1117,12 +1155,22 @@ async function main() {
         const dec = cfg.decimals;
         const unit = 10n ** BigInt(dec);
         // MAX per action, capped to what's actually possible for this account.
+        // Read once, above every cap that uses it: both withdraw and borrow are
+        // metered, so both need it and the withdraw line comes first.
+        const outflow = outflowBudget.get(a.address.toLowerCase());
         const supplyMax = wallet; // can't supply more than you hold
-        const withdrawMax = minB(supplied, r.cash); // your deposit, capped by liquidity
+        // Withdrawal is metered too, so the same third cap applies.
+        const withdrawMax = outflow === undefined
+          ? minB(supplied, r.cash)
+          : minB(minB(supplied, r.cash), outflow);
         const repayMax = minB(borrowed, wallet); // your debt, capped by wallet
+        // Collateral headroom, capped by the cash that is there, capped again by
+        // what the limiter will release this second. All three bind a borrow;
+        // quoting the first two was quoting a number the third would refuse.
         let borrowMax = 0n;
         if (cfg.borrowable && cfg.priceE8 > 0n) {
-          borrowMax = minB((headroomUsd * unit) / cfg.priceE8, r.cash); // headroom, capped by liquidity
+          borrowMax = minB((headroomUsd * unit) / cfg.priceE8, r.cash);
+          if (outflow !== undefined) borrowMax = minB(borrowMax, outflow);
         }
         return {
           // An operator-set name wins over the token symbol, so a renamed
@@ -1166,6 +1214,24 @@ async function main() {
             wallet: fmtUnits(wallet, dec),
           },
           // Both a display string and the exact raw integer for a precise MAX fill.
+          /*
+           * Which of the three caps is actually binding, so the hint can name
+           * it. Without this the UI can only say "max borrow: 11.105" and leave
+           * the reader to wonder why it is not the 545 of cash on the row above.
+           */
+          limitedBy: {
+            borrow:
+              !cfg.borrowable ? "not-borrowable"
+              : outflow !== undefined && borrowMax === outflow && outflow < r.cash ? "outflow"
+              : borrowMax === r.cash ? "liquidity"
+              : "collateral",
+            withdraw:
+              outflow !== undefined && withdrawMax === outflow && outflow < supplied ? "outflow"
+              : withdrawMax === r.cash && r.cash < supplied ? "liquidity"
+              : "balance",
+          },
+          /** What the limiter will release this second, or null when unmetered. */
+          outflowBudget: outflow === undefined ? null : fmtUnits(outflow, dec),
           max: {
             supply: fmtUnits(supplyMax, dec),
             withdraw: fmtUnits(withdrawMax, dec),
