@@ -223,3 +223,56 @@ export function aggregate(list: Allocation[], decimals: number) {
   const daily = [...byDay.values()].sort((x, y) => (x.day < y.day ? -1 : 1));
   return { totals, daily };
 }
+
+/* -------------------------------------------------------------------------
+ * Harvesting the protocol's own revenue
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Why anything has to be harvested at all.
+ *
+ * `TesseraPool` takes its cut of borrower interest by crediting the treasury a
+ * **supply position** — `supplyShares[asset][treasury] += feeShares` — rather
+ * than by transferring tokens. That is the right design: the protocol's revenue
+ * keeps earning while it waits, and a fee that moved tokens on every accrual
+ * would cost more gas than it collects.
+ *
+ * But `TesseraFeeCollector` splits only what it *holds*. It can be supplied to,
+ * swept and allocated; it has no path to withdraw from the pool. So with the
+ * collector set as the pool's treasury, revenue accrued into an address that
+ * could never realise it, and the App fees panel read 0.000000 across every
+ * destination — correctly, because nothing had ever arrived.
+ *
+ * Harvesting closes that gap: the treasury's position is withdrawn to an
+ * address the server can sign for, forwarded to the collector, and split by the
+ * collector's own cadence. Which assets are worth moving is decided here, where
+ * it can be tested, because the trap is a keeper that spends more on gas than
+ * it collects — the same trap `planClaim` exists to avoid.
+ */
+export interface HarvestCandidate {
+  symbol: string;
+  address: string;
+  decimals: number;
+  /** What the treasury has accrued in this asset, in base units. */
+  accrued: bigint;
+  /** The pool's mark for the asset, 1e8-scaled. Zero means unpriced. */
+  priceE8: bigint;
+}
+
+/** Value of an accrued balance in whole US cents, floored. */
+export function harvestValueCents(c: HarvestCandidate): bigint {
+  if (c.priceE8 <= 0n || c.accrued <= 0n) return 0n;
+  return (c.accrued * c.priceE8 * 100n) / (10n ** BigInt(c.decimals) * 100_000_000n);
+}
+
+/**
+ * Which balances are worth a withdrawal and a transfer right now.
+ *
+ * An unpriced asset is skipped rather than assumed worthless *or* valuable:
+ * without a mark there is no way to say whether the transaction pays for
+ * itself, and moving it on the next pass costs nothing but time.
+ */
+export function planHarvest(candidates: HarvestCandidate[], minCents: number): HarvestCandidate[] {
+  const floor = BigInt(Math.max(0, Math.floor(minCents)));
+  return candidates.filter((c) => c.accrued > 0n && c.priceE8 > 0n && harvestValueCents(c) >= floor);
+}

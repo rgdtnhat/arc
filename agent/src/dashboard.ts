@@ -92,7 +92,7 @@ interface PoolDeploymentRef {
 import { TesseraTreasury } from "./treasury.js";
 import { TesseraPoolClient, PRICE_IX } from "./pool.js";
 import { VaultClient, RouterClient, AmmClient } from "./defi.js";
-import { FeeReader } from "./fees.js";
+import { FeeReader, planHarvest, type HarvestCandidate } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
 import { fillPreview } from "./auction.js";
 import { priceImpact, maxInputWithin, valueCheck, IMPACT_MAX_PCT } from "./impact.js";
@@ -3683,6 +3683,59 @@ async function main() {
   let feeReading = false;
   let feeError: string | null = null;
 
+  /**
+   * Where the pool's take rate is going, and whether it can get there.
+   *
+   * `accrued` is what has been credited to the treasury and not yet moved —
+   * money the app has earned, sitting in the pool as a supply position rather
+   * than in a wallet. It is the figure that makes "0.000000 distributed"
+   * legible: earning and unrouted is a different state from earning nothing.
+   */
+  async function describeFeeRoute() {
+    const collector = liveDeployment.tesseraFeeCollector as Hex | undefined;
+    if (!collector || !poolDeployment) return null;
+    try {
+      const treasury = (await client.public.readContract({
+        address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "treasury",
+      })) as Hex;
+      const signer = owner ? (owner.account.address as Hex) : null;
+      const canHarvest = Boolean(signer && treasury.toLowerCase() === signer.toLowerCase());
+      let accruedUsd = 0;
+      const accrued: { symbol: string; amount: string }[] = [];
+      for (const a of poolDeployment.assets) {
+        // A balance that would not read is unknown, not zero. Skipping it says
+        // less than the truth; printing 0.000000 would say something false, and
+        // this whole panel is about a figure that was zero for a reason.
+        let bal: bigint;
+        try {
+          bal = (await client.public.readContract({
+            address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "supplyBalance",
+            args: [a.address as Hex, treasury],
+          })) as bigint;
+        } catch {
+          continue;
+        }
+        if (bal <= 0n) continue;
+        const dec = Number(a.decimals ?? 6);
+        accrued.push({ symbol: a.symbol, amount: fmtUnits(bal, dec) });
+        accruedUsd += Number(usdValue(a.address, bal) ?? 0);
+      }
+      return {
+        treasury,
+        collector,
+        signer,
+        canHarvest,
+        // The collector as treasury is the specific misconfiguration this
+        // deployment had, and the one with a one-click fix.
+        strandedAtCollector: treasury.toLowerCase() === collector.toLowerCase(),
+        accrued,
+        accruedUsd,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   async function refreshFees(): Promise<void> {
     if (!feeReader || feeReading) return;
     feeReading = true;
@@ -3720,6 +3773,16 @@ async function main() {
         // bound as a total. Someone will reconcile against this.
         partial: r.partial,
         block: r.block,
+        /*
+         * Whether the protocol's revenue can reach this collector at all.
+         *
+         * Five destinations reading 0.000000 look like a broken split. They
+         * were the truth about an empty collector, and said nothing about the
+         * reason it was empty — that the pool credits its take rate as a supply
+         * position to an address that cannot withdraw. The panel can only
+         * explain that if the server tells it.
+         */
+        route: await describeFeeRoute(),
       };
       feeCache = { at: Date.now(), body };
       feeError = null;
@@ -3730,7 +3793,7 @@ async function main() {
     }
   }
 
-  app.get("/api/fees", (_req, res) => {
+  app.get("/api/fees", async (_req, res) => {
     if (!feeReader) { res.status(404).json({ ok: false, error: "fee collector not deployed" }); return; }
     if (feeCache) {
       // Kick a refresh once the cached read is stale, but never wait on it.
@@ -3742,6 +3805,10 @@ async function main() {
     res.json({
       ok: false,
       indexing: true,
+      // The route does not depend on the history scan, and it is the thing most
+      // worth saying while that scan runs: an operator staring at an empty
+      // panel needs to know whether anything is even pointed at it.
+      route: await describeFeeRoute(),
       error: feeError
         ?? "Reading the collector's fee history from the chain. This is a one-off pass over its whole life; the figures appear here as soon as it lands.",
     });
@@ -3750,6 +3817,155 @@ async function main() {
   // First pass shortly after boot, then keep it warm on the split cadence.
   setTimeout(() => void refreshFees(), 12_000).unref?.();
   setInterval(() => void refreshFees(), 5 * 60_000).unref?.();
+
+  /**
+   * Move the protocol's earned interest into the collector that splits it.
+   *
+   * See `planHarvest` for why this step has to exist at all: the pool pays its
+   * take rate as a *supply position* credited to `treasury`, and the collector
+   * can only split tokens it holds. Nothing bridged the two, so every
+   * destination on the App fees panel read 0.000000 — accurately, because
+   * nothing had ever arrived.
+   *
+   * This withdraws what the treasury has accrued and forwards it. It works only
+   * when the pool's treasury is an address this server can sign for; when the
+   * treasury is still the collector itself — an address with no way to withdraw
+   * from the pool — it says so once and does nothing, because quietly doing
+   * nothing is how the gap lasted this long.
+   */
+  const HARVEST_MS = Math.max(5 * 60_000, Number(process.env.TESSERA_FEE_HARVEST_MS ?? 30 * 60_000));
+  const HARVEST_MIN_CENTS = Number(process.env.TESSERA_FEE_HARVEST_MIN_CENTS ?? 5);
+  let harvestBusy = false;
+  let harvestWarned = false;
+
+  async function harvestProtocolFees(): Promise<{ moved: { symbol: string; amount: string; txHash: string }[]; note?: string }> {
+    const collector = liveDeployment.tesseraFeeCollector as Hex | undefined;
+    if (!collector || !owner || !poolDeployment) return { moved: [], note: "no collector, pool, or deployer key" };
+    const poolAddr = poolDeployment.poolAddress;
+    const treasury = (await client.public.readContract({
+      address: poolAddr, abi: tesseraPoolAbi, functionName: "treasury",
+    })) as Hex;
+    const ownerAddr = owner.account.address as Hex;
+    if (treasury.toLowerCase() !== ownerAddr.toLowerCase()) {
+      const note =
+        treasury.toLowerCase() === collector.toLowerCase()
+          ? `the pool pays its take rate to the fee collector (${collector}), which has no way to withdraw from the ` +
+            `pool — point the pool's treasury at the deployer (${ownerAddr}) and this will forward it on`
+          : `the pool's treasury is ${treasury}, which this server cannot sign for`;
+      if (!harvestWarned) {
+        harvestWarned = true;
+        console.error(`[fees] protocol revenue is not reaching the collector: ${note}`);
+      }
+      return { moved: [], note };
+    }
+
+    const candidates: HarvestCandidate[] = [];
+    for (const a of poolDeployment.assets) {
+      try {
+        const accrued = (await client.public.readContract({
+          address: poolAddr, abi: tesseraPoolAbi, functionName: "supplyBalance", args: [a.address as Hex, ownerAddr],
+        })) as bigint;
+        const cfg = (await client.public.readContract({
+          address: poolAddr, abi: tesseraPoolAbi, functionName: "reserves", args: [a.address as Hex],
+        })) as readonly unknown[];
+        candidates.push({
+          symbol: a.symbol, address: a.address, decimals: Number(a.decimals ?? 6),
+          accrued, priceE8: cfg[PRICE_IX] as bigint,
+        });
+      } catch {
+        /* a reserve that will not answer is harvested on the next pass */
+      }
+    }
+
+    const moved: { symbol: string; amount: string; txHash: string }[] = [];
+    for (const c of planHarvest(candidates, HARVEST_MIN_CENTS)) {
+      try {
+        // Withdraw, then forward. Two transactions rather than one because the
+        // pool pays the withdrawer and the collector splits what it is sent;
+        // there is no path that does both.
+        await owner.write(poolAddr, tesseraPoolAbi, "withdraw", [c.address as Hex, c.accrued]);
+        const txHash = await owner.write(c.address as Hex, erc20Abi, "transfer", [collector, c.accrued]);
+        moved.push({ symbol: c.symbol, amount: fmtUnits(c.accrued, c.decimals), txHash });
+        console.log(`[fees] harvested ${fmtUnits(c.accrued, c.decimals)} ${c.symbol} into the collector ${txHash}`);
+        try {
+          txlog.record({
+            actor: ownerAddr, category: "defi", action: "fee-harvest", status: "success", txHash,
+            asset: c.symbol, detail: `${fmtUnits(c.accrued, c.decimals)} ${c.symbol} to the fee collector`,
+          });
+        } catch { /* the log is not the point */ }
+      } catch (e) {
+        console.error(`[fees] harvest of ${c.symbol} failed: ${String(e).slice(0, 140)}`);
+      }
+    }
+    if (moved.length) void refreshFees();
+    return { moved };
+  }
+
+  setInterval(async () => {
+    if (process.env.TESSERA_FEE_HARVEST === "off" || harvestBusy) return;
+    harvestBusy = true;
+    try {
+      await harvestProtocolFees();
+    } catch (e) {
+      console.error(`[fees] harvest sweep failed: ${String(e).slice(0, 160)}`);
+    } finally {
+      harvestBusy = false;
+    }
+  }, HARVEST_MS).unref?.();
+
+  /**
+   * Give the protocol's take rate somewhere it can actually go.
+   *
+   * One owner call, and the only one that can fix this: `treasury` decides who
+   * the pool credits, and while it names the collector the revenue accrues into
+   * a contract with no way to withdraw it. Pointing it at the deployer lets the
+   * harvest above withdraw and forward, so the collector still does the
+   * splitting — it just stops being asked to do something it cannot.
+   *
+   * Deliberately a button rather than something the server does on boot.
+   * Redirecting where an app's revenue accrues is an operator's decision, and
+   * one they should be able to point at afterwards.
+   */
+  app.post("/api/fees/route-treasury", requireOperator, async (req, res) => {
+    if (!owner || !poolDeployment) {
+      res.status(404).json({ ok: false, error: "no pool, or no deployer key to sign with" });
+      return;
+    }
+    try {
+      const ownerAddr = owner.account.address as Hex;
+      const current = (await client.public.readContract({
+        address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "treasury",
+      })) as Hex;
+      if (current.toLowerCase() === ownerAddr.toLowerCase()) {
+        res.json({ ok: true, alreadyRouted: true, treasury: current });
+        return;
+      }
+      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setTreasury", [ownerAddr]);
+      harvestWarned = false;
+      logTx(req, {
+        category: "defi", action: "fee-route", status: "success", txHash,
+        detail: `pool treasury ${current} -> ${ownerAddr}`,
+      });
+      void refreshFees();
+      res.json({ ok: true, txHash, treasury: ownerAddr, previous: current });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /** Harvest now, and say plainly when there is nothing to harvest or no route. */
+  app.post("/api/fees/harvest", requireOperator, async (req, res) => {
+    try {
+      const r = await harvestProtocolFees();
+      logTx(req, {
+        category: "defi", action: "fee-harvest", status: r.moved.length ? "success" : "declined",
+        detail: r.moved.length ? r.moved.map((m) => `${m.amount} ${m.symbol}`).join(", ") : (r.note ?? "nothing worth moving yet"),
+      });
+      res.json({ ok: true, ...r });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
 
   /** Run the split now, without waiting for the cadence. Owner-gated on-chain. */
   app.post("/api/fees/allocate", requireOperator, async (req, res) => {

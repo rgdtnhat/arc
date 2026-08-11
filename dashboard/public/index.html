@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v63" />
+    <meta name="tessera-shell" content="tessera-v64" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -432,6 +432,23 @@
       @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
       .tabPane[hidden] { display: none; }
       @keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+      /* A transaction in flight, said on the same line as the result that will
+         replace it. Text alone ("Confirming…") reads as a finished sentence on
+         a screen that is not moving; a turning ring is the part that says the
+         app is still working. `currentColor` so it inherits whatever the status
+         line is already using, and `vertical-align` keeps it on the baseline of
+         the sentence rather than riding above it. */
+      .spin {
+        display: inline-block; width: 11px; height: 11px; margin-right: 7px;
+        vertical-align: -1px; border-radius: 50%;
+        border: 2px solid currentColor; border-top-color: transparent;
+        animation: spin .7s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      /* Respect a reader who has asked the interface to stop moving: the ring
+         stays, as a state, and simply does not turn. */
+      @media (prefers-reduced-motion: reduce) { .spin { animation-duration: 3s; } }
 
       /* ---- cards / primitives -------------------------------------------- */
       .card {
@@ -1949,11 +1966,18 @@
                 checked against the chain.
               </div>
 
+              <!--
+                Earned-but-unrouted is a different state from earned-nothing,
+                and five destinations reading 0.000000 cannot tell them apart.
+              -->
+              <p class="feedNote" id="feeRoute" style="display:none;color:var(--warn);margin:0 0 12px"></p>
+
               <div class="metrics tight">
                 <div class="metric"><div class="k">Undistributed</div><div class="v" id="feePending">—</div></div>
                 <div class="metric"><div class="k">Distributed to date</div><div class="v" id="feeTotal">—</div></div>
                 <div class="metric"><div class="k">Next split</div><div class="v" id="feeNext">—</div></div>
               </div>
+              <p class="feedNote" id="feeAccrued" style="display:none;margin-top:10px"></p>
 
               <div class="tblWrap auto" style="margin-top:14px"><table class="data" style="min-width:0">
                 <thead><tr><th>Destination</th><th class="num">Share</th><th class="num">Received to date</th></tr></thead>
@@ -1971,6 +1995,8 @@
                 <div class="menuSep" style="margin:0 0 11px"></div>
                 <div class="row-actions">
                   <button class="btn" id="feeAllocate">Distribute now</button>
+                  <button class="btn" id="feeHarvest">Collect earned interest</button>
+                  <button class="btn" id="feeRouteFix" style="display:none">Route protocol fees</button>
                   <input id="feeWithdrawAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
                   <button class="btn" id="feeWithdraw">Withdraw undistributed</button>
                 </div>

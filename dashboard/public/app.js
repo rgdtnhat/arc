@@ -1744,8 +1744,7 @@ const $ = (id) => document.getElementById(id);
            */
           if (!selfMode()) {
             btn.disabled = true;
-            m.style.display = "block"; m.style.color = "var(--muted)";
-            m.textContent = "Claiming to the app wallet…";
+            showBusy("lnEmMsg", "Claiming to the app wallet…");
             try {
               const r = await (await postJson("/api/lending/emissions/claim", {})).json();
               if (r.ok) {
@@ -2266,6 +2265,9 @@ const $ = (id) => document.getElementById(id);
           return;
         }
         btn.disabled = true;
+        // The server signs and waits for the receipt, which on Arc is a second
+        // or three of a page that looks like nothing happened.
+        showBusy("lendingMsg", `${action} ${human} ${a.symbol} — sending…`);
         try {
           const r = await (
             await postAuthed(`/api/lending/${action}?asset=${a.address}&amount=${raw}`)
@@ -2787,6 +2789,42 @@ const $ = (id) => document.getElementById(id);
               `<td class="num mono">${esc(usd6(got))}</td></tr>`)
             .join("");
 
+          /*
+           * Why the five destinations read zero.
+           *
+           * The pool pays its take rate by crediting the treasury a supply
+           * position, and the collector splits only tokens it holds — so with
+           * the collector named as treasury, revenue accrued somewhere it could
+           * never leave, and every row read 0.000000 for a reason the panel
+           * never mentioned. Earning-and-unrouted is a different state from
+           * earning-nothing and now says so, with the fix attached.
+           */
+          const route = r.route;
+          if ($("feeRoute")) {
+            const broken = route && !route.canHarvest;
+            $("feeRoute").style.display = broken ? "" : "none";
+            if (broken) {
+              $("feeRoute").textContent = route.strandedAtCollector
+                ? "The pool is crediting its share of borrower interest to the collector itself, which has no way " +
+                  "to withdraw it from the pool — so nothing ever arrives here to split. Routing it to the " +
+                  "deployer lets the app collect it and forward it on."
+                : `The pool credits its share of borrower interest to ${String(route.treasury).slice(0, 10)}…, ` +
+                  "which this server cannot sign for, so it cannot be forwarded here.";
+            }
+          }
+          if ($("feeAccrued")) {
+            const acc = (route && route.accrued) || [];
+            $("feeAccrued").style.display = acc.length ? "" : "none";
+            if (acc.length) {
+              $("feeAccrued").textContent =
+                "Earned and waiting in the pool: " + acc.map((a) => `${a.amount} ${a.symbol}`).join(", ") +
+                (route.canHarvest
+                  ? " — collected automatically once it is worth the transaction."
+                  : " — it keeps earning where it is, and is not lost.");
+            }
+          }
+          if ($("feeRouteFix")) $("feeRouteFix").style.display = route && route.strandedAtCollector ? "" : "none";
+
           renderFeeChart(r.daily);
           if (note) {
             note.className = r.partial ? "feedNote bad" : "feedNote";
@@ -2860,6 +2898,41 @@ const $ = (id) => document.getElementById(id);
           try {
             const r = await (await postAuthed("/api/fees/allocate")).json();
             showReceipt("feeMsg", r.ok, r.ok ? "distributed" : `failed: ${r.error}`, r.txHash);
+            if (r.ok) loadFees();
+          } catch { feeMsg("request failed", "var(--warn)"); }
+          finally { btn.disabled = false; }
+        });
+        // Pull the pool's credited take rate out and hand it to the collector.
+        $("feeHarvest").addEventListener("click", async () => {
+          const btn = $("feeHarvest");
+          btn.disabled = true;
+          showBusy("feeMsg", "Collecting the interest the pool has credited…");
+          try {
+            const r = await (await postAuthed("/api/fees/harvest")).json();
+            const moved = (r.moved || []).map((m) => `${m.amount} ${m.symbol}`).join(", ");
+            showReceipt(
+              "feeMsg", Boolean(r.ok && (r.moved || []).length),
+              r.ok ? (moved ? `collected ${moved}` : (r.note || "nothing worth collecting yet")) : `failed: ${r.error}`,
+              (r.moved || [])[0] && r.moved[0].txHash,
+            );
+            if (r.ok) loadFees();
+          } catch { feeMsg("request failed", "var(--warn)"); }
+          finally { btn.disabled = false; }
+        });
+        // The one owner call that gives the take rate somewhere it can go.
+        $("feeRouteFix").addEventListener("click", async () => {
+          const btn = $("feeRouteFix");
+          btn.disabled = true;
+          showBusy("feeMsg", "Pointing the pool's take rate at the app wallet…");
+          try {
+            const r = await (await postAuthed("/api/fees/route-treasury")).json();
+            showReceipt(
+              "feeMsg", Boolean(r.ok),
+              r.ok
+                ? (r.alreadyRouted ? "already routed" : "protocol fees now route through the app wallet")
+                : `failed: ${r.error}`,
+              r.txHash,
+            );
             if (r.ok) loadFees();
           } catch { feeMsg("request failed", "var(--warn)"); }
           finally { btn.disabled = false; }
@@ -4516,7 +4589,11 @@ const $ = (id) => document.getElementById(id);
           msg.style.color = colour;
           if (html) msg.innerHTML = text; else msg.textContent = text;
         };
-        show("Confirm in your wallet…", "var(--muted)");
+        // The two waits worth showing: the wallet's, then the chain's. Both are
+        // the same line the receipt lands on, so the state never moves around.
+        const busy = (text, html) =>
+          show(`<span class="spin" aria-hidden="true"></span>${text}`, "var(--muted)", true);
+        busy(esc("Confirm in your wallet…"));
         let safeHash = "";
         const link = () =>
           safeHash
@@ -4536,7 +4613,7 @@ const $ = (id) => document.getElementById(id);
                  `Check your wallet's activity before retrying.`, "var(--warn)", true);
             return;
           }
-          show(`${esc(label)} sent — waiting for the chain to confirm it…${link()}`, "var(--muted)", true);
+          busy(`${esc(label)} sent — waiting for the chain to confirm it…${link()}`);
           const receipt = await waitForTx(safeHash, 120000);
           if (!receipt) {
             // Still pending. Not a success and not a failure; say which.
@@ -4796,7 +4873,28 @@ const $ = (id) => document.getElementById(id);
        * `esc` on the label, `txLink` on the hash: the only markup that reaches
        * innerHTML is the anchor this function builds.
        */
+      /**
+       * "Working on it", on the line the answer will appear on.
+       *
+       * Every action here ended in a receipt and began with nothing: the button
+       * greyed out and a line of text appeared, which on a still screen is
+       * indistinguishable from a finished message that happens to end in an
+       * ellipsis. The ring turns for as long as the transaction is in flight
+       * and is replaced by `showReceipt` in the same element, so the status of
+       * a transaction is always exactly one line in one place.
+       */
+      function showBusy(id, label) {
+        const el = $(id);
+        if (!el) return;
+        el.style.display = "block";
+        el.style.color = "var(--muted)";
+        el.innerHTML = `<span class="spin" aria-hidden="true"></span>${esc(label)}`;
+        el.setAttribute("aria-busy", "true");
+      }
+
       function showReceipt(id, ok, label, txHash) {
+        const busy = $(id);
+        if (busy) busy.removeAttribute("aria-busy");
         const el = $(id);
         if (!el) return;
         el.style.display = "block";
@@ -6652,7 +6750,7 @@ const $ = (id) => document.getElementById(id);
           // at the app wallet's own figure, and `claim` pays `msg.sender`.
           if (!selfMode()) {
             btn.disabled = true;
-            govMsg("amEmMsg", "Claiming to the app wallet…", "var(--muted)");
+            showBusy("amEmMsg", "Claiming to the app wallet…");
             try {
               const r = await (await postJson("/api/amm/emissions/claim", {})).json();
               if (r.ok) {
@@ -8412,7 +8510,7 @@ const $ = (id) => document.getElementById(id);
           const bps = $("escFeeInput").value.trim();
           if (bps === "") { $("escFeeNote").textContent = "Enter a fee in basis points."; return; }
           $("escFeeSet").disabled = true;
-          $("escFeeNote").textContent = "Sending the owner call…";
+          showBusy("escFeeNote", "Sending the owner call…");
           try {
             const r = await (await postAuthed(`/api/escrow/fee?bps=${encodeURIComponent(bps)}`)).json();
             $("escFeeNote").textContent = r.ok ? `Fee updated — ${r.txHash}` : "✗ " + (r.error || "failed");
@@ -9011,7 +9109,7 @@ const $ = (id) => document.getElementById(id);
           const msg = $("cfgMsg");
           msg.style.display = "block";
           msg.style.color = "var(--muted)";
-          msg.textContent = "Allocating collected fees…";
+          showBusy("feeMsg", "Allocating collected fees…");
           try {
             const r = await (await postAuthed("/api/fees/allocate")).json();
             msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
