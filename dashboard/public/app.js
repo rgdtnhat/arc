@@ -1973,6 +1973,21 @@ const $ = (id) => document.getElementById(id);
         }
         const action = $("lnAction").value;
         const max = a.max[action];
+        /*
+         * Values the server is still standing behind, but could not refresh.
+         *
+         * The alternative was showing zeros and "unavailable" on every reserve
+         * the moment one read was refused, which reads as an outage. A stale
+         * row keeps the market on screen and says which part of it is old —
+         * the position is the part that is missing, so Execute waits.
+         */
+        if (a.stale) {
+          $("lnMaxHint").textContent =
+            a.note || "Showing the last values read from the pool — refreshing.";
+          $("lnExecute").disabled = true;
+          $("lnExecute").style.opacity = "0.5";
+          return;
+        }
         // An asset listed in the deployment but never registered on-chain can't
         // be used — say so plainly instead of showing zeros with no explanation.
         if (a.enabled === false) {

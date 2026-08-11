@@ -1043,18 +1043,110 @@ async function main() {
   }
 
   /**
+   * The whole lending picture, without a single point of failure.
+   *
+   * `readAll` puts the account summary and every per-asset field into one
+   * multicall — the right shape, because per-asset calls got the public RPC to
+   * throttle us. But one call means one failure takes everything: when it does
+   * not answer, every reserve reads as unavailable at once and the panel says
+   * the pool could not be read, which is indistinguishable from the pool being
+   * down. It was not down; the aggregate read had simply been refused.
+   *
+   * So: try it again, and if the aggregate still will not answer, ask per asset
+   * instead. Four small calls are slower and the paced transport spaces them
+   * out anyway, but they degrade one reserve at a time rather than all four
+   * together — and a partial answer is worth far more here than a clean
+   * failure.
+   */
+  type PoolBulk = Awaited<ReturnType<TesseraPoolClient["readAll"]>>;
+  async function readPoolBulk(pool: TesseraPoolClient): Promise<PoolBulk> {
+    const addrs = poolDeployment.assets.map((a) => a.address as Hex);
+    let firstErr: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const bulk = await pool.readAll(addrs);
+        // All-failed is a failed read wearing a success's clothes: the call
+        // came back, but with nothing in it worth rendering.
+        if (bulk.perAsset.some((p) => p.ok)) return bulk;
+      } catch (e) {
+        firstErr ??= e;
+      }
+    }
+    const parts = await Promise.all(
+      addrs.map(async (addr) => {
+        try {
+          return await pool.readAll([addr]);
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const perAsset = parts.flatMap((p, i) => p?.perAsset ?? [{ asset: addrs[i], ok: false as const }]);
+    if (!perAsset.some((p) => p.ok)) {
+      console.error(`[lending] pool read failed on every reserve: ${String(firstErr).slice(0, 160)}`);
+    }
+    return { account: parts.find((p) => p?.account)?.account ?? null, perAsset } as PoolBulk;
+  }
+
+  /**
    * Last good snapshot per asset, so a throttled read for one reserve doesn't
    * make that asset vanish from the picker. Keyed by lowercased address.
    */
   const assetCache = new Map<string, NonNullable<Awaited<ReturnType<typeof readLending>>>["assets"][number]>();
 
+  /**
+   * The public half of the last good read, kept on disk.
+   *
+   * `assetCache` only fills after a successful read, so a container that has
+   * just restarted has nothing to fall back on — and that is exactly when a
+   * throttled RPC does the most damage. The lending panel came back with every
+   * reserve marked unavailable, zero liquidity and a market size of $0, which
+   * reads as "the pool is down" when the pool was healthy the whole time.
+   *
+   * Only the market half is stored. Reserve liquidity, rates and prices are
+   * public facts about the pool and are the same for whoever is looking;
+   * balances are not, and serving one visitor's position to another from a
+   * cache would be a far worse bug than the one this fixes. Positions come back
+   * as unknown until the chain answers.
+   */
+  interface MarketSnapshot {
+    at: number;
+    assets: Record<string, { symbol: string; decimals: number; enabled: boolean; borrowable: boolean; priceUsd: string; priceE8: string; reserve: unknown }>;
+  }
+  const marketFile = statePath(".tessera-lending-market.json");
+  let marketSnapshot: MarketSnapshot = { at: 0, assets: {} };
+  try {
+    const raw = JSON.parse(readFileSync(marketFile, "utf8")) as MarketSnapshot;
+    if (raw && typeof raw.at === "number" && raw.assets) marketSnapshot = raw;
+  } catch {
+    /* first run */
+  }
+  let marketSaved = 0;
+  const saveMarketSnapshot = (assets: { address: string; symbol: string; decimals: number; enabled: boolean; borrowable: boolean; unavailable?: boolean; priceUsd: string; priceE8: string; reserve: unknown }[]) => {
+    const fresh = assets.filter((a) => !a.unavailable && a.enabled);
+    if (!fresh.length) return;
+    marketSnapshot = {
+      at: Date.now(),
+      assets: Object.fromEntries(fresh.map((a) => [a.address.toLowerCase(), {
+        symbol: a.symbol, decimals: a.decimals, enabled: a.enabled, borrowable: a.borrowable,
+        priceUsd: a.priceUsd, priceE8: a.priceE8, reserve: a.reserve,
+      }])),
+    };
+    // At most once a minute: this is a crash cushion, not a journal.
+    if (Date.now() - marketSaved < 60_000) return;
+    marketSaved = Date.now();
+    try {
+      writeFileSync(marketFile, JSON.stringify(marketSnapshot));
+    } catch {
+      /* a cushion that cannot be written is not worth failing a read over */
+    }
+  };
+
   async function readLending() {
     const pool = poolClient!;
-    // ONE multicall for the account summary and every per-asset field. Doing
-    // this as ~5 calls per reserve got throttled by the public RPC, which is why
-    // panels sat empty; a single round-trip removes that whole failure mode.
-    const bulk = await pool.readAll(poolDeployment.assets.map((a) => a.address));
+    const bulk = await readPoolBulk(pool);
     const byAsset = new Map(bulk.perAsset.map((p) => [p.asset.toLowerCase(), p]));
+
 
     /*
      * How much the outflow limiter will let out of each asset right now.
@@ -1139,10 +1231,45 @@ async function main() {
         };
 
         if (!row || !row.ok) {
+          /*
+           * A read that did not answer is not a pool that is down.
+           *
+           * This went straight to the placeholder, so one refused multicall
+           * blanked every reserve: zero liquidity, no price, "unavailable" on
+           * all four, market size $0 — while the pool sat there perfectly
+           * healthy with 230 USDC of cash and a live TSRA market. The last good
+           * values are a far better answer than zeros, so they are used in
+           * order: this process's own cache first, then the snapshot on disk
+           * (which survives the restart that empties the first), and only then
+           * a placeholder that says the read failed.
+           *
+           * Positions are never served from the snapshot — see its note. What
+           * comes back is the market, with the position left unknown.
+           */
+          const live = assetCache.get(a.address.toLowerCase());
+          if (live && !live.unavailable) return { ...live, stale: true };
+          const snap = marketSnapshot.assets[a.address.toLowerCase()];
+          if (snap) {
+            const base = placeholder(snap.decimals, "");
+            return {
+              ...base,
+              symbol: snap.symbol,
+              enabled: snap.enabled,
+              borrowable: snap.borrowable,
+              unavailable: false,
+              stale: true,
+              priceUsd: snap.priceUsd,
+              priceE8: snap.priceE8,
+              reserve: snap.reserve as typeof base.reserve,
+              note:
+                "Showing the last values read from the pool — the network did not answer just now, so your own " +
+                "position is not shown until it does.",
+            };
+          }
           return placeholder(
             a.decimals ?? 6,
-            "This reserve could not be read from the pool. The most likely cause is a " +
-              "deployed pool older than the app's ABI — check /api/lending/prices, and migrate if so.",
+            "This reserve could not be read from the pool just now. It is usually the network refusing a read " +
+              "rather than the pool being down — it retries on its own every few seconds.",
           );
         }
         const cfg = row.cfg;
@@ -1259,7 +1386,10 @@ async function main() {
       }),
     );
     const assets = settled.filter((a): a is NonNullable<typeof a> => a !== null);
-    for (const a of assets) assetCache.set(a.address.toLowerCase(), a);
+    // Only rows that actually came from the chain replace the cache — writing a
+    // placeholder here would poison the very fallback it exists to feed.
+    for (const a of assets) if (!a.unavailable && !("stale" in a && a.stale)) assetCache.set(a.address.toLowerCase(), a);
+    saveMarketSnapshot(assets as never);
 
     // `ready` is sticky: once the chain has answered we keep rendering values
     // (possibly a few seconds stale) instead of flipping back to a "loading"
