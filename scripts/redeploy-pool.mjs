@@ -71,6 +71,7 @@ import {
   tesseraEmissionsAbi,
   tesseraEmitterAbi,
   tesseraGaugeAbi,
+  tesseraRateLimiterAbi,
   erc20Abi,
 } from "@tessera/shared";
 import { tesseraPoolBytecode, tesseraEmissionsBytecode } from "../shared/src/bytecode.ts";
@@ -434,6 +435,51 @@ async function main() {
   }
   if (config.global.rateLimiter !== zero) {
     await send("attach the outflow limiter", NEW, tesseraPoolAbi, "setRateLimiter", [config.global.rateLimiter]);
+    /*
+     * And tell the limiter, which is the half that was missing.
+     *
+     * `TesseraRateLimiter` trusts exactly one address and rejects every other
+     * caller with `NotConsumer()`. Attaching it to the pool is a pool-side
+     * setting; the limiter has its own, and both have to agree. Setting only
+     * the first left a pool that called a limiter which refused to answer it —
+     * so `_meter` reverted inside every borrow and every withdraw that touched
+     * it, on all four assets, with an error that is not in the pool's own ABI
+     * and therefore decoded to a bare selector.
+     *
+     * It cost a live outage. The limiter's owner is checked rather than
+     * assumed, because a limiter this run cannot repoint is a pool that will
+     * not lend, and that is worth stopping for.
+     */
+    const limiterOwner = await must("the limiter's owner", config.global.rateLimiter, tesseraRateLimiterAbi, "owner");
+    if (limiterOwner.toLowerCase() !== deployer.address.toLowerCase()) {
+      throw new Error(
+        `The outflow limiter ${config.global.rateLimiter} is owned by ${limiterOwner}, not the deployer.\n` +
+        `  Its consumer cannot be repointed from here, and until it is the new pool cannot\n` +
+        `  borrow or withdraw — the limiter rejects it with NotConsumer(). Have the owner\n` +
+        `  call setConsumer(${NEW}), or detach the limiter before re-running.`,
+      );
+    }
+    /*
+     * Detach the OLD pool first, then repoint the limiter.
+     *
+     * The limiter has exactly one consumer, so handing it to the new pool makes
+     * the old pool a stranger to it — and the old pool still has it attached, so
+     * `_meter` inside `withdraw` starts reverting `NotConsumer()`. A pool
+     * deliberately left open so people can get their money out then stops
+     * letting them out, which is a strictly worse failure than the one the
+     * repointing fixes. Doing it in this order means neither pool is ever
+     * pointing at a limiter that will refuse it.
+     *
+     * The retired pool does not need metering anyway. Outflow limits exist to
+     * slow an attack on a live market; on a pool frozen against new supply and
+     * new borrowing the only outflow left is people leaving, and that is the
+     * one flow that must not be slowed. `_meter` no-ops on a zero address.
+     */
+    await send("detach the limiter from the retired pool", OLD, tesseraPoolAbi, "setRateLimiter", [zero]);
+    await send(
+      "point the outflow limiter back at the new pool",
+      config.global.rateLimiter, tesseraRateLimiterAbi, "setConsumer", [NEW],
+    );
   }
   if (config.global.backstopTakeRate !== 0) {
     await send("backstop take rate", NEW, tesseraPoolAbi, "setBackstopTakeRate", [config.global.backstopTakeRate]);

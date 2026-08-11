@@ -48,6 +48,20 @@ async function main() {
   await pool.write.setBackstopTakeRate([1234]);
   await pool.write.setFlashFee([27]);
 
+  /*
+   * An outflow limiter, because the redeploy has to rewire *both* ends of it.
+   *
+   * The limiter trusts exactly one `consumer` and rejects everyone else with
+   * `NotConsumer()`. Attaching it to the pool is a pool-side setting; the
+   * limiter has its own. Setting only the first produced a live pool that
+   * could not borrow or withdraw at all, and the rehearsal missed it entirely
+   * because no limiter was ever in the fixture — so CI was green while the
+   * real thing was broken.
+   */
+  const limiter = await hre.viem.deployContract("TesseraRateLimiter", [pool.address]);
+  await limiter.write.setLimit([usdc.address, U(1_000_000), 3600n]);
+  await pool.write.setRateLimiter([limiter.address]);
+
   await pool.write.setEmodeCategory([1, 9000, 9300, 9950, "stables"]);
   await pool.write.setEmodeAsset([usdc.address, 1]);
 
@@ -118,6 +132,7 @@ async function main() {
         tesseraGauge: gauge.address,
         tesseraAmm: amm.address,
         tesseraPriceGuard: guard.address,
+        tesseraRateLimiter: limiter.address,
         poolAssets: [
           { symbol: "USDC", address: usdc.address, decimals: 6, borrowable: true },
           { symbol: "TSRA", address: tsra.address, decimals: 18, borrowable: false },

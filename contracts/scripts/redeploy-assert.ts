@@ -75,6 +75,40 @@ async function main() {
     (await newPool.read.priceGuard()).toLowerCase() === String(before.tesseraPriceGuard).toLowerCase(),
   );
 
+  /*
+   * Both ends of the outflow limiter.
+   *
+   * The pool has to point at the limiter *and* the limiter has to accept the
+   * pool. Only the first was wired on a real redeploy, and the result was a
+   * pool that reverted every borrow and withdraw with `NotConsumer()` — an
+   * error that is not in the pool's own ABI, so it decoded to a bare selector
+   * and read as a pricing fault. The flag is checked and then the call itself,
+   * because a correct-looking pointer that still refuses the transaction is
+   * exactly what happened.
+   */
+  const limiter = await hre.viem.getContractAt("TesseraRateLimiter", before.tesseraRateLimiter);
+  ok(
+    "the new pool is attached to the outflow limiter",
+    (await newPool.read.rateLimiter()).toLowerCase() === String(before.tesseraRateLimiter).toLowerCase(),
+  );
+  ok(
+    "the outflow limiter accepts the new pool as its consumer",
+    (await limiter.read.consumer()).toLowerCase() === String(after.tesseraPool).toLowerCase(),
+    `consumer ${await limiter.read.consumer()}`,
+  );
+  /*
+   * And the retired pool must have been let go of, in that order.
+   *
+   * A limiter with one consumer cannot serve two pools. Repointing it without
+   * detaching the old one turns the retired pool's `withdraw` into a revert —
+   * the exit that the mask-5 freeze exists to keep open.
+   */
+  ok(
+    "the retired pool no longer meters, so its exit stays open",
+    (await oldPool.read.rateLimiter()) === "0x0000000000000000000000000000000000000000",
+    `old rateLimiter ${await oldPool.read.rateLimiter()}`,
+  );
+
   const guard = await hre.viem.getContractAt("TesseraPriceGuard", before.tesseraPriceGuard);
   ok(
     "the price guard now reads the new pool",
@@ -166,6 +200,31 @@ async function main() {
     "supplyFor reproduces a position in the new pool",
     (await newPool.read.supplyBalance([usdc, alice.account.address])) === aliceOld,
     `${aliceOld}`,
+  );
+
+  /*
+   * And then borrow against it, which is the assertion that would have caught
+   * the limiter.
+   *
+   * Every check above passed on a pool that could not lend a cent: reserves
+   * listed, parameters carried, caps and curves identical, guard attached,
+   * `supplyFor` accepted. `borrow` is the first call that goes all the way
+   * through `_meter` into the limiter, so it is the first one that notices the
+   * limiter will not answer. A migration whose destination cannot be borrowed
+   * from has not succeeded, however good the configuration looks.
+   */
+  const aliceDest = await hre.viem.getContractAt("TesseraPool", after.tesseraPool, { client: { wallet: alice } });
+  const borrowed = await newPool.read.borrowBalance([usdc, alice.account.address]);
+  let borrowWhy = "";
+  try {
+    await aliceDest.write.borrow([usdc, 1_000_000n]);
+  } catch (e) {
+    borrowWhy = String((e as Error).message).split("\n").find((l) => /revert|Error:/i.test(l)) ?? String(e).slice(0, 90);
+  }
+  ok(
+    "the new pool can actually be borrowed from",
+    !borrowWhy && (await newPool.read.borrowBalance([usdc, alice.account.address])) > borrowed,
+    borrowWhy.slice(0, 100),
   );
 
   if (failed) process.exit(1);
