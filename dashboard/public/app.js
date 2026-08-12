@@ -110,7 +110,7 @@ const $ = (id) => document.getElementById(id);
        * The hash drives it (#/dashboard, #/defi, …) so links and the browser
        * back button work, and "#" (or no hash) is the landing page.
        * ==================================================================== */
-      const TABS = ["dashboard", "defi", "agents", "gov", "other"];
+      const TABS = ["dashboard", "defi", "agents", "wallet", "gov", "other"];
       // Plain names: the icons live in the drawer markup as SVG now, so the
       // labels no longer smuggle a glyph that would end up in the tab title.
       const NAV_LABELS = {
@@ -118,6 +118,7 @@ const $ = (id) => document.getElementById(id);
         dashboard: "Dashboard",
         defi: "DeFi",
         agents: "Agent workspace",
+        wallet: "Wallet",
         gov: "Governance",
         other: "Treasury & system",
       };
@@ -148,6 +149,9 @@ const $ = (id) => document.getElementById(id);
           // and nothing it reports changes second to second.
           if (route === "dashboard" && typeof loadClaimables === "function") loadClaimables().catch(() => {});
           if (route === "gov" && typeof setGovTab === "function") setGovTab(govTab);
+          // Balances and the task list are reads of their own; they load when
+          // you arrive rather than on every poll of every other tab.
+          if (route === "wallet" && typeof loadWallet === "function") { loadWallet(); loadTasks(); }
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -2961,6 +2965,303 @@ const $ = (id) => document.getElementById(id);
             if (r.ok) { $("feeWithdrawAmount").value = ""; loadFees(); }
           } catch { feeMsg("request failed", "var(--warn)"); }
           finally { btn.disabled = false; }
+        });
+      }
+
+      /* ====================================================================
+       * The wallet, and the tasks that use it.
+       *
+       * Two features that are really one: a transfer you make now, and the same
+       * transfer made later on a schedule. They share a pane because they share
+       * a wallet, and because "send 50 USDC to this address every Monday" is one
+       * thought, not two.
+       * ================================================================== */
+
+      let walletAssets = [];
+
+      async function loadWallet() {
+        const body = $("walletBody");
+        if (!body) return;
+        try {
+          const r = await (await fetch("/api/wallet", { headers: authHeaders() })).json();
+          if (!r.ok) throw new Error(r.error || "not signed in");
+          $("walletNotReady").style.display = "none";
+          body.style.display = "";
+          walletAssets = r.assets || [];
+          $("walletAddress").textContent = r.address;
+          $("walletRows").innerHTML = walletAssets.length
+            ? walletAssets.map((a) =>
+                `<tr><td><b>${esc(a.symbol)}</b><div class="muted mono" style="font-size:10.5px">${esc(String(a.address).slice(0, 10))}…</div></td>` +
+                // A balance that could not be read says so; it is not zero.
+                `<td class="num mono">${a.balance === null ? "unavailable" : esc(a.balance)}</td></tr>`).join("")
+            : emptyRow(2, "No assets.");
+          const sel = $("walSendAsset");
+          if (sel && sel.dataset.built !== String(walletAssets.length)) {
+            sel.innerHTML = walletAssets.map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`).join("");
+            sel.dataset.built = String(walletAssets.length);
+          }
+        } catch {
+          $("walletNotReady").style.display = "";
+          body.style.display = "none";
+        }
+      }
+
+      const walDecimals = (addr) => {
+        const a = walletAssets.find((x) => String(x.address).toLowerCase() === String(addr).toLowerCase());
+        return a ? a.decimals : 6;
+      };
+
+      if ($("walletCopy")) {
+        $("walletCopy").addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText($("walletAddress").textContent.trim());
+            showReceipt("walMsg", true, "address copied");
+          } catch { showReceipt("walMsg", false, "could not copy — select the address and copy it by hand"); }
+        });
+        $("walSend").addEventListener("click", async () => {
+          const asset = $("walSendAsset").value;
+          const to = $("walSendTo").value.trim();
+          const human = $("walSendAmount").value.trim();
+          if (!/^0x[0-9a-fA-F]{40}$/.test(to)) return showReceipt("walMsg", false, "that is not an address");
+          if (!(parseFloat(human) > 0)) return showReceipt("walMsg", false, "enter an amount above zero");
+          const btn = $("walSend");
+          btn.disabled = true;
+          showBusy("walMsg", `sending ${human} to ${to.slice(0, 10)}…`);
+          try {
+            const r = await (await postAuthed("/api/wallet/send", {
+              asset, to, amount: toRaw(human, walDecimals(asset)),
+            })).json();
+            showReceipt("walMsg", Boolean(r.ok), r.ok ? `sent ${human}` : `failed: ${r.error}`, r.sent && r.sent[0] && r.sent[0].txHash);
+            if (r.ok) { $("walSendAmount").value = ""; loadWallet(); }
+          } catch { showReceipt("walMsg", false, "request failed"); }
+          finally { btn.disabled = false; }
+        });
+
+        /** `address,amount` per line — the shape people already paste from a sheet. */
+        const parseBulk = () => {
+          const dec = walDecimals($("walSendAsset").value);
+          const rows = [];
+          const bad = [];
+          $("walBulk").value.split(/\r?\n/).forEach((line, i) => {
+            const t = line.trim();
+            if (!t) return;
+            const [to, amt] = t.split(/[,\s]+/);
+            if (!/^0x[0-9a-fA-F]{40}$/.test(to || "") || !(parseFloat(amt) > 0)) { bad.push(i + 1); return; }
+            rows.push({ to, amount: toRaw(amt, dec) });
+          });
+          return { rows, bad };
+        };
+        $("walBulk").addEventListener("input", () => {
+          const { rows, bad } = parseBulk();
+          $("walBulkCount").textContent =
+            `${rows.length} recipient${rows.length === 1 ? "" : "s"}` + (bad.length ? ` · line ${bad.join(", ")} unreadable` : "");
+        });
+        $("walBulkSend").addEventListener("click", async () => {
+          const { rows, bad } = parseBulk();
+          if (bad.length) return showReceipt("walMsg", false, `line ${bad.join(", ")} is not "address,amount"`);
+          if (!rows.length) return showReceipt("walMsg", false, "no recipients");
+          const btn = $("walBulkSend");
+          btn.disabled = true;
+          showBusy("walMsg", `sending to ${rows.length} address${rows.length === 1 ? "" : "es"}…`);
+          try {
+            const r = await (await postAuthed("/api/wallet/send-bulk", { asset: $("walSendAsset").value, recipients: rows })).json();
+            const sent = (r.sent || []).length, failed = (r.failed || []).length;
+            showReceipt("walMsg", Boolean(r.ok) && !failed,
+              r.ok ? `${sent} sent${failed ? `, ${failed} failed` : ""}` : `failed: ${r.error}`,
+              (r.sent || [])[0] && r.sent[0].txHash);
+            if (sent) { loadWallet(); $("walBulk").value = ""; $("walBulkCount").textContent = ""; }
+          } catch { showReceipt("walMsg", false, "request failed"); }
+          finally { btn.disabled = false; }
+        });
+      }
+
+      /* ---- tasks --------------------------------------------------------- */
+
+      let taskActions = {};
+      const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+      /** The parameters each verb needs, so the form asks for those and no others. */
+      const TASK_FIELDS = {
+        "lending:supply": ["asset", "amount"], "lending:withdraw": ["asset", "amount"],
+        "lending:borrow": ["asset", "amount"], "lending:repay": ["asset", "amount"],
+        "vault:deposit": ["amount"], "vault:withdraw": ["shares"],
+        "swap:swap": ["asset", "tokenOut", "amount"],
+        "amm:add": ["poolId", "amounts"], "amm:remove": ["poolId", "shares"],
+        "amm:swap": ["poolId", "tokenIn", "tokenOut", "amountIn"],
+        "wallet:send": ["asset", "to", "amount"], "wallet:bulk": ["asset", "recipients"],
+      };
+
+      function taskParamRow() {
+        const venue = $("taskVenue").value, action = $("taskAction").value;
+        const fields = TASK_FIELDS[`${venue}:${action}`] || [];
+        const assetOptions = walletAssets.map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`).join("");
+        $("taskParamRow").innerHTML = fields.map((f) => {
+          if (f === "asset" || f === "tokenIn" || f === "tokenOut") {
+            return `<select class="field" data-tp="${f}">${assetOptions}</select>`;
+          }
+          if (f === "recipients") {
+            return `<input class="field" data-tp="${f}" placeholder="0x…,1.5; 0x…,2" style="min-width:220px" />`;
+          }
+          const ph = { amount: "Amount", amountIn: "Amount in", shares: "Shares", poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient" }[f] || f;
+          return `<input class="field" data-tp="${f}" placeholder="${esc(ph)}" style="min-width:${f === "to" ? 210 : 120}px" />`;
+        }).join("");
+      }
+
+      function taskParams() {
+        const venue = $("taskVenue").value, action = $("taskAction").value;
+        const out = {};
+        $("taskParamRow").querySelectorAll("[data-tp]").forEach((el) => { out[el.dataset.tp] = el.value.trim(); });
+        // Amounts are stored in base units: a task outlives the form that made
+        // it, and a decimal re-read against a different asset would be wrong.
+        const dec = (a) => walDecimals(a || $("walSendAsset").value);
+        if (out.amount !== undefined) out.amount = toRaw(out.amount || "0", dec(out.asset));
+        if (out.amountIn !== undefined) out.amountIn = toRaw(out.amountIn || "0", dec(out.tokenIn));
+        if (out.amounts !== undefined) out.amounts = String(out.amounts).split(/[,\s]+/).filter(Boolean).map((v) => toRaw(v, 6));
+        if (out.recipients !== undefined) {
+          out.recipients = String(out.recipients).split(/[;\n]+/).map((r) => r.trim()).filter(Boolean).map((r) => {
+            const [to, amt] = r.split(/[,\s]+/);
+            return { to, amount: toRaw(amt || "0", dec(out.asset)) };
+          });
+        }
+        if (venue === "amm" || action === "remove") out.poolId = Number(out.poolId || 0);
+        return out;
+      }
+
+      function taskSchedule() {
+        const kind = $("taskKind").value;
+        if (kind === "manual") return { kind: "manual" };
+        if (kind === "every") {
+          return { kind: "every", seconds: Math.max(1, Number($("taskEveryN").value || 1)) * Number($("taskEveryUnit").value) };
+        }
+        const base = {
+          hour: Number($("taskHour").value || 0),
+          minute: Number($("taskMinute").value || 0),
+          offsetMinutes: Number($("taskZone").value || 0),
+        };
+        if (kind === "weekly") {
+          const days = [...$("taskDays").querySelectorAll("input:checked")].map((i) => Number(i.value));
+          return { kind: "weekly", days, ...base };
+        }
+        if (kind === "monthly") return { kind: "monthly", day: Number($("taskDom").value || 1), ...base };
+        return { kind: "yearly", month: Number($("taskMonth").value || 1), day: Number($("taskDom").value || 1), ...base };
+      }
+
+      function syncTaskForm() {
+        const kind = $("taskKind").value;
+        $("taskEvery").style.display = kind === "every" ? "" : "none";
+        $("taskCalendar").style.display = kind === "manual" || kind === "every" ? "none" : "";
+        $("taskDays").style.display = kind === "weekly" ? "" : "none";
+        $("taskDom").style.display = kind === "monthly" || kind === "yearly" ? "" : "none";
+        $("taskMonth").style.display = kind === "yearly" ? "" : "none";
+        const v = $("taskVenue").value;
+        const acts = taskActions[v] || [];
+        if ($("taskAction").dataset.venue !== v) {
+          $("taskAction").innerHTML = acts.map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
+          $("taskAction").dataset.venue = v;
+        }
+        taskParamRow();
+      }
+
+      async function loadTasks() {
+        if (!$("taskRows")) return;
+        try {
+          const r = await (await fetch("/api/tasks", { headers: authHeaders() })).json();
+          if (!r.ok) return;
+          taskActions = r.actions || {};
+          if (!$("taskVenue").options.length) {
+            $("taskVenue").innerHTML = Object.keys(taskActions)
+              .map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+            // Whole and half-hour offsets, which covers every zone in use.
+            $("taskZone").innerHTML = Array.from({ length: 57 }, (_, i) => (i - 28) * 30)
+              .map((m) => {
+                const sign = m < 0 ? "-" : "+", a = Math.abs(m);
+                const label = `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
+                return `<option value="${m}"${m === 0 ? " selected" : ""}>${label}</option>`;
+              }).join("");
+            $("taskDays").innerHTML = DAY_NAMES.map((d, i) =>
+              `<label style="font-size:12px;margin-right:7px"><input type="checkbox" value="${i}" /> ${d}</label>`).join("");
+            syncTaskForm();
+          }
+          $("taskRows").innerHTML = (r.tasks || []).length
+            ? r.tasks.map((t) => {
+                const next = t.nextRunAt ? new Date(t.nextRunAt).toLocaleString() : "—";
+                const last = t.lastRunAt
+                  ? `${t.lastStatus === "ok" ? "✓" : "✗"} ${esc(t.lastDetail || "")}`
+                  : "never run";
+                return `<tr><td><b>${esc(t.name)}</b>` +
+                  `<div class="muted" style="font-size:11px">${esc(t.venue)} · ${esc(t.action)}${t.enabled ? "" : " · paused"}</div></td>` +
+                  `<td style="font-size:12px">${esc(t.scheduleText)}<div class="muted" style="font-size:11px">next ${esc(next)}</div></td>` +
+                  `<td style="font-size:11.5px">${last}</td>` +
+                  `<td class="num"><button class="btn" data-trun="${esc(t.id)}">Run</button> ` +
+                  `<button class="btn" data-ttog="${esc(t.id)}">${t.enabled ? "Pause" : "Resume"}</button> ` +
+                  `<button class="btn" data-tdel="${esc(t.id)}">Delete</button></td></tr>`;
+              }).join("")
+            : emptyRow(4, "No tasks yet.");
+        } catch { /* the pane stays as it was */ }
+      }
+
+      if ($("taskCreate")) {
+        ["taskKind", "taskVenue", "taskAction"].forEach((id) =>
+          $(id).addEventListener("change", () => { syncTaskForm(); previewTask(); }));
+        ["taskEveryN", "taskEveryUnit", "taskHour", "taskMinute", "taskZone", "taskDom", "taskMonth"].forEach((id) =>
+          $(id).addEventListener("input", previewTask));
+        $("taskDays").addEventListener("change", previewTask);
+
+        /** Say the schedule back in words before it is saved, not after. */
+        function previewTask() {
+          const s = taskSchedule();
+          const zone = (o) => {
+            const sign = o < 0 ? "-" : "+", a = Math.abs(o);
+            return `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
+          };
+          const at = () => `${String(s.hour).padStart(2, "0")}:${String(s.minute).padStart(2, "0")} ${zone(s.offsetMinutes)}`;
+          const text =
+            s.kind === "manual" ? "runs only when you press Run"
+            : s.kind === "every" ? `runs every ${s.seconds} second${s.seconds === 1 ? "" : "s"}`
+            : s.kind === "weekly" ? (s.days.length ? `runs ${s.days.map((d) => DAY_NAMES[d]).join(", ")} at ${at()}` : "pick at least one day")
+            : s.kind === "monthly" ? `runs on day ${s.day} of each month at ${at()}`
+            : `runs on ${s.month}/${s.day} each year at ${at()}`;
+          $("taskPreview").textContent = text;
+        }
+        window.previewTask = previewTask;
+
+        $("taskCreate").addEventListener("click", async () => {
+          const btn = $("taskCreate");
+          btn.disabled = true;
+          showBusy("taskMsg", "saving the task…");
+          try {
+            const r = await (await postAuthed("/api/tasks", {
+              name: $("taskName").value.trim(),
+              venue: $("taskVenue").value,
+              action: $("taskAction").value,
+              params: taskParams(),
+              schedule: taskSchedule(),
+            })).json();
+            showReceipt("taskMsg", Boolean(r.ok), r.ok ? `created — ${r.scheduleText}` : `failed: ${r.error}`);
+            if (r.ok) { $("taskName").value = ""; loadTasks(); }
+          } catch { showReceipt("taskMsg", false, "request failed"); }
+          finally { btn.disabled = false; }
+        });
+
+        $("taskRows").addEventListener("click", async (e) => {
+          const btn = e.target.closest("button");
+          if (!btn) return;
+          const run = btn.dataset.trun, del = btn.dataset.tdel, tog = btn.dataset.ttog;
+          btn.disabled = true;
+          try {
+            if (run) {
+              showBusy("taskMsg", "running the task…");
+              const r = await (await postAuthed(`/api/tasks/${run}/run`, {})).json();
+              showReceipt("taskMsg", Boolean(r.ok), r.ok ? `ran: ${r.detail}` : `failed: ${r.detail || r.error}`, r.txHash);
+            } else if (del) {
+              await postAuthed(`/api/tasks/${del}/delete`, {});
+              showReceipt("taskMsg", true, "task deleted");
+            } else if (tog) {
+              await postAuthed(`/api/tasks/${tog}`, { enabled: btn.textContent.trim() === "Resume" });
+              showReceipt("taskMsg", true, "task updated");
+            }
+          } catch { showReceipt("taskMsg", false, "request failed"); }
+          finally { btn.disabled = false; loadTasks(); loadWallet(); }
         });
       }
 

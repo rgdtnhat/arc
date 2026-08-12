@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v67" />
+    <meta name="tessera-shell" content="tessera-v68" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1056,6 +1056,11 @@
               <path d="M12 3.4 4.2 7.2v1.4h15.6V7.2Z"/><path d="M6.4 10.4v6.2M10.1 10.4v6.2M13.9 10.4v6.2M17.6 10.4v6.2"/>
               <path d="M3.8 19.2h16.4"/>
             </svg></span> Governance
+          </button>
+          <button class="btn" data-nav="wallet">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="6" width="18" height="13" rx="2.4"/><path d="M3 10h18"/><circle cx="17" cy="14.5" r="1.2"/>
+            </svg></span> Wallet
           </button>
           <button class="btn" data-nav="other">
             <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2397,6 +2402,111 @@
 
         <!-- ---------- OTHER ---------- -->
         <!-- ---------- GOVERNANCE ---------- -->
+        <div class="tabPane" id="paneWallet" hidden>
+          <div class="card">
+            <h2>◫ Wallet — send and receive</h2>
+            <div class="notready" id="walletNotReady" style="display:none">
+              Sign in as the operator to use the wallet.
+            </div>
+            <div id="walletBody" style="display:none">
+              <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
+                The app wallet, and the plain transfers in and out of it. Everything else in this app moves value
+                <i>inside</i> the protocol — into a pool, a vault, a swap. This is the one place that sends to an
+                address of your choosing.
+              </div>
+
+              <div class="kv" style="margin-bottom:6px">Receive at</div>
+              <div class="row-actions" style="margin-bottom:14px">
+                <span class="mono" id="walletAddress" style="font-size:12.5px;word-break:break-all">—</span>
+                <button class="btn" id="walletCopy">Copy</button>
+              </div>
+
+              <div class="tblWrap auto"><table class="data" style="min-width:0">
+                <thead><tr><th>Asset</th><th class="num">Balance</th></tr></thead>
+                <tbody id="walletRows"></tbody>
+              </table></div>
+
+              <div class="menuSep" style="margin:16px 0 11px"></div>
+              <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:9px">Send</div>
+              <div class="row-actions" style="margin-bottom:9px">
+                <select id="walSendAsset" class="field"></select>
+                <input id="walSendTo" class="field" placeholder="0x… recipient" style="min-width:210px" />
+                <input id="walSendAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
+                <button class="btn primary" id="walSend">Send</button>
+              </div>
+              <div style="font-size:11.5px;color:var(--muted);margin-bottom:9px">
+                Or send the same asset to many addresses at once — one <span class="mono">address,amount</span> per
+                line. The total is checked against the balance before anything is sent, and each row reports its own
+                result, so one bad line does not take the rest with it.
+              </div>
+              <textarea id="walBulk" class="field" rows="4" style="width:100%;font-family:var(--mono,monospace);font-size:12px"
+                placeholder="0xabc…,1.5&#10;0xdef…,2"></textarea>
+              <div class="row-actions" style="margin-top:9px">
+                <button class="btn" id="walBulkSend">Send to all</button>
+                <span id="walBulkCount" style="font-size:12px;color:var(--muted)"></span>
+              </div>
+              <div class="msg" id="walMsg" style="display:none;margin-top:10px"></div>
+            </div>
+          </div>
+
+          <div class="card" id="tasksCard">
+            <h2>◷ Scheduled tasks — what the app does on its own</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
+              Every action here is one you could press yourself on the DeFi tabs — supply, borrow, add liquidity,
+              swap, deposit to the vault, send a transfer. A task adds the missing part, which is <i>when</i>. Times
+              are held in the offset you choose and honoured exactly as typed all year, so a task set for 09:00
+              GMT+07:00 never drifts an hour with daylight saving somewhere else.
+            </div>
+
+            <div class="row-actions" style="margin-bottom:9px">
+              <select id="taskVenue" class="field"></select>
+              <select id="taskAction" class="field"></select>
+              <input id="taskName" class="field" placeholder="Name (optional)" style="min-width:150px" />
+            </div>
+            <div class="row-actions" style="margin-bottom:9px" id="taskParamRow"></div>
+            <div class="row-actions" style="margin-bottom:9px">
+              <select id="taskKind" class="field">
+                <option value="manual">Only when I run it</option>
+                <option value="every">Every…</option>
+                <option value="weekly">Days of the week</option>
+                <option value="monthly">Day of the month</option>
+                <option value="yearly">Once a year</option>
+              </select>
+              <span id="taskEvery" style="display:none">
+                <input id="taskEveryN" class="field" inputmode="numeric" value="1" style="width:72px" />
+                <select id="taskEveryUnit" class="field">
+                  <option value="1">seconds</option>
+                  <option value="60" selected>minutes</option>
+                  <option value="3600">hours</option>
+                  <option value="86400">days</option>
+                  <option value="604800">weeks</option>
+                  <option value="2592000">months (30d)</option>
+                  <option value="31536000">years</option>
+                </select>
+              </span>
+              <span id="taskCalendar" style="display:none">
+                <span id="taskDays"></span>
+                <input id="taskMonth" class="field" inputmode="numeric" placeholder="Mon" style="width:64px;display:none" />
+                <input id="taskDom" class="field" inputmode="numeric" placeholder="Day" style="width:64px;display:none" />
+                <input id="taskHour" class="field" inputmode="numeric" value="9" style="width:56px" />
+                <span style="font-size:12px;color:var(--muted)">:</span>
+                <input id="taskMinute" class="field" inputmode="numeric" value="0" style="width:56px" />
+                <select id="taskZone" class="field"></select>
+              </span>
+            </div>
+            <div class="row-actions">
+              <button class="btn primary" id="taskCreate">Create task</button>
+              <span id="taskPreview" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+            <div class="msg" id="taskMsg" style="display:none;margin-top:9px"></div>
+
+            <div class="tblWrap auto" style="margin-top:14px"><table class="data" style="min-width:0">
+              <thead><tr><th>Task</th><th>When</th><th>Last run</th><th class="num">Actions</th></tr></thead>
+              <tbody id="taskRows"></tbody>
+            </table></div>
+          </div>
+        </div><!-- /#paneWallet -->
+
         <div class="tabPane" id="paneGov" hidden>
           <!-- Eleven cards in one column was a wall. Each of these is a
                different job — reading a result, casting a market vote, choosing

@@ -29,6 +29,8 @@ deployments/arc.local.json
 .tessera-lending-market.json
 # Which venue's emissions the pot guard paused, so it only ever undoes its own.
 .tessera-emissions-guard.json
+# Standing instructions: what this deployment does on its own, and when.
+.tessera-tasks.json
 # Governance drafts and comments: operator-stored, wallet-signed, per-deployment.
 .tessera-discussions.json
 deployments/arc.history.json

@@ -65,6 +65,8 @@ import {
 import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
 import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emissions-guard.js";
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
+import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
+import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import { proposeFromSources, actionable as actionablePrices, roundsToTarget } from "./price-push.js";
@@ -1595,6 +1597,7 @@ async function main() {
       // rather than at the keeper's next pass is why the claim figure now lands
       // once instead of drifting for minutes and settling back.
       void settleNow(agentAccount.address as Hex, asset);
+      emissionsInvalidate();
       res.json({ ok: true, txHash });
     } catch (e) {
       logTx(req, {
@@ -1695,6 +1698,7 @@ async function main() {
       invalidateAll();
       // The backstop is the highest-paying side, and its shares just moved.
       void settleNow(agentAccount.address as Hex, asset);
+      emissionsInvalidate();
       res.json({ ok: true, txHash });
     } catch (e) {
       logTx(req, {
@@ -3170,7 +3174,7 @@ async function main() {
       invalidateAll();
       // Adding or removing liquidity moves the shares the LP stream pays
       // against, so the position is settled now rather than at the next sweep.
-      if (req.params.action !== "swap") void settleNowLp(agentAccount.address as Hex, poolId);
+      if (req.params.action !== "swap") { void settleNowLp(agentAccount.address as Hex, poolId); emissionsInvalidate(); }
       res.json({ ok: true, txHash });
     } catch (e) {
       logTx(req, {
@@ -5792,6 +5796,16 @@ async function main() {
     if (hit && Date.now() - hit.at < EMISSIONS_TTL) return hit.body;
     return null;
   };
+  /**
+   * Drop the cached reads the moment a transaction changes them.
+   *
+   * A 15-second cache is invisible while you are reading and infuriating the
+   * instant you act: claim your rewards and the card kept showing the balance
+   * you just claimed until the entry aged out. Anything that moves a position
+   * or pays a reward clears this, so the next poll re-reads the chain.
+   */
+  const emissionsInvalidate = () => emissionsCache.clear();
+
   const emissionsStore = (key: string, body: unknown) => {
     // Bounded: one entry per viewer seen this cycle, not one per viewer ever.
     if (emissionsCache.size > 64) emissionsCache.clear();
@@ -6200,6 +6214,7 @@ async function main() {
         detail: `${paid} to ${who} across ${assets.length} stream(s)`,
       });
       invalidateAll();
+      emissionsInvalidate();
       res.json({ ok: true, txHash, paid: paid.toString(), to: who, streams: assets.length });
     } catch (e) {
       logTx(req, { category: "defi", action: "emissions-claim", status: "failed", detail: friendlyError(e) });
@@ -6476,6 +6491,7 @@ async function main() {
         detail: `${paid} to ${who} across ${ids.length} pool(s)`,
       });
       invalidateAll();
+      emissionsInvalidate();
       res.json({ ok: true, txHash, paid: paid.toString(), to: who, pools: ids.length });
     } catch (e) {
       logTx(req, { category: "defi", action: "lp-emissions-claim", status: "failed", detail: friendlyError(e) });
@@ -6609,6 +6625,302 @@ async function main() {
       guardBusy = false;
     }
   }, GUARD_MS).unref();
+
+  /* ---- The wallet, and standing instructions --------------------------- */
+
+  /**
+   * Send what the app wallet holds, to one address or to many.
+   *
+   * Everything else in this app moves money *within* the protocol — into a
+   * pool, a vault, a swap. This is the plain one: a transfer out. It is the
+   * same signer and the same operator gate as every other write, and it is
+   * deliberately the only place that can send to an arbitrary address.
+   */
+  const isAddress = (v: unknown): v is Hex => /^0x[0-9a-fA-F]{40}$/.test(String(v));
+
+  /** Every asset this deployment knows about, with what the app wallet holds. */
+  async function walletAssets(who: Hex) {
+    const seen = new Map<string, { address: Hex; symbol: string; decimals: number }>();
+    for (const a of poolDeployment?.assets ?? []) {
+      seen.set(a.address.toLowerCase(), { address: a.address as Hex, ...assetMeta(a.address) });
+    }
+    const tsra = liveDeployment.tesseraToken as Hex | undefined;
+    if (tsra) seen.set(tsra.toLowerCase(), { address: tsra, ...assetMeta(tsra) });
+    seen.set(usdcAddress.toLowerCase(), { address: usdcAddress as Hex, ...assetMeta(usdcAddress) });
+    return Promise.all(
+      [...seen.values()].map(async (a) => {
+        let raw = 0n;
+        try {
+          raw = (await client.public.readContract({
+            address: a.address, abi: erc20Abi, functionName: "balanceOf", args: [who],
+          })) as bigint;
+        } catch {
+          // An asset that will not answer is shown as unknown rather than zero:
+          // "you have none" and "we could not ask" are different sentences.
+          return { ...a, balance: null, balanceRaw: null };
+        }
+        return { ...a, balance: fmtUnits(raw, a.decimals), balanceRaw: raw.toString() };
+      }),
+    );
+  }
+
+  app.get("/api/wallet", requireOperator, async (_req, res) => {
+    try {
+      const who = agentAccount.address as Hex;
+      res.json({ ok: true, address: who, assets: await walletAssets(who) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * One transfer, or a list of them.
+   *
+   * The bulk form is a loop rather than a batch contract call, so a bad address
+   * in position seven does not take the other six with it: each transfer
+   * reports its own outcome and the caller gets the whole picture back. The
+   * total is checked against the balance first, because discovering you are
+   * short on the fourth of ten transfers is the worst moment to find out.
+   */
+  async function sendTransfers(
+    asset: Hex,
+    list: { to: Hex; amount: bigint }[],
+  ): Promise<{ sent: { to: string; amount: string; txHash: string }[]; failed: { to: string; error: string }[] }> {
+    const meta = assetMeta(asset);
+    const who = agentAccount.address as Hex;
+    const held = (await client.public.readContract({
+      address: asset, abi: erc20Abi, functionName: "balanceOf", args: [who],
+    })) as bigint;
+    const total = list.reduce((t, x) => t + x.amount, 0n);
+    if (total > held) {
+      throw new Error(`that totals ${fmtUnits(total, meta.decimals)} ${meta.symbol} and the wallet holds ${fmtUnits(held, meta.decimals)}`);
+    }
+    const sent: { to: string; amount: string; txHash: string }[] = [];
+    const failed: { to: string; error: string }[] = [];
+    for (const row of list) {
+      try {
+        const txHash = await agentSigner.write(asset, erc20Abi, "transfer", [row.to, row.amount]);
+        sent.push({ to: row.to, amount: fmtUnits(row.amount, meta.decimals), txHash });
+      } catch (e) {
+        failed.push({ to: row.to, error: friendlyError(e) });
+      }
+    }
+    return { sent, failed };
+  }
+
+  /** Parse `[{to, amount}]` where amount is already in base units. */
+  function parseRecipients(input: unknown, cap = TASK_LIMITS.maxRecipients): { to: Hex; amount: bigint }[] {
+    const rows = Array.isArray(input) ? input : [];
+    if (rows.length > cap) throw new Error(`that is more than ${cap} recipients in one go`);
+    return rows.map((r, i) => {
+      const o = (r ?? {}) as Record<string, unknown>;
+      if (!isAddress(o.to)) throw new Error(`row ${i + 1}: "${String(o.to)}" is not an address`);
+      let amount: bigint;
+      try {
+        amount = BigInt(String(o.amount ?? "0"));
+      } catch {
+        throw new Error(`row ${i + 1}: "${String(o.amount)}" is not an amount`);
+      }
+      if (amount <= 0n) throw new Error(`row ${i + 1}: the amount must be above zero`);
+      return { to: o.to, amount };
+    });
+  }
+
+  app.post("/api/wallet/send", requireOperator, async (req, res) => {
+    try {
+      const asset = (req.body?.asset ?? usdcAddress) as Hex;
+      if (!isAddress(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
+      const list = parseRecipients([{ to: req.body?.to, amount: req.body?.amount }]);
+      const r = await sendTransfers(asset, list);
+      const ok = r.sent.length === 1;
+      logTx(req, {
+        category: "defi", action: "wallet-send", status: ok ? "success" : "failed",
+        assetAddress: asset, raw: list[0].amount, txHash: r.sent[0]?.txHash,
+        detail: ok ? `to ${list[0].to}` : r.failed[0]?.error,
+      });
+      res.status(ok ? 200 : 500).json({ ok, ...r });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  app.post("/api/wallet/send-bulk", requireOperator, async (req, res) => {
+    try {
+      const asset = (req.body?.asset ?? usdcAddress) as Hex;
+      if (!isAddress(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
+      const list = parseRecipients(req.body?.recipients);
+      if (!list.length) { res.status(400).json({ ok: false, error: "no recipients" }); return; }
+      const r = await sendTransfers(asset, list);
+      logTx(req, {
+        category: "defi", action: "wallet-send-bulk", status: r.failed.length ? "failed" : "success",
+        assetAddress: asset, txHash: r.sent[0]?.txHash,
+        detail: `${r.sent.length} sent, ${r.failed.length} failed`,
+      });
+      res.json({ ok: r.sent.length > 0, ...r });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /* ---- Scheduled tasks -------------------------------------------------- */
+
+  const taskStore = new TaskStore(statePath(".tessera-tasks.json"));
+
+  /**
+   * Carry out one task, whatever venue it belongs to.
+   *
+   * Each branch is the same call the operator's own button makes — the point of
+   * a task is *when* it happens, not what it does, so anything a task can do is
+   * something you could have pressed. Amounts are always base units, because a
+   * stored task must not depend on how a form rounded a decimal months ago.
+   */
+  async function runTask(t: Task): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
+    const p = t.params ?? {};
+    const amount = () => BigInt(String(p.amount ?? "0"));
+    const asset = () => {
+      const a = (p.asset ?? usdcAddress) as Hex;
+      if (!isAddress(a)) throw new Error("bad asset");
+      return a;
+    };
+    switch (t.venue) {
+      case "lending": {
+        if (!poolClient) throw new Error("lending is not available on this deployment");
+        const a = asset();
+        const amt = amount();
+        const txHash =
+          t.action === "supply" ? await poolClient.supply(a, amt)
+          : t.action === "withdraw" ? await poolClient.withdraw(a, amt)
+          : t.action === "borrow" ? await poolClient.borrow(a, amt)
+          : await poolClient.repay(a, amt);
+        void settleNow(agentAccount.address as Hex, a);
+        emissionsInvalidate();
+        return { ok: true, detail: `${t.action} ${fmtUnits(amt, assetMeta(a).decimals)} ${assetMeta(a).symbol}`, txHash };
+      }
+      case "vault": {
+        if (!vaultClient) throw new Error("the vault is not deployed");
+        const txHash = t.action === "deposit"
+          ? await vaultClient.deposit(amount())
+          : await vaultClient.withdrawShares(BigInt(String(p.shares ?? "0")));
+        return { ok: true, detail: `vault ${t.action}`, txHash };
+      }
+      case "swap": {
+        if (!routerClient) throw new Error("the router is not deployed");
+        const txHash = await routerClient.execute(
+          asset(), p.tokenOut as Hex, amount(), BigInt(String(p.minOut ?? "0")),
+        );
+        return { ok: true, detail: `swap ${assetMeta(asset()).symbol} → ${assetMeta(p.tokenOut as Hex).symbol}`, txHash };
+      }
+      case "amm": {
+        if (!ammClient) throw new Error("the AMM is not deployed");
+        const poolId = Number(p.poolId ?? 0);
+        const snap = lastAmm ?? (await readAmm());
+        const pool = snap.pools.find((x) => x.id === poolId);
+        if (!pool) throw new Error(`no AMM pool ${poolId}`);
+        const assets = pool.assets.map((x) => x.address);
+        if (t.action === "add") {
+          const amounts = (Array.isArray(p.amounts) ? p.amounts : []).map((v) => BigInt(String(v)));
+          if (amounts.length !== assets.length) throw new Error("provide an amount for every asset in the pool");
+          const txHash = await ammClient.addLiquidity(poolId, assets, amounts, BigInt(String(p.minShares ?? "0")));
+          void settleNowLp(agentAccount.address as Hex, poolId);
+          emissionsInvalidate();
+          return { ok: true, detail: `added liquidity to ${pool.name}`, txHash };
+        }
+        if (t.action === "remove") {
+          const txHash = await ammClient.removeLiquidity(poolId, BigInt(String(p.shares ?? "0")), assets.map(() => 0n));
+          void settleNowLp(agentAccount.address as Hex, poolId);
+          emissionsInvalidate();
+          return { ok: true, detail: `removed liquidity from ${pool.name}`, txHash };
+        }
+        const txHash = await ammClient.swap(
+          poolId, p.tokenIn as Hex, p.tokenOut as Hex, BigInt(String(p.amountIn ?? "0")), BigInt(String(p.minOut ?? "0")),
+        );
+        return { ok: true, detail: `swapped in ${pool.name}`, txHash };
+      }
+      case "wallet": {
+        const a = asset();
+        const list = t.action === "send"
+          ? parseRecipients([{ to: p.to, amount: p.amount }])
+          : parseRecipients(p.recipients);
+        const r = await sendTransfers(a, list);
+        const detail = `${r.sent.length} sent${r.failed.length ? `, ${r.failed.length} failed` : ""}`;
+        return { ok: r.sent.length > 0 && r.failed.length === 0, detail, txHash: r.sent[0]?.txHash ?? null };
+      }
+    }
+  }
+
+  /** Run it, record what happened, and never let one task's failure stop another. */
+  async function executeTask(t: Task, source: "schedule" | "manual"): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
+    try {
+      const r = await runTask(t);
+      taskStore.markRun(t.id, r.ok ? "ok" : "failed", r.detail, r.txHash);
+      try {
+        txlog.record({
+          actor: agentAccount.address as string, category: "defi", action: `task ${t.venue} ${t.action}`,
+          status: r.ok ? "success" : "failed", txHash: r.txHash ?? undefined,
+          detail: `${t.name} (${source}): ${r.detail}`,
+        });
+      } catch { /* the ledger is not the point */ }
+      invalidateAll();
+      return r;
+    } catch (e) {
+      const detail = friendlyError(e);
+      taskStore.markRun(t.id, "failed", detail);
+      console.error(`[tasks] ${t.name} failed: ${detail}`);
+      return { ok: false, detail, txHash: null };
+    }
+  }
+
+  let tasksBusy = false;
+  setInterval(async () => {
+    if (process.env.TESSERA_TASKS === "off" || tasksBusy) return;
+    const due = taskStore.due();
+    if (!due.length) return;
+    tasksBusy = true;
+    try {
+      // Sequentially: these share one wallet and one nonce, and two transfers
+      // racing each other is how a scheduler starts dropping transactions.
+      for (const t of due) await executeTask(t, "schedule");
+    } finally {
+      tasksBusy = false;
+    }
+  }, 15_000).unref?.();
+
+  app.get("/api/tasks", requireOperator, (_req, res) => {
+    res.json({
+      ok: true,
+      tasks: taskStore.view(),
+      actions: TASK_ACTIONS,
+      limits: { ...TASK_LIMITS, ...SCHEDULE_LIMITS },
+      running: process.env.TESSERA_TASKS !== "off",
+    });
+  });
+
+  app.post("/api/tasks", requireOperator, (req, res) => {
+    const r = taskStore.create(req.body ?? {});
+    if (!r.ok) { res.status(400).json(r); return; }
+    logTx(req, {
+      category: "defi", action: "task-create", status: "success",
+      detail: `${r.task.name}: ${describeSchedule(r.task.schedule)}`,
+    });
+    res.json({ ok: true, task: r.task, scheduleText: describeSchedule(r.task.schedule) });
+  });
+
+  app.post("/api/tasks/:id", requireOperator, (req, res) => {
+    const r = taskStore.update(req.params.id, req.body ?? {});
+    res.status(r.ok ? 200 : 404).json(r);
+  });
+
+  app.post("/api/tasks/:id/delete", requireOperator, (req, res) => {
+    res.json({ ok: taskStore.remove(req.params.id) });
+  });
+
+  /** Run one now, whatever its schedule says — including a manual-only task. */
+  app.post("/api/tasks/:id/run", requireOperator, async (req, res) => {
+    const t = taskStore.get(req.params.id);
+    if (!t) { res.status(404).json({ ok: false, error: "no such task" }); return; }
+    const r = await executeTask(t, "manual");
+    res.status(r.ok ? 200 : 500).json({ ok: r.ok, ...r });
+  });
 
   /* ---- Agent service fees: USDC or TSRA -------------------------------- */
 
