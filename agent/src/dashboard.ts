@@ -5973,7 +5973,12 @@ async function main() {
           decimals: rewardMeta.decimals,
           priced: rewardPriceE8 > 0n,
           balance: fmtUnits(held, rewardMeta.decimals),
+          // Raw as well as formatted: the browser signs its own claim in
+          // self-custody, so it has to be able to work out the same share of
+          // the pot the server would — see the claim handler.
+          balanceRaw: held.toString(),
           owed: fmtUnits(owed, rewardMeta.decimals),
+          owedRaw: owed.toString(),
           claimedAllTime: fmtUnits(claimed, rewardMeta.decimals),
           // Capped for display: an unbounded runway is "nothing is emitting",
           // and printing 1e77 days helps nobody.
@@ -6342,7 +6347,9 @@ async function main() {
           symbol: rewardMeta.symbol,
           decimals: rewardMeta.decimals,
           balance: fmtUnits(held, rewardMeta.decimals),
+          balanceRaw: held.toString(),
           owed: fmtUnits(owed, rewardMeta.decimals),
+          owedRaw: owed.toString(),
           claimedAllTime: fmtUnits(claimed, rewardMeta.decimals),
           runwayDays: runway > 10n ** 12n ? null : Number(runway) / 86_400,
         },

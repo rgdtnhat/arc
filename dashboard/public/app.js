@@ -1733,11 +1733,25 @@ const $ = (id) => document.getElementById(id);
           // costs gas and reverts the whole call.
           // All three sides: supply, borrow, and the backstop that takes first
           // loss and is paid the most for it.
-          const assets = [], sides = [];
+          const owedStreams = [];
           for (const a of em.assets || []) {
-            if (BigInt(a.claimableSupply || "0") > 0n) { assets.push(a.address); sides.push(0); }
-            if (BigInt(a.claimableBorrow || "0") > 0n) { assets.push(a.address); sides.push(1); }
-            if (BigInt(a.claimableBackstop || "0") > 0n) { assets.push(a.address); sides.push(2); }
+            [a.claimableSupply, a.claimableBorrow, a.claimableBackstop].forEach((v, side) => {
+              const owed = BigInt(v || "0");
+              if (owed > 0n) owedStreams.push({ address: a.address, side, owed });
+            });
+          }
+          // Your share of the pot, not the pot — see `shareOfPot`.
+          const cap = shareOfPot(em.yourClaimableRaw, em.reward && em.reward.owedRaw, em.reward && em.reward.balanceRaw);
+          const picked = pickStreams(owedStreams, cap);
+          const assets = picked.map((x) => x.address), sides = picked.map((x) => x.side);
+          if (owedStreams.length && !assets.length) {
+            const m2 = $("lnEmMsg");
+            m2.style.display = "block"; m2.style.color = "var(--warn)";
+            m2.textContent = cap === 0n
+              ? "The pot is empty, so a claim would pay nothing. What you have earned stays accrued."
+              : "Your share of what is in the pot is smaller than your smallest single stream, so claiming now " +
+                "would take more than your share. It stays accrued until the pot is refilled.";
+            return;
           }
           if (!assets.length) {
             const m = $("lnEmMsg");
@@ -1794,10 +1808,13 @@ const $ = (id) => document.getElementById(id);
            * about the money. The pot bounds the payment, so the pot bounds the
            * sentence.
            */
-          const shortPot = BigInt(em.yourPayableRaw ?? em.yourClaimableRaw ?? "0") < BigInt(em.yourClaimableRaw ?? "0");
+          const taking = picked.reduce((t, x) => t + x.owed, 0n);
+          const dp = (em.reward && em.reward.decimals) || 18;
+          const human = (Number(taking) / 10 ** dp).toFixed(6).replace(/\.?0+$/, "");
+          const shortPot = taking < BigInt(em.yourClaimableRaw || "0");
           const claimLabel =
-            `claim ${em.yourPayable ?? em.yourClaimable} ${em.reward.symbol}` +
-            (shortPot ? " (all the pot can pay today — the rest stays owed)" : "");
+            `claim ${human} ${em.reward.symbol}` +
+            (shortPot ? " (your share of the pot — the rest stays owed)" : "");
           await selfCustody("lnEmMsg", claimLabel, async (from, cfg) =>
             sendTx(
               from, cfg.emissions,
@@ -5196,6 +5213,48 @@ const $ = (id) => document.getElementById(id);
        * and is replaced by `showReceipt` in the same element, so the status of
        * a transaction is always exactly one line in one place.
        */
+      /**
+       * The caller's share of a pot that cannot pay everybody, in the browser.
+       *
+       * The server caps its own claims this way — see `claim-share.ts` — but a
+       * visitor in self-custody signs for themselves, so the server never sees
+       * the call and the cap has to exist here too. Without it the fairness rule
+       * held only for the app wallet, which is the address that needed it least:
+       * a holder with 641,528 TSRA accrued against a pot of 15,140 takes all of
+       * it in one transaction, the pot guard pauses the emission for being
+       * empty, and nobody else is ever paid. That is the loop this closes.
+       *
+       * Honest about its limits: `claim` takes no amount, so the cap is applied
+       * by choosing which streams to hand it, and anyone calling the contract
+       * directly is still first come, first served until `claim` itself pays
+       * pro-rata. Exposed on `window` so the rule can be checked from outside.
+       */
+      function shareOfPot(yourOwedRaw, totalOwedRaw, potRaw) {
+        const yours = BigInt(yourOwedRaw || "0");
+        const total = BigInt(totalOwedRaw || "0");
+        const pot = BigInt(potRaw || "0");
+        if (yours <= 0n || pot <= 0n) return 0n;
+        if (total <= pot) return yours < pot ? yours : pot;
+        const share = (pot * yours) / total;
+        return share < yours ? share : yours;
+      }
+
+      /** Largest first, taking only what fits inside the cap. */
+      function pickStreams(streams, cap) {
+        const owed = streams.reduce((t, s) => t + s.owed, 0n);
+        if (owed <= 0n || cap <= 0n) return [];
+        if (cap >= owed) return streams;
+        const sorted = [...streams].sort((a, b) => (a.owed < b.owed ? 1 : a.owed > b.owed ? -1 : 0));
+        const take = [];
+        let amount = 0n;
+        for (const st of sorted) {
+          if (amount + st.owed <= cap) { take.push(st); amount += st.owed; }
+        }
+        return take;
+      }
+      window.shareOfPot = shareOfPot;
+      window.pickStreams = pickStreams;
+
       function showBusy(id, label) {
         const el = $(id);
         if (!el) return;
@@ -7053,7 +7112,24 @@ const $ = (id) => document.getElementById(id);
         $("amEmClaim").addEventListener("click", async () => {
           const em = window.__lpEmissions;
           if (!em) return;
-          const ids = (em.pools || []).filter((p) => BigInt(p.claimable || "0") > 0n).map((p) => BigInt(p.poolId));
+          const owedPools = (em.pools || [])
+            .filter((p) => BigInt(p.claimable || "0") > 0n)
+            .map((p) => ({ poolId: BigInt(p.poolId), owed: BigInt(p.claimable) }));
+          // Your share of the pot, the same rule as the lending twin.
+          const lpCap = shareOfPot(em.yourClaimableRaw, em.reward && em.reward.owedRaw, em.reward && em.reward.balanceRaw);
+          const lpPicked = pickStreams(owedPools, lpCap);
+          const ids = lpPicked.map((x) => x.poolId);
+          if (owedPools.length && !ids.length) {
+            govMsg(
+              "amEmMsg",
+              lpCap === 0n
+                ? "The pot is empty, so a claim would pay nothing. What you have earned stays accrued."
+                : "Your share of what is in the pot is smaller than your smallest pool balance, so claiming now " +
+                  "would take more than your share. It stays accrued until the pot is refilled.",
+              "var(--warn)",
+            );
+            return;
+          }
           if (!ids.length) {
             govMsg("amEmMsg", "Nothing has accrued to claim yet.", "var(--warn)");
             return;
@@ -7083,10 +7159,12 @@ const $ = (id) => document.getElementById(id);
           }
           btn.disabled = true;
           // What will arrive, not what is owed — see the lending twin.
-          const shortPot = BigInt(em.yourPayableRaw ?? em.yourClaimableRaw ?? "0") < BigInt(em.yourClaimableRaw ?? "0");
+          const lpTaking = lpPicked.reduce((t, x) => t + x.owed, 0n);
+          const lpDp = (em.reward && em.reward.decimals) || 18;
+          const lpHuman = (Number(lpTaking) / 10 ** lpDp).toFixed(6).replace(/\.?0+$/, "");
           const claimLabel =
-            `claim ${em.yourPayable ?? em.yourClaimable} ${em.reward.symbol}` +
-            (shortPot ? " (all the pot can pay today — the rest stays owed)" : "");
+            `claim ${lpHuman} ${em.reward.symbol}` +
+            (lpTaking < BigInt(em.yourClaimableRaw || "0") ? " (your share of the pot — the rest stays owed)" : "");
           await selfCustody("amEmMsg", claimLabel, async (from, cfg) =>
             // claim(uint256[]): one dynamic array, so the head is a single
             // offset to the length word.
