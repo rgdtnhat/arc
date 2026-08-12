@@ -2994,6 +2994,27 @@ const $ = (id) => document.getElementById(id);
        * thought, not two.
        * ================================================================== */
 
+      /**
+       * `address,amount` per line, with the bad lines named rather than dropped.
+       *
+       * Both the immediate bulk send and the scheduled one read a list the same
+       * way, so they share this. Silently skipping an unreadable line is the
+       * worst option available: the transfer looks like it worked and one
+       * recipient simply never hears from you.
+       */
+      function parseRecipientList(text, decimals) {
+        const rows = [];
+        const bad = [];
+        String(text || "").split(/[\r\n;]+/).forEach((line, i) => {
+          const t = line.trim();
+          if (!t) return;
+          const [to, amt] = t.split(/[,\s]+/);
+          if (!/^0x[0-9a-fA-F]{40}$/.test(to || "") || !(parseFloat(amt) > 0)) { bad.push(i + 1); return; }
+          rows.push({ to, amount: toRaw(amt, decimals) });
+        });
+        return { rows, bad };
+      }
+
       let walletAssets = [];
 
       async function loadWallet() {
@@ -3055,19 +3076,7 @@ const $ = (id) => document.getElementById(id);
         });
 
         /** `address,amount` per line — the shape people already paste from a sheet. */
-        const parseBulk = () => {
-          const dec = walDecimals($("walSendAsset").value);
-          const rows = [];
-          const bad = [];
-          $("walBulk").value.split(/\r?\n/).forEach((line, i) => {
-            const t = line.trim();
-            if (!t) return;
-            const [to, amt] = t.split(/[,\s]+/);
-            if (!/^0x[0-9a-fA-F]{40}$/.test(to || "") || !(parseFloat(amt) > 0)) { bad.push(i + 1); return; }
-            rows.push({ to, amount: toRaw(amt, dec) });
-          });
-          return { rows, bad };
-        };
+        const parseBulk = () => parseRecipientList($("walBulk").value, walDecimals($("walSendAsset").value));
         $("walBulk").addEventListener("input", () => {
           const { rows, bad } = parseBulk();
           $("walBulkCount").textContent =
@@ -3117,7 +3126,18 @@ const $ = (id) => document.getElementById(id);
             return `<select class="field" data-tp="${f}">${assetOptions}</select>`;
           }
           if (f === "recipients") {
-            return `<input class="field" data-tp="${f}" placeholder="0x…,1.5; 0x…,2" style="min-width:220px" />`;
+            /*
+             * A list needs room to be a list.
+             *
+             * This was a single-line input, which meant the newline separator
+             * the parser looks for could never be typed and a list of twenty
+             * addresses had to be scrolled through a 220px box. It is the same
+             * editor as the send form above, so a list pasted from a sheet
+             * works in both places.
+             */
+            return `<textarea class="field" data-tp="${f}" rows="4" placeholder="0xabc…,1.5&#10;0xdef…,2" ` +
+              `style="width:100%;font-family:var(--mono,monospace);font-size:12px"></textarea>` +
+              `<span id="taskRecipCount" style="font-size:11.5px;color:var(--muted)"></span>`;
           }
           const ph = { amount: "Amount", amountIn: "Amount in", shares: "Shares", poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient" }[f] || f;
           return `<input class="field" data-tp="${f}" placeholder="${esc(ph)}" style="min-width:${f === "to" ? 210 : 120}px" />`;
@@ -3133,13 +3153,16 @@ const $ = (id) => document.getElementById(id);
         const dec = (a) => walDecimals(a || $("walSendAsset").value);
         if (out.amount !== undefined) out.amount = toRaw(out.amount || "0", dec(out.asset));
         if (out.amountIn !== undefined) out.amountIn = toRaw(out.amountIn || "0", dec(out.tokenIn));
-        if (out.amounts !== undefined) out.amounts = String(out.amounts).split(/[,\s]+/).filter(Boolean).map((v) => toRaw(v, 6));
-        if (out.recipients !== undefined) {
-          out.recipients = String(out.recipients).split(/[;\n]+/).map((r) => r.trim()).filter(Boolean).map((r) => {
-            const [to, amt] = r.split(/[,\s]+/);
-            return { to, amount: toRaw(amt || "0", dec(out.asset)) };
-          });
+        if (out.amounts !== undefined) {
+          // Each amount against its own asset's decimals. Six for everything
+          // turned an 18-decimal deposit into dust and a task that would have
+          // added nothing to the pool for as long as it kept running.
+          const pool = ((window.__amm && window.__amm.pools) || []).find((x) => String(x.id) === String(out.poolId ?? 0));
+          const decs = pool ? pool.assets.map((a) => a.decimals) : [];
+          out.amounts = String(out.amounts).split(/[,\s]+/).filter(Boolean)
+            .map((v, i) => toRaw(v, decs[i] !== undefined ? decs[i] : 6));
         }
+        if (out.recipients !== undefined) out.recipients = parseRecipientList(out.recipients, dec(out.asset)).rows;
         if (venue === "amm" || action === "remove") out.poolId = Number(out.poolId || 0);
         return out;
       }
@@ -3242,8 +3265,35 @@ const $ = (id) => document.getElementById(id);
         }
         window.previewTask = previewTask;
 
+        // Count the list as it is typed, and name the lines that will not parse.
+        $("taskParamRow").addEventListener("input", (e) => {
+          if (!e.target.matches('[data-tp="recipients"]')) return;
+          const el = $("taskRecipCount");
+          if (!el) return;
+          const { rows, bad } = parseRecipientList(e.target.value, 6);
+          el.textContent = `${rows.length} recipient${rows.length === 1 ? "" : "s"}` +
+            (bad.length ? ` · line ${bad.join(", ")} unreadable` : "");
+        });
+
         $("taskCreate").addEventListener("click", async () => {
           const btn = $("taskCreate");
+          /*
+           * Refuse a broken list here, not when it fires.
+           *
+           * A task is written once and runs unattended afterwards, so a bad
+           * address that is only caught at run time is discovered in a log at
+           * whatever hour the schedule chose. The form knows now.
+           */
+          const recipEl = $("taskParamRow").querySelector('[data-tp="recipients"]');
+          if (recipEl) {
+            const { rows, bad } = parseRecipientList(recipEl.value, 6);
+            if (bad.length) return showReceipt("taskMsg", false, `line ${bad.join(", ")} is not "address,amount"`);
+            if (!rows.length) return showReceipt("taskMsg", false, "add at least one recipient");
+          }
+          const toEl = $("taskParamRow").querySelector('[data-tp="to"]');
+          if (toEl && !/^0x[0-9a-fA-F]{40}$/.test(toEl.value.trim())) {
+            return showReceipt("taskMsg", false, "that is not an address");
+          }
           btn.disabled = true;
           showBusy("taskMsg", "saving the task…");
           try {

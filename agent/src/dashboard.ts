@@ -6849,7 +6849,20 @@ async function main() {
           ? parseRecipients([{ to: p.to, amount: p.amount }])
           : parseRecipients(p.recipients);
         const r = await sendTransfers(a, list);
-        const detail = `${r.sent.length} sent${r.failed.length ? `, ${r.failed.length} failed` : ""}`;
+        /*
+         * Every recipient, not just the first.
+         *
+         * A bulk transfer is one transaction per recipient, and reporting only
+         * `sent[0]` left a ten-address payroll with one hash in the ledger and
+         * nine transfers nobody could point at. The detail carries each
+         * recipient and what they were paid; the row's link is the first, since
+         * a table cell holds one.
+         */
+        const paid = r.sent.map((x) => `${x.amount}→${x.to.slice(0, 8)}…`).join(" ");
+        const detail =
+          `${r.sent.length} sent${r.failed.length ? `, ${r.failed.length} failed` : ""}` +
+          (paid ? `: ${paid}` : "") +
+          (r.failed.length ? ` · ${r.failed.map((f) => `${f.to.slice(0, 8)}… ${f.error}`).join("; ")}` : "");
         return { ok: r.sent.length > 0 && r.failed.length === 0, detail, txHash: r.sent[0]?.txHash ?? null };
       }
     }
@@ -6903,6 +6916,28 @@ async function main() {
   });
 
   app.post("/api/tasks", requireOperator, (req, res) => {
+    /*
+     * Check the parameters now, not at the hour the task chooses.
+     *
+     * `TaskStore` validates the venue and the verb, which is what it can know
+     * on its own. Whether an address is an address is something this half
+     * knows, and a transfer task with a typo in it is otherwise a working task
+     * right up until the night it runs.
+     */
+    const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
+    if (body.venue === "wallet") {
+      try {
+        if (body.action === "bulk") {
+          const list = parseRecipients(body.params?.recipients);
+          if (!list.length) { res.status(400).json({ ok: false, error: "no recipients" }); return; }
+        } else {
+          parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
+        }
+      } catch (e) {
+        res.status(400).json({ ok: false, error: friendlyError(e) });
+        return;
+      }
+    }
     const r = taskStore.create(req.body ?? {});
     if (!r.ok) { res.status(400).json(r); return; }
     logTx(req, {
