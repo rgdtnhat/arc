@@ -48,6 +48,7 @@ const assetRegistry = readArtifact("TesseraAssetRegistry");
 const keeper = readArtifact("TesseraKeeper");
 const providerStake = readArtifact("TesseraProviderStake");
 const twapOracle = readArtifact("TesseraTwapOracle");
+const sessionKeys = readArtifact("TesseraSessionKeys");
 const backstop = readArtifact("TesseraBackstop");
 
 const outDir = path.resolve(root, "..", "shared", "src");
@@ -85,6 +86,7 @@ const abiTs =
   `export const tesseraAssetRegistryAbi = ${JSON.stringify(assetRegistry.abi)} as const;\n` +
   `export const tesseraKeeperAbi = ${JSON.stringify(keeper.abi)} as const;\n` +
   `export const tesseraProviderStakeAbi = ${JSON.stringify(providerStake.abi)} as const;\n` +
+  `export const tesseraSessionKeysAbi = ${JSON.stringify(sessionKeys.abi)} as const;\n` +
   `export const tesseraTwapOracleAbi = ${JSON.stringify(twapOracle.abi)} as const;\n` +
   `export const tesseraBackstopAbi = ${JSON.stringify(backstop.abi)} as const;\n`;
 fs.writeFileSync(path.join(outDir, "abi.ts"), abiTs);
@@ -122,6 +124,7 @@ const bytecodeTs =
   `export const tesseraAssetRegistryBytecode = "${assetRegistry.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraKeeperBytecode = "${keeper.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraProviderStakeBytecode = "${providerStake.bytecode}" as \`0x\${string}\`;\n` +
+  `export const tesseraSessionKeysBytecode = "${sessionKeys.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraTwapOracleBytecode = "${twapOracle.bytecode}" as \`0x\${string}\`;\n` +
   `export const tesseraBackstopBytecode = "${backstop.bytecode}" as \`0x\${string}\`;\n`;
 fs.writeFileSync(path.join(outDir, "bytecode.ts"), bytecodeTs);

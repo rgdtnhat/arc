@@ -68,7 +68,10 @@ export const TASK_ACTIONS: Record<TaskVenue, string[]> = {
   amm: ["add", "remove", "swap"],
   vault: ["deposit", "withdraw"],
   swap: ["swap"],
-  wallet: ["send", "bulk"],
+  // `sessionSend` and `sessionBulk` pay out of a *visitor's* wallet through a
+  // session key they delegated, rather than out of the app wallet. Same shape,
+  // different funding address and a cap the visitor set and can revoke.
+  wallet: ["send", "bulk", "sessionSend", "sessionBulk"],
 };
 
 export class TaskStore {

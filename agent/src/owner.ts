@@ -51,6 +51,17 @@ export class OwnerClient {
    * `WALLET_MODE=circle` deployment keeps signing through Circle rather than
    * quietly falling back to a raw key.
    */
+  /**
+   * A signer built from a key that is not the deployer's.
+   *
+   * The session key is the case this exists for: an address whose whole
+   * authority is what other wallets have delegated to it, which must never be
+   * the deployer and must still get this class's gas margin and receipt check.
+   */
+  static fromKey(chain: Chain, rpcUrl: string, key: Hex): OwnerClient {
+    return new OwnerClient(chain, rpcUrl, key);
+  }
+
   static forAccount(chain: Chain, rpcUrl: string, account: Account): OwnerClient {
     return new OwnerClient(chain, rpcUrl, account);
   }

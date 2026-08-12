@@ -21,6 +21,7 @@ import {
   tesseraRegistryAbi,
   tesseraEmissionsAbi,
   tesseraLpEmissionsAbi,
+  tesseraSessionKeysAbi,
   tesseraGaugeAbi,
   tesseraServiceFeesAbi,
   tesseraAssetRegistryAbi,
@@ -1033,6 +1034,24 @@ async function main() {
       [/noauction/, "There is no open auction for that account."],
       [/auctionexists/, "That account already has an open auction. Fill it or cancel it first."],
       [/stilllocked/, "Those backstop shares are still in the queue period. They unlock 21 days after they were queued."],
+      /*
+       * Session-key refusals, before the generic allowance rule below.
+       *
+       * Every one of these is a limit the wallet's owner set on purpose, and
+       * naming the wrong one is worse than saying nothing: a cap that had run
+       * out was being reported as "approve the spender first", which sends
+       * somebody to re-approve a contract that is working exactly as asked.
+       * The `allowance` rule matched because the honest explanation of a cap
+       * mentions the allowance as one of the three things that bind.
+       */
+      [/pertxexceeded/, "That is more than this session's per-transfer limit. Send a smaller amount, or open a session with a higher limit."],
+      [/capexceeded/, "This session has spent its whole cap. Open a new one to keep paying from that wallet."],
+      [/sessionexpired/, "This session has expired. Open a new one to keep paying from that wallet."],
+      [/sessionrevokederror|sessionrevoked|has been revoked/, "The wallet's owner revoked this session, so it can no longer spend."],
+      [/session (has expired|can pay)|no such session|delegated to a different key/, ""],
+      [/notsessionkey/, "This server is not the key that session was delegated to."],
+      [/recipientnotallowed/, "That recipient is not on this session's allow-list."],
+      [/whichever binds first/, ""],
       [/allowance|transferfrom/, "Token approval failed — approve the spender first, or check the wallet holds enough of that token."],
       [/exceeds balance|insufficient balance|\bbalance\b/, "Not enough balance for that amount."],
       [/insufficient funds|gas required|out of gas/, "Not enough USDC to cover network fees. Top up the wallet at faucet.circle.com."],
@@ -1040,7 +1059,10 @@ async function main() {
       [/user rejected|user denied/, "You cancelled the transaction in your wallet."],
       [/reverted/, "The contract rejected this transaction. Double-check the amount and try again."],
     ];
-    for (const [re, msg] of table) if (re.test(s)) return msg;
+    // An empty entry marks a message this app wrote itself: it is already the
+    // sentence we want, and running it through the table would replace a
+    // precise reason with a generic one.
+    for (const [re, msg] of table) if (re.test(s)) return msg || raw.split("\n")[0].slice(0, 200);
     // Unknown cause: give a short, single-line hint rather than a stack dump.
     return "That transaction didn't go through. " + raw.split("\n")[0].slice(0, 120);
   }
@@ -6671,6 +6693,136 @@ async function main() {
     );
   }
 
+  /* ---- Session keys: scheduling from a wallet whose key we never hold ---- */
+
+  /**
+   * The signer a visitor delegates to, and nothing more.
+   *
+   * A scheduled transfer has to be signed while nobody is present. For the app
+   * wallet that is fine — the server holds that key on purpose. For a visitor's
+   * wallet it is not, and "give us your MetaMask key" is not an answer worth
+   * offering. `TesseraSessionKeys` is the answer that does not need it: the
+   * visitor authorises this address to move one asset out of their wallet, up
+   * to a cap, until an expiry, revocable at any moment, and nothing else.
+   *
+   * It is deliberately a *different* address from the app wallet. If the two
+   * were the same, a visitor inspecting their session would be granting a
+   * spending allowance to the address that already runs the protocol, and the
+   * blast radius of one leaked key would cover both. This one can do exactly
+   * what the sessions naming it allow and nothing more, which is what makes it
+   * safe to publish and safe to hand out.
+   */
+  const sessionKeysAddr = (liveDeployment.tesseraSessionKeys as Hex) ?? null;
+  const sessionSigner = process.env.SESSION_KEY_PRIVATE_KEY
+    ? OwnerClient.fromKey(chain, rpcUrl, process.env.SESSION_KEY_PRIVATE_KEY as Hex)
+    : null;
+
+  /** Everything a page needs to show, or a task needs to spend against. */
+  async function readSession(id: Hex) {
+    if (!sessionKeysAddr) return null;
+    const s = (await client.public.readContract({
+      address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "sessions", args: [id],
+    })) as readonly [Hex, Hex, Hex, bigint, bigint, bigint, bigint, boolean, boolean];
+    if (s[0] === "0x0000000000000000000000000000000000000000") return null;
+    const spendable = (await client.public.readContract({
+      address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "spendable", args: [id],
+    })) as bigint;
+    const meta = assetMeta(s[2]);
+    return {
+      id,
+      owner: s[0], key: s[1], asset: s[2],
+      symbol: meta.symbol, decimals: meta.decimals,
+      cap: fmtUnits(s[3], meta.decimals), capRaw: s[3].toString(),
+      spent: fmtUnits(s[4], meta.decimals), spentRaw: s[4].toString(),
+      perTxMax: fmtUnits(s[5], meta.decimals), perTxMaxRaw: s[5].toString(),
+      expiry: Number(s[6]),
+      revoked: s[7],
+      restricted: s[8],
+      // What can actually be paid: the cap, the allowance and the balance,
+      // whichever binds first. See the contract's note on why all three.
+      spendable: fmtUnits(spendable, meta.decimals),
+      spendableRaw: spendable.toString(),
+      // Ours to spend, or somebody else's delegation that we merely can see.
+      ours: Boolean(sessionSigner && s[1].toLowerCase() === sessionSigner.account.address.toLowerCase()),
+    };
+  }
+
+  /** The address a visitor should delegate to, so the page can show it. */
+  app.get("/api/sessions/key", (_req, res) => {
+    res.json({
+      ok: true,
+      contract: sessionKeysAddr,
+      key: sessionSigner ? (sessionSigner.account.address as Hex) : null,
+      note: sessionSigner
+        ? undefined
+        : "No session key is configured on this server, so scheduling from your own wallet is unavailable. " +
+          "Set SESSION_KEY_PRIVATE_KEY to enable it.",
+    });
+  });
+
+  /** Every session a wallet has opened. Public: they are the owner's own. */
+  app.get("/api/sessions", async (req, res) => {
+    if (!sessionKeysAddr) { res.json({ ok: true, deployed: false, sessions: [] }); return; }
+    const owner = String(req.query.owner ?? "");
+    if (!isAddress(owner)) { res.status(400).json({ ok: false, error: "owner must be an address" }); return; }
+    try {
+      const ids = (await client.public.readContract({
+        address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "sessionsOf", args: [owner as Hex],
+      })) as readonly Hex[];
+      const rows = [];
+      for (const id of ids) {
+        const r = await readSession(id);
+        if (r) rows.push(r);
+      }
+      res.json({ ok: true, deployed: true, key: sessionSigner ? sessionSigner.account.address : null, sessions: rows });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
+  /**
+   * Spend against a session — the one thing the session key is for.
+   *
+   * Every limit is enforced on-chain; this checks them first only so a refusal
+   * arrives as a sentence rather than as a reverted transaction the caller paid
+   * for. The signer is the session key, never the app wallet: an operator
+   * pressing this cannot reach a wallet that has not delegated to it.
+   */
+  async function spendFromSession(id: Hex, to: Hex, amount: bigint) {
+    if (!sessionKeysAddr) throw new Error("session keys are not deployed on this network");
+    if (!sessionSigner) throw new Error("this server has no session key configured");
+    const s = await readSession(id);
+    if (!s) throw new Error("no such session");
+    if (!s.ours) throw new Error("that session is delegated to a different key, not to this server");
+    if (s.revoked) throw new Error("that session has been revoked by its owner");
+    if (s.expiry * 1000 < Date.now()) throw new Error("that session has expired");
+    if (BigInt(s.spendableRaw) < amount) {
+      throw new Error(
+        `that session can pay ${s.spendable} ${s.symbol} right now — its cap, the wallet's allowance or its balance, whichever binds first`,
+      );
+    }
+    return sessionSigner.write(sessionKeysAddr, tesseraSessionKeysAbi, "spend", [id, to, amount]);
+  }
+
+  app.post("/api/sessions/spend", requireOperator, async (req, res) => {
+    try {
+      const id = String(req.body?.id ?? "") as Hex;
+      const to = req.body?.to as Hex;
+      if (!/^0x[0-9a-fA-F]{64}$/.test(id)) { res.status(400).json({ ok: false, error: "bad session id" }); return; }
+      if (!isAddress(to)) { res.status(400).json({ ok: false, error: "bad recipient" }); return; }
+      const amount = BigInt(String(req.body?.amount ?? "0"));
+      if (amount <= 0n) { res.status(400).json({ ok: false, error: "amount must be above zero" }); return; }
+      const txHash = await spendFromSession(id, to, amount);
+      logTx(req, {
+        category: "defi", action: "session-spend", status: "success", txHash,
+        detail: `${amount} from session ${id.slice(0, 10)}… to ${to}`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   app.get("/api/wallet", requireOperator, async (_req, res) => {
     try {
       const who = agentAccount.address as Hex;
@@ -6845,6 +6997,38 @@ async function main() {
       }
       case "wallet": {
         const a = asset();
+        /*
+         * Two funding addresses, one shape.
+         *
+         * `send`/`bulk` spend the app wallet. `sessionSend`/`sessionBulk` spend
+         * a visitor's wallet through the session they opened — same list, same
+         * schedule, but the money leaves an address whose key this server has
+         * never seen, within a cap that wallet set and can revoke at any time.
+         */
+        if (t.action === "sessionSend" || t.action === "sessionBulk") {
+          const id = String(p.sessionId ?? "") as Hex;
+          if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("that task has no session id");
+          const list = t.action === "sessionSend"
+            ? parseRecipients([{ to: p.to, amount: p.amount }])
+            : parseRecipients(p.recipients);
+          const sent: string[] = [];
+          const failed: string[] = [];
+          let first: string | null = null;
+          for (const row of list) {
+            try {
+              const txHash = await spendFromSession(id, row.to, row.amount);
+              first ??= txHash;
+              sent.push(`${fmtUnits(row.amount, assetMeta(a).decimals)}→${row.to.slice(0, 8)}…`);
+            } catch (e) {
+              failed.push(`${row.to.slice(0, 8)}… ${friendlyError(e)}`);
+            }
+          }
+          const detail =
+            `${sent.length} sent from the delegated wallet${failed.length ? `, ${failed.length} failed` : ""}` +
+            (sent.length ? `: ${sent.join(" ")}` : "") +
+            (failed.length ? ` · ${failed.join("; ")}` : "");
+          return { ok: sent.length > 0 && failed.length === 0, detail, txHash: first };
+        }
         const list = t.action === "send"
           ? parseRecipients([{ to: p.to, amount: p.amount }])
           : parseRecipients(p.recipients);
@@ -6915,7 +7099,7 @@ async function main() {
     });
   });
 
-  app.post("/api/tasks", requireOperator, (req, res) => {
+  app.post("/api/tasks", requireOperator, async (req, res) => {
     /*
      * Check the parameters now, not at the hour the task chooses.
      *
@@ -6927,7 +7111,19 @@ async function main() {
     const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
     if (body.venue === "wallet") {
       try {
-        if (body.action === "bulk") {
+        if (body.action === "sessionSend" || body.action === "sessionBulk") {
+          const id = String(body.params?.sessionId ?? "");
+          if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("choose a session to spend from");
+          const s0 = await readSession(id as Hex);
+          if (!s0) throw new Error("no such session");
+          if (!s0.ours) throw new Error("that session is delegated to a different key");
+          if (s0.revoked) throw new Error("that session has been revoked");
+          if (body.action === "sessionBulk") {
+            if (!parseRecipients(body.params?.recipients).length) throw new Error("no recipients");
+          } else {
+            parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
+          }
+        } else if (body.action === "bulk") {
           const list = parseRecipients(body.params?.recipients);
           if (!list.length) { res.status(400).json({ ok: false, error: "no recipients" }); return; }
         } else {
