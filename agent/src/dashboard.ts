@@ -64,6 +64,7 @@ import {
 } from "./keeper.js";
 import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
 import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emissions-guard.js";
+import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import { proposeFromSources, actionable as actionablePrices, roundsToTarget } from "./price-push.js";
@@ -3856,11 +3857,37 @@ async function main() {
     })) as Hex;
     const ownerAddr = owner.account.address as Hex;
     if (treasury.toLowerCase() !== ownerAddr.toLowerCase()) {
-      const note =
-        treasury.toLowerCase() === collector.toLowerCase()
-          ? `the pool pays its take rate to the fee collector (${collector}), which has no way to withdraw from the ` +
-            `pool — point the pool's treasury at the deployer (${ownerAddr}) and this will forward it on`
-          : `the pool's treasury is ${treasury}, which this server cannot sign for`;
+      /*
+       * The collector as treasury is not a preference, it is a dead end.
+       *
+       * Every other misrouting is a choice somebody could have meant — pay the
+       * take rate to a multisig, to a grant wallet, anywhere. Naming the
+       * collector is the one configuration that cannot work at all: it splits
+       * only tokens it holds and has no way to withdraw from the pool, so the
+       * revenue accrues somewhere it can never leave. Waiting for an operator
+       * to press a button to undo an impossibility is how it stayed broken
+       * across two deploys, so this repairs it and says loudly that it did.
+       */
+      if (treasury.toLowerCase() === collector.toLowerCase()) {
+        try {
+          const txHash = await owner.write(poolAddr, tesseraPoolAbi, "setTreasury", [ownerAddr]);
+          console.log(`[fees] the pool was paying its take rate into the collector, which cannot withdraw it — routed to ${ownerAddr} ${txHash}`);
+          try {
+            txlog.record({
+              actor: ownerAddr, category: "defi", action: "fee-route", status: "success", txHash,
+              detail: `pool treasury ${treasury} -> ${ownerAddr} (the collector cannot withdraw from the pool)`,
+            });
+          } catch { /* the log is not the point */ }
+          // Fall through: the next sweep harvests. Nothing has accrued to the
+          // new treasury yet, so there is nothing to move this pass.
+          return { moved: [], note: "routed the pool's take rate to the app wallet; collection starts from here" };
+        } catch (e) {
+          const why = `could not route the pool's treasury away from the collector: ${String(e).slice(0, 140)}`;
+          if (!harvestWarned) { harvestWarned = true; console.error(`[fees] ${why}`); }
+          return { moved: [], note: why };
+        }
+      }
+      const note = `the pool's treasury is ${treasury}, which this server cannot sign for`;
       if (!harvestWarned) {
         harvestWarned = true;
         console.error(`[fees] protocol revenue is not reaching the collector: ${note}`);
@@ -3910,6 +3937,11 @@ async function main() {
     return { moved };
   }
 
+  // A sweep shortly after boot, so a broken route is repaired on the deploy that
+  // ships the repair rather than half an hour later.
+  setTimeout(() => {
+    if (process.env.TESSERA_FEE_HARVEST !== "off") void harvestProtocolFees().catch(() => {});
+  }, 45_000).unref?.();
   setInterval(async () => {
     if (process.env.TESSERA_FEE_HARVEST === "off" || harvestBusy) return;
     harvestBusy = true;
@@ -5739,11 +5771,42 @@ async function main() {
    * lends and liquidates against — mixing in a second price source here would
    * make the badge disagree with the borrow limit two panels up.
    */
+  /*
+   * Emissions reads, cached per viewer for one read cycle.
+   *
+   * Both emissions panels poll, every open tab polls independently, and each
+   * request fans out to three streams per reserve plus the reward metadata —
+   * roughly forty `eth_call`s. On Arc's public endpoint that is what tips the
+   * whole app into "Request exceeds defined limit", which then surfaces
+   * everywhere at once: a claim that will not send, an agent run that dies
+   * mid-multicall, a panel that blanks. The chain state these read moves once a
+   * block, so serving a few seconds old to a second poller costs nothing and
+   * removes most of the traffic.
+   *
+   * Keyed by viewer, because the payload carries that viewer's own balances.
+   */
+  const emissionsCache = new Map<string, { at: number; body: unknown }>();
+  const EMISSIONS_TTL = live ? 15_000 : 500;
+  const emissionsCached = (key: string): unknown | null => {
+    const hit = emissionsCache.get(key);
+    if (hit && Date.now() - hit.at < EMISSIONS_TTL) return hit.body;
+    return null;
+  };
+  const emissionsStore = (key: string, body: unknown) => {
+    // Bounded: one entry per viewer seen this cycle, not one per viewer ever.
+    if (emissionsCache.size > 64) emissionsCache.clear();
+    emissionsCache.set(key, { at: Date.now(), body });
+    return body;
+  };
+
   app.get("/api/lending/emissions", async (req, res) => {
     if (!emissionsAddr || !poolDeployment) {
       res.json({ ok: true, deployed: false, note: "No emissions contract on this deployment." });
       return;
     }
+    const cacheKey = `ln:${String(req.query.user ?? "")}`;
+    const cached = emissionsCached(cacheKey);
+    if (cached) { res.json(cached); return; }
     try {
       const user = String(req.query.user ?? "");
       const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
@@ -5880,7 +5943,7 @@ async function main() {
 
       const claimable = rows.reduce(
         (t, r) => t + BigInt(r.claimableSupply) + BigInt(r.claimableBorrow) + BigInt(r.claimableBackstop), 0n);
-      res.json({
+      const body = {
         ok: true,
         deployed: true,
         configured: true,
@@ -5918,7 +5981,8 @@ async function main() {
         yourPayable: fmtUnits(claimable < held ? claimable : held, rewardMeta.decimals),
         yourPayableRaw: (claimable < held ? claimable : held).toString(),
         assets: rows,
-      });
+      };
+      res.json(emissionsStore(cacheKey, body));
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -6054,18 +6118,17 @@ async function main() {
        * checkpoint for nothing — so the set is computed from what the chain
        * says is owed, not from what the page last rendered.
        */
-      const assets: Hex[] = [];
-      const sides: number[] = [];
+      const owedStreams: { key: string; owed: bigint; asset: Hex; side: number }[] = [];
       for (const a of poolDeployment?.assets ?? []) {
         for (const side of [0, 1, 2]) {
           const owed = (await client.public.readContract({
             address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "claimable",
             args: [who, a.address as Hex, side],
           })) as bigint;
-          if (owed > 0n) { assets.push(a.address as Hex); sides.push(side); }
+          if (owed > 0n) owedStreams.push({ key: `${a.address}:${side}`, owed, asset: a.address as Hex, side });
         }
       }
-      if (!assets.length) {
+      if (!owedStreams.length) {
         res.status(400).json({ ok: false, error: `nothing has accrued to ${who} yet` });
         return;
       }
@@ -6092,6 +6155,33 @@ async function main() {
         });
         return;
       }
+
+      /*
+       * Take a share of the pot, not the pot.
+       *
+       * `claim` pays `min(accrued, held)`, which is first come, first served:
+       * one address emptied the pot on every refill, the guard then paused the
+       * emission because the pot was empty, and nobody else was ever paid.
+       * Rewards accrue in proportion to each holder's share of the market, and
+       * a payout queue that ignores that proportion undoes it at the last step.
+       *
+       * The contract takes no amount, so the cap is applied by choosing which
+       * streams to hand it — see `claim-share.ts` for what that can and cannot
+       * guarantee.
+       */
+      const totalOwedAll = (await client.public.readContract({
+        address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "totalOwed",
+      })) as bigint;
+      const yourOwed = owedStreams.reduce((t, x) => t + x.owed, 0n);
+      const plan = planClaimShare(owedStreams, proRataCap(yourOwed, totalOwedAll, potHeld));
+      if (!plan.take.length) {
+        res.status(400).json({ ok: false, error: plan.reason, cap: plan.cap.toString() });
+        return;
+      }
+      const chosen = new Set(plan.take.map((t) => t.key));
+      const picked = owedStreams.filter((x) => chosen.has(x.key));
+      const assets = picked.map((x) => x.asset);
+      const sides = picked.map((x) => x.side);
 
       const before = (await client.public.readContract({
         address: reward, abi: erc20Abi, functionName: "balanceOf", args: [who],
@@ -6134,6 +6224,9 @@ async function main() {
       res.json({ ok: true, deployed: false, note: "No AMM emissions contract on this deployment." });
       return;
     }
+    const cacheKey = `lp:${String(req.query.user ?? "")}`;
+    const cachedLp = emissionsCached(cacheKey);
+    if (cachedLp) { res.json(cachedLp); return; }
     try {
       const user = String(req.query.user ?? "");
       const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
@@ -6221,7 +6314,7 @@ async function main() {
       );
 
       const claimable = rows.reduce((t, r) => t + BigInt(r.claimable), 0n);
-      res.json({
+      const body = {
         ok: true,
         deployed: true,
         configured: true,
@@ -6244,7 +6337,8 @@ async function main() {
         yourPayable: fmtUnits(claimable < held ? claimable : held, rewardMeta.decimals),
         yourPayableRaw: (claimable < held ? claimable : held).toString(),
         pools: rows,
-      });
+      };
+      res.json(emissionsStore(cacheKey, body));
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -6326,7 +6420,7 @@ async function main() {
       const count = Number(await client.public.readContract({
         address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "streamedPoolCount",
       }));
-      const ids: bigint[] = [];
+      const owedPools: { key: string; owed: bigint; poolId: bigint }[] = [];
       for (let i = 0; i < count; i++) {
         const poolId = (await client.public.readContract({
           address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "streamedPools", args: [BigInt(i)],
@@ -6334,9 +6428,9 @@ async function main() {
         const owed = (await client.public.readContract({
           address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "claimable", args: [who, poolId],
         })) as bigint;
-        if (owed > 0n) ids.push(poolId);
+        if (owed > 0n) owedPools.push({ key: String(poolId), owed, poolId });
       }
-      if (!ids.length) {
+      if (!owedPools.length) {
         res.status(400).json({ ok: false, error: `nothing has accrued to ${who} yet` });
         return;
       }
@@ -6354,6 +6448,19 @@ async function main() {
         });
         return;
       }
+
+      // And the same share of the pot rather than the pot — see the lending twin.
+      const totalOwedAll = (await client.public.readContract({
+        address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "totalOwed",
+      })) as bigint;
+      const yourOwed = owedPools.reduce((t, x) => t + x.owed, 0n);
+      const plan = planClaimShare(owedPools, proRataCap(yourOwed, totalOwedAll, potHeld));
+      if (!plan.take.length) {
+        res.status(400).json({ ok: false, error: plan.reason, cap: plan.cap.toString() });
+        return;
+      }
+      const chosen = new Set(plan.take.map((t) => t.key));
+      const ids = owedPools.filter((x) => chosen.has(x.key)).map((x) => x.poolId);
 
       const before = (await client.public.readContract({
         address: reward, abi: erc20Abi, functionName: "balanceOf", args: [who],
@@ -9685,7 +9792,19 @@ async function main() {
     running = true;
     res.json({ started: true });
     runScenario()
-      .catch((e) => pushEvent({ source: "agent", ts: Date.now(), level: "info", message: `error: ${e}` } as UiEvent))
+      /*
+       * A sentence, not a JSON-RPC dump.
+       *
+       * `${e}` on a viem error prints the ABI, the encoded calldata and the
+       * whole request body — hundreds of lines of hex in the activity feed,
+       * where the one fact that mattered ("the RPC refused the read") was
+       * buried at the top. `friendlyError` already turns these into the
+       * sentence the rest of the app shows.
+       */
+      .catch((e) => pushEvent({
+        source: "agent", ts: Date.now(), level: "info",
+        message: `error: ${friendlyError(e)}`,
+      } as UiEvent))
       .finally(() => {
         running = false;
       });

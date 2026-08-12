@@ -27,8 +27,20 @@ import { http, type HttpTransportConfig, type Transport } from "viem";
  *   ARC_RPC_RETRY_BUDGET_MS  total time one call may spend incl. backoff (15000)
  */
 
-const MIN_INTERVAL_MS = Number(process.env.ARC_RPC_MIN_INTERVAL_MS ?? 180);
-const MAX_RETRIES = Number(process.env.ARC_RPC_MAX_RETRIES ?? 6);
+/*
+ * 260ms ≈ 3.8 requests a second.
+ *
+ * 180 was set against an endpoint that tolerated it, and stopped being enough
+ * once the app grew the reads it has now — emissions polling, holder scans, the
+ * keeper's checkpoints. "Request exceeds defined limit" then surfaced
+ * everywhere at once, because everything shares this gate: a claim that would
+ * not send, an agent run dying mid-multicall, a panel blanking. Pacing slightly
+ * slower costs a fraction of a second on a page that already renders from
+ * cache, and it is the difference between a read succeeding and a read being
+ * refused.
+ */
+const MIN_INTERVAL_MS = Number(process.env.ARC_RPC_MIN_INTERVAL_MS ?? 260);
+const MAX_RETRIES = Number(process.env.ARC_RPC_MAX_RETRIES ?? 8);
 const TIMEOUT_MS = Number(process.env.ARC_RPC_TIMEOUT_MS ?? 12_000);
 /**
  * Hard ceiling on the *total* time one logical RPC call may spend, including all
@@ -36,7 +48,7 @@ const TIMEOUT_MS = Number(process.env.ARC_RPC_TIMEOUT_MS ?? 12_000);
  * to 30s+ and stall whatever awaited the call. Retrying past this budget is
  * pointless anyway — the caller has already given up or the data is stale.
  */
-const RETRY_BUDGET_MS = Number(process.env.ARC_RPC_RETRY_BUDGET_MS ?? 15_000);
+const RETRY_BUDGET_MS = Number(process.env.ARC_RPC_RETRY_BUDGET_MS ?? 25_000);
 
 // Pure reads: safe to de-dupe and safe to retry on any transient failure.
 const READ_METHODS = new Set([
