@@ -418,9 +418,21 @@ const $ = (id) => document.getElementById(id);
         // fees, so both cached views are stale. Only the visible venue is
         // re-scanned — re-running all four log sweeps would be gratuitous.
         feeDailyCache = null;
+        /*
+         * Emissions move with the position, so the card has to be re-read.
+         *
+         * Supplying changes your share of the market, and a share of the market
+         * is exactly what the reward stream pays against — one system, not two
+         * that happen to sit on the same page. Without this the claim figure
+         * kept whatever it had been rendered with and only corrected on its own
+         * poll, which reads as the number wandering and then reversing.
+         */
+        if (typeof loadEmissions === "function") loadEmissions();
         setTimeout(() => {
           tick({ fresh: true });
           refreshMyPositions().catch(() => {});
+          // Again once the settle transaction has had time to land.
+          if (typeof loadEmissions === "function") loadEmissions();
           if (defiTab === "lending" && typeof loadBorrowers === "function") loadBorrowers();
           const key = { lending: "Lending", vault: "Vault", swap: "Swap", amm: "Amm" }[defiTab];
           if (key && typeof loadHolders === "function") {

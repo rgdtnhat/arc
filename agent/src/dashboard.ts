@@ -1590,6 +1590,10 @@ async function main() {
       if (txHash === null) { res.status(400).json({ ok: false, error: "unknown action" }); return; }
       logTx(req, { category: "defi", action: a, status: "success", assetAddress: asset, raw: amount, txHash });
       invalidateAll();
+      // The position just moved, so what it earns moved with it. Settling here
+      // rather than at the keeper's next pass is why the claim figure now lands
+      // once instead of drifting for minutes and settling back.
+      void settleNow(agentAccount.address as Hex, asset);
       res.json({ ok: true, txHash });
     } catch (e) {
       logTx(req, {
@@ -1688,6 +1692,8 @@ async function main() {
         assetAddress: asset, raw: amount, txHash,
       });
       invalidateAll();
+      // The backstop is the highest-paying side, and its shares just moved.
+      void settleNow(agentAccount.address as Hex, asset);
       res.json({ ok: true, txHash });
     } catch (e) {
       logTx(req, {
@@ -5458,6 +5464,69 @@ async function main() {
     if (watched.has(key)) return;
     if (watched.size >= KEEPER_WATCH_MAX) return;
     watched.add(key);
+  };
+
+  /**
+   * Everybody who actually holds a position, not just everybody who looked.
+   *
+   * Filling the watch set from the read endpoints meant a holder who never
+   * opened the page was never checkpointed — and an uncheckpointed position
+   * accrues against `min(sharesAtCheckpoint, sharesNow)` with a checkpoint of
+   * zero, which is zero. Read against the live pool, every holder came back
+   * with `checkpointShares = 0` while holding shares in the millions: the
+   * emission was not being split in proportion to the pool at all, it was
+   * reaching whoever had clicked recently, however small their share.
+   *
+   * The holder index already knows who is in the pool — it is what the holder
+   * tables are drawn from — so the keeper is seeded from it. `checkpoint` is
+   * permissionless, which is what makes settling a stranger a service rather
+   * than a privilege, and it is what makes a share of the market mean a share
+   * of the emission.
+   */
+  const seedWatchFromHolders = async () => {
+    if (!poolDeployment) return;
+    try {
+      const report = await holderReader.read("lending", holderOpts());
+      for (const h of report.holders) watch(h.address as Hex);
+    } catch (e) {
+      console.error(`[emissions] could not seed the keeper from holders: ${String(e).slice(0, 120)}`);
+    }
+  };
+  // After the boot warm-up has had time to land, then on a slow cadence: the
+  // holder set only changes when somebody enters or leaves the pool.
+  setTimeout(() => void seedWatchFromHolders(), 90_000).unref?.();
+  setInterval(() => void seedWatchFromHolders(), 60 * 60_000).unref?.();
+
+  /**
+   * Settle one address now, across the streams whose shares just moved.
+   *
+   * Supplying changes your share of the market, and a share of the market is
+   * what the reward stream pays against — they are one system, not two that
+   * happen to share a page. Leaving the emission to catch up on the keeper's
+   * own cadence is why the claim figure appeared to wander for minutes after a
+   * supply and then settle back.
+   */
+  const settleNow = async (who: Hex | null, only?: Hex) => {
+    if (!who || !emissionsAddr || !poolDeployment || !owner) return;
+    const assets: Hex[] = [];
+    const sides: number[] = [];
+    // Only the reserve that moved, across its three sides. Checkpointing every
+    // stream on every action would pay gas to re-settle positions that did not
+    // change; the keeper's sweep is where the rest is caught.
+    const touched = only
+      ? poolDeployment.assets.filter((a) => a.address.toLowerCase() === only.toLowerCase())
+      : poolDeployment.assets;
+    for (const a of touched) {
+      for (const side of [0, 1, 2]) { assets.push(a.address as Hex); sides.push(side); }
+    }
+    if (!assets.length) return;
+    try {
+      await owner.write(emissionsAddr, tesseraEmissionsAbi, "checkpointMany", [who, assets, sides]);
+    } catch (e) {
+      // The keeper picks it up on its next pass; this is the fast path, not the
+      // only one.
+      console.error(`[emissions] immediate checkpoint for ${who.slice(0, 10)}… failed: ${String(e).slice(0, 120)}`);
+    }
   };
 
   /** Settle anybody whose recorded share count no longer matches the chain. */
