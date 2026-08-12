@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v65" />
+    <meta name="tessera-shell" content="tessera-v66" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1873,9 +1873,18 @@
                    control with no explanation reads as broken. -->
               <div class="note" id="amEmWhy" style="display:none;margin-top:6px;color:var(--warn)"></div>
               <div class="tblWrap auto" style="margin-top:10px"><table class="data" style="min-width:0">
-                <thead><tr><th>Pool</th><th class="num">Rate</th><th class="num">Your share</th><th class="num">Earned</th></tr></thead>
+                <thead><tr><th>Pool</th><th class="num">Rate</th><th class="num">Your share now</th><th class="num">Earned</th></tr></thead>
                 <tbody id="amEmRows"></tbody>
               </table></div>
+              <!-- The two columns answer different questions, and a reader
+                   comparing them against another provider's needs to be told
+                   which. Share is a snapshot; earned is an integral. -->
+              <p class="feedNote" id="amEmBasis" style="margin-top:8px">
+                Rewards accrue every second against the shares you held <i>at that second</i>, so what you have
+                earned reflects your share over time, not the share you hold today. A provider who joined earlier
+                with less liquidity can have earned more than one who has just added a lot — and adding liquidity
+                now starts earning from now, it does not backdate.
+              </p>
               <div class="msg" id="amEmMsg" style="display:none"></div>
             </div>
 

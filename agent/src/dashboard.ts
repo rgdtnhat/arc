@@ -3167,6 +3167,9 @@ async function main() {
         txHash, detail: pool.name,
       });
       invalidateAll();
+      // Adding or removing liquidity moves the shares the LP stream pays
+      // against, so the position is settled now rather than at the next sweep.
+      if (req.params.action !== "swap") void settleNowLp(agentAccount.address as Hex, poolId);
       res.json({ ok: true, txHash });
     } catch (e) {
       logTx(req, {
@@ -5484,10 +5487,23 @@ async function main() {
    * of the emission.
    */
   const seedWatchFromHolders = async () => {
-    if (!poolDeployment) return;
     try {
-      const report = await holderReader.read("lending", holderOpts());
-      for (const h of report.holders) watch(h.address as Hex);
+      // Both venues, for the same reason. An LP who never opens the page is in
+      // exactly the position a supplier was: earning against a checkpoint that
+      // was never taken, however much liquidity they have provided.
+      if (poolDeployment) {
+        const report = await holderReader.read("lending", holderOpts());
+        for (const h of report.holders) watch(h.address as Hex);
+      }
+      if (ammClient) {
+        const count = Number(await client.public.readContract({
+          address: ammClient.amm, abi: tesseraAmmAbi, functionName: "poolCount",
+        }));
+        for (let id = 0; id < count; id++) {
+          const report = await holderReader.read("amm", holderOpts(id));
+          for (const h of report.holders) watch(h.address as Hex);
+        }
+      }
     } catch (e) {
       console.error(`[emissions] could not seed the keeper from holders: ${String(e).slice(0, 120)}`);
     }
@@ -5526,6 +5542,16 @@ async function main() {
       // The keeper picks it up on its next pass; this is the fast path, not the
       // only one.
       console.error(`[emissions] immediate checkpoint for ${who.slice(0, 10)}… failed: ${String(e).slice(0, 120)}`);
+    }
+  };
+
+  /** The same, for a liquidity position. */
+  const settleNowLp = async (who: Hex | null, poolId: number) => {
+    if (!who || !lpEmissionsAddr || !owner) return;
+    try {
+      await owner.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "checkpointMany", [who, [BigInt(poolId)]]);
+    } catch (e) {
+      console.error(`[emissions] immediate LP checkpoint for ${who.slice(0, 10)}… failed: ${String(e).slice(0, 120)}`);
     }
   };
 
