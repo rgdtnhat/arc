@@ -255,6 +255,16 @@ const CLIENT_SELECTORS = Object.fromEntries(
     lpCheckpoint: "function checkpoint(address,uint256)",
     lpClaimable: "function claimable(address,uint256)",
     lpClaimableTotal: "function claimableTotal(address)",
+    /*
+     * Session keys. Opening one is two transactions from the visitor's own
+     * wallet — an ERC-20 approval and the session itself — because the
+     * allowance is deliberately a ceiling this contract cannot raise. Revoking
+     * is one, and it is theirs alone.
+     */
+    skOpen: "function open(address,address,uint256,uint256,uint64,address[])",
+    skRevoke: "function revoke(bytes32)",
+    skSpendable: "function spendable(bytes32)",
+    erc20Approve: "function approve(address,uint256)",
     // The gauge. Voting, withdrawing a vote, and the bribe market — all of it
     // is the holder's own transaction, never the agent's.
     gaVote: "function vote(uint256[],uint256[])",
@@ -10086,6 +10096,7 @@ async function main() {
       gauge: (liveDeployment.tesseraGauge as Hex) ?? null,
       serviceFees: (liveDeployment.tesseraServiceFees as Hex) ?? null,
       assetRegistry: (liveDeployment.tesseraAssetRegistry as Hex) ?? null,
+      sessionKeys: (liveDeployment.tesseraSessionKeys as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded

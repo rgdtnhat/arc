@@ -151,7 +151,7 @@ const $ = (id) => document.getElementById(id);
           if (route === "gov" && typeof setGovTab === "function") setGovTab(govTab);
           // Balances and the task list are reads of their own; they load when
           // you arrive rather than on every poll of every other tab.
-          if (route === "wallet" && typeof loadWallet === "function") { loadWallet(); loadTasks(); }
+          if (route === "wallet" && typeof loadWallet === "function") { loadWallet(); loadTasks(); loadSessions(); }
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -3033,10 +3033,14 @@ const $ = (id) => document.getElementById(id);
                 // A balance that could not be read says so; it is not zero.
                 `<td class="num mono">${a.balance === null ? "unavailable" : esc(a.balance)}</td></tr>`).join("")
             : emptyRow(2, "No assets.");
-          const sel = $("walSendAsset");
-          if (sel && sel.dataset.built !== String(walletAssets.length)) {
-            sel.innerHTML = walletAssets.map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`).join("");
-            sel.dataset.built = String(walletAssets.length);
+          // Both asset pickers on this page: the one you send from now, and the
+          // one a session would be opened against.
+          for (const id of ["walSendAsset", "skAsset"]) {
+            const sel = $(id);
+            if (sel && sel.dataset.built !== String(walletAssets.length)) {
+              sel.innerHTML = walletAssets.map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`).join("");
+              sel.dataset.built = String(walletAssets.length);
+            }
           }
         } catch {
           $("walletNotReady").style.display = "";
@@ -3101,6 +3105,119 @@ const $ = (id) => document.getElementById(id);
         });
       }
 
+      /* ---- session keys -------------------------------------------------- */
+
+      let sessionRows = [];
+
+      /**
+       * The sessions this visitor's own wallet has opened.
+       *
+       * Read for the connected address rather than the app wallet: a session is
+       * a thing *you* granted, and the only wallet that can grant or revoke one
+       * is the one holding the tokens.
+       */
+      async function loadSessions() {
+        if (!$("skRows")) return;
+        try {
+          const key = await (await fetch("/api/sessions/key")).json();
+          $("skKeyAddr").textContent = key.key || "no session key configured on this server";
+          if ($("skOpen")) $("skOpen").disabled = !key.key;
+          const from = await connectedAddress();
+          if (!from) {
+            $("skRows").innerHTML = emptyRow(4, "Connect a wallet to see or open sessions.");
+            sessionRows = [];
+            return;
+          }
+          const r = await (await fetch(`/api/sessions?owner=${from}`)).json();
+          sessionRows = (r.sessions || []).filter((x) => !x.revoked);
+          $("skRows").innerHTML = (r.sessions || []).length
+            ? r.sessions.map((x) => {
+                const when = new Date(x.expiry * 1000).toLocaleDateString();
+                const dead = x.revoked || x.expiry * 1000 < Date.now();
+                return `<tr><td><b>${esc(x.symbol)}</b>` +
+                  `<div class="muted mono" style="font-size:10.5px">${esc(x.id.slice(0, 14))}…</div>` +
+                  `<div class="muted" style="font-size:11px">${x.revoked ? "revoked" : `until ${esc(when)}`}` +
+                  `${Number(x.perTxMaxRaw) > 0 ? ` · max ${esc(x.perTxMax)} each` : ""}` +
+                  `${x.restricted ? " · allow-list" : ""}</div></td>` +
+                  `<td class="num mono">${esc(x.spent)} / ${esc(x.cap)}</td>` +
+                  `<td class="num mono">${dead ? "—" : esc(x.spendable)}</td>` +
+                  `<td class="num">${dead ? "" : `<button class="btn" data-skrev="${esc(x.id)}">Revoke</button>`}</td></tr>`;
+              }).join("")
+            : emptyRow(4, "No sessions yet.");
+          // The task form's picker is the same list, so a task can only be
+          // pointed at a session that exists and is still live.
+          const sel = $("taskSession");
+          if (sel) {
+            sel.innerHTML = sessionRows.length
+              ? sessionRows.map((x) => `<option value="${esc(x.id)}">${esc(x.symbol)} · ${esc(x.spendable)} left</option>`).join("")
+              : `<option value="">no live session</option>`;
+          }
+        } catch {
+          /* leave whatever is on screen */
+        }
+      }
+
+      /** The address the wallet is currently offering, or null. */
+      async function connectedAddress() {
+        try {
+          if (!eth()) return null;
+          const accts = await eth().request({ method: "eth_accounts" });
+          return accts && accts[0] ? accts[0] : null;
+        } catch { return null; }
+      }
+
+      if ($("skOpen")) {
+        $("skOpen").addEventListener("click", async () => {
+          const cfg = await loadDefiConfig();
+          if (!cfg.sessionKeys) return showReceipt("skMsg", false, "session keys are not deployed on this network");
+          const keyCfg = await (await fetch("/api/sessions/key")).json();
+          if (!keyCfg.key) return showReceipt("skMsg", false, keyCfg.note || "no session key on this server");
+          const asset = $("skAsset").value;
+          const dec = walDecimals(asset);
+          const cap = $("skCap").value.trim(), perTx = $("skPerTx").value.trim();
+          const days = Number($("skDays").value || 0);
+          if (!(parseFloat(cap) > 0)) return showReceipt("skMsg", false, "set a cap above zero");
+          if (!(days > 0)) return showReceipt("skMsg", false, "set how many days it should last");
+          const allow = $("skAllow").value.split(/[,\s]+/).map((a) => a.trim()).filter(Boolean);
+          if (allow.some((a) => !/^0x[0-9a-fA-F]{40}$/.test(a))) {
+            return showReceipt("skMsg", false, "one of those allow-list entries is not an address");
+          }
+          const capRaw = toRaw(cap, dec);
+          const perTxRaw = parseFloat(perTx) > 0 ? toRaw(perTx, dec) : "0";
+          const expiry = String(Math.floor(Date.now() / 1000) + days * 86400);
+          /*
+           * Two signatures, in this order, and the order matters.
+           *
+           * The allowance is a ceiling the wallet controls independently of
+           * this contract — it is what lets somebody revoke from any wallet UI
+           * without asking us. Opening the session first would leave a live
+           * delegation that cannot move anything, which reads as broken.
+           */
+          await selfCustody("skMsg", `approve ${cap} for the session`, async (from, c) =>
+            sendTx(from, asset, callData(c.selectors.erc20Approve, encAddr(c.sessionKeys), encUint(capRaw))));
+          await selfCustody("skMsg", `open a ${cap} session`, async (from, c) =>
+            sendTx(from, c.sessionKeys, callData(
+              c.selectors.skOpen,
+              encAddr(keyCfg.key), encAddr(asset), encUint(capRaw), encUint(perTxRaw), encUint(expiry),
+              // The allow-list is the one dynamic argument, so its offset is
+              // after the six head words.
+              encUint(192), encArray(allow.map((a) => BigInt(a))),
+            )));
+          loadSessions();
+        });
+
+        $("skRows").addEventListener("click", async (e) => {
+          const btn = e.target.closest("button[data-skrev]");
+          if (!btn) return;
+          const cfg = await loadDefiConfig();
+          btn.disabled = true;
+          await selfCustody("skMsg", "revoke the session", async (from, c) =>
+            sendTx(from, c.sessionKeys, callData(c.selectors.skRevoke, btn.dataset.skrev.replace(/^0x/, ""))));
+          btn.disabled = false;
+          loadSessions();
+        });
+      }
+
       /* ---- tasks --------------------------------------------------------- */
 
       let taskActions = {};
@@ -3115,6 +3232,8 @@ const $ = (id) => document.getElementById(id);
         "amm:add": ["poolId", "amounts"], "amm:remove": ["poolId", "shares"],
         "amm:swap": ["poolId", "tokenIn", "tokenOut", "amountIn"],
         "wallet:send": ["asset", "to", "amount"], "wallet:bulk": ["asset", "recipients"],
+        // Funded by a visitor's delegation rather than the app wallet.
+        "wallet:sessionSend": ["session", "to", "amount"], "wallet:sessionBulk": ["session", "recipients"],
       };
 
       function taskParamRow() {
@@ -3124,6 +3243,12 @@ const $ = (id) => document.getElementById(id);
         $("taskParamRow").innerHTML = fields.map((f) => {
           if (f === "asset" || f === "tokenIn" || f === "tokenOut") {
             return `<select class="field" data-tp="${f}">${assetOptions}</select>`;
+          }
+          if (f === "session") {
+            const opts = sessionRows.length
+              ? sessionRows.map((x) => `<option value="${esc(x.id)}">${esc(x.symbol)} · ${esc(x.spendable)} left</option>`).join("")
+              : `<option value="">no live session — open one above</option>`;
+            return `<select class="field" id="taskSession" data-tp="sessionId">${opts}</select>`;
           }
           if (f === "recipients") {
             /*
@@ -3150,7 +3275,11 @@ const $ = (id) => document.getElementById(id);
         $("taskParamRow").querySelectorAll("[data-tp]").forEach((el) => { out[el.dataset.tp] = el.value.trim(); });
         // Amounts are stored in base units: a task outlives the form that made
         // it, and a decimal re-read against a different asset would be wrong.
-        const dec = (a) => walDecimals(a || $("walSendAsset").value);
+        const session = sessionRows.find((x) => x.id === out.sessionId);
+        // A session names its own asset, so a session-funded task converts
+        // against that rather than against whatever the send form has selected.
+        const dec = (a) => (session ? session.decimals : walDecimals(a || $("walSendAsset").value));
+        if (session) out.asset = session.asset;
         if (out.amount !== undefined) out.amount = toRaw(out.amount || "0", dec(out.asset));
         if (out.amountIn !== undefined) out.amountIn = toRaw(out.amountIn || "0", dec(out.tokenIn));
         if (out.amounts !== undefined) {
