@@ -40,23 +40,6 @@ export const MAX_MOVE_BPS = 1_000; // 10%
 /** Below this, the move is not worth a transaction. */
 export const MIN_MOVE_BPS = 25; // 0.25%
 
-/**
- * Refresh a mark once it is this far through its life, even if nothing moved.
- *
- * The two rules that produced the outage were each sensible alone. "Do not
- * spend gas on a move smaller than 0.25%" keeps the keeper quiet. "A mark older
- * than `maxAge` is not usable" keeps a frozen feed from pricing the book. Put
- * together they guarantee that the *steadiest* asset is the one that breaks:
- * USDC sat at exactly $1.00 for a week, never moved enough to be re-pushed,
- * went stale, and `accountData` — which walks every listed reserve — began
- * reverting `NoUsablePrice`. Every borrow limit and health factor on the site
- * read "n/a", for a stablecoin behaving perfectly.
- *
- * So a price is also worth sending simply because it is old. Half the age
- * budget leaves a wide margin for a keeper that is asleep, throttled, or
- * failing, and costs one transaction per asset per few days.
- */
-export const STALE_REFRESH_FRACTION = 0.5;
 
 /** Refuse to act on a quote older than this. */
 export const MAX_QUOTE_AGE_MS = 15 * 60_000;
@@ -66,14 +49,6 @@ export const SANITY_FLOOR = 1n; // 1e-8 USD
 export const SANITY_CEIL = 10_000_000n * PRICE_SCALE; // $10m
 
 export interface PriceProposal {
-  /**
-   * Sent because the mark was going stale, not because the price moved.
-   *
-   * Worth distinguishing in a log: a keeper that suddenly writes four prices
-   * in a quiet market is either broken or doing this, and the operator reading
-   * the line should not have to guess which.
-   */
-  refreshing?: boolean;
   asset: `0x${string}`;
   symbol: string;
   /** What the pool currently marks it at, 1e8. */
@@ -195,10 +170,7 @@ export function proposeFromSources(args: {
   maxSpreadBps?: number;
   maxMoveBps?: number;
   minMoveBps?: number;
-  /** Age of the on-chain mark, and how long the oracle will accept it. */
-  markAgeSeconds?: number;
-  markMaxAgeSeconds?: number;
-}): PriceProposal & { sources: string[]; spreadBps: number } {
+}): PriceProposal & { sources: string[]; spreadBps: number; agreedUsd: number | null } {
   const agreed = crossCheck(args.quotes, args.maxSpreadBps);
   const p = proposePrice({
     asset: args.asset,
@@ -207,8 +179,6 @@ export function proposeFromSources(args: {
     marketUsd: agreed.usd,
     maxMoveBps: args.maxMoveBps,
     minMoveBps: args.minMoveBps,
-    markAgeSeconds: args.markAgeSeconds,
-    markMaxAgeSeconds: args.markMaxAgeSeconds,
   });
   return {
     ...p,
@@ -216,7 +186,200 @@ export function proposeFromSources(args: {
     skip: agreed.usd === null ? agreed.reason : p.skip,
     sources: agreed.used,
     spreadBps: agreed.spreadBps,
+    /*
+     * The agreed price itself, separately from what it implies for any one
+     * writer.
+     *
+     * `target` cannot stand in for this: when no source answers it falls back
+     * to `current`, so "the market says the mark is right" and "nobody could
+     * tell us what the market says" arrive as the same number. A second writer
+     * reading that would refresh a price on the strength of a feed that never
+     * answered, which is the one thing staleness is supposed to catch.
+     */
+    agreedUsd: agreed.usd,
   };
+}
+
+/** The oracle's stored view of one asset, as `configOf` returns it. */
+export interface OracleEntry {
+  enabled: boolean;
+  /** The manual price on record, 1e8. Zero when the asset was never seeded. */
+  stored: bigint;
+  /** Unix seconds of the last manual write. */
+  updatedAt: number;
+  /** Seconds after which the manual price stops counting as a source at all. */
+  maxAge: number;
+  /** Shortest gap the oracle will accept between manual writes. */
+  minUpdateInterval: number;
+  /** Largest single move the oracle will accept, in bps. */
+  maxMoveBps: number;
+}
+
+export interface OracleWrite {
+  asset: `0x${string}`;
+  symbol: string;
+  /** What the oracle currently has on record, 1e8. */
+  stored: bigint;
+  /** What the agreed feed says, 1e8. */
+  target: bigint;
+  /** What to actually send — `target`, or a clamped step toward it. */
+  next: bigint;
+  /** Signed, relative to `stored`. */
+  moveBps: number;
+  clamped: boolean;
+  /** Why this is being sent, or null when nothing is. */
+  reason: "drift" | "expiring" | null;
+  /** Seconds until the stored price stops counting as a source. */
+  expiresInS: number;
+  /** True once it already has. */
+  expired: boolean;
+  /** Set when nothing should be sent, and why. */
+  skip?: string;
+}
+
+/**
+ * How much of an entry's life may pass before it is rewritten.
+ *
+ * Half, so a failed round has as long to recover as it has already used. With
+ * the pool's seven-day `maxAge` that is a write every three and a half days per
+ * asset — a handful of transactions a week against an outage that takes the
+ * whole market down.
+ */
+export const ORACLE_REFRESH_AT = 0.5;
+
+/**
+ * Keep an asset's oracle entry alive, and pointed at the market.
+ *
+ * ## Why this is a separate decision from the pool's mark
+ * There are two prices per asset, written by two different calls.
+ * `TesseraPool.setPrice` sets the pool's own mark — the number the dashboard
+ * displays. `TesseraOracle.setPrice` sets the manual source behind
+ * `riskPrice`, which is what every borrow limit, health factor and liquidation
+ * check actually reads.
+ *
+ * The tracker only ever wrote the first one, so the marks stayed current while
+ * the oracle entries aged out on their own seven-day timer. That is not a
+ * display problem: with no usable source the pool refuses `borrow`, `withdraw`
+ * and `liquidate` outright, which is a frozen market and, worse, an underwater
+ * position nobody can seize. It happened — three of four assets expired
+ * together, eleven hours before anyone noticed, while the dashboard beside them
+ * showed live prices.
+ *
+ * ## Why a heartbeat and not just a tracker
+ * Move-driven updates cannot keep a stablecoin alive. USDC is $1.00 and stays
+ * $1.00, so it never clears the "worth a transaction" threshold, never gets
+ * written, and expires on schedule every single time. So an entry past
+ * `ORACLE_REFRESH_AT` of its life is rewritten whether or not the number
+ * changed.
+ *
+ * ## What it will not do
+ * Refresh on a price no source would confirm. Rewriting the stored value when
+ * the feed is down would keep the pool trading on a number nothing corroborates
+ * and defeat the `maxAge` that exists to stop precisely that. With no agreed
+ * quote this reports why and lets the entry expire — a frozen market is the
+ * designed failure, and it is the recoverable one.
+ */
+export function proposeOracleWrite(args: {
+  asset: `0x${string}`;
+  symbol: string;
+  entry: OracleEntry;
+  /** The cross-checked price, or null when the sources did not agree. */
+  agreedUsd: number | null;
+  /** Chain time, in seconds — the clock the oracle's own guards are measured against. */
+  nowS: number;
+  minMoveBps?: number;
+  refreshAt?: number;
+}): OracleWrite {
+  const { asset, symbol, entry, agreedUsd, nowS } = args;
+  const minMoveBps = args.minMoveBps ?? MIN_MOVE_BPS;
+  const refreshAt = args.refreshAt ?? ORACLE_REFRESH_AT;
+
+  const age = nowS - entry.updatedAt;
+  const expiresInS = entry.maxAge - age;
+  const base: OracleWrite = {
+    asset,
+    symbol,
+    stored: entry.stored,
+    target: entry.stored,
+    next: entry.stored,
+    moveBps: 0,
+    clamped: false,
+    reason: null,
+    expiresInS,
+    expired: expiresInS <= 0,
+  };
+
+  // Each of the next three guards mirrors a revert in `TesseraOracle.setPrice`.
+  // Skipping here rather than discovering it on-chain keeps a keeper that runs
+  // every ten minutes from burning a transaction every ten minutes.
+  if (!entry.enabled) {
+    return { ...base, skip: "not configured on the risk oracle — configureAsset seeds it first" };
+  }
+  if (entry.stored === 0n) {
+    // `setPrice` measures every move against the stored value, so there is
+    // nothing to move from. Seeding a first price is a deliberate act.
+    return { ...base, skip: "the oracle has no price on record for this asset — seed it by hand" };
+  }
+  const nextAllowedAt = entry.updatedAt + entry.minUpdateInterval;
+  if (nowS < nextAllowedAt) {
+    return { ...base, skip: `the oracle accepts the next write in ${Math.ceil((nextAllowedAt - nowS) / 60)}m` };
+  }
+
+  const target = agreedUsd === null ? null : toPoolPrice(agreedUsd);
+  if (target === null) {
+    return {
+      ...base,
+      // Named by urgency: an entry that is about to stop pricing the pool is a
+      // different message from one that is merely not being tracked today.
+      skip:
+        base.expired ? "no agreed quote — the entry has already expired and the pool is refusing new risk"
+        : expiresInS <= entry.maxAge * (1 - refreshAt) ? `no agreed quote — the entry expires in ${Math.round(expiresInS / 3600)}h`
+        : "no agreed quote for this asset",
+    };
+  }
+  if (target < SANITY_FLOOR || target > SANITY_CEIL) {
+    return { ...base, target, skip: "quote is outside the sanity band — treating the feed as broken" };
+  }
+
+  const diff = target - entry.stored;
+  const moveBps = Number((diff * 10_000n) / entry.stored);
+  const limit = (entry.stored * BigInt(entry.maxMoveBps)) / 10_000n;
+  const clamped = diff > limit || diff < -limit;
+  const next = clamped ? (diff > 0n ? entry.stored + limit : entry.stored - limit) : target;
+
+  const drifted = Math.abs(moveBps) >= minMoveBps;
+  const expiring = age >= entry.maxAge * refreshAt;
+  if (!drifted && !expiring) {
+    return {
+      ...base,
+      target,
+      moveBps,
+      skip: `on the market and good for another ${Math.round(expiresInS / 3600)}h`,
+    };
+  }
+
+  return {
+    ...base,
+    target,
+    next,
+    moveBps,
+    clamped,
+    // Expiry is the more useful headline when both are true: it says the write
+    // had a deadline, which is the part an operator reading a log needs.
+    reason: expiring ? "expiring" : "drift",
+  };
+}
+
+/**
+ * Every oracle entry that should be written this round, most urgent first.
+ *
+ * Deliberately not `actionable`: that filters on the value having changed,
+ * which would drop the identical-price heartbeat — the one write a stablecoin
+ * ever needs. Ordered by how soon the entry stops pricing the pool, so an
+ * interrupted round has still done the part that mattered.
+ */
+export function actionableOracleWrites(writes: OracleWrite[]): OracleWrite[] {
+  return writes.filter((w) => !w.skip).sort((a, b) => a.expiresInS - b.expiresInS);
 }
 
 /**
@@ -234,10 +397,6 @@ export function proposePrice(args: {
   quoteAgeMs?: number;
   maxMoveBps?: number;
   minMoveBps?: number;
-  /** How long ago the on-chain mark was last written, in seconds. */
-  markAgeSeconds?: number;
-  /** How long the oracle will accept that mark, in seconds. Zero = no limit. */
-  markMaxAgeSeconds?: number;
 }): PriceProposal {
   const {
     asset,
@@ -247,8 +406,6 @@ export function proposePrice(args: {
     quoteAgeMs = 0,
     maxMoveBps = MAX_MOVE_BPS,
     minMoveBps = MIN_MOVE_BPS,
-    markAgeSeconds = 0,
-    markMaxAgeSeconds = 0,
   } = args;
 
   const base: PriceProposal = {
@@ -277,20 +434,8 @@ export function proposePrice(args: {
 
   const diff = target - current;
   const moveBps = Number((diff * 10_000n) / current);
-  // Past half its life, a mark is worth rewriting for its own sake — see
-  // `STALE_REFRESH_FRACTION`. Nudging by a single unit keeps `actionable`'s
-  // "nothing changed, send nothing" rule intact without pretending the price
-  // moved: what is being refreshed is the timestamp, not the number.
-  const ageing = markMaxAgeSeconds > 0 && markAgeSeconds >= markMaxAgeSeconds * STALE_REFRESH_FRACTION;
   if (Math.abs(moveBps) < minMoveBps) {
-    if (!ageing) return { ...base, target, moveBps, skip: "already within tolerance" };
-    return {
-      ...base,
-      target,
-      next: target === current ? current + 1n : target,
-      moveBps,
-      refreshing: true,
-    };
+    return { ...base, target, moveBps, skip: "already within tolerance" };
   }
 
   // Clamp toward the target rather than refusing outright: a real 30% move

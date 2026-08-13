@@ -7,6 +7,9 @@ import {
   roundsToTarget,
   PRICE_SCALE,
   MAX_MOVE_BPS,
+  proposeOracleWrite,
+  actionableOracleWrites,
+  type OracleEntry,
 } from "../src/price-push.ts";
 
 const A = "0xf0c4a4ce82a5746abaad9425360ab04fbba432bf" as const;
@@ -226,62 +229,130 @@ test("reports which sources were used, so a disagreement is actionable", () => {
   assert.match(p.skip!, /coingecko vs amm-twap|amm-twap vs coingecko/);
 });
 
-/**
- * The outage this exists to prevent.
- *
- * USDC sat at exactly $1.00 for a week. It never moved enough to be re-pushed,
- * its mark passed the oracle's age limit, and `accountData` — which walks every
- * listed reserve — started reverting `NoUsablePrice`. Every borrow limit and
- * health factor on the site read "n/a" because a stablecoin was behaving
- * perfectly. The steadiest asset was the one guaranteed to break.
- */
-const WEEK = 7 * 24 * 3600;
+/* ---- keeping the risk oracle's entries alive ---------------------------- */
 
-test("refreshes a mark that is going stale even when the price has not moved", () => {
-  const p = proposePrice({
-    asset: "0x36", symbol: "USDC", current: 100_000_000n, marketUsd: 1,
-    markAgeSeconds: 4 * 24 * 3600, markMaxAgeSeconds: WEEK,
-  });
-  assert.equal(p.skip, undefined, "a mark past half its life is worth sending");
-  assert.equal(p.refreshing, true);
-  assert.ok(actionable([p]).length === 1, "and it reaches the chain");
+const DAY = 86_400;
+const WEEK = 7 * DAY;
+
+const entry = (o: Partial<OracleEntry> = {}): OracleEntry => ({
+  enabled: true,
+  stored: P(95_000),
+  updatedAt: 0,
+  maxAge: WEEK,
+  minUpdateInterval: 1800,
+  maxMoveBps: 1000,
+  ...o,
 });
 
-test("stays quiet while the mark is still young", () => {
-  const p = proposePrice({
-    asset: "0x36", symbol: "USDC", current: 100_000_000n, marketUsd: 1,
-    markAgeSeconds: 3600, markMaxAgeSeconds: WEEK,
+const oracleAt = (o: { agreedUsd?: number | null; nowS?: number; entry?: Partial<OracleEntry> } = {}) =>
+  proposeOracleWrite({
+    asset: A,
+    symbol: "cirBTC",
+    entry: entry(o.entry),
+    agreedUsd: o.agreedUsd === undefined ? 95_000 : o.agreedUsd,
+    nowS: o.nowS ?? DAY,
   });
-  assert.equal(p.skip, "already within tolerance");
-  assert.deepEqual(actionable([p]), []);
+
+test("leaves a fresh entry that is already on the market alone", () => {
+  const w = oracleAt({ nowS: DAY });
+  assert.ok(w.skip, "no transaction for an entry with six days left and nothing to correct");
+  assert.equal(w.reason, null);
 });
 
-test("an oracle with no age limit is never refreshed for age alone", () => {
-  const p = proposePrice({
-    asset: "0x36", symbol: "USDC", current: 100_000_000n, marketUsd: 1,
-    markAgeSeconds: 10 * 365 * 24 * 3600, markMaxAgeSeconds: 0,
+test("rewrites an unchanged price once the entry is past half its life", () => {
+  // The failure this exists to stop: a stablecoin never moves 0.25%, so a
+  // move-driven tracker never writes it, and the entry expires on schedule
+  // every single time — taking borrowing, withdrawal and liquidation with it.
+  const w = proposeOracleWrite({
+    asset: A,
+    symbol: "USDC",
+    entry: entry({ stored: P(1), maxAge: WEEK, updatedAt: 0 }),
+    agreedUsd: 1,
+    nowS: 4 * DAY,
   });
-  assert.equal(p.skip, "already within tolerance");
+  assert.equal(w.skip, undefined);
+  assert.equal(w.reason, "expiring");
+  assert.equal(w.next, P(1), "the same number, written again — that is the whole point");
+  assert.equal(w.moveBps, 0);
 });
 
-test("a real move still wins over the heartbeat, and is still clamped", () => {
-  // Ageing must not weaken the safety rails: a 30% jump is still stepped.
-  const p = proposePrice({
-    asset: "0xf0", symbol: "cirBTC", current: 100_000_000n, marketUsd: 1.3,
-    markAgeSeconds: 6 * 24 * 3600, markMaxAgeSeconds: WEEK,
-  });
-  assert.equal(p.clamped, true);
-  assert.equal(p.refreshing, undefined);
-  assert.equal(p.next, 110_000_000n);
+test("tracks a real move without waiting for the entry to age", () => {
+  const w = oracleAt({ agreedUsd: 99_000, nowS: DAY });
+  assert.equal(w.reason, "drift");
+  assert.equal(w.next, P(99_000));
 });
 
-test("a stale feed is still refused, however old the mark is", () => {
-  // The one thing worse than a stale mark is a fresh mark carrying a stale
-  // number. Age pressure must never override the quote's own freshness check.
-  const p = proposePrice({
-    asset: "0x36", symbol: "USDC", current: 100_000_000n, marketUsd: 1,
-    quoteAgeMs: 60 * 60_000, markAgeSeconds: 6 * 24 * 3600, markMaxAgeSeconds: WEEK,
+test("clamps an oracle move to the limit the oracle itself will accept", () => {
+  // Sent unclamped, this reverts MoveTooLarge and the entry expires anyway.
+  const w = oracleAt({ agreedUsd: 63_400, nowS: 4 * DAY });
+  assert.equal(w.clamped, true);
+  assert.equal(w.next, P(95_000) - (P(95_000) * 1000n) / 10_000n);
+  assert.ok(w.next > P(63_400), "one step, and the entry lives to take the next one");
+});
+
+test("will not refresh an entry on a price nothing confirms", () => {
+  // Rewriting the stored value on a dead feed keeps the pool trading on a
+  // number no source stands behind, which is exactly what maxAge is for.
+  const w = oracleAt({ agreedUsd: null, nowS: 6 * DAY });
+  assert.ok(w.skip?.includes("no agreed quote"));
+  assert.equal(w.reason, null);
+});
+
+test("says how close an unconfirmable entry is to taking the market down", () => {
+  assert.match(oracleAt({ agreedUsd: null, nowS: 6 * DAY }).skip!, /expires in \d+h/);
+  assert.match(oracleAt({ agreedUsd: null, nowS: 8 * DAY }).skip!, /already expired/);
+});
+
+test("reports an expired entry as expired", () => {
+  const w = oracleAt({ nowS: 8 * DAY });
+  assert.equal(w.expired, true);
+  assert.ok(w.expiresInS < 0);
+  assert.equal(w.reason, "expiring", "and still writes it — this is the outage");
+});
+
+test("holds off inside the oracle's own update interval", () => {
+  // Otherwise a ten-minute keeper burns a reverting transaction every ten
+  // minutes against a thirty-minute minimum.
+  const w = oracleAt({ agreedUsd: 99_000, entry: { updatedAt: 1000 }, nowS: 1600 });
+  assert.ok(w.skip?.includes("next write in"));
+});
+
+test("refuses an asset the oracle was never told about", () => {
+  assert.ok(oracleAt({ entry: { enabled: false } }).skip?.includes("configureAsset"));
+  assert.ok(oracleAt({ entry: { stored: 0n } }).skip?.includes("by hand"));
+});
+
+test("refuses a broken quote outright rather than clamping toward it", () => {
+  assert.ok(oracleAt({ agreedUsd: 50_000_000, nowS: 6 * DAY }).skip?.includes("sanity"));
+});
+
+test("orders oracle writes by how soon the entry stops pricing the pool", () => {
+  const urgent = proposeOracleWrite({
+    asset: A, symbol: "USDC", entry: entry({ stored: P(1), updatedAt: 0 }), agreedUsd: 1, nowS: 6.5 * DAY,
   });
-  assert.match(String(p.skip), /old/);
-  assert.deepEqual(actionable([p]), []);
+  const later = proposeOracleWrite({
+    asset: A, symbol: "cirBTC", entry: entry({ updatedAt: 0 }), agreedUsd: 99_000, nowS: 4 * DAY,
+  });
+  const out = actionableOracleWrites([later, urgent]);
+  assert.equal(out[0]!.symbol, "USDC", "the one about to expire goes first");
+  assert.equal(out.length, 2);
+});
+
+test("actionableOracleWrites keeps the no-change heartbeat that actionable would drop", () => {
+  const beat = proposeOracleWrite({
+    asset: A, symbol: "USDC", entry: entry({ stored: P(1) }), agreedUsd: 1, nowS: 5 * DAY,
+  });
+  assert.equal(beat.next, beat.stored);
+  assert.equal(actionableOracleWrites([beat]).length, 1);
+});
+
+test("agreedUsd distinguishes a confirmed price from a feed that never answered", () => {
+  const quiet = proposeFromSources({ asset: A, symbol: "cirBTC", current: P(95_000), quotes: [] });
+  assert.equal(quiet.agreedUsd, null);
+  assert.equal(quiet.target, quiet.current, "target falls back to the mark — which is why it cannot stand in");
+  const agreed = proposeFromSources({
+    asset: A, symbol: "cirBTC", current: P(95_000),
+    quotes: [{ source: "a", usd: 96_000 }, { source: "b", usd: 96_050 }],
+  });
+  assert.ok(agreed.agreedUsd! > 0);
 });
