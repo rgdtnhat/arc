@@ -1606,7 +1606,22 @@ async function main() {
   }
 
   // Agent-driven lending actions from the dashboard.
-  app.post("/api/lending/:action", requireOperator, async (req, res) => {
+  /**
+   * The four position verbs, and only those.
+   *
+   * `:action` is a wildcard, and Express matches in registration order, so this
+   * route was also swallowing every later `POST /api/lending/<something>` —
+   * `price-track` among them, which answered "unknown action" and could never
+   * be reached. That is not a cosmetic routing bug: pushing a fresh price is
+   * how a mark is kept alive, so the one control that would have prevented the
+   * oracle going stale was unreachable from the moment it was added.
+   *
+   * Handing an unknown verb to `next()` lets the specific routes below answer
+   * for themselves, and keeps this one honest about what it owns.
+   */
+  const LENDING_VERBS = new Set(["supply", "withdraw", "borrow", "repay"]);
+  app.post("/api/lending/:action", requireOperator, async (req, res, next) => {
+    if (!LENDING_VERBS.has(req.params.action)) return next();
     if (!poolClient || !poolDeployment) {
       res.status(404).json({ ok: false, error: "lending not available (live mode has no pool deployed)" });
       return;
@@ -5372,6 +5387,36 @@ async function main() {
       }),
     );
 
+    /*
+     * How old each mark is, and how long the oracle will accept it.
+     *
+     * Without this the keeper only ever reacted to movement, and a mark that
+     * nothing moved was never rewritten — so USDC, pinned at exactly $1.00,
+     * aged past the oracle's limit and took `accountData` down with it. The
+     * config carries both numbers; reading them is what lets a price be sent
+     * for being old rather than for being wrong.
+     */
+    const oracleAddr = (liveDeployment?.tesseraOracle as Hex) ?? null;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const markAge = await Promise.all(
+      assets.map(async (a) => {
+        if (!oracleAddr) return { age: 0, max: 0 };
+        try {
+          const cfg = (await client.public.readContract({
+            address: oracleAddr, abi: tesseraOracleAbi, functionName: "configOf", args: [a.address as Hex],
+          })) as readonly [boolean, bigint, bigint, Hex, number, number, number, number, number];
+          const updatedAt = Number(cfg[2]);
+          // The last field is the age the oracle will tolerate; a zero there
+          // means it never expires, and nothing needs refreshing for age.
+          const max = Number(cfg[8] ?? 0);
+          return { age: updatedAt > 0 ? Math.max(0, nowSec - updatedAt) : 0, max };
+        } catch {
+          // An unreadable config is not an excuse to start pushing prices.
+          return { age: 0, max: 0 };
+        }
+      }),
+    );
+
     return assets.map((a, i) => {
       const row = onChain[i];
       const current = row?.status === "success" ? (row.result as bigint) : 0n;
@@ -5383,12 +5428,47 @@ async function main() {
           { source: "market-feed", usd: marketFor(a.symbol) },
           { source: "amm-twap", usd: twapUsd[i] ?? null },
         ],
+        markAgeSeconds: markAge[i].age,
+        markMaxAgeSeconds: markAge[i].max,
       });
-      return { ...p, roundsToTarget: roundsToTarget(p) };
+      return { ...p, roundsToTarget: roundsToTarget(p), markAgeSeconds: markAge[i].age, markMaxAgeSeconds: markAge[i].max };
     });
   }
 
   const fmtPrice = (v: bigint) => (Number(v) / 1e8).toFixed(v >= 100n * 100_000_000n ? 0 : 4);
+
+  /**
+   * Write one mark to both places that hold one.
+   *
+   * The pool keeps a price and the risk oracle keeps its own, with its own
+   * timestamp — and `accountData` reads the oracle's. Two callers used to write
+   * only the pool: the operator's button and the automatic round. Both looked
+   * successful and both let the oracle age out, which is how every borrow limit
+   * on the site read "n/a" while the price panel showed a fresh number.
+   *
+   * One function, so they cannot drift apart again. The oracle step is clamped
+   * against the *oracle's* own price because the two contracts drift and each
+   * refuses a jump larger than its own ceiling.
+   */
+  async function writeMark(p: { asset: Hex; symbol: string; next: bigint }): Promise<{ pool: string; oracle: string | null }> {
+    const poolTx = await owner!.write(poolDeployment!.poolAddress, tesseraPoolAbi, "setPrice", [p.asset, p.next]);
+    const riskOracle = (liveDeployment?.tesseraOracle as Hex) ?? null;
+    if (!riskOracle) return { pool: poolTx, oracle: null };
+    const ocfg = (await client.public.readContract({
+      address: riskOracle, abi: tesseraOracleAbi, functionName: "configOf", args: [p.asset],
+    })) as readonly [boolean, bigint, bigint, Hex, number, number, number, number, number];
+    const oCurrent = ocfg[1];
+    const oMaxBps = BigInt(ocfg[5] || 1000);
+    let oNext = p.next;
+    if (oCurrent > 0n) {
+      const limit = (oCurrent * oMaxBps) / 10_000n;
+      const diff = p.next - oCurrent;
+      if (diff > limit) oNext = oCurrent + limit;
+      else if (diff < -limit) oNext = oCurrent - limit;
+    }
+    const oracleTx = await owner!.write(riskOracle, tesseraOracleAbi, "setPrice", [p.asset, oNext]);
+    return { pool: poolTx, oracle: oracleTx };
+  }
 
   app.get("/api/lending/price-track", async (_req, res) => {
     if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
@@ -5404,6 +5484,19 @@ async function main() {
           // Which sources answered and how far apart they sat. "The feeds
           // disagree" is not something anybody can act on; naming them is.
           sources: p.sources, sourceSpreadBps: p.spreadBps,
+          /*
+           * How old the mark is, and how long the oracle will take it.
+           *
+           * The outage that prompted this was invisible on this very panel: it
+           * reported the price and the move, and neither of those was wrong —
+           * USDC really was $1.00 and really had not moved. What it did not say
+           * was that the mark was 7.5 days old against a 7-day limit, which was
+           * the only number that mattered.
+           */
+          markAgeSeconds: p.markAgeSeconds ?? null,
+          markMaxAgeSeconds: p.markMaxAgeSeconds ?? null,
+          expiresInSeconds: p.markMaxAgeSeconds ? p.markMaxAgeSeconds - p.markAgeSeconds : null,
+          refreshing: p.refreshing ?? false,
         })),
         pending: actionablePrices(all).length,
       });
@@ -5423,9 +5516,20 @@ async function main() {
       const todo = actionablePrices((await priceProposals()) ?? []);
       const sent: { symbol: string; usd: string; txHash: string }[] = [];
       const failedRows: { symbol: string; error: string }[] = [];
+      /*
+       * Two marks, not one.
+       *
+       * The pool keeps a price and the risk oracle keeps its own, with its own
+       * timestamp — and `accountData` reads the oracle's. Writing only the
+       * pool's left the oracle ageing quietly until it passed `maxAge`, at
+       * which point every borrow limit and health factor on the site read
+       * "n/a" while this panel reported a perfectly fresh price. Refreshing one
+       * and not the other is how a keeper can run for a week, report success,
+       * and still let the book go dark.
+       */
       for (const p of todo) {
         try {
-          const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setPrice", [p.asset, p.next]);
+          const { pool: txHash } = await writeMark(p);
           sent.push({ symbol: p.symbol, usd: fmtPrice(p.next), txHash });
           logTx(req, {
             category: "defi", action: "track-price", status: "success", txHash,
@@ -5471,12 +5575,11 @@ async function main() {
       const todo = actionablePrices((await priceProposals()) ?? []);
       for (const p of todo) {
         try {
-          const txHash = await owner.write(
-            poolDeployment.poolAddress, tesseraPoolAbi, "setPrice", [p.asset, p.next],
-          );
+          const { pool: txHash, oracle } = await writeMark(p);
           console.log(
             `[price] ${p.symbol} ${fmtPrice(p.current)} -> ${fmtPrice(p.next)}` +
-            `${p.clamped ? " (clamped step)" : ""} ${txHash}`,
+            `${p.clamped ? " (clamped step)" : ""}${p.refreshing ? " (refreshing an ageing mark)" : ""}` +
+            ` ${txHash}${oracle ? ` oracle ${oracle.slice(0, 10)}…` : ""}`,
           );
         } catch (e) {
           // One asset failing must not abandon the others; the loop repeats.

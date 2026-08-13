@@ -40,6 +40,24 @@ export const MAX_MOVE_BPS = 1_000; // 10%
 /** Below this, the move is not worth a transaction. */
 export const MIN_MOVE_BPS = 25; // 0.25%
 
+/**
+ * Refresh a mark once it is this far through its life, even if nothing moved.
+ *
+ * The two rules that produced the outage were each sensible alone. "Do not
+ * spend gas on a move smaller than 0.25%" keeps the keeper quiet. "A mark older
+ * than `maxAge` is not usable" keeps a frozen feed from pricing the book. Put
+ * together they guarantee that the *steadiest* asset is the one that breaks:
+ * USDC sat at exactly $1.00 for a week, never moved enough to be re-pushed,
+ * went stale, and `accountData` — which walks every listed reserve — began
+ * reverting `NoUsablePrice`. Every borrow limit and health factor on the site
+ * read "n/a", for a stablecoin behaving perfectly.
+ *
+ * So a price is also worth sending simply because it is old. Half the age
+ * budget leaves a wide margin for a keeper that is asleep, throttled, or
+ * failing, and costs one transaction per asset per few days.
+ */
+export const STALE_REFRESH_FRACTION = 0.5;
+
 /** Refuse to act on a quote older than this. */
 export const MAX_QUOTE_AGE_MS = 15 * 60_000;
 
@@ -48,6 +66,14 @@ export const SANITY_FLOOR = 1n; // 1e-8 USD
 export const SANITY_CEIL = 10_000_000n * PRICE_SCALE; // $10m
 
 export interface PriceProposal {
+  /**
+   * Sent because the mark was going stale, not because the price moved.
+   *
+   * Worth distinguishing in a log: a keeper that suddenly writes four prices
+   * in a quiet market is either broken or doing this, and the operator reading
+   * the line should not have to guess which.
+   */
+  refreshing?: boolean;
   asset: `0x${string}`;
   symbol: string;
   /** What the pool currently marks it at, 1e8. */
@@ -169,6 +195,9 @@ export function proposeFromSources(args: {
   maxSpreadBps?: number;
   maxMoveBps?: number;
   minMoveBps?: number;
+  /** Age of the on-chain mark, and how long the oracle will accept it. */
+  markAgeSeconds?: number;
+  markMaxAgeSeconds?: number;
 }): PriceProposal & { sources: string[]; spreadBps: number } {
   const agreed = crossCheck(args.quotes, args.maxSpreadBps);
   const p = proposePrice({
@@ -178,6 +207,8 @@ export function proposeFromSources(args: {
     marketUsd: agreed.usd,
     maxMoveBps: args.maxMoveBps,
     minMoveBps: args.minMoveBps,
+    markAgeSeconds: args.markAgeSeconds,
+    markMaxAgeSeconds: args.markMaxAgeSeconds,
   });
   return {
     ...p,
@@ -203,6 +234,10 @@ export function proposePrice(args: {
   quoteAgeMs?: number;
   maxMoveBps?: number;
   minMoveBps?: number;
+  /** How long ago the on-chain mark was last written, in seconds. */
+  markAgeSeconds?: number;
+  /** How long the oracle will accept that mark, in seconds. Zero = no limit. */
+  markMaxAgeSeconds?: number;
 }): PriceProposal {
   const {
     asset,
@@ -212,6 +247,8 @@ export function proposePrice(args: {
     quoteAgeMs = 0,
     maxMoveBps = MAX_MOVE_BPS,
     minMoveBps = MIN_MOVE_BPS,
+    markAgeSeconds = 0,
+    markMaxAgeSeconds = 0,
   } = args;
 
   const base: PriceProposal = {
@@ -240,8 +277,20 @@ export function proposePrice(args: {
 
   const diff = target - current;
   const moveBps = Number((diff * 10_000n) / current);
+  // Past half its life, a mark is worth rewriting for its own sake — see
+  // `STALE_REFRESH_FRACTION`. Nudging by a single unit keeps `actionable`'s
+  // "nothing changed, send nothing" rule intact without pretending the price
+  // moved: what is being refreshed is the timestamp, not the number.
+  const ageing = markMaxAgeSeconds > 0 && markAgeSeconds >= markMaxAgeSeconds * STALE_REFRESH_FRACTION;
   if (Math.abs(moveBps) < minMoveBps) {
-    return { ...base, target, moveBps, skip: "already within tolerance" };
+    if (!ageing) return { ...base, target, moveBps, skip: "already within tolerance" };
+    return {
+      ...base,
+      target,
+      next: target === current ? current + 1n : target,
+      moveBps,
+      refreshing: true,
+    };
   }
 
   // Clamp toward the target rather than refusing outright: a real 30% move

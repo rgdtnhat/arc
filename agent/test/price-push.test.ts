@@ -225,3 +225,63 @@ test("reports which sources were used, so a disagreement is actionable", () => {
   assert.deepEqual(p.sources, ["coingecko", "amm-twap"]);
   assert.match(p.skip!, /coingecko vs amm-twap|amm-twap vs coingecko/);
 });
+
+/**
+ * The outage this exists to prevent.
+ *
+ * USDC sat at exactly $1.00 for a week. It never moved enough to be re-pushed,
+ * its mark passed the oracle's age limit, and `accountData` — which walks every
+ * listed reserve — started reverting `NoUsablePrice`. Every borrow limit and
+ * health factor on the site read "n/a" because a stablecoin was behaving
+ * perfectly. The steadiest asset was the one guaranteed to break.
+ */
+const WEEK = 7 * 24 * 3600;
+
+test("refreshes a mark that is going stale even when the price has not moved", () => {
+  const p = proposePrice({
+    asset: "0x36", symbol: "USDC", current: 100_000_000n, marketUsd: 1,
+    markAgeSeconds: 4 * 24 * 3600, markMaxAgeSeconds: WEEK,
+  });
+  assert.equal(p.skip, undefined, "a mark past half its life is worth sending");
+  assert.equal(p.refreshing, true);
+  assert.ok(actionable([p]).length === 1, "and it reaches the chain");
+});
+
+test("stays quiet while the mark is still young", () => {
+  const p = proposePrice({
+    asset: "0x36", symbol: "USDC", current: 100_000_000n, marketUsd: 1,
+    markAgeSeconds: 3600, markMaxAgeSeconds: WEEK,
+  });
+  assert.equal(p.skip, "already within tolerance");
+  assert.deepEqual(actionable([p]), []);
+});
+
+test("an oracle with no age limit is never refreshed for age alone", () => {
+  const p = proposePrice({
+    asset: "0x36", symbol: "USDC", current: 100_000_000n, marketUsd: 1,
+    markAgeSeconds: 10 * 365 * 24 * 3600, markMaxAgeSeconds: 0,
+  });
+  assert.equal(p.skip, "already within tolerance");
+});
+
+test("a real move still wins over the heartbeat, and is still clamped", () => {
+  // Ageing must not weaken the safety rails: a 30% jump is still stepped.
+  const p = proposePrice({
+    asset: "0xf0", symbol: "cirBTC", current: 100_000_000n, marketUsd: 1.3,
+    markAgeSeconds: 6 * 24 * 3600, markMaxAgeSeconds: WEEK,
+  });
+  assert.equal(p.clamped, true);
+  assert.equal(p.refreshing, undefined);
+  assert.equal(p.next, 110_000_000n);
+});
+
+test("a stale feed is still refused, however old the mark is", () => {
+  // The one thing worse than a stale mark is a fresh mark carrying a stale
+  // number. Age pressure must never override the quote's own freshness check.
+  const p = proposePrice({
+    asset: "0x36", symbol: "USDC", current: 100_000_000n, marketUsd: 1,
+    quoteAgeMs: 60 * 60_000, markAgeSeconds: 6 * 24 * 3600, markMaxAgeSeconds: WEEK,
+  });
+  assert.match(String(p.skip), /old/);
+  assert.deepEqual(actionable([p]), []);
+});
