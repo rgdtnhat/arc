@@ -34,7 +34,8 @@
     "e2e": "node scripts/e2e.mjs",
     "verify": "npm run compile && npm run abi:check -- --compiled && npm run shell:check && npm run reads:check && npm test --workspace contracts && npm test --workspace agent && npm run e2e && npm run rehearse:redeploy",
     "redeploy:pool": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/redeploy-pool.mjs",
-    "rehearse:redeploy": "node scripts/redeploy-rehearsal.mjs"
+    "rehearse:redeploy": "node scripts/redeploy-rehearsal.mjs",
+    "session:key": "node scripts/session-key.mjs"
   },
   "overrides": {
     "adm-zip": "^0.6.0",
