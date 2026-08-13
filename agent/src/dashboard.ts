@@ -272,6 +272,11 @@ const CLIENT_SELECTORS = Object.fromEntries(
     skRevoke: "function revoke(bytes32)",
     skSpendable: "function spendable(bytes32)",
     erc20Approve: "function approve(address,uint256)",
+    // A plain transfer out of the visitor's own wallet. The Wallet pane sends
+    // from whichever wallet the page is acting as, and for a connected visitor
+    // that is theirs — the server has no key for it and must not be asked for
+    // one.
+    erc20Transfer: "function transfer(address,uint256)",
     // The gauge. Voting, withdrawing a vote, and the bribe market — all of it
     // is the holder's own transaction, never the agent's.
     gaVote: "function vote(uint256[],uint256[])",

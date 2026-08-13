@@ -63,9 +63,27 @@ export function proRataCap(yourOwed: bigint, totalOwed: bigint, pot: bigint): bi
  *
  * Largest-first gets closest to the cap in the fewest transactions' worth of
  * gas, and leaves the small remainders for the next refill, where they are
- * worth relatively more. A caller whose smallest single stream is already
- * larger than their share takes nothing rather than overshooting: the point of
- * the cap is that the next person finds something left.
+ * worth relatively more.
+ *
+ * ## Why the plan is allowed to overshoot by one stream
+ * The first version stopped at the last stream that fit. Two things went wrong
+ * with that, and both were bad enough to see in production.
+ *
+ * A caller whose rewards sit in a single large stream — which is most holders —
+ * claimed *nothing*, ever, because no whole stream fits a share smaller than
+ * it. Somebody owed the same amount across several small streams claimed
+ * freely. That is not fairness; it is an accident of how a balance is shaped.
+ *
+ * And a caller with one huge stream and a handful of small ones claimed the
+ * handful: 1,535 TSRA against a share of 62,420, because the only stream that
+ * would have used the share did not fit inside it. Getting paid what you are
+ * owed then takes dozens of claims, each costing gas.
+ *
+ * So when the greedy pass leaves room under the cap, the plan adds one more
+ * stream — the smallest of the ones left. The overshoot is bounded by a single
+ * stream, and bounded again by the pot, because `claim` pays `min(owed, held)`
+ * and deducts proportionally: the remainder stays accrued and coherent either
+ * way. Nothing else may exceed the cap.
  */
 export function planClaim(streams: OwedStream[], cap: bigint): ClaimPlan {
   const owed = streams.reduce((t, s) => t + (s.owed > 0n ? s.owed : 0n), 0n);
@@ -87,12 +105,23 @@ export function planClaim(streams: OwedStream[], cap: bigint): ClaimPlan {
       amount += s.owed;
     }
   }
-  if (!take.length) {
-    return {
-      take: [], amount: 0n, cap,
-      reason: "your share of what is in the pot is smaller than your smallest single stream, so claiming now would " +
-        "take more than your share — it stays accrued until the pot is refilled",
-    };
+  if (amount < cap) {
+    // Room left under the cap that no remaining stream fits into. Take the
+    // smallest of them, so the overshoot is the least available.
+    const rest = sorted.filter((s) => !take.includes(s));
+    const smallest = rest[rest.length - 1];
+    if (smallest) {
+      return {
+        take: [...take, smallest],
+        amount: amount + smallest.owed,
+        cap,
+        reason: take.length
+          ? "the pot is short of what everyone is owed, so this claims up to your share of it — the pot pays what " +
+            "it can and the rest stays accrued"
+          : "your share of the pot is smaller than your smallest single stream, so this claims that one stream — " +
+            "the pot pays what it can and the rest stays accrued",
+      };
+    }
   }
   return {
     take, amount, cap,

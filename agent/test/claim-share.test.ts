@@ -50,12 +50,27 @@ test("takes the largest subset that fits inside the share", () => {
   assert.equal(plan.amount, T(12));
 });
 
-test("takes nothing rather than overshooting a share", () => {
-  // One stream of 40 against a share of 12. Claiming it would empty the pot
-  // out from under everyone else — which is the whole failure being fixed.
+test("still claims when no whole stream fits inside the share", () => {
+  /*
+   * One stream of 40 against a share of 12.
+   *
+   * This used to take nothing, on the reasoning that claiming would overshoot
+   * the share. In practice that locked out everybody whose rewards sit in one
+   * large stream — permanently, because the share only shrinks as the debt
+   * grows — while somebody owed the same amount across small streams claimed
+   * freely. `claim` pays no more than the pot holds and leaves the remainder
+   * accrued, so taking the one stream is bounded anyway.
+   */
   const plan = planClaim([s("a", 40)], T(12));
-  assert.deepEqual(plan.take, []);
-  assert.match(plan.reason, /more than your share/);
+  assert.equal(plan.take.length, 1);
+  assert.equal(plan.amount, T(40));
+});
+
+test("when nothing fits, it takes the smallest stream, not the first", () => {
+  // Least overshoot available. `take` must be the 9, not the 30 or the 50.
+  const plan = planClaim([s("big", 50), s("small", 9), s("mid", 30)], T(8));
+  assert.equal(plan.take.length, 1);
+  assert.equal(plan.take[0].key, "small");
 });
 
 test("an empty pot claims nothing and says why", () => {
@@ -70,13 +85,42 @@ test("nothing accrued is not a rationing problem", () => {
   assert.match(plan.reason, /nothing has accrued/);
 });
 
-test("the plan never exceeds the cap", () => {
-  // Property: whatever the mix, the selection fits. A plan that overshot would
-  // be worse than no cap, because it would look fair while not being it.
+test("the plan never exceeds the cap by more than one stream", () => {
+  /*
+   * Property: drop the single stream that overshoots and the rest fits.
+   *
+   * The overshoot is the deliberate escape hatch — without it a share too
+   * small for the one stream that would use it claims almost nothing — and
+   * bounding it to *one* stream is what keeps it from becoming "ignore the
+   * cap". Nothing beyond that one may exceed the share.
+   */
   const streams = [s("a", 7.5), s("b", 3.25), s("c", 11), s("d", 0.5), s("e", 2)];
   for (const capWhole of [0.4, 1, 3, 7.6, 12, 24.25, 30]) {
     const cap = T(capWhole);
     const plan = planClaim(streams, cap);
-    assert.ok(plan.amount <= cap, `took ${plan.amount} against a cap of ${cap}`);
+    if (plan.amount <= cap) continue;
+    // One stream, and only one, may be responsible for the overshoot.
+    assert.ok(
+      plan.take.some((x) => plan.amount - x.owed <= cap),
+      `took ${plan.amount} over ${plan.take.length} streams against a cap of ${cap}`,
+    );
   }
+});
+
+test("uses the share it has rather than only the streams that fit under it", () => {
+  /*
+   * The live shape that exposed this: one enormous stream and a few small
+   * ones, with a share big enough for neither the big one nor much else. The
+   * old plan took the small ones and left 97% of the share on the table.
+   */
+  const plan = planClaim([s("huge", 641_528), s("a", 900), s("b", 600), s("c", 35)], T(62_420));
+  assert.ok(plan.take.some((x) => x.key === "huge"), "the stream worth claiming was left behind");
+  assert.equal(plan.take.length, 4);
+});
+
+test("a pot that covers everything is not rationed at all", () => {
+  const streams = [s("a", 7.5), s("b", 3.25)];
+  const plan = planClaim(streams, proRataCap(T(10.75), T(10.75), T(1000)));
+  assert.equal(plan.take.length, 2);
+  assert.equal(plan.amount, T(10.75));
 });

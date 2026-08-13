@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v72" />
+    <meta name="tessera-shell" content="tessera-v79" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2406,14 +2406,16 @@
           <div class="card">
             <h2>◫ Wallet — send and receive</h2>
             <div class="notready" id="walletNotReady" style="display:none">
-              Sign in as the operator to use the wallet.
+              Connect a wallet and switch on “Use my own wallet” to send your own funds, or sign in as the
+              operator to use the app wallet.
             </div>
             <div id="walletBody" style="display:none">
               <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
-                The app wallet, and the plain transfers in and out of it. Everything else in this app moves value
-                <i>inside</i> the protocol — into a pool, a vault, a swap. This is the one place that sends to an
-                address of your choosing.
+                Plain transfers in and out of the wallet this page is acting as — your own when “Use my own wallet”
+                is on, the app wallet otherwise. Everything else in this app moves value <i>inside</i> the protocol —
+                into a pool, a vault, a swap. This is the one place that sends to an address of your choosing.
               </div>
+              <div class="kv" id="walletWhose" style="margin-bottom:10px"></div>
 
               <div class="kv" style="margin-bottom:6px">Receive at</div>
               <div class="row-actions" style="margin-bottom:14px">
@@ -2495,6 +2497,11 @@
               swap, deposit to the vault, send a transfer. A task adds the missing part, which is <i>when</i>. Times
               are held in the offset you choose and honoured exactly as typed all year, so a task set for 09:00
               GMT+07:00 never drifts an hour with daylight saving somewhere else.
+            </div>
+            <div class="notready" id="tasksNotReady" style="display:none">
+              Scheduling runs on the server, which signs with the app wallet or with a session key you have
+              delegated — so creating tasks needs an operator sign-in. Open a session key above and the operator
+              can schedule against it without ever holding your funds.
             </div>
 
             <div class="row-actions" style="margin-bottom:9px">

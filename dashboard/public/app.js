@@ -977,8 +977,28 @@ const $ = (id) => document.getElementById(id);
       // POST wrapper that attaches the token and explains the two auth levels:
       // 401 = not signed in at all; 403 = signed in, but the action spends the
       // agent's own wallet and is therefore operator-only.
+      /*
+       * The second argument is either fetch options or a JSON body.
+       *
+       * It started as fetch options only, so `postAuthed(url, { to, amount })`
+       * spread two unknown keys into `fetch` and posted *no body at all*. The
+       * request still succeeded, the server read `undefined` for every field,
+       * and the failure surfaced as `row 1: "undefined" is not an address` on
+       * a wallet transfer — a message that points at the recipient box, which
+       * was filled in correctly. Guessing between the two shapes is not pretty,
+       * but silently dropping the body of a payment request is far worse, so
+       * anything that is not recognisably fetch options is treated as a body.
+       */
+      const FETCH_INIT_KEYS = new Set([
+        "method", "headers", "body", "mode", "credentials", "cache", "redirect",
+        "referrer", "referrerPolicy", "integrity", "keepalive", "signal", "window",
+      ]);
       async function postAuthed(url, opts = {}) {
-        const res = await fetch(url, { method: "POST", ...opts, headers: { ...(opts.headers || {}), ...authHeaders() } });
+        const keys = Object.keys(opts);
+        const init = keys.length && !keys.every((k) => FETCH_INIT_KEYS.has(k))
+          ? { headers: { "content-type": "application/json" }, body: JSON.stringify(opts) }
+          : opts;
+        const res = await fetch(url, { method: "POST", ...init, headers: { ...(init.headers || {}), ...authHeaders() } });
         if (res.status === 401) {
           alert("Please sign in first — Connect Wallet or use the Admin button.");
         } else if (res.status === 403) {
@@ -1435,12 +1455,45 @@ const $ = (id) => document.getElementById(id);
       $("walletBtn").addEventListener("click", connectWallet);
       (async () => {
         const t = localStorage.getItem("tessera_token");
-        if (!t) return;
+        if (!t) { adoptConnectedAccount(); return; }
         try {
           const me = await (await fetch("/api/auth/me", { headers: { authorization: "Bearer " + t } })).json();
           if (me.address) setWallet(me.address);
         } catch {}
+        adoptConnectedAccount();
       })();
+
+      /**
+       * In self-custody, the wallet the browser is offering *is* who you are.
+       *
+       * "Use my own wallet" says no sign-in is needed, and it is true of every
+       * action — those are signed by the wallet, not by the server. But every
+       * "yours" figure on the page keys off `__myAddress`, which was only ever
+       * set by a SIWE sign-in, and fell back to the operator's `actingAs`. So a
+       * visitor who switched on self-custody without signing in was shown the
+       * *app wallet's* rewards and positions as their own, with the claim
+       * button greyed out because the app wallet had nothing to claim.
+       *
+       * Read-only adoption, deliberately: it decides whose numbers to display,
+       * never what the server will sign. Spending endpoints still require a
+       * proper session.
+       */
+      async function adoptConnectedAccount() {
+        try {
+          if (!selfMode() || window.__myAddress) return;
+          const a = await connectedAddress();
+          if (!a) return;
+          setWallet(a);
+          refreshMyPositions().catch(() => {});
+          if (typeof loadClaimables === "function") loadClaimables().catch(() => {});
+          // Anything already drawn against "no address" is drawn against the
+          // wrong person, and the reward cards are the ones where that shows:
+          // they had reported the app wallet's balance with the claim button
+          // greyed out. Re-read them for whoever this actually is.
+          if (typeof loadEmissions === "function") loadEmissions().catch(() => {});
+          if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {});
+        } catch { /* no wallet, or one that will not answer — leave it alone */ }
+      }
 
       /* ---- Market table: every reserve at once ----------------------------
        *
@@ -1703,8 +1756,8 @@ const $ = (id) => document.getElementById(id);
           if (r.paused) {
             $("lnEmNote").textContent =
               (r.guard && r.guard.byGuard
-                ? "Paused automatically because the reward pot ran out — emission stops rather than booking rewards " +
-                  "nobody could claim, and restarts on its own once the pot is funded. "
+                ? `Paused automatically: ${guardWhy(r)} Emission stops rather than booking rewards nobody could ` +
+                  "claim, and restarts on its own once the pot is ahead of what is owed. "
                 : "Paused — nothing is accruing right now. ") +
               "What you have already earned is still yours and still claimable. " +
               $("lnEmNote").textContent;
@@ -1747,10 +1800,9 @@ const $ = (id) => document.getElementById(id);
           if (owedStreams.length && !assets.length) {
             const m2 = $("lnEmMsg");
             m2.style.display = "block"; m2.style.color = "var(--warn)";
-            m2.textContent = cap === 0n
-              ? "The pot is empty, so a claim would pay nothing. What you have earned stays accrued."
-              : "Your share of what is in the pot is smaller than your smallest single stream, so claiming now " +
-                "would take more than your share. It stays accrued until the pot is refilled.";
+            // Only reachable with an empty pot now: `pickStreams` always
+            // returns at least one stream while there is anything to pay.
+            m2.textContent = "The pot is empty, so a claim would pay nothing. What you have earned stays accrued.";
             return;
           }
           if (!assets.length) {
@@ -1809,12 +1861,15 @@ const $ = (id) => document.getElementById(id);
            * sentence.
            */
           const taking = picked.reduce((t, x) => t + x.owed, 0n);
+          const pot = BigInt((em.reward && em.reward.balanceRaw) || "0");
+          // `claim` pays min(what these streams hold, what the pot holds), so
+          // the pot has the last word on the sentence as well as on the money.
+          const paying = taking < pot ? taking : pot;
           const dp = (em.reward && em.reward.decimals) || 18;
-          const human = (Number(taking) / 10 ** dp).toFixed(6).replace(/\.?0+$/, "");
-          const shortPot = taking < BigInt(em.yourClaimableRaw || "0");
+          const human = (Number(paying) / 10 ** dp).toFixed(6).replace(/\.?0+$/, "");
           const claimLabel =
             `claim ${human} ${em.reward.symbol}` +
-            (shortPot ? " (your share of the pot — the rest stays owed)" : "");
+            (paying < BigInt(em.yourClaimableRaw || "0") ? " (what the pot can pay — the rest stays owed)" : "");
           await selfCustody("lnEmMsg", claimLabel, async (from, cfg) =>
             sendTx(
               from, cfg.emissions,
@@ -3016,13 +3071,34 @@ const $ = (id) => document.getElementById(id);
       }
 
       let walletAssets = [];
+      /** Whose wallet this pane is showing — null until `loadWallet` has run. */
+      let walletOwner = null;
 
+      /**
+       * The Wallet pane shows whichever wallet the page is acting as.
+       *
+       * In self-custody that is the visitor's own, read from the public
+       * balances endpoint and spent with their own signature. Otherwise it is
+       * the app wallet, which is operator-only. Reading `/api/wallet` in both
+       * cases was what made this pane look broken to a connected visitor: the
+       * request 403s, the pane hid itself, and a wallet with a balance sitting
+       * right there reported nothing to send.
+       */
       async function loadWallet() {
         const body = $("walletBody");
         if (!body) return;
         try {
-          const r = await (await fetch("/api/wallet", { headers: authHeaders() })).json();
+          const mine = selfMode() ? await connectedAddress() : null;
+          const r = mine
+            ? { ...(await (await fetch(`/api/wallet/assets?user=${encodeURIComponent(mine)}&size=100`)).json()), address: mine }
+            : await (await fetch("/api/wallet", { headers: authHeaders() })).json();
           if (!r.ok) throw new Error(r.error || "not signed in");
+          walletOwner = r.address;
+          if ($("walletWhose")) {
+            $("walletWhose").textContent = mine
+              ? "Sending from your connected wallet."
+              : "Sending from the app wallet — switch on “Use my own wallet” to send your own funds instead.";
+          }
           $("walletNotReady").style.display = "none";
           body.style.display = "";
           walletAssets = r.assets || [];
@@ -3067,12 +3143,24 @@ const $ = (id) => document.getElementById(id);
           if (!/^0x[0-9a-fA-F]{40}$/.test(to)) return showReceipt("walMsg", false, "that is not an address");
           if (!(parseFloat(human) > 0)) return showReceipt("walMsg", false, "enter an amount above zero");
           const btn = $("walSend");
+          const raw = toRaw(human, walDecimals(asset));
+          // Self-custody sends the visitor's own tokens with their own
+          // signature. The server has no key for that wallet, so routing this
+          // through `/api/wallet/send` would either 403 or — worse — move the
+          // app wallet's money instead of theirs.
+          if (selfMode()) {
+            btn.disabled = true;
+            await selfCustody("walMsg", `send ${human} to ${to.slice(0, 10)}…`, async (from, c) =>
+              sendTx(from, asset, callData(c.selectors.erc20Transfer, encAddr(to), encUint(raw))));
+            btn.disabled = false;
+            $("walSendAmount").value = "";
+            loadWallet();
+            return;
+          }
           btn.disabled = true;
           showBusy("walMsg", `sending ${human} to ${to.slice(0, 10)}…`);
           try {
-            const r = await (await postAuthed("/api/wallet/send", {
-              asset, to, amount: toRaw(human, walDecimals(asset)),
-            })).json();
+            const r = await (await postAuthed("/api/wallet/send", { asset, to, amount: raw })).json();
             showReceipt("walMsg", Boolean(r.ok), r.ok ? `sent ${human}` : `failed: ${r.error}`, r.sent && r.sent[0] && r.sent[0].txHash);
             if (r.ok) { $("walSendAmount").value = ""; loadWallet(); }
           } catch { showReceipt("walMsg", false, "request failed"); }
@@ -3091,6 +3179,31 @@ const $ = (id) => document.getElementById(id);
           if (bad.length) return showReceipt("walMsg", false, `line ${bad.join(", ")} is not "address,amount"`);
           if (!rows.length) return showReceipt("walMsg", false, "no recipients");
           const btn = $("walBulkSend");
+          /*
+           * Self-custody bulk is a transfer per row, signed one at a time.
+           *
+           * There is no batch call here on purpose: a multicall would need an
+           * approval to a contract that then moves the whole list, which is a
+           * far bigger permission than the thing being asked for. So the
+           * wallet prompts per recipient, and a row that fails or is rejected
+           * stops the rest rather than leaving the list half sent with no
+           * record of where it stopped.
+           */
+          if (selfMode()) {
+            const asset = $("walSendAsset").value;
+            btn.disabled = true;
+            for (let i = 0; i < rows.length; i++) {
+              const row = rows[i];
+              const ok = await selfCustody(
+                "walMsg", `send ${i + 1} of ${rows.length} to ${row.to.slice(0, 10)}…`,
+                async (from, c) => sendTx(from, asset, callData(c.selectors.erc20Transfer, encAddr(row.to), encUint(row.amount))),
+              );
+              if (!ok) break;
+            }
+            btn.disabled = false;
+            loadWallet();
+            return;
+          }
           btn.disabled = true;
           showBusy("walMsg", `sending to ${rows.length} address${rows.length === 1 ? "" : "es"}…`);
           try {
@@ -3236,11 +3349,30 @@ const $ = (id) => document.getElementById(id);
         "wallet:sessionSend": ["session", "to", "amount"], "wallet:sessionBulk": ["session", "recipients"],
       };
 
+      /**
+       * Build the parameter inputs for the selected verb — without losing what
+       * is already typed into them.
+       *
+       * This is called from every form change, including the schedule
+       * dropdown, and it used to rebuild the row unconditionally. So filling in
+       * a recipient and *then* choosing when it should run silently emptied the
+       * recipient box: the form looked complete, and the task was created with
+       * an undefined address. Values are carried across a rebuild, and a
+       * rebuild that would change nothing does not happen at all.
+       */
       function taskParamRow() {
         const venue = $("taskVenue").value, action = $("taskAction").value;
         const fields = TASK_FIELDS[`${venue}:${action}`] || [];
+        const row = $("taskParamRow");
         const assetOptions = walletAssets.map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`).join("");
-        $("taskParamRow").innerHTML = fields.map((f) => {
+        // Signature of what the row would contain. Same signature, same DOM —
+        // and rebuilding identical DOM is how a half-typed form gets wiped.
+        const sig = JSON.stringify([venue, action, fields, assetOptions, sessionRows.map((x) => [x.id, x.symbol, x.spendable])]);
+        if (row.dataset.sig === sig) return;
+        const kept = {};
+        row.querySelectorAll("[data-tp]").forEach((el) => { kept[el.dataset.tp] = el.value; });
+        row.dataset.sig = sig;
+        row.innerHTML = fields.map((f) => {
           if (f === "asset" || f === "tokenIn" || f === "tokenOut") {
             return `<select class="field" data-tp="${f}">${assetOptions}</select>`;
           }
@@ -3267,6 +3399,15 @@ const $ = (id) => document.getElementById(id);
           const ph = { amount: "Amount", amountIn: "Amount in", shares: "Shares", poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient" }[f] || f;
           return `<input class="field" data-tp="${f}" placeholder="${esc(ph)}" style="min-width:${f === "to" ? 210 : 120}px" />`;
         }).join("");
+        // Restore anything the visitor had already typed that this verb still
+        // asks for. A select only keeps its value if the option still exists,
+        // which is exactly the condition to check.
+        row.querySelectorAll("[data-tp]").forEach((el) => {
+          const was = kept[el.dataset.tp];
+          if (was === undefined || was === "") return;
+          if (el.tagName === "SELECT" && ![...el.options].some((o) => o.value === was)) return;
+          el.value = was;
+        });
       }
 
       function taskParams() {
@@ -3333,9 +3474,17 @@ const $ = (id) => document.getElementById(id);
 
       async function loadTasks() {
         if (!$("taskRows")) return;
+        const notReady = (why) => {
+          // A card that 403s in silence looks broken: empty dropdowns, a
+          // Create button that does nothing, and no reason given anywhere.
+          if ($("tasksNotReady")) $("tasksNotReady").style.display = why ? "" : "none";
+          if ($("taskCreate")) $("taskCreate").disabled = Boolean(why);
+        };
         try {
-          const r = await (await fetch("/api/tasks", { headers: authHeaders() })).json();
-          if (!r.ok) return;
+          const res = await fetch("/api/tasks", { headers: authHeaders() });
+          const r = await res.json();
+          if (!r.ok) { notReady(r.error || "operator sign-in required"); return; }
+          notReady(null);
           taskActions = r.actions || {};
           if (!$("taskVenue").options.length) {
             $("taskVenue").innerHTML = Object.keys(taskActions)
@@ -5090,6 +5239,11 @@ const $ = (id) => document.getElementById(id);
        * "supply 1 USDC ✓" in the app and "Fail" on Arcscan, from the same
        * hash. The tick now waits for the receipt and reads its status, and
        * says so plainly when the chain rejected it.
+       *
+       * Returns true only for a confirmed success. Callers that chain several
+       * transactions — a bulk send, an approve-then-act — need to know whether
+       * to carry on, and "it did not throw" is not that: a revert and a
+       * rejected prompt both land in here without throwing to the caller.
        */
       async function selfCustody(msgEl, label, fn) {
         const msg = $(msgEl);
@@ -5120,7 +5274,7 @@ const $ = (id) => document.getElementById(id);
             // a success, and claiming one would be the exact bug above.
             show(`${esc(label)}: your wallet did not return a transaction hash, so the result is unknown. ` +
                  `Check your wallet's activity before retrying.`, "var(--warn)", true);
-            return;
+            return false;
           }
           busy(`${esc(label)} sent — waiting for the chain to confirm it…${link()}`);
           const receipt = await waitForTx(safeHash, 120000);
@@ -5128,16 +5282,18 @@ const $ = (id) => document.getElementById(id);
             // Still pending. Not a success and not a failure; say which.
             show(`${esc(label)} is still pending after two minutes. It may yet land — ` +
                  `check the explorer rather than sending it again.${link()}`, "var(--warn)", true);
-            return;
+            return false;
           }
           if (!receiptOkHex(receipt.status)) {
             show(`${esc(label)} <b>failed on chain</b> — it was mined but reverted, so nothing moved. ` +
                  `Your funds are untouched.${link()}`, "var(--warn)", true);
-            return;
+            return false;
           }
           show(`${esc(label)} confirmed ✓${link()}`, "var(--good)", true);
+          return true;
         } catch (e) {
           show(walletError(e) + (safeHash ? ` (${safeHash.slice(0, 12)}…)` : ""), "var(--warn)");
+          return false;
         } finally {
           afterTx();
         }
@@ -5418,7 +5574,15 @@ const $ = (id) => document.getElementById(id);
         return share < yours ? share : yours;
       }
 
-      /** Largest first, taking only what fits inside the cap. */
+      /**
+       * Largest first, then one more stream if the cap still has room.
+       *
+       * The twin of `planClaim` in agent/src/claim-share.ts — see there for
+       * why the plan is allowed to overshoot by exactly one stream. The short
+       * version: stopping at the last stream that fits meant a holder whose
+       * rewards sit in one large stream claimed a rounding error, or nothing
+       * at all, and `claim` already pays no more than the pot holds.
+       */
       function pickStreams(streams, cap) {
         const owed = streams.reduce((t, s) => t + s.owed, 0n);
         if (owed <= 0n || cap <= 0n) return [];
@@ -5429,10 +5593,37 @@ const $ = (id) => document.getElementById(id);
         for (const st of sorted) {
           if (amount + st.owed <= cap) { take.push(st); amount += st.owed; }
         }
+        if (amount < cap) {
+          const rest = sorted.filter((st) => !take.includes(st));
+          const smallest = rest[rest.length - 1];
+          if (smallest) take.push(smallest);
+        }
         return take;
       }
       window.shareOfPot = shareOfPot;
       window.pickStreams = pickStreams;
+
+      /**
+       * Why the guard stopped this emission, from the numbers on the page.
+       *
+       * "The reward pot ran out" was hard-coded here, and it was wrong in the
+       * case that actually happens: the guard trips on `held - owed`, so a pot
+       * holding 46,925 TSRA against 200,000 already owed is paused with a very
+       * visible balance sitting in it. Telling somebody the pot is empty while
+       * the same card prints its balance destroys the card's credibility, so
+       * this says which of the two it is.
+       */
+      function guardWhy(r) {
+        const rw = (r && r.reward) || {};
+        const held = BigInt(rw.balanceRaw || "0");
+        const owed = BigInt(rw.owedRaw || "0");
+        if (held === 0n) return "the reward pot is empty.";
+        if (owed >= held) {
+          return `the pot holds ${rw.balance} ${rw.symbol} but ${rw.owed} is already owed to claimants, ` +
+            "so there is nothing spare to keep emitting.";
+        }
+        return "the pot no longer covers the current rates for long enough.";
+      }
 
       function showBusy(id, label) {
         const el = $(id);
@@ -5450,8 +5641,14 @@ const $ = (id) => document.getElementById(id);
         if (!el) return;
         el.style.display = "block";
         el.style.color = ok ? "var(--good)" : "var(--warn)";
-        if (ok) el.innerHTML = `${esc(label)} ✓ — view on Arcscan: ${txLink(txHash)}`;
-        else el.textContent = label;
+        // Not everything that succeeds is a transaction. Saving a task, copying
+        // an address and changing a setting all land here, and offering "view
+        // on Arcscan:" followed by nothing reads as a link that failed to load.
+        if (ok) {
+          el.innerHTML = /^0x[0-9a-fA-F]{64}$/.test(String(txHash || ""))
+            ? `${esc(label)} ✓ — view on Arcscan: ${txLink(txHash)}`
+            : `${esc(label)} ✓`;
+        } else el.textContent = label;
       }
 
       function setMine(id, text) {
@@ -7223,7 +7420,7 @@ const $ = (id) => document.getElementById(id);
           $("amEmNote").textContent =
             (r.paused
               ? (r.guard && r.guard.byGuard
-                  ? "Paused automatically because the reward pot ran out — it restarts on its own once the pot is funded. "
+                  ? `Paused automatically: ${guardWhy(r)} It restarts on its own once the pot is ahead of what is owed. `
                   : "Paused — nothing is accruing right now. ") +
                 "What you have already earned is still claimable. "
               : "") +
@@ -7299,14 +7496,9 @@ const $ = (id) => document.getElementById(id);
           const lpPicked = pickStreams(owedPools, lpCap);
           const ids = lpPicked.map((x) => x.poolId);
           if (owedPools.length && !ids.length) {
-            govMsg(
-              "amEmMsg",
-              lpCap === 0n
-                ? "The pot is empty, so a claim would pay nothing. What you have earned stays accrued."
-                : "Your share of what is in the pot is smaller than your smallest pool balance, so claiming now " +
-                  "would take more than your share. It stays accrued until the pot is refilled.",
-              "var(--warn)",
-            );
+            // Empty pot only — `pickStreams` never returns nothing while
+            // there is something to pay.
+            govMsg("amEmMsg", "The pot is empty, so a claim would pay nothing. What you have earned stays accrued.", "var(--warn)");
             return;
           }
           if (!ids.length) {
@@ -7339,11 +7531,13 @@ const $ = (id) => document.getElementById(id);
           btn.disabled = true;
           // What will arrive, not what is owed — see the lending twin.
           const lpTaking = lpPicked.reduce((t, x) => t + x.owed, 0n);
+          const lpPot = BigInt((em.reward && em.reward.balanceRaw) || "0");
+          const lpPaying = lpTaking < lpPot ? lpTaking : lpPot;
           const lpDp = (em.reward && em.reward.decimals) || 18;
-          const lpHuman = (Number(lpTaking) / 10 ** lpDp).toFixed(6).replace(/\.?0+$/, "");
+          const lpHuman = (Number(lpPaying) / 10 ** lpDp).toFixed(6).replace(/\.?0+$/, "");
           const claimLabel =
             `claim ${lpHuman} ${em.reward.symbol}` +
-            (lpTaking < BigInt(em.yourClaimableRaw || "0") ? " (your share of the pot — the rest stays owed)" : "");
+            (lpPaying < BigInt(em.yourClaimableRaw || "0") ? " (what the pot can pay — the rest stays owed)" : "");
           await selfCustody("amEmMsg", claimLabel, async (from, cfg) =>
             // claim(uint256[]): one dynamic array, so the head is a single
             // offset to the length word.
@@ -7694,6 +7888,16 @@ const $ = (id) => document.getElementById(id);
           }
           refreshMyPositions().catch(() => {});
           if (typeof loadAllowances === "function") loadAllowances().catch(() => {});
+          /*
+           * This switch turns itself on, and a programmatic `checked` fires no
+           * change event — so nothing downstream of the toggle's own handler
+           * ran on the path most people actually take. That is why a visitor
+           * with MetaMask saw the *app wallet's* rewards and positions labelled
+           * as theirs: self-custody was on, and the page had never worked out
+           * whose numbers to show. Do here what the change handler does.
+           */
+          if (selfMode()) adoptConnectedAccount();
+          if (typeof loadWallet === "function") loadWallet();
           tick();
         } else {
           t.checked = false;
@@ -7728,6 +7932,13 @@ const $ = (id) => document.getElementById(id);
           const on = selfMode();
           if (!on) clearMine(); else refreshMyPositions().catch(() => {});
           if (typeof loadAllowances === "function") loadAllowances().catch(() => {});
+          // Switching on self-custody without signing in is a supported path,
+          // and it is the one where the page has to work out who you are.
+          if (on) adoptConnectedAccount();
+          // The Wallet pane shows a different wallet either side of this
+          // switch, so it has to be re-read rather than left showing the one
+          // the visitor just switched away from.
+          if (typeof loadWallet === "function") loadWallet();
           $("custodyNote").textContent = on
             ? "Self-custody: your wallet signs and your own funds move. No sign-in needed. " +
               "(Position figures below track the app's agent wallet; your own balances live in your wallet.)"
@@ -8403,10 +8614,15 @@ const $ = (id) => document.getElementById(id);
            * A connected wallet always wins: if somebody has one, that is who
            * they are, and the operator session is only how they authenticate.
            */
-          if (!window.__myAddress && p.actingAs) {
+          // …and self-custody wins over both. An operator who has switched on
+          // "use my own wallet" is acting as their own wallet, so showing them
+          // the agent's balances there is the same error in the other
+          // direction.
+          if (!window.__myAddress && p.actingAs && !selfMode()) {
             window.__myAddress = p.actingAs;
             if (typeof loadClaimables === "function") loadClaimables().catch(() => {});
           }
+          if (selfMode()) adoptConnectedAccount();
           if (wrap) wrap.style.display = "inline-block";
           $("profileLabel").textContent = p.name || (p.kind === "admin" ? "Operator" : short(p.address));
           $("profileWho").textContent = p.kind === "admin" ? "Signed in as operator" : "Wallet " + short(p.address);
