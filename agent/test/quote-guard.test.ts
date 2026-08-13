@@ -75,6 +75,22 @@ function stubClient() {
     escrowAddress: escrow,
     public: { chain: { id: chainId } },
     async ensureApproval() {},
+    /*
+     * The escrow's own bond, which `purchase` adds to the price before it
+     * checks the balance.
+     *
+     * This double predates that call: the branch it came from was written
+     * before the bond existed, so the happy-path test failed with
+     * "bondFor is not a function" while the eight guard tests around it — the
+     * point of the file — passed. Zero keeps the arithmetic the assertions
+     * expect, and the guards are unaffected either way.
+     */
+    async bondFor() {
+      return 0n;
+    },
+    async usdcBalance() {
+      return 10n ** 12n;
+    },
     async chainTime() {
       return BigInt(Math.floor(Date.now() / 1000));
     },
