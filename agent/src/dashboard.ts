@@ -7103,6 +7103,22 @@ async function main() {
     return { sent, failed };
   }
 
+  /**
+   * The optional note that can ride along with a transfer.
+   *
+   * Kept by this app, not written to the chain. An ERC-20 `transfer` carries no
+   * memo field, and the tricks for smuggling one — trailing calldata, a second
+   * zero-value transaction — either depend on the token's decoder tolerating
+   * bytes it never asked for, or cost a second transaction to deliver text the
+   * recipient's wallet will not display anyway. Neither is a thing to do with
+   * somebody's money by default. So the note goes in the activity log and on
+   * the receipt, where it answers the question it is actually for: "what was
+   * that payment?", asked later, by the person who sent it.
+   */
+  function noteOf(v: unknown): string {
+    return String(v ?? "").replace(/\s+/g, " ").trim().slice(0, TASK_LIMITS.maxMessage);
+  }
+
   /** Parse `[{to, amount}]` where amount is already in base units. */
   function parseRecipients(input: unknown, cap = TASK_LIMITS.maxRecipients): { to: Hex; amount: bigint }[] {
     const rows = Array.isArray(input) ? input : [];
@@ -7126,14 +7142,15 @@ async function main() {
       const asset = (req.body?.asset ?? usdcAddress) as Hex;
       if (!isAddress(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
       const list = parseRecipients([{ to: req.body?.to, amount: req.body?.amount }]);
+      const note = noteOf(req.body?.message);
       const r = await sendTransfers(asset, list);
       const ok = r.sent.length === 1;
       logTx(req, {
         category: "defi", action: "wallet-send", status: ok ? "success" : "failed",
         assetAddress: asset, raw: list[0].amount, txHash: r.sent[0]?.txHash,
-        detail: ok ? `to ${list[0].to}` : r.failed[0]?.error,
+        detail: (ok ? `to ${list[0].to}` : r.failed[0]?.error) + (note ? ` — "${note}"` : ""),
       });
-      res.status(ok ? 200 : 500).json({ ok, ...r });
+      res.status(ok ? 200 : 500).json({ ok, ...r, message: note || undefined });
     } catch (e) {
       res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -7145,13 +7162,14 @@ async function main() {
       if (!isAddress(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
       const list = parseRecipients(req.body?.recipients);
       if (!list.length) { res.status(400).json({ ok: false, error: "no recipients" }); return; }
+      const note = noteOf(req.body?.message);
       const r = await sendTransfers(asset, list);
       logTx(req, {
         category: "defi", action: "wallet-send-bulk", status: r.failed.length ? "failed" : "success",
         assetAddress: asset, txHash: r.sent[0]?.txHash,
-        detail: `${r.sent.length} sent, ${r.failed.length} failed`,
+        detail: `${r.sent.length} sent, ${r.failed.length} failed` + (note ? ` — "${note}"` : ""),
       });
-      res.json({ ok: r.sent.length > 0, ...r });
+      res.json({ ok: r.sent.length > 0, ...r, message: note || undefined });
     } catch (e) {
       res.status(400).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -7259,10 +7277,12 @@ async function main() {
               failed.push(`${row.to.slice(0, 8)}… ${friendlyError(e)}`);
             }
           }
+          const note = noteOf(p.message);
           const detail =
             `${sent.length} sent from the delegated wallet${failed.length ? `, ${failed.length} failed` : ""}` +
             (sent.length ? `: ${sent.join(" ")}` : "") +
-            (failed.length ? ` · ${failed.join("; ")}` : "");
+            (failed.length ? ` · ${failed.join("; ")}` : "") +
+            (note ? ` — "${note}"` : "");
           return { ok: sent.length > 0 && failed.length === 0, detail, txHash: first };
         }
         const list = t.action === "send"
@@ -7279,10 +7299,12 @@ async function main() {
          * a table cell holds one.
          */
         const paid = r.sent.map((x) => `${x.amount}→${x.to.slice(0, 8)}…`).join(" ");
+        const note = noteOf(p.message);
         const detail =
           `${r.sent.length} sent${r.failed.length ? `, ${r.failed.length} failed` : ""}` +
           (paid ? `: ${paid}` : "") +
-          (r.failed.length ? ` · ${r.failed.map((f) => `${f.to.slice(0, 8)}… ${f.error}`).join("; ")}` : "");
+          (r.failed.length ? ` · ${r.failed.map((f) => `${f.to.slice(0, 8)}… ${f.error}`).join("; ")}` : "") +
+          (note ? ` — "${note}"` : "");
         return { ok: r.sent.length > 0 && r.failed.length === 0, detail, txHash: r.sent[0]?.txHash ?? null };
       }
     }
@@ -7319,11 +7341,22 @@ async function main() {
     try {
       // Sequentially: these share one wallet and one nonce, and two transfers
       // racing each other is how a scheduler starts dropping transactions.
-      for (const t of due) await executeTask(t, "schedule");
+      for (const t of due) {
+        // Re-read rather than trusting the snapshot `due()` returned. A batch
+        // can take a while — each of these is a transaction — and an operator
+        // pressing Stop during it means stop, not "stop after the rest of the
+        // queue has spent".
+        const now = taskStore.get(t.id);
+        if (!now || !now.enabled) continue;
+        await executeTask(now, "schedule");
+      }
     } finally {
       tasksBusy = false;
     }
-  }, 15_000).unref?.();
+    // Ticking at the schedule floor, so the fastest interval an operator can
+    // set is one the runner can actually keep. A tick with nothing due costs a
+    // list scan and no RPC.
+  }, SCHEDULE_LIMITS.minSeconds * 1000).unref?.();
 
   app.get("/api/tasks", requireOperator, (_req, res) => {
     res.json({
@@ -7335,40 +7368,46 @@ async function main() {
     });
   });
 
-  app.post("/api/tasks", requireOperator, async (req, res) => {
-    /*
-     * Check the parameters now, not at the hour the task chooses.
-     *
-     * `TaskStore` validates the venue and the verb, which is what it can know
-     * on its own. Whether an address is an address is something this half
-     * knows, and a transfer task with a typo in it is otherwise a working task
-     * right up until the night it runs.
-     */
-    const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
-    if (body.venue === "wallet") {
-      try {
-        if (body.action === "sessionSend" || body.action === "sessionBulk") {
-          const id = String(body.params?.sessionId ?? "");
-          if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("choose a session to spend from");
-          const s0 = await readSession(id as Hex);
-          if (!s0) throw new Error("no such session");
-          if (!s0.ours) throw new Error("that session is delegated to a different key");
-          if (s0.revoked) throw new Error("that session has been revoked");
-          if (body.action === "sessionBulk") {
-            if (!parseRecipients(body.params?.recipients).length) throw new Error("no recipients");
-          } else {
-            parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
-          }
-        } else if (body.action === "bulk") {
-          const list = parseRecipients(body.params?.recipients);
-          if (!list.length) { res.status(400).json({ ok: false, error: "no recipients" }); return; }
-        } else {
-          parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
-        }
-      } catch (e) {
-        res.status(400).json({ ok: false, error: friendlyError(e) });
-        return;
+  /**
+   * Check the parameters now, not at the hour the task chooses.
+   *
+   * `TaskStore` validates the venue and the verb, which is what it can know on
+   * its own. Whether an address is an address is something this half knows, and
+   * a transfer task with a typo in it is otherwise a working task right up
+   * until the night it runs.
+   *
+   * Shared by create and edit on purpose: an edit that skipped these checks
+   * would be a way to put into a task exactly what creating one refuses.
+   */
+  async function checkTaskParams(body: { venue?: string; action?: string; params?: Record<string, unknown> }) {
+    if (body.venue !== "wallet") return;
+    if (body.action === "sessionSend" || body.action === "sessionBulk") {
+      const id = String(body.params?.sessionId ?? "");
+      if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("choose a session to spend from");
+      const s0 = await readSession(id as Hex);
+      if (!s0) throw new Error("no such session");
+      if (!s0.ours) throw new Error("that session is delegated to a different key");
+      if (s0.revoked) throw new Error("that session has been revoked");
+      if (body.action === "sessionBulk") {
+        if (!parseRecipients(body.params?.recipients).length) throw new Error("no recipients");
+      } else {
+        parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
       }
+      return;
+    }
+    if (body.action === "bulk") {
+      if (!parseRecipients(body.params?.recipients).length) throw new Error("no recipients");
+      return;
+    }
+    parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
+  }
+
+  app.post("/api/tasks", requireOperator, async (req, res) => {
+    try {
+      await checkTaskParams((req.body ?? {}) as Record<string, never>);
+    } catch (e) {
+      res.status(400).json({ ok: false, error: friendlyError(e) });
+      return;
     }
     const r = taskStore.create(req.body ?? {});
     if (!r.ok) { res.status(400).json(r); return; }
@@ -7379,9 +7418,34 @@ async function main() {
     res.json({ ok: true, task: r.task, scheduleText: describeSchedule(r.task.schedule) });
   });
 
-  app.post("/api/tasks/:id", requireOperator, (req, res) => {
-    const r = taskStore.update(req.params.id, req.body ?? {});
-    res.status(r.ok ? 200 : 404).json(r);
+  app.post("/api/tasks/:id", requireOperator, async (req, res) => {
+    const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
+    const existing = taskStore.get(req.params.id);
+    if (!existing) { res.status(404).json({ ok: false, error: "no such task" }); return; }
+    // Only re-check when the edit actually touches what a task does. Pausing
+    // one must not be refused because a recipient it was created with has since
+    // become unspendable — stopping a task is the very thing you want to still
+    // work in that situation.
+    if (body.params !== undefined || body.venue !== undefined || body.action !== undefined) {
+      try {
+        await checkTaskParams({
+          venue: body.venue ?? existing.venue,
+          action: body.action ?? existing.action,
+          params: body.params ?? existing.params,
+        });
+      } catch (e) {
+        res.status(400).json({ ok: false, error: friendlyError(e) });
+        return;
+      }
+    }
+    const r = taskStore.update(req.params.id, body);
+    if (r.ok) {
+      logTx(req, {
+        category: "defi", action: "task-edit", status: "success",
+        detail: `${r.task.name}: ${describeSchedule(r.task.schedule)}${r.task.enabled ? "" : " (stopped)"}`,
+      });
+    }
+    res.status(r.ok ? 200 : 400).json(r.ok ? { ...r, scheduleText: describeSchedule(r.task.schedule) } : r);
   });
 
   app.post("/api/tasks/:id/delete", requireOperator, (req, res) => {

@@ -41,8 +41,17 @@ export type Schedule =
 
 /** Bounds that keep a typo from becoming a schedule. */
 export const SCHEDULE_LIMITS = {
-  /** Anything faster than this is a loop, not a schedule. */
-  minSeconds: 15,
+  /**
+   * Anything faster than this is a loop, not a schedule.
+   *
+   * This was 15, which was really the runner's tick interval wearing a
+   * guardrail's hat: asking for "every 10 seconds" was silently rounded up and
+   * the row came back reading "every 15 seconds", with nothing to say why. A
+   * floor is fine — a floor nobody is told about is not. It is now 5, the
+   * runner ticks at the same 5, so every interval an operator can type is one
+   * the scheduler can actually keep, and the form refuses the rest out loud.
+   */
+  minSeconds: 5,
   /** Ten years. Past this, "never" is the clearer setting. */
   maxSeconds: 315_360_000,
   /** Both signs, up to 14 hours, which covers every real offset including +13:45. */

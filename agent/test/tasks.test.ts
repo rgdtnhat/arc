@@ -89,3 +89,53 @@ test("the view carries the next time and the schedule in words", () => {
   assert.match(row.scheduleText, /Monday at 09:00 GMT\+07:00/);
   assert.ok(row.nextRunAt && row.nextRunAt > Date.now());
 });
+
+test("an edit keeps the task's id and its history", () => {
+  /*
+   * Editing used to mean delete-and-recreate for the venue and the verb — the
+   * two fields most likely to be the thing somebody got wrong — which threw
+   * away the run history that says whether the task has ever worked.
+   */
+  const s = store();
+  const made = s.create({
+    venue: "wallet", action: "send", name: "rent",
+    params: { to: "0x1111111111111111111111111111111111111111", amount: "1000" },
+    schedule: { kind: "every", seconds: 60 },
+  });
+  assert.ok(made.ok);
+  const id = (made as { task: { id: string } }).task.id;
+  s.markRun(id, "ok", "1 sent");
+
+  const edited = s.update(id, { venue: "lending", action: "supply", params: { amount: "5" } });
+  assert.ok(edited.ok);
+  const after = s.get(id)!;
+  assert.equal(after.id, id);
+  assert.equal(after.venue, "lending");
+  assert.equal(after.action, "supply");
+  assert.equal(after.runs, 1, "the history went with the edit");
+});
+
+test("an edit cannot put a verb into a task that creating one refuses", () => {
+  const s = store();
+  const made = s.create({ venue: "vault", action: "deposit", schedule: { kind: "manual" } });
+  assert.ok(made.ok);
+  const id = (made as { task: { id: string } }).task.id;
+  // A vault has no "borrow", and neither does an edit.
+  const bad = s.update(id, { action: "borrow" });
+  assert.equal(bad.ok, false);
+  assert.equal(s.get(id)!.action, "deposit");
+  // Nor an invented venue.
+  assert.equal(s.update(id, { venue: "casino" }).ok, false);
+});
+
+test("a stopped task is never due, whatever its schedule says", () => {
+  // The Stop button's whole contract. A task that keeps coming back due after
+  // being stopped is one that keeps spending after being told not to.
+  const s = store();
+  const made = s.create({ venue: "wallet", action: "send", schedule: { kind: "every", seconds: 5 } });
+  const id = (made as { task: { id: string } }).task.id;
+  assert.equal(s.due(Date.now() + 60_000).length, 1);
+  s.update(id, { enabled: false });
+  assert.equal(s.due(Date.now() + 60_000).length, 0);
+  assert.equal(s.nextRunAt(s.get(id)!), null);
+});

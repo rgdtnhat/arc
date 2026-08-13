@@ -43,6 +43,25 @@ test("an interval below the floor is raised to it", () => {
   assert.deepEqual(s, { kind: "every", seconds: SCHEDULE_LIMITS.minSeconds });
 });
 
+test("an interval the runner can keep is kept exactly", () => {
+  /*
+   * The floor used to sit at 15 — the runner's tick interval, standing in for
+   * a guardrail. "Every 10 seconds" was silently rounded up and the row came
+   * back reading "every 15 seconds" with nothing to say why. The runner now
+   * ticks at the floor, so anything at or above it survives untouched.
+   */
+  for (const seconds of [5, 10, 30, 90]) {
+    assert.deepEqual(parseSchedule({ kind: "every", seconds }), { kind: "every", seconds });
+  }
+});
+
+test("the floor is one the runner can actually keep", () => {
+  // If these ever disagree, a schedule is being promised at a cadence nothing
+  // is awake often enough to deliver — which is the bug this pair replaced.
+  assert.ok(SCHEDULE_LIMITS.minSeconds >= 1, "a floor below a second is a loop");
+  assert.equal(describeSchedule({ kind: "every", seconds: 10 }), "every 10 seconds");
+});
+
 // --- weekly, in a stated offset ---------------------------------------------
 
 test("fires at the wall time in the offset it was set in", () => {

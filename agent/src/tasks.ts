@@ -58,6 +58,8 @@ export const TASK_LIMITS = {
   maxName: 80,
   /** Recipients in one bulk transfer. Past this it is an airdrop tool, not a wallet. */
   maxRecipients: 200,
+  /** A note against a transfer. Long enough for a reference, short enough to store. */
+  maxMessage: 200,
 };
 
 const VENUES: TaskVenue[] = ["lending", "amm", "vault", "swap", "wallet"];
@@ -141,9 +143,25 @@ export class TaskStore {
     return { ok: true, task: { ...task } };
   }
 
+  /**
+   * Change a task in place, keeping its id and its history.
+   *
+   * The venue and the verb are editable too, and validated exactly as they are
+   * at creation. Without that, "edit" meant delete-and-recreate for the two
+   * fields most likely to be the thing somebody got wrong — losing the run
+   * history that says whether the task has ever worked.
+   */
   update(id: string, input: TaskInput): { ok: true; task: Task } | { ok: false; error: string } {
     const t = this.tasks.find((x) => x.id === id);
     if (!t) return { ok: false, error: "no such task" };
+    const venue = input.venue === undefined ? t.venue : (String(input.venue) as TaskVenue);
+    if (!VENUES.includes(venue)) return { ok: false, error: `unknown venue "${input.venue}"` };
+    const action = input.action === undefined ? t.action : String(input.action);
+    if (!TASK_ACTIONS[venue].includes(action)) {
+      return { ok: false, error: `${venue} cannot "${action}" — try ${TASK_ACTIONS[venue].join(", ")}` };
+    }
+    t.venue = venue;
+    t.action = action;
     if (input.name !== undefined) t.name = String(input.name).trim().slice(0, TASK_LIMITS.maxName) || t.name;
     if (input.params !== undefined) t.params = input.params as Record<string, unknown>;
     if (input.schedule !== undefined) t.schedule = parseSchedule(input.schedule);

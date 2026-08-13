@@ -1400,8 +1400,23 @@ const $ = (id) => document.getElementById(id);
          * signature requests without reading them, the precise habit that gets
          * wallets drained.
          */
-        if (window.__myAddress && localStorage.getItem("tessera_token")) {
-          $("profileBtn").click();
+        /*
+         * "Already connected" means the *provider* says so — nothing else.
+         *
+         * This tested `window.__myAddress`, which three different things set:
+         * a wallet sign-in, self-custody adoption, and an operator session
+         * falling back to the agent's own address. Only the first is a
+         * connected wallet. So an operator signed in with no wallet at all had
+         * `__myAddress` set to the agent, took this branch, and got nothing:
+         * the synthetic click bubbled to the document listener that closes
+         * menus, so the panel opened and shut in the same tick. Connect Wallet
+         * did nothing at all, with no error, on the most ordinary session
+         * there is.
+         */
+        const live = await connectedAddress();
+        if (live && localStorage.getItem("tessera_token")) {
+          if (profileMenu && profileMenu.open) profileMenu.open();
+          else alert("Connected: " + live);
           return;
         }
         // Pick when there is a choice, or when there is nothing yet — the
@@ -3144,6 +3159,7 @@ const $ = (id) => document.getElementById(id);
           if (!(parseFloat(human) > 0)) return showReceipt("walMsg", false, "enter an amount above zero");
           const btn = $("walSend");
           const raw = toRaw(human, walDecimals(asset));
+          const note = ($("walSendMsg") ? $("walSendMsg").value : "").trim().slice(0, 200);
           // Self-custody sends the visitor's own tokens with their own
           // signature. The server has no key for that wallet, so routing this
           // through `/api/wallet/send` would either 403 or — worse — move the
@@ -3154,13 +3170,20 @@ const $ = (id) => document.getElementById(id);
               sendTx(from, asset, callData(c.selectors.erc20Transfer, encAddr(to), encUint(raw))));
             btn.disabled = false;
             $("walSendAmount").value = "";
+            // Self-custody never reaches the server, so the note has nowhere
+            // to be filed. Say that rather than appearing to have kept it.
+            if (note) {
+              const m = $("walMsg");
+              m.innerHTML += ` <span class="muted">· note "${esc(note)}" was not saved — your wallet signed this ` +
+                `transfer directly, so it never passed through this app.</span>`;
+            }
             loadWallet();
             return;
           }
           btn.disabled = true;
           showBusy("walMsg", `sending ${human} to ${to.slice(0, 10)}…`);
           try {
-            const r = await (await postAuthed("/api/wallet/send", { asset, to, amount: raw })).json();
+            const r = await (await postAuthed("/api/wallet/send", { asset, to, amount: raw, message: note })).json();
             showReceipt("walMsg", Boolean(r.ok), r.ok ? `sent ${human}` : `failed: ${r.error}`, r.sent && r.sent[0] && r.sent[0].txHash);
             if (r.ok) { $("walSendAmount").value = ""; loadWallet(); }
           } catch { showReceipt("walMsg", false, "request failed"); }
@@ -3207,7 +3230,10 @@ const $ = (id) => document.getElementById(id);
           btn.disabled = true;
           showBusy("walMsg", `sending to ${rows.length} address${rows.length === 1 ? "" : "es"}…`);
           try {
-            const r = await (await postAuthed("/api/wallet/send-bulk", { asset: $("walSendAsset").value, recipients: rows })).json();
+            const r = await (await postAuthed("/api/wallet/send-bulk", {
+              asset: $("walSendAsset").value, recipients: rows,
+              message: ($("walSendMsg") ? $("walSendMsg").value : "").trim().slice(0, 200),
+            })).json();
             const sent = (r.sent || []).length, failed = (r.failed || []).length;
             showReceipt("walMsg", Boolean(r.ok) && !failed,
               r.ok ? `${sent} sent${failed ? `, ${failed} failed` : ""}` : `failed: ${r.error}`,
@@ -3334,6 +3360,10 @@ const $ = (id) => document.getElementById(id);
       /* ---- tasks --------------------------------------------------------- */
 
       let taskActions = {};
+      /** The rows as the server last described them, for the Edit button. */
+      let taskRowsById = new Map();
+      /** The task being edited, or null when the form creates a new one. */
+      let editingTask = null;
       const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
       /** The parameters each verb needs, so the form asks for those and no others. */
@@ -3344,9 +3374,10 @@ const $ = (id) => document.getElementById(id);
         "swap:swap": ["asset", "tokenOut", "amount"],
         "amm:add": ["poolId", "amounts"], "amm:remove": ["poolId", "shares"],
         "amm:swap": ["poolId", "tokenIn", "tokenOut", "amountIn"],
-        "wallet:send": ["asset", "to", "amount"], "wallet:bulk": ["asset", "recipients"],
+        "wallet:send": ["asset", "to", "amount", "message"], "wallet:bulk": ["asset", "recipients", "message"],
         // Funded by a visitor's delegation rather than the app wallet.
-        "wallet:sessionSend": ["session", "to", "amount"], "wallet:sessionBulk": ["session", "recipients"],
+        "wallet:sessionSend": ["session", "to", "amount", "message"],
+        "wallet:sessionBulk": ["session", "recipients", "message"],
       };
 
       /**
@@ -3396,6 +3427,13 @@ const $ = (id) => document.getElementById(id);
               `style="width:100%;font-family:var(--mono,monospace);font-size:12px"></textarea>` +
               `<span id="taskRecipCount" style="font-size:11.5px;color:var(--muted)"></span>`;
           }
+          if (f === "message") {
+            // Optional, and honest about where it goes: nothing here is written
+            // to the chain, so it must not look like something the recipient
+            // will read.
+            return `<input class="field" data-tp="message" maxlength="200" placeholder="Note for your own records (optional)" ` +
+              `style="min-width:200px;flex:1" />`;
+          }
           const ph = { amount: "Amount", amountIn: "Amount in", shares: "Shares", poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient" }[f] || f;
           return `<input class="field" data-tp="${f}" placeholder="${esc(ph)}" style="min-width:${f === "to" ? 210 : 120}px" />`;
         }).join("");
@@ -3437,11 +3475,23 @@ const $ = (id) => document.getElementById(id);
         return out;
       }
 
+      /**
+       * The floor the server will apply, so the form can apply the same one.
+       *
+       * The two used to disagree: the form previewed "runs every 10 seconds",
+       * the server clamped to its 15-second floor, and the row came back saying
+       * "every 15 seconds" with nothing anywhere explaining the change. Reading
+       * the limit from the server means there is one number, not two.
+       */
+      let taskLimits = { minSeconds: 5, maxSeconds: 315360000 };
+
       function taskSchedule() {
         const kind = $("taskKind").value;
         if (kind === "manual") return { kind: "manual" };
         if (kind === "every") {
-          return { kind: "every", seconds: Math.max(1, Number($("taskEveryN").value || 1)) * Number($("taskEveryUnit").value) };
+          const want = Math.max(1, Number($("taskEveryN").value || 1)) * Number($("taskEveryUnit").value);
+          const seconds = Math.min(taskLimits.maxSeconds, Math.max(taskLimits.minSeconds, want));
+          return { kind: "every", seconds };
         }
         const base = {
           hour: Number($("taskHour").value || 0),
@@ -3454,6 +3504,80 @@ const $ = (id) => document.getElementById(id);
         }
         if (kind === "monthly") return { kind: "monthly", day: Number($("taskDom").value || 1), ...base };
         return { kind: "yearly", month: Number($("taskMonth").value || 1), day: Number($("taskDom").value || 1), ...base };
+      }
+
+      /**
+       * Load a task back into the form it was made in.
+       *
+       * Editing reuses the create form rather than opening a second one: two
+       * forms for the same thing drift, and the one that drifts is always the
+       * one used less. The form is filled from what the server last reported,
+       * amounts converted back out of base units so the boxes read the way they
+       * were typed.
+       */
+      function startEditing(id) {
+        const t = taskRowsById.get(id);
+        if (!t) return;
+        editingTask = id;
+        $("taskName").value = t.name || "";
+        $("taskVenue").value = t.venue;
+        $("taskAction").dataset.venue = ""; // force the verb list to rebuild
+        syncTaskForm();
+        $("taskAction").value = t.action;
+        syncTaskForm();
+
+        const s = t.schedule || { kind: "manual" };
+        $("taskKind").value = s.kind;
+        if (s.kind === "every") {
+          // Show it in the largest whole unit it divides into, which is how it
+          // was almost certainly typed.
+          const unit = s.seconds % 604800 === 0 ? 604800
+            : s.seconds % 86400 === 0 ? 86400
+            : s.seconds % 3600 === 0 ? 3600
+            : s.seconds % 60 === 0 ? 60 : 1;
+          $("taskEveryUnit").value = String(unit);
+          $("taskEveryN").value = String(s.seconds / unit);
+        } else if (s.kind !== "manual") {
+          $("taskHour").value = String(s.hour ?? 0);
+          $("taskMinute").value = String(s.minute ?? 0);
+          $("taskZone").value = String(s.offsetMinutes ?? 0);
+          if (s.kind === "weekly") {
+            $("taskDays").querySelectorAll("input").forEach((i) => { i.checked = (s.days || []).includes(Number(i.value)); });
+          }
+          if (s.kind === "monthly" || s.kind === "yearly") $("taskDom").value = String(s.day ?? 1);
+          if (s.kind === "yearly") $("taskMonth").value = String(s.month ?? 1);
+        }
+        syncTaskForm();
+
+        // Params last: `syncTaskForm` rebuilds the inputs, so filling them
+        // before it would fill boxes that are about to be replaced.
+        const p = t.params || {};
+        $("taskParamRow").querySelectorAll("[data-tp]").forEach((el) => {
+          const k = el.dataset.tp;
+          const raw = k === "sessionId" ? p.sessionId : p[k];
+          if (raw === undefined || raw === null) return;
+          const session = sessionRows.find((x) => x.id === p.sessionId);
+          const dec = session ? session.decimals : walDecimals(p.asset);
+          if (k === "amount" || k === "amountIn") el.value = fmtUnitsStr(String(raw), dec);
+          else if (k === "recipients") {
+            el.value = (Array.isArray(raw) ? raw : [])
+              .map((x) => `${x.to},${fmtUnitsStr(String(x.amount), dec)}`).join("\n");
+          } else el.value = String(raw);
+        });
+
+        previewTask();
+        $("taskCreate").textContent = "Save changes";
+        if ($("taskCancelEdit")) $("taskCancelEdit").style.display = "";
+        showReceipt("taskMsg", true, `editing "${t.name}" — Save changes keeps its history`);
+        $("taskVenue").scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+
+      /** Back to creating, leaving the edited task exactly as it was. */
+      function stopEditing() {
+        editingTask = null;
+        $("taskName").value = "";
+        $("taskCreate").textContent = "Create task";
+        if ($("taskCancelEdit")) $("taskCancelEdit").style.display = "none";
       }
 
       function syncTaskForm() {
@@ -3486,6 +3610,9 @@ const $ = (id) => document.getElementById(id);
           if (!r.ok) { notReady(r.error || "operator sign-in required"); return; }
           notReady(null);
           taskActions = r.actions || {};
+          if (r.limits) taskLimits = { ...taskLimits, ...r.limits };
+          if ($("taskEveryN")) $("taskEveryN").min = "1";
+          taskRowsById = new Map((r.tasks || []).map((t) => [t.id, t]));
           if (!$("taskVenue").options.length) {
             $("taskVenue").innerHTML = Object.keys(taskActions)
               .map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
@@ -3506,13 +3633,29 @@ const $ = (id) => document.getElementById(id);
                 const last = t.lastRunAt
                   ? `${t.lastStatus === "ok" ? "✓" : "✗"} ${esc(t.lastDetail || "")}`
                   : "never run";
+                /*
+                 * The buttons get their own full-width row.
+                 *
+                 * They were a fourth cell, which on a phone put Stop and Delete
+                 * off the right-hand edge of a table that scrolls — so the only
+                 * control for a task that was firing every fifteen seconds was
+                 * one the operator could not reach. A control that stops
+                 * something spending money has to be the easiest thing on the
+                 * row to hit.
+                 */
                 return `<tr><td><b>${esc(t.name)}</b>` +
-                  `<div class="muted" style="font-size:11px">${esc(t.venue)} · ${esc(t.action)}${t.enabled ? "" : " · paused"}</div></td>` +
+                  `<div class="muted" style="font-size:11px">${esc(t.venue)} · ${esc(t.action)}` +
+                  `${t.enabled ? "" : ` · <span style="color:var(--warn)">stopped</span>`}</div></td>` +
                   `<td style="font-size:12px">${esc(t.scheduleText)}<div class="muted" style="font-size:11px">next ${esc(next)}</div></td>` +
-                  `<td style="font-size:11.5px">${last}</td>` +
-                  `<td class="num"><button class="btn" data-trun="${esc(t.id)}">Run</button> ` +
-                  `<button class="btn" data-ttog="${esc(t.id)}">${t.enabled ? "Pause" : "Resume"}</button> ` +
-                  `<button class="btn" data-tdel="${esc(t.id)}">Delete</button></td></tr>`;
+                  `<td style="font-size:11.5px">${last}</td></tr>` +
+                  `<tr><td colspan="3" style="padding-top:0">` +
+                  `<div style="display:flex;flex-wrap:wrap;gap:6px">` +
+                  `<button class="btn" data-trun="${esc(t.id)}">Run now</button>` +
+                  `<button class="btn" data-tedit="${esc(t.id)}">Edit</button>` +
+                  `<button class="btn${t.enabled ? " warn" : ""}" data-ttog="${esc(t.id)}" data-tnext="${t.enabled ? "0" : "1"}">` +
+                  `${t.enabled ? "Stop" : "Start"}</button>` +
+                  `<button class="btn" data-tdel="${esc(t.id)}">Delete</button>` +
+                  `</div></td></tr>`;
               }).join("")
             : emptyRow(4, "No tasks yet.");
         } catch { /* the pane stays as it was */ }
@@ -3533,13 +3676,28 @@ const $ = (id) => document.getElementById(id);
             return `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
           };
           const at = () => `${String(s.hour).padStart(2, "0")}:${String(s.minute).padStart(2, "0")} ${zone(s.offsetMinutes)}`;
+          // The typed figure, before the floor — so a raise can be named rather
+          // than just silently appearing in the sentence.
+          const typed = Math.max(1, Number($("taskEveryN").value || 1)) * Number($("taskEveryUnit").value);
+          const raised = s.kind === "every" && s.seconds !== typed;
+          const every = (n) => {
+            const u = n % 604800 === 0 ? [n / 604800, "week"]
+              : n % 86400 === 0 ? [n / 86400, "day"]
+              : n % 3600 === 0 ? [n / 3600, "hour"]
+              : n % 60 === 0 ? [n / 60, "minute"]
+              : [n, "second"];
+            return `every ${u[0] === 1 ? "" : u[0] + " "}${u[1]}${u[0] === 1 ? "" : "s"}`;
+          };
           const text =
             s.kind === "manual" ? "runs only when you press Run"
-            : s.kind === "every" ? `runs every ${s.seconds} second${s.seconds === 1 ? "" : "s"}`
+            : s.kind === "every"
+              ? `runs ${every(s.seconds)}` +
+                (raised ? ` — ${taskLimits.minSeconds} seconds is the fastest the runner ticks, so ${typed} was raised` : "")
             : s.kind === "weekly" ? (s.days.length ? `runs ${s.days.map((d) => DAY_NAMES[d]).join(", ")} at ${at()}` : "pick at least one day")
             : s.kind === "monthly" ? `runs on day ${s.day} of each month at ${at()}`
             : `runs on ${s.month}/${s.day} each year at ${at()}`;
           $("taskPreview").textContent = text;
+          $("taskPreview").style.color = raised ? "var(--warn)" : "";
         }
         window.previewTask = previewTask;
 
@@ -3573,17 +3731,24 @@ const $ = (id) => document.getElementById(id);
             return showReceipt("taskMsg", false, "that is not an address");
           }
           btn.disabled = true;
-          showBusy("taskMsg", "saving the task…");
+          showBusy("taskMsg", editingTask ? "saving your changes…" : "saving the task…");
           try {
-            const r = await (await postAuthed("/api/tasks", {
+            // Same body either way; only the address differs. An edit keeps the
+            // task's id, and with it the run history that says whether this
+            // task has ever actually worked.
+            const body = {
               name: $("taskName").value.trim(),
               venue: $("taskVenue").value,
               action: $("taskAction").value,
               params: taskParams(),
               schedule: taskSchedule(),
-            })).json();
-            showReceipt("taskMsg", Boolean(r.ok), r.ok ? `created — ${r.scheduleText}` : `failed: ${r.error}`);
-            if (r.ok) { $("taskName").value = ""; loadTasks(); }
+            };
+            const r = await (await postAuthed(editingTask ? `/api/tasks/${editingTask}` : "/api/tasks", body)).json();
+            showReceipt(
+              "taskMsg", Boolean(r.ok),
+              r.ok ? `${editingTask ? "saved" : "created"} — ${r.scheduleText}` : `failed: ${r.error}`,
+            );
+            if (r.ok) { stopEditing(); loadTasks(); }
           } catch { showReceipt("taskMsg", false, "request failed"); }
           finally { btn.disabled = false; }
         });
@@ -3591,7 +3756,8 @@ const $ = (id) => document.getElementById(id);
         $("taskRows").addEventListener("click", async (e) => {
           const btn = e.target.closest("button");
           if (!btn) return;
-          const run = btn.dataset.trun, del = btn.dataset.tdel, tog = btn.dataset.ttog;
+          const run = btn.dataset.trun, del = btn.dataset.tdel, tog = btn.dataset.ttog, edit = btn.dataset.tedit;
+          if (edit) { startEditing(edit); return; }
           btn.disabled = true;
           try {
             if (run) {
@@ -3599,11 +3765,19 @@ const $ = (id) => document.getElementById(id);
               const r = await (await postAuthed(`/api/tasks/${run}/run`, {})).json();
               showReceipt("taskMsg", Boolean(r.ok), r.ok ? `ran: ${r.detail}` : `failed: ${r.detail || r.error}`, r.txHash);
             } else if (del) {
+              const t = taskRowsById.get(del);
+              if (!confirm(`Delete "${t ? t.name : "this task"}"? This cannot be undone.`)) { btn.disabled = false; return; }
               await postAuthed(`/api/tasks/${del}/delete`, {});
+              if (editingTask === del) stopEditing();
               showReceipt("taskMsg", true, "task deleted");
             } else if (tog) {
-              await postAuthed(`/api/tasks/${tog}`, { enabled: btn.textContent.trim() === "Resume" });
-              showReceipt("taskMsg", true, "task updated");
+              // Read the intent off the button rather than its label: a
+              // translated or restyled label must not be able to flip the
+              // meaning of the control that stops a task from spending.
+              const enabled = btn.dataset.tnext === "1";
+              const r = await (await postAuthed(`/api/tasks/${tog}`, { enabled })).json();
+              showReceipt("taskMsg", Boolean(r.ok),
+                r.ok ? (enabled ? "task started" : "task stopped — it will not run again until you start it") : `failed: ${r.error}`);
             }
           } catch { showReceipt("taskMsg", false, "request failed"); }
           finally { btn.disabled = false; loadTasks(); loadWallet(); }
@@ -7981,7 +8155,19 @@ const $ = (id) => document.getElementById(id);
         panel.addEventListener("click", (e) => e.stopPropagation());
         document.addEventListener("click", close);
         document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
-        return { close };
+        /*
+         * A real opener, because `btn.click()` is not one.
+         *
+         * A synthetic click bubbles to the `document` listener above, which
+         * closes every menu — so opening a panel from code toggled it on and
+         * straight back off, and looked exactly like a dead button.
+         */
+        const open = () => {
+          document.querySelectorAll(".menuPanel.open").forEach((p) => { if (p !== panel) p.classList.remove("open"); });
+          panel.classList.add("open");
+          btn.setAttribute("aria-expanded", "true");
+        };
+        return { close, open };
       }
       const profileMenu = bindMenu("profileBtn", "profileMenu");
       /* App Config opens as a large scrollable dialog rather than a dropdown —
