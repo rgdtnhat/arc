@@ -6934,6 +6934,14 @@ async function main() {
   const sessionSigner = process.env.SESSION_KEY_PRIVATE_KEY
     ? OwnerClient.fromKey(chain, rpcUrl, process.env.SESSION_KEY_PRIVATE_KEY as Hex)
     : null;
+  // Say so at boot, on both branches. A feature that is off because a variable
+  // never arrived is otherwise only discoverable by a visitor finding the panel
+  // greyed out, which is the slowest possible way to learn it.
+  console.log(
+    sessionSigner
+      ? `[sessions] session key ${sessionSigner.account.address} — scheduling from a visitor's own wallet is available`
+      : "[sessions] no SESSION_KEY_PRIVATE_KEY in this process, so scheduling from a visitor's own wallet is off",
+  );
 
   /** Everything a page needs to show, or a task needs to spend against. */
   async function readSession(id: Hex) {
@@ -6971,10 +6979,20 @@ async function main() {
       ok: true,
       contract: sessionKeysAddr,
       key: sessionSigner ? (sessionSigner.account.address as Hex) : null,
+      /*
+       * Say where to look, not just what is missing.
+       *
+       * "Set SESSION_KEY_PRIVATE_KEY" is unhelpful to somebody who has already
+       * set it — which is the common case, because on a Docker host setting it
+       * in .env is only half the job: it also has to reach the container. That
+       * is exactly how this message stayed on a live site with the key sitting
+       * correctly in .env the whole time.
+       */
       note: sessionSigner
         ? undefined
         : "No session key is configured on this server, so scheduling from your own wallet is unavailable. " +
-          "Set SESSION_KEY_PRIVATE_KEY to enable it.",
+          "Set SESSION_KEY_PRIVATE_KEY and restart. If it is already in your .env, the container is not " +
+          "seeing it — check with: docker compose exec tessera printenv SESSION_KEY_PRIVATE_KEY",
     });
   });
 

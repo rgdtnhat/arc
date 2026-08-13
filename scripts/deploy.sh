@@ -144,5 +144,30 @@ fi
 
 ok "server is serving $got"
 version_json | sed 's/^/   /'
+
+# Did everything in .env actually reach the container?
+#
+# The compose file used to pass a hand-kept list of variables through, so a
+# value added to .env was simply not there inside the container — and nothing
+# failed, the app just behaved as though it were unset. A key correctly set on
+# the host produced "no session key configured on this server" on the live
+# site. The list is gone (env_file now carries the whole file), and this is the
+# check that would have caught it in the first place.
+if [ -f .env ]; then
+  missing=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    docker compose exec -T tessera printenv "$name" >/dev/null 2>&1 || missing="$missing $name"
+  done <<EOFVARS
+$(grep -oE '^[[:space:]]*[A-Z_][A-Z0-9_]*=' .env | tr -d ' =')
+EOFVARS
+  if [ -n "$missing" ]; then
+    say "Settings that did not reach the container"
+    for name in $missing; do warn "$name is in .env but unset inside the container"; done
+    warn "Compose needs v2.24+ for this file's env_file form — check: docker compose version"
+  else
+    ok "every variable in .env is set inside the container"
+  fi
+fi
 printf '\n\033[32mUpdate complete.\033[0m If the page still looks unchanged, that is your browser:\n'
 printf 'close every tab of the site and reopen it — the service worker answers before the network.\n\n'

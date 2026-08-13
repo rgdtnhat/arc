@@ -8,32 +8,38 @@
 services:
   tessera:
     build: .
+    #
+    # The whole .env goes into the container, rather than a hand-kept list.
+    #
+    # This used to name each variable it passed through, which meant the
+    # container only ever saw the dozen somebody had remembered to add. Setting
+    # anything newer in .env did nothing at all, and nothing said so: the app
+    # started fine and simply behaved as though the value were unset. That is
+    # how a SESSION_KEY_PRIVATE_KEY sitting correctly in .env still produced
+    # "no session key configured on this server" on the live site, and the same
+    # silence covered the emissions guard, the autopilot, the keeper, the fee
+    # harvester, the task runner and every RPC tuning knob.
+    #
+    # `required: false` so a host with no .env still starts — the quick-start in
+    # docs/SELF_HOST.md passes SITE_ADDRESS inline and never writes one.
+    # (Needs Compose v2.24+; older versions reject the mapping form.)
+    env_file:
+      - path: .env
+        required: false
+    # Only what the *container* fixes, or defaults for a .env that omits them.
+    # Secrets are deliberately not repeated here: an `environment` entry wins
+    # over env_file, and it is interpolated — so a password containing `$`
+    # arrives mangled through this path and intact through the other.
     environment:
       - PORT=8787
-      # Live on Arc: the agent runs the scenario against the deployed contracts
-      # in real USDC. Set these in a .env file next to this compose file.
-      - AGENT_PRIVATE_KEY=${AGENT_PRIVATE_KEY:-}
-      - PROVIDER_PRIVATE_KEY=${PROVIDER_PRIVATE_KEY:-}
-      # Owner key. REQUIRED for App Config to reach the contracts and for
-      # "Allocate now" — the deployer owns the vault and the fee collector, so
-      # without this the server can only save config locally.
-      - DEPLOYER_PRIVATE_KEY=${DEPLOYER_PRIVATE_KEY:-}
-      - ARC_RPC_URL=${ARC_RPC_URL:-https://rpc.testnet.arc.network}
       # Where runtime state lives. This MUST match the volume mounted below:
       # without it STATE_DIR falls back to the app root, which is inside the
       # image — so every `up --build` reset the admin password to the env seed
       # and lost the config, profiles, transaction history and holder index.
       - STATE_DIR=/app/state
-      - ARC_CHAIN_ID=${ARC_CHAIN_ID:-}
-      - ARC_EXPLORER_URL=${ARC_EXPLORER_URL:-}
-      # Dashboard admin login (secret — set in a .env next to this file). Blank = disabled.
+      - ARC_RPC_URL=${ARC_RPC_URL:-https://rpc.testnet.arc.network}
       - ADMIN_ID=${ADMIN_ID:-admin}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
-      # Optional: programmatic testnet USDC drips.
-      - CIRCLE_API_KEY=${CIRCLE_API_KEY:-}
-      # Optional LLM brain:
       - AGENT_BRAIN=${AGENT_BRAIN:-rules}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     volumes:
       # Live deployment record + persisted admin/config/profile state, so a
       # redeploy or a container rebuild doesn't lose them.

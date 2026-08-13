@@ -72,10 +72,28 @@ a `.env` next to `docker-compose.yml` on the server (gitignored — never commit
 SITE_ADDRESS=tesra.xyz, www.tesra.xyz
 AGENT_PRIVATE_KEY=0x...          # your Arc agent key
 PROVIDER_PRIVATE_KEY=0x...       # your Arc provider key
+DEPLOYER_PRIVATE_KEY=0x...       # owner key; App Config and fee routing need it
 ADMIN_ID=admin                   # dashboard admin login
 ADMIN_PASSWORD=change-me         # secret; enables the Admin button
+SESSION_KEY_PRIVATE_KEY=0x...    # optional; enables scheduling from a visitor's own wallet
 # ARC_RPC_URL=https://rpc.testnet.arc.network   # optional override
 ```
+
+The whole file is passed into the container (`env_file` in `docker-compose.yml`),
+so anything the app reads can go in here. That is deliberate: the compose file
+used to name each variable it forwarded, and a value added to `.env` that was
+not on that list simply never reached the container — the app started fine and
+behaved as though it were unset, with nothing anywhere saying why. This form
+needs Compose v2.24 or newer (`docker compose version`).
+
+To confirm a setting arrived, ask the container rather than the host:
+
+```bash
+docker compose exec tessera printenv SESSION_KEY_PRIVATE_KEY
+```
+
+`./scripts/deploy.sh` runs that check for every variable in `.env` at the end of
+an update.
 
 Then `docker compose up -d --build`. What's hosted:
 
