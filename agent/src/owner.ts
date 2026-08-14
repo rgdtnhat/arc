@@ -87,6 +87,28 @@ export class OwnerClient {
   private static readonly GAS_DENOMINATOR = 2n;
   private static readonly GAS_FLOOR = 50_000n;
 
+  /**
+   * One signature at a time, per account.
+   *
+   * A chain orders an account's transactions by nonce, so two sends from the
+   * same key in the same instant either race for a nonce or take the same one
+   * and one of them is dropped. Nothing here used to overlap; a task series
+   * running in parallel mode does. The queue is per address — different keys
+   * (the app wallet and a session key) still sign at the same time — and it
+   * covers only the broadcast, not the wait for a receipt, so "parallel" still
+   * means nobody waits for anybody else's result.
+   */
+  private static readonly sending = new Map<string, Promise<unknown>>();
+
+  private queued<T>(fn: () => Promise<T>): Promise<T> {
+    const key = this.account.address.toLowerCase();
+    const prev = OwnerClient.sending.get(key) ?? Promise.resolve();
+    // `catch` so one failed send does not poison every send after it.
+    const next = prev.catch(() => {}).then(fn);
+    OwnerClient.sending.set(key, next.catch(() => {}));
+    return next;
+  }
+
   private async send(address: Hex, abi: unknown, functionName: string, args: unknown[]): Promise<Hex> {
     const { request } = await this.pub.simulateContract({
       address,
@@ -96,7 +118,8 @@ export class OwnerClient {
       account: this.account,
     });
     const gas = await this.gasFor(address, abi, functionName, args);
-    const hash = await this.wallet.writeContract({ ...(request as object), ...(gas ? { gas } : {}) } as never);
+    const hash = await this.queued(() =>
+      this.wallet.writeContract({ ...(request as object), ...(gas ? { gas } : {}) } as never));
     await confirm(this.pub, hash);
     return hash;
   }
@@ -150,9 +173,9 @@ export class OwnerClient {
       // A call that will not estimate will not send either; let the send
       // produce the real error rather than inventing a limit for it.
     }
-    const hash = await this.wallet.sendTransaction({
+    const hash = await this.queued(() => this.wallet.sendTransaction({
       account: this.account, chain: this.chain, to, data, ...(gas ? { gas } : {}),
-    } as never);
+    } as never));
     await confirm(this.pub, hash);
     return hash;
   }

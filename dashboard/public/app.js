@@ -156,7 +156,9 @@ const $ = (id) => document.getElementById(id);
           // you arrive rather than on every poll of every other tab.
           // Sessions first: it is the slowest of the three and the one the pane
           // is mostly made of.
-          if (route === "wallet" && typeof loadWallet === "function") { loadSessions(); loadWallet(); loadTasks(); }
+          if (route === "wallet" && typeof loadWallet === "function") {
+            loadSessions(); loadWallet(); loadTasks(); loadSeries();
+          }
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -4312,6 +4314,8 @@ const $ = (id) => document.getElementById(id);
                   `</div></td></tr>`;
               }).join("")
             : emptyRow(4, "No tasks yet.");
+          // The series picker is built from this list, so it follows it.
+          if (typeof renderSeriesPicker === "function") renderSeriesPicker();
         } catch { /* the pane stays as it was */ }
       }
 
@@ -4329,6 +4333,7 @@ const $ = (id) => document.getElementById(id);
         if (!pane || pane.hidden || !$("taskRows")) return;
         if (document.hidden) return;
         loadTasks();
+        loadSeries();
       }, 5000);
 
       if ($("taskCreate")) {
@@ -4471,6 +4476,255 @@ const $ = (id) => document.getElementById(id);
             }
           } catch { showReceipt("taskMsg", false, "request failed"); }
           finally { btn.disabled = false; loadTasks(); loadWallet(); }
+        });
+      }
+
+      /* ---- task series ---------------------------------------------------
+       *
+       * The same shape as a single task, one level up: a schedule, the same
+       * five controls, and a list of members it triggers. It shares the task
+       * card's schedule vocabulary deliberately — an operator who has learnt
+       * "every 10 minutes" once should not have to learn it again here.
+       * ================================================================== */
+
+      let seriesRowsById = new Map();
+      let editingSeries = null;
+
+      function serSchedule() {
+        const kind = $("serKind").value;
+        if (kind === "manual") return { kind: "manual" };
+        if (kind === "every") {
+          const want = Math.max(1, Number($("serEveryN").value || 1)) * Number($("serEveryUnit").value);
+          return { kind: "every", seconds: Math.min(taskLimits.maxSeconds, Math.max(taskLimits.minSeconds, want)) };
+        }
+        const base = {
+          hour: Number($("serHour").value || 0),
+          minute: Number($("serMinute").value || 0),
+          offsetMinutes: Number($("serZone").value || 0),
+        };
+        if (kind === "weekly") {
+          return { kind: "weekly", days: [...$("serDays").querySelectorAll("input:checked")].map((i) => Number(i.value)), ...base };
+        }
+        if (kind === "monthly") return { kind: "monthly", day: Number($("serDom").value || 1), ...base };
+        return { kind: "yearly", month: Number($("serMonth").value || 1), day: Number($("serDom").value || 1), ...base };
+      }
+
+      function syncSeriesForm() {
+        const kind = $("serKind").value;
+        $("serEvery").style.display = kind === "every" ? "" : "none";
+        $("serCalendar").style.display = kind === "manual" || kind === "every" ? "none" : "";
+        $("serDays").style.display = kind === "weekly" ? "" : "none";
+        $("serDom").style.display = kind === "monthly" || kind === "yearly" ? "" : "none";
+        $("serMonth").style.display = kind === "yearly" ? "" : "none";
+      }
+
+      /** The tasks to choose from, with the order they were ticked preserved. */
+      function renderSeriesPicker() {
+        const host = $("serPick");
+        if (!host) return;
+        const chosen = [...host.querySelectorAll("input:checked")].map((i) => i.value);
+        const rows = [...taskRowsById.values()];
+        host.innerHTML = rows.length
+          ? rows.map((t) =>
+              `<label style="display:flex;gap:8px;align-items:center;font-size:12.5px">` +
+              `<input type="checkbox" value="${esc(t.id)}"${chosen.includes(t.id) ? " checked" : ""} />` +
+              `<span><b>${esc(t.name)}</b> <span class="muted">${esc(t.venue)} · ${esc(t.action)}</span></span></label>`).join("")
+          : `<span class="muted" style="font-size:12px">Create a task first — a series triggers tasks you already have.</span>`;
+      }
+
+      /** Ticked members, in the order the list shows them. */
+      const serChosen = () => [...$("serPick").querySelectorAll("input:checked")].map((i) => i.value);
+
+      async function loadSeries() {
+        if (!$("serRows")) return;
+        try {
+          const r = await (await fetch("/api/series", { headers: authHeaders() })).json();
+          if (!r.ok) {
+            if ($("seriesNotReady")) {
+              $("seriesNotReady").style.display = "";
+              $("seriesNotReady").textContent = r.error || "sign in to build a series";
+            }
+            if ($("seriesBody")) $("seriesBody").style.display = "none";
+            return;
+          }
+          if ($("seriesNotReady")) $("seriesNotReady").style.display = "none";
+          if ($("seriesBody")) $("seriesBody").style.display = "";
+          seriesRowsById = new Map((r.series || []).map((x) => [x.id, x]));
+          if (!$("serZone").options.length) {
+            $("serZone").innerHTML = $("taskZone").innerHTML;
+            $("serDays").innerHTML = DAY_NAMES.map((d, i) =>
+              `<label style="font-size:12px;margin-right:7px"><input type="checkbox" value="${i}" /> ${d}</label>`).join("");
+            syncSeriesForm();
+          }
+          renderSeriesPicker();
+          const when = (ms) => new Date(ms).toLocaleString(undefined, {
+            year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+          });
+          $("serRows").innerHTML = (r.series || []).length
+            ? r.series.map((x) => {
+                const next = x.nextRunAt ? when(x.nextRunAt) : "—";
+                const state = x.busy
+                  ? ` · <span style="color:var(--good)">running now</span>`
+                  : x.enabled ? "" : ` · <span style="color:var(--warn)">paused</span>`;
+                const last = x.lastRunAt
+                  ? `<div><b style="color:var(--${x.lastStatus === "ok" ? "good" : "warn"})">` +
+                      `${x.lastStatus === "ok" ? "✓" : "✗"}</b> ${esc(when(x.lastRunAt))}</div>` +
+                    `<div class="muted" style="font-size:11px">run ${x.runs}` +
+                      `${x.firstRunAt ? ` · first ran ${esc(when(x.firstRunAt))}` : ""}</div>` +
+                    `<div style="font-size:11px;margin-top:2px">${esc(x.lastDetail || "")}</div>`
+                  : `<span class="muted">never run</span>`;
+                const steps = (x.members || []).map((m, i) =>
+                  `<div class="muted" style="font-size:11px">${x.mode === "sequential" ? `${i + 1}. ` : "· "}` +
+                  `${esc(m.name)}${m.missing ? ' <span style="color:var(--warn)">(deleted)</span>' : ""}</div>`).join("");
+                return `<tr><td><b>${esc(x.name)}</b>` +
+                  `<div class="muted" style="font-size:11px">` +
+                  `${x.mode === "sequential" ? "one after another" : "all at once"} · ` +
+                  `${(x.members || []).length} task${(x.members || []).length === 1 ? "" : "s"}${state}</div>${steps}</td>` +
+                  `<td style="font-size:12px">${esc(x.scheduleText)}<div class="muted" style="font-size:11px">next ${esc(next)}</div></td>` +
+                  `<td style="font-size:11.5px">${last}</td></tr>` +
+                  `<tr><td colspan="3" style="padding-top:0">` +
+                  `<div style="display:flex;flex-wrap:wrap;gap:6px">` +
+                  `<button class="btn" data-srun="${esc(x.id)}">Run now</button>` +
+                  `<button class="btn" data-sedit="${esc(x.id)}">Edit</button>` +
+                  `<button class="btn" data-stog="${esc(x.id)}" data-snext="${x.enabled ? "0" : "1"}">` +
+                  `${x.enabled ? "Pause" : "Resume"}</button>` +
+                  `<button class="btn warn" data-sstop="${esc(x.id)}"${x.stopping ? " disabled" : ""}>` +
+                  `${x.stopping ? "Stopping…" : "Stop"}</button>` +
+                  `<button class="btn" data-sdel="${esc(x.id)}">Delete</button>` +
+                  `</div></td></tr>`;
+              }).join("")
+            : emptyRow(4, "No series yet.");
+        } catch { /* leave the card as it was */ }
+      }
+
+      function startEditingSeries(id) {
+        const x = seriesRowsById.get(id);
+        if (!x) return;
+        editingSeries = id;
+        $("serName").value = x.name || "";
+        $("serMode").value = x.mode;
+        renderSeriesPicker();
+        $("serPick").querySelectorAll("input").forEach((i) => { i.checked = (x.taskIds || []).includes(i.value); });
+        const sc = x.schedule || { kind: "manual" };
+        $("serKind").value = sc.kind;
+        if (sc.kind === "every") {
+          const unit = sc.seconds % 604800 === 0 ? 604800
+            : sc.seconds % 86400 === 0 ? 86400
+            : sc.seconds % 3600 === 0 ? 3600
+            : sc.seconds % 60 === 0 ? 60 : 1;
+          $("serEveryUnit").value = String(unit);
+          $("serEveryN").value = String(sc.seconds / unit);
+        } else if (sc.kind !== "manual") {
+          $("serHour").value = String(sc.hour ?? 0);
+          $("serMinute").value = String(sc.minute ?? 0);
+          $("serZone").value = String(sc.offsetMinutes ?? 0);
+          if (sc.kind === "weekly") {
+            $("serDays").querySelectorAll("input").forEach((i) => { i.checked = (sc.days || []).includes(Number(i.value)); });
+          }
+          if (sc.kind === "monthly" || sc.kind === "yearly") $("serDom").value = String(sc.day ?? 1);
+          if (sc.kind === "yearly") $("serMonth").value = String(sc.month ?? 1);
+        }
+        syncSeriesForm();
+        previewSeries();
+        $("serCreate").textContent = "Save changes";
+        if ($("serCancelEdit")) $("serCancelEdit").style.display = "";
+        showReceipt("serMsg", true, `editing "${x.name}" — Save changes keeps its history`);
+        $("serName").scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+
+      /** Back to creating, with an empty form — see `stopEditing` for why. */
+      function stopEditingSeries() {
+        editingSeries = null;
+        $("serName").value = "";
+        $("serPick").querySelectorAll("input").forEach((i) => { i.checked = false; });
+        $("serCreate").textContent = "Create series";
+        if ($("serCancelEdit")) $("serCancelEdit").style.display = "none";
+        previewSeries();
+      }
+
+      function previewSeries() {
+        const sc = serSchedule();
+        const n = serChosen().length;
+        const zone = (o) => {
+          const sign = o < 0 ? "-" : "+", a = Math.abs(o);
+          return `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
+        };
+        const at = () => `${String(sc.hour).padStart(2, "0")}:${String(sc.minute).padStart(2, "0")} ${zone(sc.offsetMinutes)}`;
+        const every = (x) => {
+          const u = x % 604800 === 0 ? [x / 604800, "week"]
+            : x % 86400 === 0 ? [x / 86400, "day"]
+            : x % 3600 === 0 ? [x / 3600, "hour"]
+            : x % 60 === 0 ? [x / 60, "minute"] : [x, "second"];
+          return `every ${u[0] === 1 ? "" : u[0] + " "}${u[1]}${u[0] === 1 ? "" : "s"}`;
+        };
+        const when =
+          sc.kind === "manual" ? "only when you press Run"
+          : sc.kind === "every" ? every(sc.seconds)
+          : sc.kind === "weekly" ? (sc.days.length ? `${sc.days.map((d) => DAY_NAMES[d]).join(", ")} at ${at()}` : "pick at least one day")
+          : sc.kind === "monthly" ? `day ${sc.day} of each month at ${at()}`
+          : `${sc.month}/${sc.day} each year at ${at()}`;
+        $("serPreview").textContent = n
+          ? `${n} task${n === 1 ? "" : "s"}, ${$("serMode").value === "sequential" ? "one after another" : "all at once"}, ${when}`
+          : "tick the tasks this series should run";
+      }
+
+      if ($("serCreate")) {
+        ["serKind", "serMode"].forEach((id) => $(id).addEventListener("change", () => { syncSeriesForm(); previewSeries(); }));
+        ["serEveryN", "serEveryUnit", "serHour", "serMinute", "serZone", "serDom", "serMonth"].forEach((id) =>
+          $(id).addEventListener("input", previewSeries));
+        $("serDays").addEventListener("change", previewSeries);
+        $("serPick").addEventListener("change", previewSeries);
+        if ($("serCancelEdit")) $("serCancelEdit").addEventListener("click", () => {
+          stopEditingSeries();
+          showReceipt("serMsg", true, "edit cancelled — the series is unchanged");
+        });
+
+        $("serCreate").addEventListener("click", async () => {
+          const taskIds = serChosen();
+          if (!taskIds.length) return showReceipt("serMsg", false, "tick at least one task");
+          const btn = $("serCreate");
+          btn.disabled = true;
+          showBusy("serMsg", editingSeries ? "saving your changes…" : "saving the series…");
+          try {
+            const body = { name: $("serName").value.trim(), mode: $("serMode").value, taskIds, schedule: serSchedule() };
+            const r = await (await postAuthed(editingSeries ? `/api/series/${editingSeries}` : "/api/series", body)).json();
+            showReceipt("serMsg", Boolean(r.ok),
+              r.ok ? `${editingSeries ? "saved" : "created"} — ${r.scheduleText}` : `failed: ${r.error}`);
+            if (r.ok) { stopEditingSeries(); loadSeries(); }
+          } catch { showReceipt("serMsg", false, "request failed"); }
+          finally { btn.disabled = false; }
+        });
+
+        $("serRows").addEventListener("click", async (e) => {
+          const btn = e.target.closest("button");
+          if (!btn) return;
+          const run = btn.dataset.srun, del = btn.dataset.sdel, tog = btn.dataset.stog;
+          const edit = btn.dataset.sedit, stop = btn.dataset.sstop;
+          if (edit) { startEditingSeries(edit); return; }
+          btn.disabled = true;
+          try {
+            if (run) {
+              showBusy("serMsg", "running the series…");
+              const r = await (await postAuthed(`/api/series/${run}/run`, {})).json();
+              showReceipt("serMsg", Boolean(r.ok), r.ok ? `ran: ${r.detail}` : `did not finish: ${r.detail || r.error}`);
+            } else if (del) {
+              const x = seriesRowsById.get(del);
+              if (!confirm(`Delete "${x ? x.name : "this series"}"? The tasks in it are not deleted.`)) { btn.disabled = false; return; }
+              await postAuthed(`/api/series/${del}/delete`, {});
+              if (editingSeries === del) stopEditingSeries();
+              showReceipt("serMsg", true, "series deleted — its tasks are still there");
+            } else if (stop) {
+              showBusy("serMsg", "stopping…");
+              const r = await (await postAuthed(`/api/series/${stop}/stop`, {})).json();
+              showReceipt("serMsg", Boolean(r.ok), r.ok ? r.note : `failed: ${r.error}`);
+            } else if (tog) {
+              const enabled = btn.dataset.snext === "1";
+              const r = await (await postAuthed(`/api/series/${tog}`, { enabled })).json();
+              showReceipt("serMsg", Boolean(r.ok),
+                r.ok ? (enabled ? "resumed — the schedule is live again" : "paused — no further runs") : `failed: ${r.error}`);
+            }
+          } catch { showReceipt("serMsg", false, "request failed"); }
+          finally { btn.disabled = false; loadSeries(); loadTasks(); }
         });
       }
 

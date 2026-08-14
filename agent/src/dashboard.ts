@@ -68,6 +68,7 @@ import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emiss
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
+import { SeriesStore, SERIES_LIMITS, type TaskSeries } from "./series.js";
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
@@ -7448,6 +7449,7 @@ async function main() {
   /* ---- Scheduled tasks -------------------------------------------------- */
 
   const taskStore = new TaskStore(statePath(".tessera-tasks.json"));
+  const seriesStore = new SeriesStore(statePath(".tessera-series.json"));
 
   /**
    * Carry out one task, whatever venue it belongs to.
@@ -7625,6 +7627,105 @@ async function main() {
       stopRequested.delete(t.id);
     }
   }
+
+  /**
+   * Run every task in a series, in the relation its mode asks for.
+   *
+   * Sequential stops at the first failure: a series of dependent steps that
+   * carries on past a step which was meant to fund the next one does something
+   * nobody asked for. Parallel reports each failure and lets the rest finish,
+   * because there was no dependency to break.
+   *
+   * Members are re-read at the moment they run. A task deleted, paused or
+   * stopped since the series was written is skipped and named in the receipt,
+   * rather than the series either failing wholesale or quietly running a
+   * shorter list than it says it has.
+   */
+  async function executeSeries(sr: TaskSeries, source: "schedule" | "manual") {
+    seriesRunning.add(sr.id);
+    const done: string[] = [];
+    const failed: string[] = [];
+    const skipped: string[] = [];
+    /*
+     * Three outcomes, not two.
+     *
+     * A member that is *paused* has not failed — somebody turned it off on
+     * purpose — so a sequential series steps over it and carries on. Only a
+     * member that actually tried and failed stops the chain, because that is
+     * the case where the next step may have been relying on it.
+     */
+    const runOne = async (id: string): Promise<"ok" | "failed" | "skipped"> => {
+      const t = taskStore.get(id);
+      if (!t) { skipped.push("a task that no longer exists"); return "skipped"; }
+      if (!t.enabled) { skipped.push(`${t.name} (paused)`); return "skipped"; }
+      const r = await executeTask(t, source);
+      if (r.ok) { done.push(t.name); return "ok"; }
+      failed.push(`${t.name}: ${r.detail}`);
+      return "failed";
+    };
+    try {
+      if (sr.mode === "parallel") {
+        await Promise.all(sr.taskIds.map((id) => runOne(id).catch(() => "failed" as const)));
+      } else {
+        for (const id of sr.taskIds) {
+          if (seriesStopped.has(sr.id)) { skipped.push("stopped by the operator"); break; }
+          const outcome = await runOne(id);
+          if (outcome === "failed") {
+            // Name the ones that never got a turn, so the receipt is the whole
+            // story rather than the point it stopped telling it.
+            const at = sr.taskIds.indexOf(id);
+            for (const rest of sr.taskIds.slice(at + 1)) {
+              const t = taskStore.get(rest);
+              skipped.push(`${t ? t.name : rest} (an earlier step failed)`);
+            }
+            break;
+          }
+        }
+      }
+      const detail =
+        `${done.length}/${sr.taskIds.length} ran` +
+        (done.length ? `: ${done.join(", ")}` : "") +
+        (failed.length ? ` · failed — ${failed.join("; ")}` : "") +
+        (skipped.length ? ` · skipped — ${skipped.join("; ")}` : "");
+      // A partial run is not a success. Every member either ran or it did not,
+      // and "2 of 3" with a green tick is how a missed payment goes unnoticed.
+      const ok = failed.length === 0 && done.length === sr.taskIds.length;
+      seriesStore.markRun(sr.id, ok ? "ok" : "failed", detail);
+      try {
+        txlog.record({
+          actor: agentAccount.address as string, category: "defi", action: `series ${sr.mode}`,
+          status: ok ? "success" : "failed", detail: `${sr.name} (${source}): ${detail}`,
+        });
+      } catch { /* the ledger is not the point */ }
+      return { ok, detail };
+    } finally {
+      seriesRunning.delete(sr.id);
+      seriesStopped.delete(sr.id);
+    }
+  }
+
+  /** Series currently running, and those an operator has asked to stop. */
+  const seriesRunning = new Set<string>();
+  const seriesStopped = new Set<string>();
+
+  let seriesBusy = false;
+  setInterval(async () => {
+    if (process.env.TESSERA_TASKS === "off" || seriesBusy) return;
+    const due = seriesStore.due();
+    if (!due.length) return;
+    seriesBusy = true;
+    try {
+      for (const sr of due) {
+        const now = seriesStore.get(sr.id);
+        if (!now || !now.enabled) continue;
+        await executeSeries(now, "schedule");
+      }
+    } catch (e) {
+      console.error(`[series] sweep failed: ${String(e).slice(0, 160)}`);
+    } finally {
+      seriesBusy = false;
+    }
+  }, SCHEDULE_LIMITS.minSeconds * 1000).unref?.();
 
   let tasksBusy = false;
   setInterval(async () => {
@@ -7883,7 +7984,135 @@ async function main() {
 
   app.post("/api/tasks/:id/delete", requireAuth, (req, res) => {
     if (!myTask(req, res)) return;
-    res.json({ ok: taskStore.remove(req.params.id) });
+    const gone = taskStore.remove(req.params.id);
+    // A series holding a deleted task would report a failure on every run for
+    // something nobody can find. Drop it from the lists that name it.
+    if (gone) seriesStore.forgetTask(req.params.id);
+    res.json({ ok: gone });
+  });
+
+  /* ---- Task series: several tasks, triggered as one --------------------- */
+
+  /** The series, if this caller may act on it. 404 for somebody else's. */
+  function mySeries(req: express.Request, res: express.Response) {
+    const scope = taskScope(req);
+    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return null; }
+    const sr = seriesStore.get(req.params.id);
+    if (!sr || !seriesStore.ownedBy(sr.id, scope.owner)) {
+      res.status(404).json({ ok: false, error: "no such series" });
+      return null;
+    }
+    return sr;
+  }
+
+  /**
+   * Every member must be a task this caller may run.
+   *
+   * Without it a visitor could name the operator's tasks in their own series
+   * and have the server run them — the tasks are the choke point for *what*
+   * may be scheduled, and the series must not be a way around it.
+   */
+  function checkMembers(ids: unknown, owner: string | null): string | null {
+    const list = Array.isArray(ids) ? ids : [];
+    for (const raw of list) {
+      const id = String(raw ?? "");
+      if (!taskStore.get(id)) return "one of those tasks no longer exists";
+      if (!taskStore.ownedBy(id, owner)) return "one of those tasks is not yours to run";
+    }
+    return null;
+  }
+
+  app.get("/api/series", requireAuth, (req, res) => {
+    const scope = taskScope(req);
+    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
+    res.json({
+      ok: true,
+      series: seriesStore.view(Date.now(), scope.owner).map((sr) => ({
+        ...sr,
+        busy: seriesRunning.has(sr.id),
+        stopping: seriesStopped.has(sr.id),
+        // The member names, so a row can say what it will do without the page
+        // having to join two lists itself.
+        members: sr.taskIds.map((id) => {
+          const t = taskStore.get(id);
+          return { id, name: t ? t.name : "(deleted)", venue: t?.venue ?? "", action: t?.action ?? "", missing: !t };
+        }),
+      })),
+      limits: SERIES_LIMITS,
+    });
+  });
+
+  app.post("/api/series", requireAuth, (req, res) => {
+    const scope = taskScope(req);
+    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
+    const bad = checkMembers(req.body?.taskIds, scope.owner);
+    if (bad) { res.status(400).json({ ok: false, error: bad }); return; }
+    const r = seriesStore.create({ ...(req.body ?? {}), owner: scope.owner });
+    if (!r.ok) { res.status(400).json(r); return; }
+    logTx(req, {
+      category: "defi", action: "series-create", status: "success",
+      detail: `${r.series.name}: ${r.series.taskIds.length} task(s), ${r.series.mode}, ${describeSchedule(r.series.schedule)}`,
+    });
+    res.json({ ok: true, series: r.series, scheduleText: describeSchedule(r.series.schedule) });
+  });
+
+  app.post("/api/series/:id", requireAuth, (req, res) => {
+    const scope = taskScope(req);
+    const existing = mySeries(req, res);
+    if (!existing || !scope) return;
+    if (req.body?.taskIds !== undefined) {
+      const bad = checkMembers(req.body.taskIds, scope.owner);
+      if (bad) { res.status(400).json({ ok: false, error: bad }); return; }
+    }
+    const r = seriesStore.update(req.params.id, req.body ?? {});
+    if (!r.ok) { res.status(400).json(r); return; }
+    logTx(req, {
+      category: "defi", action: "series-edit", status: "success",
+      detail: `${r.series.name}: ${describeSchedule(r.series.schedule)}${r.series.enabled ? "" : " (paused)"}`,
+    });
+    res.json({ ok: true, series: r.series, scheduleText: describeSchedule(r.series.schedule) });
+  });
+
+  app.post("/api/series/:id/delete", requireAuth, (req, res) => {
+    if (!mySeries(req, res)) return;
+    res.json({ ok: seriesStore.remove(req.params.id) });
+  });
+
+  app.post("/api/series/:id/run", requireAuth, async (req, res) => {
+    const sr = mySeries(req, res);
+    if (!sr) return;
+    const r = await executeSeries(sr, "manual");
+    res.status(r.ok ? 200 : 500).json({ ok: r.ok, detail: r.detail });
+  });
+
+  /**
+   * Stop a series that is running now.
+   *
+   * Sequential mode can be stopped between members — the ones that have not
+   * started do not start. Parallel mode has already begun all of them, so this
+   * pauses the series and says so rather than implying it recalled anything.
+   */
+  app.post("/api/series/:id/stop", requireAuth, (req, res) => {
+    const sr = mySeries(req, res);
+    if (!sr) return;
+    const wasRunning = seriesRunning.has(sr.id);
+    seriesStopped.add(sr.id);
+    seriesStore.update(sr.id, { enabled: false });
+    // Stop the member tasks too, so one already sending stops mid-list.
+    for (const id of sr.taskIds) stopRequested.add(id);
+    logTx(req, {
+      category: "defi", action: "series-stop", status: "success",
+      detail: `${sr.name}: ${wasRunning ? "stopped mid-run" : "stopped"}`,
+    });
+    res.json({
+      ok: true,
+      wasRunning,
+      note: wasRunning
+        ? (sr.mode === "sequential"
+            ? "Stopping — the steps that have not started will not start. Anything already broadcast is on the chain."
+            : "Stopping — every step had already been started, so this pauses the series. Anything broadcast is on the chain.")
+        : "Stopped. It was not running, so nothing was interrupted, and it will not start again until you resume it.",
+    });
   });
 
   /** Run one now, whatever its schedule says — including a manual-only task. */
