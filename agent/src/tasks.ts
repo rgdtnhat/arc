@@ -36,6 +36,8 @@ export interface Task {
   schedule: Schedule;
   enabled: boolean;
   createdAt: number;
+  /** When it first ran, so "running since" is answerable without a log. */
+  firstRunAt: number | null;
   lastRunAt: number | null;
   lastStatus: "ok" | "failed" | null;
   lastDetail: string;
@@ -132,6 +134,7 @@ export class TaskStore {
       schedule: parseSchedule(input.schedule),
       enabled: input.enabled !== false,
       createdAt: Date.now(),
+      firstRunAt: null,
       lastRunAt: null,
       lastStatus: null,
       lastDetail: "",
@@ -205,6 +208,9 @@ export class TaskStore {
   markRun(id: string, status: "ok" | "failed", detail: string, txHash: string | null = null) {
     const t = this.tasks.find((x) => x.id === id);
     if (!t) return;
+    // Stamped once and never again: "since" is the start of the series, and a
+    // task edited or paused in between is still the same series.
+    t.firstRunAt ??= Date.now();
     t.lastRunAt = Date.now();
     t.lastStatus = status;
     t.lastDetail = detail.slice(0, 300);

@@ -7080,6 +7080,8 @@ async function main() {
   async function sendTransfers(
     asset: Hex,
     list: { to: Hex; amount: bigint }[],
+    /** Asked between transfers: true means send no more of them. */
+    abort: () => boolean = () => false,
   ): Promise<{ sent: { to: string; amount: string; txHash: string }[]; failed: { to: string; error: string }[] }> {
     const meta = assetMeta(asset);
     const who = agentAccount.address as Hex;
@@ -7093,6 +7095,10 @@ async function main() {
     const sent: { to: string; amount: string; txHash: string }[] = [];
     const failed: { to: string; error: string }[] = [];
     for (const row of list) {
+      if (abort()) {
+        failed.push({ to: row.to, error: "stopped by the operator before this one was sent" });
+        continue;
+      }
       try {
         const txHash = await agentSigner.write(asset, erc20Abi, "transfer", [row.to, row.amount]);
         sent.push({ to: row.to, amount: fmtUnits(row.amount, meta.decimals), txHash });
@@ -7187,8 +7193,24 @@ async function main() {
    * something you could have pressed. Amounts are always base units, because a
    * stored task must not depend on how a form rounded a decimal months ago.
    */
+  /**
+   * Tasks an operator has asked to stop *while they are running*.
+   *
+   * Pausing a task stops the next run; it cannot touch the one already in
+   * flight, and a bulk transfer to two hundred addresses is in flight for a
+   * long time. Stop puts the id in here, and every loop that is about to spend
+   * checks it first — so the transfers that have not gone out do not go out.
+   * What has already been broadcast cannot be recalled by anybody, and the
+   * receipt says how far it got rather than pretending otherwise.
+   */
+  const stopRequested = new Set<string>();
+  const stopped = (id: string) => stopRequested.has(id);
+  /** Ids currently inside `executeTask`, so the page can show what is live. */
+  const runningTasks = new Set<string>();
+
   async function runTask(t: Task): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
     const p = t.params ?? {};
+    if (stopped(t.id)) throw new Error("stopped before it started");
     const amount = () => BigInt(String(p.amount ?? "0"));
     const asset = () => {
       const a = (p.asset ?? usdcAddress) as Hex;
@@ -7269,6 +7291,7 @@ async function main() {
           const failed: string[] = [];
           let first: string | null = null;
           for (const row of list) {
+            if (stopped(t.id)) { failed.push("stopped by the operator — the rest were not sent"); break; }
             try {
               const txHash = await spendFromSession(id, row.to, row.amount);
               first ??= txHash;
@@ -7288,7 +7311,7 @@ async function main() {
         const list = t.action === "send"
           ? parseRecipients([{ to: p.to, amount: p.amount }])
           : parseRecipients(p.recipients);
-        const r = await sendTransfers(a, list);
+        const r = await sendTransfers(a, list, () => stopped(t.id));
         /*
          * Every recipient, not just the first.
          *
@@ -7312,6 +7335,10 @@ async function main() {
 
   /** Run it, record what happened, and never let one task's failure stop another. */
   async function executeTask(t: Task, source: "schedule" | "manual"): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
+    // A stop applies to the run it was pressed during, not to every run after
+    // it. Clearing here — not when the flag is set — is what keeps a task that
+    // was stopped once from being permanently, invisibly dead.
+    runningTasks.add(t.id);
     try {
       const r = await runTask(t);
       taskStore.markRun(t.id, r.ok ? "ok" : "failed", r.detail, r.txHash);
@@ -7329,6 +7356,9 @@ async function main() {
       taskStore.markRun(t.id, "failed", detail);
       console.error(`[tasks] ${t.name} failed: ${detail}`);
       return { ok: false, detail, txHash: null };
+    } finally {
+      runningTasks.delete(t.id);
+      stopRequested.delete(t.id);
     }
   }
 
@@ -7361,10 +7391,44 @@ async function main() {
   app.get("/api/tasks", requireOperator, (_req, res) => {
     res.json({
       ok: true,
-      tasks: taskStore.view(),
+      // `busy` is what makes Stop meaningful on the page: a control that stops
+      // something in progress has to say which ones are in progress.
+      tasks: taskStore.view().map((t) => ({ ...t, busy: runningTasks.has(t.id), stopping: stopRequested.has(t.id) })),
       actions: TASK_ACTIONS,
       limits: { ...TASK_LIMITS, ...SCHEDULE_LIMITS },
       running: process.env.TESSERA_TASKS !== "off",
+    });
+  });
+
+  /**
+   * Stop a run that is happening right now.
+   *
+   * Distinct from pausing, and both are wanted. Pause is about the *next* run —
+   * it leaves whatever is in flight to finish, which is the right default for a
+   * transfer that is already half sent. Stop is about *this* run: no further
+   * transaction in it goes out, and the task is paused as well, because
+   * somebody hitting Stop on a task firing every ten seconds does not mean
+   * "stop this one and start the next in ten seconds".
+   *
+   * What has already been broadcast is on the chain and nobody can recall it.
+   * The receipt says how far it got.
+   */
+  app.post("/api/tasks/:id/stop", requireOperator, (req, res) => {
+    const t = taskStore.get(req.params.id);
+    if (!t) { res.status(404).json({ ok: false, error: "no such task" }); return; }
+    const wasRunning = runningTasks.has(t.id);
+    stopRequested.add(t.id);
+    taskStore.update(t.id, { enabled: false });
+    logTx(req, {
+      category: "defi", action: "task-stop", status: "success",
+      detail: `${t.name}: ${wasRunning ? "stopped mid-run" : "stopped"}`,
+    });
+    res.json({
+      ok: true,
+      wasRunning,
+      note: wasRunning
+        ? "Stopping — nothing further in this run will be sent. Anything already broadcast is on the chain."
+        : "Stopped. It was not running, so nothing was interrupted, and it will not start again until you resume it.",
     });
   });
 

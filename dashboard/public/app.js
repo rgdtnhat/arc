@@ -1319,65 +1319,6 @@ const $ = (id) => document.getElementById(id);
         if (el) el.remove();
       }
 
-      /**
-       * Ask which wallet, and return its provider — or null if the user is being
-       * sent to an app instead.
-       */
-      function pickWallet() {
-        askWallets();
-        closeWalletPicker();
-        return new Promise((resolve) => {
-          const found = [...discovered.values()];
-          const wrap = document.createElement("div");
-          wrap.id = "walletPicker";
-          wrap.className = "modalWrap";
-          const rows = found.length
-            ? found
-                .map(
-                  (d, i) =>
-                    `<button class="btn" data-i="${i}" style="display:flex;width:100%;justify-content:flex-start;gap:10px;margin-bottom:8px">` +
-                    (d.info.icon ? `<img src="${d.info.icon}" alt="" width="20" height="20" style="border-radius:5px">` : "") +
-                    `${esc(d.info.name)}</button>`,
-                )
-                .join("")
-            : "";
-          // Deep links only where they can work. On a desktop with no wallet the
-          // honest answer is "install one", not a link that opens nothing.
-          const links = !found.length && isMobile()
-            ? `<p class="muted" style="margin:0 0 10px;font-size:13px">No wallet is available to this browser. Open Tessera inside your wallet's own browser:</p>` +
-              MOBILE_WALLETS.map(
-                (w) => `<a class="btn" href="${w.link()}" style="display:flex;width:100%;justify-content:flex-start;margin-bottom:8px" rel="noopener">${w.name}</a>`,
-              ).join("")
-            : "";
-          const none = !found.length && !isMobile()
-            ? `<p class="muted" style="margin:0;font-size:13px">No wallet extension detected. Install MetaMask, Rabby or another EIP-1193 wallet, then try again.</p>`
-            : "";
-
-          wrap.innerHTML =
-            `<div class="modalCard" style="padding:18px">` +
-            `<h3 style="margin:0 0 12px;font-size:15px">Connect a wallet</h3>` +
-            rows + links + none +
-            `<button class="btn" id="walletPickerCancel" style="display:flex;width:100%;justify-content:center;margin-top:6px">Cancel</button>` +
-            `</div>`;
-          document.body.appendChild(wrap);
-
-          wrap.addEventListener("click", (ev) => {
-            if (ev.target === wrap) { closeWalletPicker(); resolve(null); }
-          });
-          $("walletPickerCancel").addEventListener("click", () => { closeWalletPicker(); resolve(null); });
-          wrap.querySelectorAll("button[data-i]").forEach((b) => {
-            b.addEventListener("click", () => {
-              const d = found[Number(b.dataset.i)];
-              chosenProvider = d.provider;
-              try { localStorage.setItem("tessera_wallet_rdns", d.info.rdns || ""); } catch {}
-              closeWalletPicker();
-              resolve(d.provider);
-            });
-          });
-          // Following a deep link leaves the page; nothing to resolve.
-        });
-      }
-
       // Reconnect to the same wallet on a return visit, so the choice sticks.
       (() => {
         let saved = null;
@@ -1390,82 +1331,175 @@ const $ = (id) => document.getElementById(id);
         }, 300);
       })();
 
-      async function connectWallet() {
-        /*
-         * Already connected? Open the profile instead of asking again.
-         *
-         * The button ran the whole sign-in every tap: request accounts, fetch a
-         * nonce, personal_sign. So touching it after connecting produced another
-         * signature prompt for no reason — which trains people to approve
-         * signature requests without reading them, the precise habit that gets
-         * wallets drained.
-         */
-        /*
-         * "Already connected" means the *provider* says so — nothing else.
-         *
-         * This tested `window.__myAddress`, which three different things set:
-         * a wallet sign-in, self-custody adoption, and an operator session
-         * falling back to the agent's own address. Only the first is a
-         * connected wallet. So an operator signed in with no wallet at all had
-         * `__myAddress` set to the agent, took this branch, and got nothing:
-         * the synthetic click bubbled to the document listener that closes
-         * menus, so the panel opened and shut in the same tick. Connect Wallet
-         * did nothing at all, with no error, on the most ordinary session
-         * there is.
-         */
+      /**
+       * A sheet that is on screen before anything can go wrong.
+       *
+       * The Connect button kept being reported as dead, and every cause had the
+       * same shape: a branch that returned, or an await that rejected, before
+       * anything had been drawn. A tap that produces no pixels is
+       * indistinguishable from a broken page, and no amount of correct logic
+       * behind it helps.
+       *
+       * So the tap opens this synchronously, and every later step only ever
+       * *replaces its contents*. There is no path from here that shows nothing.
+       * The wrapper carries its own inline layout as well as the class, so a
+       * stylesheet that failed to load cannot hide it either.
+       */
+      function walletSheet() {
+        closeWalletPicker();
+        const wrap = document.createElement("div");
+        wrap.id = "walletPicker";
+        wrap.className = "modalWrap";
+        wrap.style.cssText =
+          "position:fixed;inset:0;z-index:2147483000;display:grid;place-items:center;" +
+          "background:rgba(4,7,14,.78);padding:20px";
+        const card = document.createElement("div");
+        card.className = "modalCard";
+        card.style.cssText =
+          "width:min(94vw,400px);max-height:86vh;overflow:auto;border-radius:18px;padding:18px 20px;" +
+          "background:var(--bg-soft,#111827);color:var(--fg,#e5e7eb);border:1px solid var(--line-strong,#374151)";
+        wrap.appendChild(card);
+        document.body.appendChild(wrap);
+        wrap.addEventListener("click", (ev) => { if (ev.target === wrap) closeWalletPicker(); });
+        return {
+          card,
+          set(html) { card.innerHTML = html; },
+          close: closeWalletPicker,
+        };
+      }
+
+      const sheetCancel = '<button class="btn" data-wsheet="cancel" style="display:flex;width:100%;justify-content:center;margin-top:8px">Close</button>';
+
+      /**
+       * Connect, or explain exactly why it cannot.
+       *
+       * Not `async` at the top level on purpose: the sheet must be painted in
+       * the same tick as the tap, before the first `await` hands control back
+       * to the browser.
+       */
+      function connectWallet() {
+        const sheet = walletSheet();
+        sheet.set(`<h3 style="margin:0 0 12px;font-size:15px">Connect a wallet</h3>` +
+          `<p class="muted" style="margin:0;font-size:13px"><span class="spin" aria-hidden="true"></span>Looking for a wallet…</p>` +
+          sheetCancel);
+
+        sheet.card.addEventListener("click", (ev) => {
+          const b = ev.target.closest("[data-wsheet]");
+          if (b && b.dataset.wsheet === "cancel") sheet.close();
+        });
+
+        runConnect(sheet).catch((e) => {
+          // The last resort, and the reason this function is shaped like this:
+          // whatever threw, the tap still produced something readable.
+          sheet.set(`<h3 style="margin:0 0 12px;font-size:15px">Connect a wallet</h3>` +
+            `<p style="margin:0;font-size:13px;color:var(--warn,#f59e0b)">${esc(walletError(e))}</p>` + sheetCancel);
+        });
+      }
+
+      async function runConnect(sheet) {
+        // Wallets answer `requestProvider` synchronously, but an extension that
+        // is still waking up answers a moment later. A short wait here is the
+        // difference between "no wallet found" and finding it.
+        askWallets();
+        await new Promise((r) => setTimeout(r, 350));
+        askWallets();
+
+        const title = `<h3 style="margin:0 0 12px;font-size:15px">Connect a wallet</h3>`;
         const live = await connectedAddress();
         if (live && localStorage.getItem("tessera_token")) {
-          if (profileMenu && profileMenu.open) profileMenu.open();
-          else alert("Connected: " + live);
+          sheet.set(title +
+            `<p class="muted" style="margin:0 0 10px;font-size:13px">Connected as</p>` +
+            `<p class="mono" style="margin:0 0 12px;font-size:12.5px;word-break:break-all">${esc(live)}</p>` +
+            `<button class="btn" data-wsheet="profile" style="display:flex;width:100%;justify-content:center;margin-bottom:8px">Open profile</button>` +
+            `<button class="btn" data-wsheet="signout" style="display:flex;width:100%;justify-content:center">Sign out</button>` +
+            sheetCancel);
+          sheet.card.addEventListener("click", async (ev) => {
+            const b = ev.target.closest("[data-wsheet]");
+            if (!b) return;
+            if (b.dataset.wsheet === "profile") {
+              sheet.close();
+              if (profileMenu && profileMenu.open) profileMenu.open();
+            } else if (b.dataset.wsheet === "signout") {
+              await postAuthed("/api/admin/logout").catch(() => {});
+              localStorage.removeItem("tessera_token");
+              setWallet(null);
+              sheet.close();
+              location.reload();
+            }
+          });
           return;
         }
-        // Pick when there is a choice, or when there is nothing yet — the
-        // picker is also what offers the deep links on a phone.
-        if (!eth() || discovered.size > 1) {
-          const picked = await pickWallet();
-          if (!picked) return; // cancelled, or being sent to a wallet app
+
+        const found = [...discovered.values()];
+        // `window.ethereum` without an EIP-6963 announcement is still a wallet,
+        // and older injected wallets are exactly the ones that never announce.
+        const legacy = !found.length && window.ethereum ? [{ info: { name: "Injected wallet", uuid: "legacy" }, provider: window.ethereum }] : [];
+        const all = found.concat(legacy);
+
+        if (all.length) {
+          sheet.set(title +
+            `<p class="muted" style="margin:0 0 10px;font-size:13px">Sign in with your wallet. You will be asked to approve a signature — it costs nothing and moves nothing.</p>` +
+            all.map((d, i) =>
+              `<button class="btn" data-wsheet="use" data-i="${i}" style="display:flex;width:100%;justify-content:flex-start;gap:10px;margin-bottom:8px">` +
+              (d.info.icon ? `<img src="${esc(d.info.icon)}" alt="" width="20" height="20" style="border-radius:5px">` : "") +
+              `${esc(d.info.name)}</button>`).join("") +
+            sheetCancel);
+          sheet.card.addEventListener("click", (ev) => {
+            const b = ev.target.closest('[data-wsheet="use"]');
+            if (!b) return;
+            const d = all[Number(b.dataset.i)];
+            chosenProvider = d.provider;
+            try { localStorage.setItem("tessera_wallet_rdns", d.info.rdns || ""); } catch {}
+            signInWith(sheet, d.provider).catch((e) => {
+              sheet.set(title + `<p style="margin:0;font-size:13px;color:var(--warn,#f59e0b)">${esc(walletError(e))}</p>` + sheetCancel);
+            });
+          });
+          return;
         }
-        if (!eth()) return;
-        const btn = $("walletBtn");
-        btn.disabled = true;
-        try {
-          const [address] = await eth().request({ method: "eth_requestAccounts" });
-          const { nonce } = await (await fetch("/api/auth/nonce")).json();
-          const chainIdHex = await eth().request({ method: "eth_chainId" });
-          const message =
-            `${location.host} wants you to sign in with your Ethereum account:\n${address}\n\n` +
-            `Sign in to Tessera.\n\nURI: ${location.origin}\nVersion: 1\n` +
-            `Chain ID: ${parseInt(chainIdHex, 16)}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`;
-          const signature = await eth().request({ method: "personal_sign", params: [message, address] });
-          const r = await (
-            await fetch("/api/auth/verify", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ address, message, signature, nonce }),
-            })
-          ).json();
-          if (r.ok) {
-            localStorage.setItem("tessera_token", r.token);
-            setWallet(r.address);
-            refreshProfile();
-            refreshMyPositions().catch(() => {});
-            if (typeof loadAllowances === "function") loadAllowances().catch(() => {});
-          } else {
-            alert("Sign-in failed: " + r.error);
-          }
-        } catch (e) {
-          /*
-           * "Cancelled or failed" covers two situations that need opposite
-           * responses, and after a wallet decides a site is spamming it, the
-           * one it hides is the one that matters: the site is *blocked*, and no
-           * amount of tapping Connect will get past it — the permission has to
-           * be given back in the wallet's own settings. Saying so is the
-           * difference between a fixable state and a dead button.
-           */
-          alert(walletError(e));
-        } finally {
-          btn.disabled = false;
-        }
+
+        // Nothing injected. On a phone that is normal and fixable — the wallet
+        // has its own browser — and on a desktop it means no extension.
+        sheet.set(title + (isMobile()
+          ? `<p class="muted" style="margin:0 0 10px;font-size:13px">This browser has no wallet. Open Tessera inside your wallet's own browser — the page and the tab you are on come with you:</p>` +
+            MOBILE_WALLETS.map((w) =>
+              `<a class="btn" href="${w.link()}" style="display:flex;width:100%;justify-content:flex-start;margin-bottom:8px" rel="noopener">${w.name}</a>`).join("") +
+            `<p class="muted" style="margin:8px 0 0;font-size:12px">Already using a wallet browser? Reload this page — some wallets only inject on a fresh load.</p>`
+          : `<p class="muted" style="margin:0;font-size:13px">No wallet extension detected. Install MetaMask, Rabby or another EIP-1193 wallet, then reload this page.</p>`) +
+          sheetCancel);
+      }
+
+      /** The SIWE half, with every step reported into the sheet. */
+      async function signInWith(sheet, provider) {
+        const title = `<h3 style="margin:0 0 12px;font-size:15px">Connect a wallet</h3>`;
+        const step = (t) => sheet.set(title +
+          `<p class="muted" style="margin:0;font-size:13px"><span class="spin" aria-hidden="true"></span>${esc(t)}</p>` + sheetCancel);
+        step("Approve the connection in your wallet…");
+        const [address] = await provider.request({ method: "eth_requestAccounts" });
+        if (!address) throw new Error("Your wallet did not return an account.");
+        step("Sign in — check your wallet for a signature request…");
+        const { nonce } = await (await fetch("/api/auth/nonce")).json();
+        const chainIdHex = await provider.request({ method: "eth_chainId" });
+        const message =
+          `${location.host} wants you to sign in with your Ethereum account:\n${address}\n\n` +
+          `Sign in to Tessera.\n\nURI: ${location.origin}\nVersion: 1\n` +
+          `Chain ID: ${parseInt(chainIdHex, 16)}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`;
+        const signature = await provider.request({ method: "personal_sign", params: [message, address] });
+        step("Checking your signature…");
+        const r = await (await fetch("/api/auth/verify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ address, message, signature, nonce }),
+        })).json();
+        if (!r.ok) throw new Error(r.error || "sign-in failed");
+        localStorage.setItem("tessera_token", r.token);
+        setWallet(r.address);
+        refreshProfile();
+        refreshMyPositions().catch(() => {});
+        if (typeof loadAllowances === "function") loadAllowances().catch(() => {});
+        reflectWalletAvailability();
+        adoptConnectedAccount();
+        if (typeof loadWallet === "function") loadWallet();
+        sheet.close();
       }
       $("walletBtn").addEventListener("click", connectWallet);
       (async () => {
@@ -3629,10 +3663,31 @@ const $ = (id) => document.getElementById(id);
           }
           $("taskRows").innerHTML = (r.tasks || []).length
             ? r.tasks.map((t) => {
-                const next = t.nextRunAt ? new Date(t.nextRunAt).toLocaleString() : "—";
+                const when = (ms) => new Date(ms).toLocaleString(undefined, {
+                  year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+                });
+                const next = t.nextRunAt ? when(t.nextRunAt) : "—";
+                /*
+                 * "✓ 1 sent: 0.001 → 0x4D3163…" was the whole history, and it
+                 * answered none of the questions actually asked of a task that
+                 * spends on a timer: when did this last happen, how long has it
+                 * been happening, who is being paid, and where is the receipt.
+                 */
+                const paidTo = t.venue === "wallet" && t.params && t.params.to ? String(t.params.to) : "";
                 const last = t.lastRunAt
-                  ? `${t.lastStatus === "ok" ? "✓" : "✗"} ${esc(t.lastDetail || "")}`
-                  : "never run";
+                  ? `<div><b style="color:var(--${t.lastStatus === "ok" ? "good" : "warn"})">` +
+                      `${t.lastStatus === "ok" ? "✓" : "✗"}</b> ${esc(when(t.lastRunAt))}</div>` +
+                    `<div class="muted" style="font-size:11px">` +
+                      `run ${t.runs}${t.firstRunAt ? ` · first ran ${esc(when(t.firstRunAt))}` : ""}</div>` +
+                    `<div style="font-size:11px;margin-top:2px">${esc(t.lastDetail || "")}</div>` +
+                    (t.lastTxHash ? `<div style="font-size:11px;margin-top:2px">${txLink(t.lastTxHash)}</div>` : "")
+                  : `<span class="muted">never run</span>` +
+                    `<div class="muted" style="font-size:11px">created ${esc(when(t.createdAt))}</div>`;
+                const payee = paidTo
+                  ? `<div class="muted mono" style="font-size:10.5px;margin-top:3px;word-break:break-all">` +
+                    `to ${esc(paidTo)} <button class="btn" data-tcopy="${esc(paidTo)}" ` +
+                    `style="padding:1px 6px;font-size:10px;vertical-align:middle">copy</button></div>`
+                  : "";
                 /*
                  * The buttons get their own full-width row.
                  *
@@ -3643,17 +3698,23 @@ const $ = (id) => document.getElementById(id);
                  * something spending money has to be the easiest thing on the
                  * row to hit.
                  */
+                const state = t.busy
+                  ? ` · <span style="color:var(--good)">running now</span>`
+                  : t.enabled ? "" : ` · <span style="color:var(--warn)">paused</span>`;
                 return `<tr><td><b>${esc(t.name)}</b>` +
-                  `<div class="muted" style="font-size:11px">${esc(t.venue)} · ${esc(t.action)}` +
-                  `${t.enabled ? "" : ` · <span style="color:var(--warn)">stopped</span>`}</div></td>` +
+                  `<div class="muted" style="font-size:11px">${esc(t.venue)} · ${esc(t.action)}${state}</div>${payee}</td>` +
                   `<td style="font-size:12px">${esc(t.scheduleText)}<div class="muted" style="font-size:11px">next ${esc(next)}</div></td>` +
                   `<td style="font-size:11.5px">${last}</td></tr>` +
                   `<tr><td colspan="3" style="padding-top:0">` +
                   `<div style="display:flex;flex-wrap:wrap;gap:6px">` +
                   `<button class="btn" data-trun="${esc(t.id)}">Run now</button>` +
                   `<button class="btn" data-tedit="${esc(t.id)}">Edit</button>` +
-                  `<button class="btn${t.enabled ? " warn" : ""}" data-ttog="${esc(t.id)}" data-tnext="${t.enabled ? "0" : "1"}">` +
-                  `${t.enabled ? "Stop" : "Start"}</button>` +
+                  // Pause and Stop are different questions — the next run, and
+                  // the one happening right now — so they are different buttons.
+                  `<button class="btn" data-ttog="${esc(t.id)}" data-tnext="${t.enabled ? "0" : "1"}">` +
+                  `${t.enabled ? "Pause" : "Resume"}</button>` +
+                  `<button class="btn warn" data-tstop="${esc(t.id)}"${t.stopping ? " disabled" : ""}>` +
+                  `${t.stopping ? "Stopping…" : "Stop"}</button>` +
                   `<button class="btn" data-tdel="${esc(t.id)}">Delete</button>` +
                   `</div></td></tr>`;
               }).join("")
@@ -3661,7 +3722,27 @@ const $ = (id) => document.getElementById(id);
         } catch { /* the pane stays as it was */ }
       }
 
+      /*
+       * Keep the list honest while something is happening in it.
+       *
+       * "Running now" and "Stopping…" are states that change without anybody
+       * touching the page, and a Stop button is worth much less if you cannot
+       * see whether it worked. Only while the pane is actually on screen — a
+       * background poll of an operator-only endpoint is a request nobody asked
+       * for.
+       */
+      setInterval(() => {
+        const pane = $("paneWallet");
+        if (!pane || pane.hidden || !$("taskRows")) return;
+        if (document.hidden) return;
+        loadTasks();
+      }, 5000);
+
       if ($("taskCreate")) {
+        if ($("taskCancelEdit")) $("taskCancelEdit").addEventListener("click", () => {
+          stopEditing();
+          showReceipt("taskMsg", true, "edit cancelled — the task is unchanged");
+        });
         ["taskKind", "taskVenue", "taskAction"].forEach((id) =>
           $(id).addEventListener("change", () => { syncTaskForm(); previewTask(); }));
         ["taskEveryN", "taskEveryUnit", "taskHour", "taskMinute", "taskZone", "taskDom", "taskMonth"].forEach((id) =>
@@ -3756,8 +3837,16 @@ const $ = (id) => document.getElementById(id);
         $("taskRows").addEventListener("click", async (e) => {
           const btn = e.target.closest("button");
           if (!btn) return;
-          const run = btn.dataset.trun, del = btn.dataset.tdel, tog = btn.dataset.ttog, edit = btn.dataset.tedit;
+          const run = btn.dataset.trun, del = btn.dataset.tdel, tog = btn.dataset.ttog;
+          const edit = btn.dataset.tedit, stop = btn.dataset.tstop, copy = btn.dataset.tcopy;
           if (edit) { startEditing(edit); return; }
+          if (copy) {
+            try {
+              await navigator.clipboard.writeText(copy);
+              showReceipt("taskMsg", true, "address copied");
+            } catch { showReceipt("taskMsg", false, "could not copy — select the address and copy it by hand"); }
+            return;
+          }
           btn.disabled = true;
           try {
             if (run) {
@@ -3770,6 +3859,10 @@ const $ = (id) => document.getElementById(id);
               await postAuthed(`/api/tasks/${del}/delete`, {});
               if (editingTask === del) stopEditing();
               showReceipt("taskMsg", true, "task deleted");
+            } else if (stop) {
+              showBusy("taskMsg", "stopping…");
+              const r = await (await postAuthed(`/api/tasks/${stop}/stop`, {})).json();
+              showReceipt("taskMsg", Boolean(r.ok), r.ok ? r.note : `failed: ${r.error}`);
             } else if (tog) {
               // Read the intent off the button rather than its label: a
               // translated or restyled label must not be able to flip the
@@ -3777,7 +3870,11 @@ const $ = (id) => document.getElementById(id);
               const enabled = btn.dataset.tnext === "1";
               const r = await (await postAuthed(`/api/tasks/${tog}`, { enabled })).json();
               showReceipt("taskMsg", Boolean(r.ok),
-                r.ok ? (enabled ? "task started" : "task stopped — it will not run again until you start it") : `failed: ${r.error}`);
+                r.ok
+                  ? (enabled
+                      ? "resumed — the schedule is live again"
+                      : "paused — no further runs, but anything already in progress finishes")
+                  : `failed: ${r.error}`);
             }
           } catch { showReceipt("taskMsg", false, "request failed"); }
           finally { btn.disabled = false; loadTasks(); loadWallet(); }

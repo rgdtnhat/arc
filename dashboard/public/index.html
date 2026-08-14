@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v80" />
+    <meta name="tessera-shell" content="tessera-v81" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2506,6 +2506,12 @@
               swap, deposit to the vault, send a transfer. A task adds the missing part, which is <i>when</i>. Times
               are held in the offset you choose and honoured exactly as typed all year, so a task set for 09:00
               GMT+07:00 never drifts an hour with daylight saving somewhere else.
+            </div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+              <b>Pause</b> stops the next run and leaves anything in progress to finish — the right choice for a
+              transfer that is already part way through a list. <b>Stop</b> is for the run happening right now: no
+              further transaction in it is sent, and the task is paused too. Whatever has already been broadcast is
+              on the chain, and nobody can recall it.
             </div>
             <div class="notready" id="tasksNotReady" style="display:none">
               Scheduling runs on the server, which signs with the app wallet or with a session key you have
