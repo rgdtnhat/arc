@@ -7685,6 +7685,9 @@ async function main() {
       actions: scope.operator ? TASK_ACTIONS : SESSION_ACTIONS,
       operator: scope.operator,
       owner: scope.owner,
+      // The wallet an operator's task pays from, so a row can name it rather
+      // than saying "the app wallet" and leaving nothing to copy.
+      appWallet: agentAccount.address,
       limits: { ...TASK_LIMITS, ...SCHEDULE_LIMITS },
       running: process.env.TESSERA_TASKS !== "off",
       note: scope.operator

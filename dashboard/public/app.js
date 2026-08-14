@@ -3901,6 +3901,8 @@ const $ = (id) => document.getElementById(id);
       let taskActions = {};
       /** The rows as the server last described them, for the Edit button. */
       let taskRowsById = new Map();
+      /** The wallet an operator's task pays from, named by the server. */
+      let taskAppWallet = "";
       /** The task being edited, or null when the form creates a new one. */
       let editingTask = null;
       const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -4119,11 +4121,34 @@ const $ = (id) => document.getElementById(id);
       }
 
       /** Back to creating, leaving the edited task exactly as it was. */
+      /**
+       * Back to creating — with an empty form, not the last task's contents.
+       *
+       * This cleared only the name, so everything else an edit had loaded
+       * stayed in the boxes: recipient, amount, note and memo. Press Cancel and
+       * then Create and you got a new task carrying the edited one's details —
+       * which is how a memo written for somebody else's scheduled payment
+       * turned up pre-filled on a fresh one. Values that belong to a task must
+       * leave with it.
+       */
       function stopEditing() {
         editingTask = null;
         $("taskName").value = "";
         $("taskCreate").textContent = "Create task";
         if ($("taskCancelEdit")) $("taskCancelEdit").style.display = "none";
+        // Rebuild the parameter row from scratch rather than blanking it: the
+        // `kept` restore in `taskParamRow` exists to survive a *rebuild*, and
+        // would otherwise put the same values straight back.
+        const row = $("taskParamRow");
+        if (row) {
+          row.querySelectorAll("[data-tp]").forEach((el) => {
+            if (el.tagName === "SELECT") el.selectedIndex = 0;
+            else el.value = "";
+          });
+          row.dataset.sig = "";
+        }
+        if ($("taskRecipCount")) $("taskRecipCount").textContent = "";
+        if (typeof previewTask === "function") previewTask();
       }
 
       function syncTaskForm() {
@@ -4173,6 +4198,7 @@ const $ = (id) => document.getElementById(id);
           }
           taskActions = r.actions || {};
           if (r.limits) taskLimits = { ...taskLimits, ...r.limits };
+          if (r.appWallet) taskAppWallet = r.appWallet;
           if ($("taskEveryN")) $("taskEveryN").min = "1";
           taskRowsById = new Map((r.tasks || []).map((t) => [t.id, t]));
           // Rebuild when the set of venues changes — signing in or out swaps a
@@ -4211,6 +4237,34 @@ const $ = (id) => document.getElementById(id);
                  * been happening, who is being paid, and where is the receipt.
                  */
                 const paidTo = t.venue === "wallet" && t.params && t.params.to ? String(t.params.to) : "";
+                /*
+                 * What it pays, and out of whose wallet.
+                 *
+                 * A row that says "wallet · send" and names a recipient still
+                 * leaves the two questions people actually ask of a standing
+                 * order unanswered: how much, and whose money. Both are in the
+                 * task; neither was on screen.
+                 */
+                const p = t.params || {};
+                const sess = sessionAll.find((x) => x.id === p.sessionId);
+                const dec = sess ? sess.decimals : walDecimals(p.asset);
+                const sym = sess ? sess.symbol
+                  : (walletAssets.find((a) => String(a.address).toLowerCase() === String(p.asset || "").toLowerCase()) || {}).symbol || "";
+                const amountText =
+                  p.amount !== undefined && p.amount !== null && p.amount !== ""
+                    ? `${fmtUnitsStr(String(p.amount), dec)} ${sym}`.trim()
+                    : Array.isArray(p.recipients) && p.recipients.length
+                      ? `${fmtUnitsStr(String(p.recipients.reduce((sum, r) => sum + BigInt(r.amount || 0), 0n)), dec)} ${sym}`.trim() +
+                        ` to ${p.recipients.length} address${p.recipients.length === 1 ? "" : "es"}`
+                      : "";
+                // Null owner is the app wallet — an operator's task. Anything
+                // else is a visitor's, paid out of their own delegation.
+                const owner = t.owner || "";
+                const ownerLine = owner
+                  ? `<div class="muted mono" style="font-size:10.5px;word-break:break-all">from ${esc(owner)} ` +
+                    `<button class="btn" data-tcopy="${esc(owner)}" style="padding:0 5px;font-size:10px">copy</button></div>`
+                  : `<div class="muted mono" style="font-size:10.5px;word-break:break-all">from the app wallet ${esc(taskAppWallet)} ` +
+                    `<button class="btn" data-tcopy="${esc(taskAppWallet)}" style="padding:0 5px;font-size:10px">copy</button></div>`;
                 const last = t.lastRunAt
                   ? `<div><b style="color:var(--${t.lastStatus === "ok" ? "good" : "warn"})">` +
                       `${t.lastStatus === "ok" ? "✓" : "✗"}</b> ${esc(when(t.lastRunAt))}</div>` +
@@ -4239,7 +4293,9 @@ const $ = (id) => document.getElementById(id);
                   ? ` · <span style="color:var(--good)">running now</span>`
                   : t.enabled ? "" : ` · <span style="color:var(--warn)">paused</span>`;
                 return `<tr><td><b>${esc(t.name)}</b>` +
-                  `<div class="muted" style="font-size:11px">${esc(t.venue)} · ${esc(t.action)}${state}</div>${payee}</td>` +
+                  `${amountText ? ` <span style="font-size:12px;color:var(--good)">${esc(amountText)}</span>` : ""}` +
+                  `<div class="muted" style="font-size:11px">${esc(t.venue)} · ${esc(t.action)}${state}</div>` +
+                  ownerLine + payee + `</td>` +
                   `<td style="font-size:12px">${esc(t.scheduleText)}<div class="muted" style="font-size:11px">next ${esc(next)}</div></td>` +
                   `<td style="font-size:11.5px">${last}</td></tr>` +
                   `<tr><td colspan="3" style="padding-top:0">` +
