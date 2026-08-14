@@ -4148,6 +4148,10 @@ const $ = (id) => document.getElementById(id);
             else el.value = "";
           });
           row.dataset.sig = "";
+          // Rebuild immediately, from the blanked row. Leaving it to whatever
+          // calls `taskParamRow` next means the values are only gone if nothing
+          // re-reads them first, and "gone unless something looks" is not gone.
+          taskParamRow();
         }
         if ($("taskRecipCount")) $("taskRecipCount").textContent = "";
         if (typeof previewTask === "function") previewTask();
@@ -4271,7 +4275,11 @@ const $ = (id) => document.getElementById(id);
                   ? `<div><b style="color:var(--${t.lastStatus === "ok" ? "good" : "warn"})">` +
                       `${t.lastStatus === "ok" ? "✓" : "✗"}</b> ${esc(when(t.lastRunAt))}</div>` +
                     `<div class="muted" style="font-size:11px">` +
-                      `run ${t.runs}${t.firstRunAt ? ` · first ran ${esc(when(t.firstRunAt))}` : ""}</div>` +
+                      `run ${t.runs}${t.firstRunAt ? ` · first ran ${esc(when(t.firstRunAt))}` : ""}` +
+                      // What the run cost. Absent rather than zero when the
+                      // receipts could not be read — free and unknown are not
+                      // the same answer.
+                      `${t.lastFee ? ` · fee ${esc(t.lastFee)} USDC` : ""}</div>` +
                     `<div style="font-size:11px;margin-top:2px">${esc(t.lastDetail || "")}</div>` +
                     (t.lastTxHash ? `<div style="font-size:11px;margin-top:2px">${txLink(t.lastTxHash)}</div>` : "")
                   : `<span class="muted">never run</span>` +

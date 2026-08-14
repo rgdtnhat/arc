@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v104" />
+    <meta name="tessera-shell" content="tessera-v106" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -270,16 +270,19 @@
         overflow: hidden; max-height: 0; transition: max-height .28s ease;
         border-bottom: 1px solid transparent;
       }
-      .navDrawer.open { max-height: 320px; border-bottom-color: var(--line); }
+      .navDrawer.open { max-height: 120px; border-bottom-color: var(--line); }
       .navDrawer .inner { max-width: var(--maxw); margin: 0 auto; padding: 12px 22px 16px; display: flex; flex-wrap: wrap; gap: 8px; }
-      /* Icons only, and the current section names itself.
-         Six labels across a phone made the drawer a wall of text you had to
+      /* Icons only, all seven in one row, and the current section names itself.
+         Seven labels across a phone made the drawer a wall of text you had to
          read to navigate. The icons carry the row; the one you are in prints
-         its name under its icon, so "where am I" is answered by the thing that
-         is different rather than by reading all six. */
+         its name under its icon — and that label is positioned rather than
+         laid out, so it can run wider than its own button and across its
+         neighbours' space instead of being cut to "Agent works…". */
+      .navDrawer .inner { flex-wrap: nowrap; padding-bottom: 30px; }
       .navDrawer .btn {
+        position: relative;
         display: inline-flex; flex-direction: column; align-items: center; justify-content: center;
-        gap: 4px; padding: 10px 8px;
+        flex: 1 1 0; min-width: 0; gap: 3px; padding: 8px 2px;
       }
       /* Hidden to the eye, not to a screen reader: an icon-only control that
          announces nothing is a control only sighted users have. */
@@ -287,9 +290,15 @@
         position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
         overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
       }
+      /* Out of the flow: centred under its own icon, free to overhang the
+         buttons either side, and clamped to the drawer so a long name is never
+         cut off and never pushes the row wider. */
       .navDrawer .btn[aria-current="page"] .navLbl {
-        position: static; width: auto; height: auto; margin: 0; overflow: visible;
-        clip: auto; white-space: normal; font-size: 12px; line-height: 1.2;
+        position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+        width: max-content; max-width: min(70vw, 240px); height: auto; margin: 2px 0 0;
+        overflow: visible; clip: auto; white-space: nowrap; text-align: center;
+        font-size: 12px; line-height: 1.2; color: var(--accent); font-weight: 650;
+        pointer-events: none;
       }
       /* Line icons drawn as SVG, not glyphs. The previous ◈ ◫ ◇ ◎ ⬡ set had to
          borrow whatever face the platform had for those code points, so the row
@@ -307,12 +316,16 @@
       }
       /* A bar marks the current section without relying on colour alone — above
          the icon now that the button is a column, so it reads as a tab marker
-         rather than a stray dash beside the glyph. */
-      .navDrawer .btn[aria-current="page"]::before {
+         rather than a stray dash beside the glyph. Every button reserves the
+         space; only the current one fills it, so the row's icons stay level
+         instead of one sitting 3px proud of its neighbours. */
+      .navDrawer .btn::before {
         content: ""; display: block; width: 16px; height: 3px; border-radius: 2px;
-        background: var(--accent); flex: 0 0 auto;
+        background: transparent; flex: 0 0 auto;
       }
-      .navIco { width: 20px; height: 20px; }
+      .navDrawer .btn[aria-current="page"]::before { background: var(--accent); }
+      /* Small enough that seven fit a narrow phone without crowding. */
+      .navIco { width: 18px; height: 18px; }
 
       /* ---- notice banner ---------------------------------------------------
          Under the header, above the navigation. Transparent background so it
@@ -932,11 +945,11 @@
            spending screen. Two compact columns instead of five tall rows keeps
            the whole menu under a third of the viewport. */
         .navDrawer .inner { padding: 9px 12px 12px; gap: 6px; }
-        /* Icon-only buttons need far less room than labelled ones, so they go
-           three across rather than two — the whole menu in two short rows. */
-        .navDrawer .inner .btn {
-          flex: 1 1 calc(33.333% - 4px); min-width: 0; padding: 9px 6px; font-size: 12px;
-        }
+        /* One row on a phone too: seven icons at 18px fit inside 360px with
+           room to tap. The gap shrinks rather than the touch target. */
+        .navDrawer .inner { padding: 9px 8px 30px; gap: 2px; }
+        .navDrawer .inner .btn { flex: 1 1 0; min-width: 0; padding: 8px 2px; font-size: 12px; }
+        .navIco { width: 17px; height: 17px; }
       }
       @media (max-width: 420px) {
         .hero h1 { font-size: 30px; }

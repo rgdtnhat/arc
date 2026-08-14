@@ -7474,7 +7474,11 @@ async function main() {
   /** Ids currently inside `executeTask`, so the page can show what is live. */
   const runningTasks = new Set<string>();
 
-  async function runTask(t: Task): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
+  async function runTask(
+    t: Task,
+    /** Every transaction this run broadcast, so the caller can price it. */
+    hashes: Hex[] = [],
+  ): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
     const p = t.params ?? {};
     if (stopped(t.id)) throw new Error("stopped before it started");
     const amount = () => BigInt(String(p.amount ?? "0"));
@@ -7495,6 +7499,8 @@ async function main() {
           : await poolClient.repay(a, amt);
         void settleNow(agentAccount.address as Hex, a);
         emissionsInvalidate();
+        hashes.push(txHash as Hex);
+
         return { ok: true, detail: `${t.action} ${fmtUnits(amt, assetMeta(a).decimals)} ${assetMeta(a).symbol}`, txHash };
       }
       case "vault": {
@@ -7502,6 +7508,8 @@ async function main() {
         const txHash = t.action === "deposit"
           ? await vaultClient.deposit(amount())
           : await vaultClient.withdrawShares(BigInt(String(p.shares ?? "0")));
+        hashes.push(txHash as Hex);
+
         return { ok: true, detail: `vault ${t.action}`, txHash };
       }
       case "swap": {
@@ -7509,6 +7517,8 @@ async function main() {
         const txHash = await routerClient.execute(
           asset(), p.tokenOut as Hex, amount(), BigInt(String(p.minOut ?? "0")),
         );
+        hashes.push(txHash as Hex);
+
         return { ok: true, detail: `swap ${assetMeta(asset()).symbol} → ${assetMeta(p.tokenOut as Hex).symbol}`, txHash };
       }
       case "amm": {
@@ -7524,17 +7534,23 @@ async function main() {
           const txHash = await ammClient.addLiquidity(poolId, assets, amounts, BigInt(String(p.minShares ?? "0")));
           void settleNowLp(agentAccount.address as Hex, poolId);
           emissionsInvalidate();
+          hashes.push(txHash as Hex);
+
           return { ok: true, detail: `added liquidity to ${pool.name}`, txHash };
         }
         if (t.action === "remove") {
           const txHash = await ammClient.removeLiquidity(poolId, BigInt(String(p.shares ?? "0")), assets.map(() => 0n));
           void settleNowLp(agentAccount.address as Hex, poolId);
           emissionsInvalidate();
+          hashes.push(txHash as Hex);
+
           return { ok: true, detail: `removed liquidity from ${pool.name}`, txHash };
         }
         const txHash = await ammClient.swap(
           poolId, p.tokenIn as Hex, p.tokenOut as Hex, BigInt(String(p.amountIn ?? "0")), BigInt(String(p.minOut ?? "0")),
         );
+        hashes.push(txHash as Hex);
+
         return { ok: true, detail: `swapped in ${pool.name}`, txHash };
       }
       case "wallet": {
@@ -7560,6 +7576,7 @@ async function main() {
             if (stopped(t.id)) { failed.push("stopped by the operator — the rest were not sent"); break; }
             try {
               const txHash = await spendFromSession(id, row.to, row.amount, noteOf(p.memo));
+              hashes.push(txHash as Hex);
               first ??= txHash;
               sent.push(`${fmtUnits(row.amount, assetMeta(a).decimals)}→${row.to.slice(0, 8)}…`);
             } catch (e) {
@@ -7587,6 +7604,7 @@ async function main() {
          * recipient and what they were paid; the row's link is the first, since
          * a table cell holds one.
          */
+        hashes.push(...r.sent.map((x) => x.txHash));
         const paid = r.sent.map((x) => `${x.amount}→${x.to.slice(0, 8)}…`).join(" ");
         const note = noteOf(p.message);
         const detail =
@@ -7599,15 +7617,35 @@ async function main() {
     }
   }
 
+  /**
+   * What a run cost in gas, across every transaction it sent.
+   *
+   * A bulk transfer is one transaction per recipient, so pricing only the
+   * first would understate a ten-address payroll by nine tenths. Receipts are
+   * read in parallel and a receipt that will not answer makes the whole figure
+   * null rather than a smaller number presented as the total — an
+   * under-reported cost is worse than an absent one.
+   */
+  async function feeOf(hashes: Hex[]): Promise<bigint | null> {
+    if (!hashes.length) return null;
+    try {
+      const rs = await Promise.all(hashes.map((h) => client.public.getTransactionReceipt({ hash: h })));
+      return rs.reduce((t, r) => t + r.gasUsed * r.effectiveGasPrice, 0n);
+    } catch {
+      return null;
+    }
+  }
+
   /** Run it, record what happened, and never let one task's failure stop another. */
   async function executeTask(t: Task, source: "schedule" | "manual"): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
     // A stop applies to the run it was pressed during, not to every run after
     // it. Clearing here — not when the flag is set — is what keeps a task that
     // was stopped once from being permanently, invisibly dead.
     runningTasks.add(t.id);
+    const hashes: Hex[] = [];
     try {
-      const r = await runTask(t);
-      taskStore.markRun(t.id, r.ok ? "ok" : "failed", r.detail, r.txHash);
+      const r = await runTask(t, hashes);
+      taskStore.markRun(t.id, r.ok ? "ok" : "failed", r.detail, r.txHash, await feeOf(hashes));
       try {
         txlog.record({
           actor: agentAccount.address as string, category: "defi", action: `task ${t.venue} ${t.action}`,
@@ -7619,7 +7657,9 @@ async function main() {
       return r;
     } catch (e) {
       const detail = friendlyError(e);
-      taskStore.markRun(t.id, "failed", detail);
+      // A run that threw part way through still spent gas on whatever it did
+      // broadcast, and that is exactly the run somebody wants the cost of.
+      taskStore.markRun(t.id, "failed", detail, hashes[0] ?? null, await feeOf(hashes));
       console.error(`[tasks] ${t.name} failed: ${detail}`);
       return { ok: false, detail, txHash: null };
     } finally {
@@ -7781,8 +7821,14 @@ async function main() {
       ok: true,
       // `busy` is what makes Stop meaningful on the page: a control that stops
       // something in progress has to say which ones are in progress.
-      tasks: taskStore.view(Date.now(), scope.owner)
-        .map((t) => ({ ...t, busy: runningTasks.has(t.id), stopping: stopRequested.has(t.id) })),
+      tasks: taskStore.view(Date.now(), scope.owner).map((t) => ({
+        ...t,
+        busy: runningTasks.has(t.id),
+        stopping: stopRequested.has(t.id),
+        // Gas is quoted in the chain's 18-decimal unit; USDC's own view has
+        // six. Converting here means the page never has to know that.
+        lastFee: t.lastFeeWei ? fmtUnits(BigInt(t.lastFeeWei), 18) : null,
+      })),
       actions: scope.operator ? TASK_ACTIONS : SESSION_ACTIONS,
       operator: scope.operator,
       owner: scope.owner,

@@ -51,6 +51,15 @@ export interface Task {
   lastStatus: "ok" | "failed" | null;
   lastDetail: string;
   lastTxHash: string | null;
+  /**
+   * Gas the last run cost, in wei — 18 decimals, even here.
+   *
+   * USDC is the gas token on Arc and its ERC-20 view has six decimals, but the
+   * fee a receipt reports is in the chain's own 18-decimal unit. Storing the
+   * raw figure keeps that conversion in one place instead of every reader
+   * guessing which scale a number is in.
+   */
+  lastFeeWei: string | null;
   runs: number;
 }
 
@@ -165,6 +174,7 @@ export class TaskStore {
       lastStatus: null,
       lastDetail: "",
       lastTxHash: null,
+      lastFeeWei: null,
       runs: 0,
     };
     this.tasks.push(task);
@@ -233,9 +243,18 @@ export class TaskStore {
   }
 
   /** Record an attempt, whatever came of it. A failed run still counts as run. */
-  markRun(id: string, status: "ok" | "failed", detail: string, txHash: string | null = null) {
+  markRun(
+    id: string,
+    status: "ok" | "failed",
+    detail: string,
+    txHash: string | null = null,
+    feeWei: bigint | null = null,
+  ) {
     const t = this.tasks.find((x) => x.id === id);
     if (!t) return;
+    // Null when the run sent nothing, or when the receipts could not be read —
+    // which is not the same as "it was free", so it is not written as zero.
+    t.lastFeeWei = feeWei === null ? null : feeWei.toString();
     // Stamped once and never again: "since" is the start of the series, and a
     // task edited or paused in between is still the same series.
     t.firstRunAt ??= Date.now();
