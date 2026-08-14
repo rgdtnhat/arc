@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v99" />
+    <meta name="tessera-shell" content="tessera-v100" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2507,6 +2507,13 @@
               <tbody id="skRows"></tbody>
             </table></div>
             <button class="btn" id="skMore" style="display:none;width:100%;justify-content:center;margin-top:8px"></button>
+            <p class="feedNote" style="margin-top:8px">
+              A session is bounded by three things, and the smallest one wins: its own cap, your ERC-20
+              <b>approval</b> to the session contract, and your balance. The approval is a single shared number per
+              token — every session spends from it — so a session can show a healthy cap and still pay nothing when
+              the approval has run out. Where that is the case the row says so and offers to top it up, for the sum
+              of what your live sessions could still spend and not a wei more.
+            </p>
             <p class="feedNote" style="margin-top:8px">
               Revoking is instant and yours alone — the session key cannot undo it. Dropping the token allowance to
               zero from any wallet stops it too, without this contract's cooperation.

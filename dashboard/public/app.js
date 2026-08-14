@@ -3434,13 +3434,29 @@ const $ = (id) => document.getElementById(id);
       const sessionUsable = (x) =>
         x.ours && !x.revoked && x.expiry * 1000 > Date.now() && BigInt(x.spendableRaw || "0") > 0n;
 
-      /** Why it cannot be used, in a phrase — empty when it can. */
+      /**
+       * Why it cannot be used, in a phrase — empty when it can.
+       *
+       * "Nothing left to spend" was true and unanswerable: a session with 30
+       * USDC of unused cap, against a wallet holding 326, said it and left
+       * nobody any way to find out why. Three ceilings bind a session — its own
+       * cap, the wallet's ERC-20 allowance to the contract, and the wallet's
+       * balance — and the allowance is almost always the one, because it is a
+       * single shared number per wallet and token that every session draws
+       * down. Name it, and say what fixes it.
+       */
       function sessionWhy(x) {
         if (x.revoked) return "revoked";
         if (x.expiry * 1000 < Date.now()) return "expired";
         if (!x.ours) return "delegated to a key this app no longer holds — open a new one";
-        if (BigInt(x.spendableRaw || "0") === 0n) return "nothing left to spend";
-        return "";
+        if (BigInt(x.spendableRaw || "0") > 0n) return "";
+        if (x.binds === "allowance") {
+          return `${x.capLeft} ${x.symbol} of cap is unused, but your approval to the session contract is ` +
+            `${x.allowance} — top it up to use this session`;
+        }
+        if (x.binds === "balance") return `your wallet holds ${x.balance} ${x.symbol}, less than this session could pay`;
+        if (x.binds === "cap") return "its cap is fully spent — open a new session for more";
+        return "nothing left to spend";
       }
 
       /**
@@ -3495,6 +3511,11 @@ const $ = (id) => document.getElementById(id);
                 // Not repeated when the line above already says it — "revoked"
                 // twice under each other read as a rendering fault.
                 (bad && !ok && bad !== "revoked" ? `<div style="color:var(--warn);font-size:11px">${esc(bad)}</div>` : "") +
+                // One signature to make every live session on this asset
+                // usable again, rather than opening yet another one.
+                (isMine && x.binds === "allowance"
+                  ? `<button class="btn" data-skallow="${esc(x.asset)}" style="margin-top:5px;padding:2px 8px;font-size:11px">Top up approval</button>`
+                  : "") +
                 `</td>` +
                 `<td class="num mono">${esc(x.spent)} / ${esc(x.cap)}</td>` +
                 `<td class="num mono">${gone ? "—" : esc(x.spendable)}</td>` +
@@ -3765,9 +3786,27 @@ const $ = (id) => document.getElementById(id);
            * this contract — it is what lets somebody revoke from any wallet UI
            * without asking us. Opening the session first would leave a live
            * delegation that cannot move anything, which reads as broken.
+           *
+           * And it approves the new cap *plus what the live sessions still
+           * have*, because `approve` replaces rather than adds. Approving only
+           * the new cap silently cut the allowance every existing session was
+           * relying on: open a 0.02 session after a 30 one and the 30 could
+           * suddenly pay 0.02. The sum is exactly what the owner has agreed to,
+           * session by session — never an unlimited approval.
            */
-          await selfCustody("skMsg", `approve ${cap} for the session`, async (from, c) =>
-            sendTx(from, asset, callData(c.selectors.erc20Approve, encAddr(c.sessionKeys), encUint(capRaw))));
+          const committed = sessionAll
+            .filter((x) => String(x.asset).toLowerCase() === asset.toLowerCase() &&
+              !x.revoked && x.expiry * 1000 > Date.now())
+            .reduce((t, x) => t + BigInt(x.capLeftRaw || "0"), 0n);
+          const approveRaw = (committed + BigInt(capRaw)).toString();
+          const approveHuman = fmtUnitsStr(approveRaw, dec);
+          await selfCustody(
+            "skMsg",
+            committed > 0n
+              ? `approve ${approveHuman} — this session's ${cap} plus what your other live sessions still hold`
+              : `approve ${cap} for the session`,
+            async (from, c) =>
+              sendTx(from, asset, callData(c.selectors.erc20Approve, encAddr(c.sessionKeys), encUint(approveRaw))));
           await selfCustody("skMsg", `open a ${cap} session`, async (from, c) =>
             sendTx(from, c.sessionKeys, callData(
               c.selectors.skOpen,
@@ -3808,6 +3847,36 @@ const $ = (id) => document.getElementById(id);
         }
 
         $("skRows").addEventListener("click", async (e) => {
+          /*
+           * Raise the approval to cover every live session on this asset.
+           *
+           * The allowance is one number per wallet and token, shared by every
+           * session — so this approves the *sum* of what all the live ones
+           * could still spend. Approving one session's cap is what created the
+           * problem: `approve` replaces rather than adds, so opening a small
+           * session silently cut the allowance the big one was relying on.
+           *
+           * The sum is exactly what the owner has already agreed to, session by
+           * session, and not a wei more. No unlimited approval, ever.
+           */
+          const allow = e.target.closest("button[data-skallow]");
+          if (allow) {
+            const asset = allow.dataset.skallow;
+            const live = sessionAll.filter((x) =>
+              String(x.asset).toLowerCase() === asset.toLowerCase() &&
+              !x.revoked && x.expiry * 1000 > Date.now() && BigInt(x.capLeftRaw || "0") > 0n);
+            const need = live.reduce((t, x) => t + BigInt(x.capLeftRaw || "0"), 0n);
+            if (need <= 0n) return showReceipt("skMsg", false, "no live session needs an approval");
+            const dec = live[0].decimals, sym = live[0].symbol;
+            allow.disabled = true;
+            await selfCustody(
+              "skMsg", `approve ${fmtUnitsStr(need.toString(), dec)} ${sym} for ${live.length} session${live.length === 1 ? "" : "s"}`,
+              async (from, c) => sendTx(from, asset, callData(c.selectors.erc20Approve, encAddr(c.sessionKeys), encUint(need.toString()))),
+            );
+            allow.disabled = false;
+            loadSessions();
+            return;
+          }
           const cp = e.target.closest("button[data-skcopy]");
           if (cp) {
             try {

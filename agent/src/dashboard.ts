@@ -6951,10 +6951,36 @@ async function main() {
       address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "sessions", args: [id],
     })) as readonly [Hex, Hex, Hex, bigint, bigint, bigint, bigint, boolean, boolean];
     if (s[0] === "0x0000000000000000000000000000000000000000") return null;
-    const spendable = (await client.public.readContract({
-      address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "spendable", args: [id],
-    })) as bigint;
+    /*
+     * Three ceilings, and the page has to be able to name the one that binds.
+     *
+     * `spendable` is their minimum, which is the right number to act on and a
+     * useless one to explain: a session showing "nothing left to spend" with
+     * 30 USDC of unused cap and 326 USDC in the wallet is answered only by
+     * saying *which* of the three is zero. It is almost always the allowance,
+     * because that is one shared number per wallet and token — every session
+     * draws it down, and opening a new one with `approve(cap)` replaces it
+     * rather than adding to it.
+     */
+    const [spendable, allowance, balance] = await Promise.all([
+      client.public.readContract({
+        address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "spendable", args: [id],
+      }) as Promise<bigint>,
+      client.public.readContract({
+        address: s[2], abi: erc20Abi, functionName: "allowance", args: [s[0], sessionKeysAddr],
+      }) as Promise<bigint>,
+      client.public.readContract({
+        address: s[2], abi: erc20Abi, functionName: "balanceOf", args: [s[0]],
+      }) as Promise<bigint>,
+    ]);
     const meta = assetMeta(s[2]);
+    const capLeft = s[3] > s[4] ? s[3] - s[4] : 0n;
+    const dead = s[7] || Number(s[6]) * 1000 < Date.now();
+    const binds = dead ? "closed"
+      : capLeft === 0n ? "cap"
+      : allowance < capLeft && allowance <= balance ? "allowance"
+      : balance < capLeft ? "balance"
+      : "none";
     return {
       id,
       owner: s[0], key: s[1], asset: s[2],
@@ -6969,6 +6995,14 @@ async function main() {
       // whichever binds first. See the contract's note on why all three.
       spendable: fmtUnits(spendable, meta.decimals),
       spendableRaw: spendable.toString(),
+      // The three, and which of them is the reason for the answer above.
+      capLeft: fmtUnits(capLeft, meta.decimals),
+      capLeftRaw: capLeft.toString(),
+      allowance: fmtUnits(allowance, meta.decimals),
+      allowanceRaw: allowance.toString(),
+      balance: fmtUnits(balance, meta.decimals),
+      balanceRaw: balance.toString(),
+      binds,
       // Ours to spend, or somebody else's delegation that we merely can see.
       ours: Boolean(sessionSigner && s[1].toLowerCase() === sessionSigner.account.address.toLowerCase()),
     };
