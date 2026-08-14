@@ -1548,13 +1548,28 @@ const $ = (id) => document.getElementById(id);
         if (!r.ok) throw new Error(r.error || "sign-in failed");
         localStorage.setItem("tessera_token", r.token);
         setWallet(r.address);
+        /*
+         * Close first, refresh after — and never await a refresh here.
+         *
+         * Sign-in is finished the moment the token exists; everything below is
+         * the page catching up. Awaiting `loadSessions` put a dozen paced chain
+         * reads between a successful signature and the sheet closing, so the
+         * dialog sat on "Checking your signature…" for half a minute after the
+         * work was done. A spinner that outlives what it describes is the thing
+         * people read as a hang.
+         */
+        sheet.close();
         refreshProfile();
         refreshMyPositions().catch(() => {});
         if (typeof loadAllowances === "function") loadAllowances().catch(() => {});
         reflectWalletAvailability();
         adoptConnectedAccount();
         if (typeof loadWallet === "function") loadWallet();
-        sheet.close();
+        // The session card and the task list were both drawn while signed out —
+        // one said "connect a wallet", the other showed nothing to schedule
+        // against. Neither re-read itself when the wallet arrived.
+        if (typeof loadSessions === "function") loadSessions().catch(() => {});
+        if (typeof loadTasks === "function") loadTasks();
       }
       $("walletBtn").addEventListener("click", connectWallet);
       (async () => {
@@ -1596,6 +1611,9 @@ const $ = (id) => document.getElementById(id);
           // greyed out. Re-read them for whoever this actually is.
           if (typeof loadEmissions === "function") loadEmissions().catch(() => {});
           if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {});
+          // Sessions are keyed by the connected address, so they are unreadable
+          // until there is one — and this is the moment there is.
+          if (typeof loadSessions === "function") loadSessions().catch(() => {});
         } catch { /* no wallet, or one that will not answer — leave it alone */ }
       }
 
@@ -3338,6 +3356,23 @@ const $ = (id) => document.getElementById(id);
       let sessionRows = [];
 
       /**
+       * The picker's labels, which have to tell four delegations apart.
+       *
+       * Four options all reading "USDC · 0.018 left" is not a choice. The id
+       * is what distinguishes them — it is what the table shows and what the
+       * receipt names — so it leads, with the expiry and the per-payment
+       * ceiling after it.
+       */
+      function sessionOptions() {
+        if (!sessionRows.length) return `<option value="">no session this app can spend from — open one above</option>`;
+        return sessionRows.map((x) => {
+          const until = new Date(x.expiry * 1000).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
+          return `<option value="${esc(x.id)}">${esc(x.id.slice(0, 10))}… · ${esc(x.spendable)} ${esc(x.symbol)} left` +
+            `${Number(x.perTxMaxRaw) > 0 ? ` · max ${esc(x.perTxMax)}` : ""} · until ${esc(until)}</option>`;
+        }).join("");
+      }
+
+      /**
        * The sessions this visitor's own wallet has opened.
        *
        * Read for the connected address rather than the app wallet: a session is
@@ -3376,28 +3411,57 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           const r = await (await fetch(`/api/sessions?owner=${from}`)).json();
-          sessionRows = (r.sessions || []).filter((x) => !x.revoked);
+          /*
+           * Which sessions this server can actually spend from.
+           *
+           * `ours` is the one that kept being missed. A session names the key
+           * it delegates to, and a key that has since been replaced — or a
+           * session opened while the server had none — leaves a delegation that
+           * looks perfectly healthy and that this server can never use. Those
+           * were offered in the task picker anyway, and the only way to find
+           * out was creating a task and being told "that session is delegated
+           * to a different key".
+           */
+          const usable = (x) => x.ours && !x.revoked && x.expiry * 1000 > Date.now() && BigInt(x.spendableRaw || "0") > 0n;
+          sessionRows = (r.sessions || []).filter(usable);
+          const why = (x) =>
+            x.revoked ? "revoked"
+            : x.expiry * 1000 < Date.now() ? "expired"
+            : !x.ours ? "delegated to a key this server no longer holds — open a new one"
+            : BigInt(x.spendableRaw || "0") === 0n ? "nothing left to spend"
+            : "";
           $("skRows").innerHTML = (r.sessions || []).length
             ? r.sessions.map((x) => {
                 const when = new Date(x.expiry * 1000).toLocaleDateString();
                 const dead = x.revoked || x.expiry * 1000 < Date.now();
-                return `<tr><td><b>${esc(x.symbol)}</b>` +
-                  `<div class="muted mono" style="font-size:10.5px">${esc(x.id.slice(0, 14))}…</div>` +
+                const bad = why(x);
+                return `<tr><td><b>${esc(x.symbol)}</b>${usable(x) ? ` <span style="color:var(--good);font-size:10.5px">usable</span>` : ""}` +
+                  `<div class="muted mono" style="font-size:10.5px">${esc(x.id.slice(0, 14))}…` +
+                  ` <button class="btn" data-skcopy="${esc(x.id)}" style="padding:0 5px;font-size:10px">copy id</button></div>` +
                   `<div class="muted" style="font-size:11px">${x.revoked ? "revoked" : `until ${esc(when)}`}` +
                   `${Number(x.perTxMaxRaw) > 0 ? ` · max ${esc(x.perTxMax)} each` : ""}` +
-                  `${x.restricted ? " · allow-list" : ""}</div></td>` +
+                  `${x.restricted ? " · allow-list" : ""}</div>` +
+                  (bad && !usable(x) ? `<div style="color:var(--warn);font-size:11px">${esc(bad)}</div>` : "") +
+                  `</td>` +
                   `<td class="num mono">${esc(x.spent)} / ${esc(x.cap)}</td>` +
                   `<td class="num mono">${dead ? "—" : esc(x.spendable)}</td>` +
                   `<td class="num">${dead ? "" : `<button class="btn" data-skrev="${esc(x.id)}">Revoke</button>`}</td></tr>`;
               }).join("")
             : emptyRow(4, "No sessions yet.");
-          // The task form's picker is the same list, so a task can only be
-          // pointed at a session that exists and is still live.
+          /*
+           * The picker names each session, rather than describing it.
+           *
+           * Four options all reading "USDC · 0.018 left" is not a choice — it
+           * is four identical labels for four different delegations, and the
+           * only one that differs is the one you cannot use. Each carries its
+           * own id and expiry, which is what actually tells them apart, and
+           * only sessions this server can spend from are offered at all.
+           */
           const sel = $("taskSession");
           if (sel) {
-            sel.innerHTML = sessionRows.length
-              ? sessionRows.map((x) => `<option value="${esc(x.id)}">${esc(x.symbol)} · ${esc(x.spendable)} left</option>`).join("")
-              : `<option value="">no live session</option>`;
+            const keep = sel.value;
+            sel.innerHTML = sessionOptions();
+            if (keep && sessionRows.some((x) => x.id === keep)) sel.value = keep;
           }
         } catch {
           /* leave whatever is on screen */
@@ -3454,6 +3518,14 @@ const $ = (id) => document.getElementById(id);
         });
 
         $("skRows").addEventListener("click", async (e) => {
+          const cp = e.target.closest("button[data-skcopy]");
+          if (cp) {
+            try {
+              await navigator.clipboard.writeText(cp.dataset.skcopy);
+              showReceipt("skMsg", true, "session id copied");
+            } catch { showReceipt("skMsg", false, "could not copy — select the id and copy it by hand"); }
+            return;
+          }
           const btn = e.target.closest("button[data-skrev]");
           if (!btn) return;
           const cfg = await loadDefiConfig();
@@ -3516,10 +3588,11 @@ const $ = (id) => document.getElementById(id);
             return `<select class="field" data-tp="${f}">${assetOptions}</select>`;
           }
           if (f === "session") {
-            const opts = sessionRows.length
-              ? sessionRows.map((x) => `<option value="${esc(x.id)}">${esc(x.symbol)} · ${esc(x.spendable)} left</option>`).join("")
-              : `<option value="">no live session — open one above</option>`;
-            return `<select class="field" id="taskSession" data-tp="sessionId">${opts}</select>`;
+            // `sessionOptions` and nowhere else — this select is built here on
+            // a form change and again in `loadSessions` when the chain answers,
+            // and two renderers meant the labels disagreed depending on which
+            // ran last.
+            return `<select class="field" id="taskSession" data-tp="sessionId">${sessionOptions()}</select>`;
           }
           if (f === "recipients") {
             /*
@@ -3724,10 +3797,11 @@ const $ = (id) => document.getElementById(id);
            * spending cap and then had no way to schedule anything against it.
            * The server decides what each caller may create; this reflects it.
            */
-          notReady(r.operator || sessionRows.some((x) => x.ours && !x.revoked)
+          notReady(r.operator || sessionRows.length
             ? null
             : "Open a session key above first — a scheduled payment from your own wallet is funded by one, " +
-              "and bounded by the cap you set.");
+              "and bounded by the cap you set. Sessions that are revoked, expired, spent out, or delegated to a " +
+              "key this app no longer holds cannot be scheduled against, and are not offered.");
           if ($("tasksOwnNote")) {
             $("tasksOwnNote").style.display = r.operator ? "none" : "";
             if (r.note) $("tasksOwnNote").textContent = r.note;

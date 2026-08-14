@@ -7099,7 +7099,12 @@ async function main() {
     if (!sessionSigner) throw new Error("this server has no session key configured");
     const s = await readSession(id);
     if (!s) throw new Error("no such session");
-    if (!s.ours) throw new Error("that session is delegated to a different key, not to this server");
+    if (!s.ours) {
+      throw new Error(
+        `that session delegates to ${s.key}, and this app signs with ` +
+        `${sessionSigner.account.address} — revoke it and open a new session`,
+      );
+    }
     if (s.revoked) throw new Error("that session has been revoked by its owner");
     if (s.expiry * 1000 < Date.now()) throw new Error("that session has expired");
     if (BigInt(s.spendableRaw) < amount) {
@@ -7571,7 +7576,15 @@ async function main() {
       if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("choose a session to spend from");
       const s0 = await readSession(id as Hex);
       if (!s0) throw new Error("no such session");
-      if (!s0.ours) throw new Error("that session is delegated to a different key");
+      if (!s0.ours) {
+        // Say which key, and what to do. "Delegated to a different key" is true
+        // and useless: the session looks healthy in every other respect, and
+        // nothing on the page explains that the server's key has moved on.
+        throw new Error(
+          `that session delegates to ${s0.key}, and this app now signs with ` +
+          `${sessionSigner ? sessionSigner.account.address : "no key at all"} — revoke it and open a new session`,
+        );
+      }
       if (s0.revoked) throw new Error("that session has been revoked");
       if (body.action === "sessionBulk") {
         if (!parseRecipients(body.params?.recipients).length) throw new Error("no recipients");
