@@ -3355,6 +3355,112 @@ const $ = (id) => document.getElementById(id);
 
       let sessionRows = [];
 
+      /** Everything the last fetch returned, newest first. */
+      let sessionAll = [];
+      /** Whose sessions are on screen — the connected wallet, or a searched one. */
+      let sessionOwnerShown = null;
+      /** How many rows the table is showing; "Show more" raises it. */
+      let sessionPage = 10;
+      const SESSION_PAGE = 10;
+
+      /** Can this app spend from it right now? */
+      const sessionUsable = (x) =>
+        x.ours && !x.revoked && x.expiry * 1000 > Date.now() && BigInt(x.spendableRaw || "0") > 0n;
+
+      /** Why it cannot be used, in a phrase — empty when it can. */
+      function sessionWhy(x) {
+        if (x.revoked) return "revoked";
+        if (x.expiry * 1000 < Date.now()) return "expired";
+        if (!x.ours) return "delegated to a key this app no longer holds — open a new one";
+        if (BigInt(x.spendableRaw || "0") === 0n) return "nothing left to spend";
+        return "";
+      }
+
+      /**
+       * The session table: live first, newest first, ten at a time.
+       *
+       * Ordering matters more than it looks. Revoked and expired delegations
+       * accumulate and never go away — they are on chain — so a list in raw
+       * contract order buries the one session somebody just opened under
+       * everything they have ever finished with. Live at the top, newest
+       * first, and the dead ones still reachable underneath.
+       */
+      function renderSessionTable() {
+        const body = $("skRows");
+        if (!body) return;
+        const q = ($("skSearch") ? $("skSearch").value : "").trim().toLowerCase();
+        const byAddress = /^0x[0-9a-f]{40}$/.test(q);
+        const rows = sessionAll.filter((x) => {
+          if (!q || byAddress) return true;           // an address query re-fetched already
+          return x.id.toLowerCase().includes(q);      // otherwise match the session id
+        });
+        // Stable: live before dead, and within each the order they arrived in
+        // (which is newest first).
+        const live = rows.filter((x) => !x.revoked && x.expiry * 1000 > Date.now());
+        const dead = rows.filter((x) => x.revoked || x.expiry * 1000 <= Date.now());
+        const ordered = live.concat(dead);
+        const shown = ordered.slice(0, sessionPage);
+        const me = String(window.__myAddress || "").toLowerCase();
+
+        body.innerHTML = shown.length
+          ? shown.map((x) => {
+              const when = new Date(x.expiry * 1000).toLocaleDateString();
+              const gone = x.revoked || x.expiry * 1000 < Date.now();
+              const bad = sessionWhy(x);
+              const ok = sessionUsable(x);
+              // Whose wallet this delegation is out of. It is the question the
+              // table could not answer — every row looked the same and none of
+              // them said who was paying.
+              const owner = String(x.owner || "");
+              const isMine = me && owner.toLowerCase() === me;
+              const tag = isMine
+                ? `<span style="color:var(--good);font-size:10.5px;font-weight:600">this wallet</span>`
+                : `<span style="color:var(--warn);font-size:10.5px">another wallet</span>`;
+              return `<tr><td><b>${esc(x.symbol)}</b> ${tag}` +
+                `${ok ? ` <span style="color:var(--good);font-size:10.5px">usable</span>` : ""}` +
+                `<div class="muted mono" style="font-size:10.5px;word-break:break-all;margin-top:2px">` +
+                `from ${esc(owner)} <button class="btn" data-skcopy="${esc(owner)}" style="padding:0 5px;font-size:10px">copy</button></div>` +
+                `<div class="muted mono" style="font-size:10.5px">id ${esc(x.id.slice(0, 14))}…` +
+                ` <button class="btn" data-skcopy="${esc(x.id)}" style="padding:0 5px;font-size:10px">copy id</button></div>` +
+                `<div class="muted" style="font-size:11px">${x.revoked ? "revoked" : `until ${esc(when)}`}` +
+                `${Number(x.perTxMaxRaw) > 0 ? ` · max ${esc(x.perTxMax)} each` : ""}` +
+                `${x.restricted ? " · allow-list" : ""}</div>` +
+                // Not repeated when the line above already says it — "revoked"
+                // twice under each other read as a rendering fault.
+                (bad && !ok && bad !== "revoked" ? `<div style="color:var(--warn);font-size:11px">${esc(bad)}</div>` : "") +
+                `</td>` +
+                `<td class="num mono">${esc(x.spent)} / ${esc(x.cap)}</td>` +
+                `<td class="num mono">${gone ? "—" : esc(x.spendable)}</td>` +
+                `<td class="num">${gone || !isMine ? "" : `<button class="btn" data-skrev="${esc(x.id)}">Revoke</button>`}</td></tr>`;
+            }).join("")
+          : emptyRow(4, q ? "No session matches that." : "No sessions yet.");
+
+        const more = $("skMore");
+        if (more) {
+          const left = ordered.length - shown.length;
+          more.style.display = left > 0 ? "" : "none";
+          more.textContent = `Show ${Math.min(SESSION_PAGE, left)} more (${left} hidden)`;
+        }
+        const count = $("skCount");
+        if (count) {
+          count.textContent = ordered.length
+            ? `${live.length} live · ${dead.length} finished` +
+              (sessionOwnerShown && me && sessionOwnerShown.toLowerCase() !== me
+                ? ` · showing ${sessionOwnerShown.slice(0, 10)}…, not your own`
+                : "")
+            : "";
+        }
+      }
+
+      /** Fill the task form's session picker from whatever is spendable. */
+      function renderSessionPicker() {
+        const sel = $("taskSession");
+        if (!sel) return;
+        const keep = sel.value;
+        sel.innerHTML = sessionOptions();
+        if (keep && sessionRows.some((x) => x.id === keep)) sel.value = keep;
+      }
+
       /**
        * The picker's labels, which have to tell four delegations apart.
        *
@@ -3379,8 +3485,21 @@ const $ = (id) => document.getElementById(id);
        * a thing *you* granted, and the only wallet that can grant or revoke one
        * is the one holding the tokens.
        */
+      /**
+       * Which `loadSessions` call is the current one.
+       *
+       * Reading a wallet's delegations is several paced chain calls, so two
+       * loads overlap easily — a search while a refresh is in flight, a route
+       * change while a search is. Whichever finished last used to win, which
+       * put one owner's rows on screen under another owner's heading. Only the
+       * newest call may write to the shared state.
+       */
+      let sessionLoadSeq = 0;
+
       async function loadSessions() {
         if (!$("skRows")) return;
+        const seq = ++sessionLoadSeq;
+        const stale = () => seq !== sessionLoadSeq;
         try {
           const key = await (await fetch("/api/sessions/key")).json();
           $("skKeyAddr").textContent = key.key || "no session key configured on this server";
@@ -3405,12 +3524,35 @@ const $ = (id) => document.getElementById(id);
                 `from its own wallet the first time a scheduled payment runs.`;
           }
           const from = await connectedAddress();
-          if (!from) {
-            $("skRows").innerHTML = emptyRow(4, "Connect a wallet to see or open sessions.");
+          /*
+           * Whose sessions this table is showing.
+           *
+           * Normally the connected wallet's own. The search box can point it at
+           * any address, because a delegation is public on chain and looking
+           * one up is how you check what a wallet has signed away — but a
+           * session that is not yours is read-only here, and says so.
+           */
+          const q = ($("skSearch") ? $("skSearch").value : "").trim();
+          const searchAddr = /^0x[0-9a-fA-F]{40}$/.test(q) ? q : null;
+          const lookAt = searchAddr || from;
+          sessionOwnerShown = lookAt;
+          if (stale()) return;
+          if (!lookAt) {
+            $("skRows").innerHTML = emptyRow(4, "Connect a wallet, or search an address, to see sessions.");
             sessionRows = [];
+            sessionAll = [];
+            renderSessionPicker();
             return;
           }
-          const r = await (await fetch(`/api/sessions?owner=${from}`)).json();
+          // Reading a list of delegations is several paced chain calls, so say
+          // it is happening rather than leaving the previous owner's rows on
+          // screen looking like the answer.
+          if ($("skCount")) $("skCount").textContent = `Reading ${String(lookAt).slice(0, 10)}…'s sessions…`;
+          const r = await (await fetch(`/api/sessions?owner=${lookAt}`)).json();
+          if (stale()) return;
+          // On-chain order is creation order, so the newest is last. Newest
+          // first is what a list of "what did I just open" wants.
+          sessionAll = (r.sessions || []).slice().reverse();
           /*
            * Which sessions this server can actually spend from.
            *
@@ -3422,47 +3564,11 @@ const $ = (id) => document.getElementById(id);
            * out was creating a task and being told "that session is delegated
            * to a different key".
            */
-          const usable = (x) => x.ours && !x.revoked && x.expiry * 1000 > Date.now() && BigInt(x.spendableRaw || "0") > 0n;
-          sessionRows = (r.sessions || []).filter(usable);
-          const why = (x) =>
-            x.revoked ? "revoked"
-            : x.expiry * 1000 < Date.now() ? "expired"
-            : !x.ours ? "delegated to a key this server no longer holds — open a new one"
-            : BigInt(x.spendableRaw || "0") === 0n ? "nothing left to spend"
-            : "";
-          $("skRows").innerHTML = (r.sessions || []).length
-            ? r.sessions.map((x) => {
-                const when = new Date(x.expiry * 1000).toLocaleDateString();
-                const dead = x.revoked || x.expiry * 1000 < Date.now();
-                const bad = why(x);
-                return `<tr><td><b>${esc(x.symbol)}</b>${usable(x) ? ` <span style="color:var(--good);font-size:10.5px">usable</span>` : ""}` +
-                  `<div class="muted mono" style="font-size:10.5px">${esc(x.id.slice(0, 14))}…` +
-                  ` <button class="btn" data-skcopy="${esc(x.id)}" style="padding:0 5px;font-size:10px">copy id</button></div>` +
-                  `<div class="muted" style="font-size:11px">${x.revoked ? "revoked" : `until ${esc(when)}`}` +
-                  `${Number(x.perTxMaxRaw) > 0 ? ` · max ${esc(x.perTxMax)} each` : ""}` +
-                  `${x.restricted ? " · allow-list" : ""}</div>` +
-                  (bad && !usable(x) ? `<div style="color:var(--warn);font-size:11px">${esc(bad)}</div>` : "") +
-                  `</td>` +
-                  `<td class="num mono">${esc(x.spent)} / ${esc(x.cap)}</td>` +
-                  `<td class="num mono">${dead ? "—" : esc(x.spendable)}</td>` +
-                  `<td class="num">${dead ? "" : `<button class="btn" data-skrev="${esc(x.id)}">Revoke</button>`}</td></tr>`;
-              }).join("")
-            : emptyRow(4, "No sessions yet.");
-          /*
-           * The picker names each session, rather than describing it.
-           *
-           * Four options all reading "USDC · 0.018 left" is not a choice — it
-           * is four identical labels for four different delegations, and the
-           * only one that differs is the one you cannot use. Each carries its
-           * own id and expiry, which is what actually tells them apart, and
-           * only sessions this server can spend from are offered at all.
-           */
-          const sel = $("taskSession");
-          if (sel) {
-            const keep = sel.value;
-            sel.innerHTML = sessionOptions();
-            if (keep && sessionRows.some((x) => x.id === keep)) sel.value = keep;
-          }
+          sessionRows = searchAddr && from && searchAddr.toLowerCase() !== from.toLowerCase()
+            ? []  // somebody else's delegation — visible, never schedulable here
+            : sessionAll.filter(sessionUsable);
+          renderSessionTable();
+          renderSessionPicker();
         } catch {
           /* leave whatever is on screen */
         }
@@ -3516,6 +3622,34 @@ const $ = (id) => document.getElementById(id);
             )));
           loadSessions();
         });
+
+        if ($("skMore")) {
+          $("skMore").addEventListener("click", () => { sessionPage += SESSION_PAGE; renderSessionTable(); });
+        }
+        if ($("skSearch")) {
+          /*
+           * Two kinds of search, and the difference is one round trip.
+           *
+           * A full address is a different owner's list and has to be fetched.
+           * Anything else filters what is already here. Debounced, because
+           * typing an address a character at a time would otherwise be forty
+           * requests for the one that matters.
+           */
+          let searchTimer = null;
+          const runSearch = () => {
+            sessionPage = SESSION_PAGE;
+            const q = $("skSearch").value.trim();
+            if (/^0x[0-9a-fA-F]{40}$/.test(q) || !q) loadSessions();
+            else renderSessionTable();
+          };
+          $("skSearch").addEventListener("input", () => {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(runSearch, 350);
+          });
+          if ($("skSearchClear")) {
+            $("skSearchClear").addEventListener("click", () => { $("skSearch").value = ""; runSearch(); });
+          }
+        }
 
         $("skRows").addEventListener("click", async (e) => {
           const cp = e.target.closest("button[data-skcopy]");

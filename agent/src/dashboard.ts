@@ -7019,11 +7019,17 @@ async function main() {
       const ids = (await client.public.readContract({
         address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "sessionsOf", args: [owner as Hex],
       })) as readonly Hex[];
-      const rows = [];
-      for (const id of ids) {
-        const r = await readSession(id);
-        if (r) rows.push(r);
-      }
+      /*
+       * All of them at once, not one after another.
+       *
+       * Each session is two contract reads, and this was a sequential loop —
+       * so a wallet with five delegations waited for ten paced round trips
+       * before the table drew anything, and the search box felt broken because
+       * the answer arrived long after the typing stopped. The client already
+       * paces and retries; handing it the whole batch lets it do that once.
+       */
+      const rows = (await Promise.all(ids.map((id) => readSession(id).catch(() => null))))
+        .filter((r): r is NonNullable<typeof r> => r !== null);
       res.json({ ok: true, deployed: true, key: sessionSigner ? sessionSigner.account.address : null, sessions: rows });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
