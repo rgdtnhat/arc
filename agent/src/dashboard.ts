@@ -6974,17 +6974,35 @@ async function main() {
   }
 
   /** The address a visitor should delegate to, so the page can show it. */
-  app.get("/api/sessions/key", async (_req, res) => {
-    let gas: string | null = null;
-    if (sessionSigner) {
-      gas = await client.public
-        .readContract({
-          address: usdcAddress as Hex, abi: erc20Abi, functionName: "balanceOf",
-          args: [sessionSigner.account.address as Hex],
-        })
-        .then((v) => fmtUnits(v as bigint, 6))
-        .catch(() => null);
-    }
+  /*
+   * The key never changes; only its gas balance does.
+   *
+   * This did a chain read on every call, and it is called on every page load
+   * and every refresh of the session card — 3.5 seconds of a browser's six
+   * connections, in front of the request that actually draws the table. The
+   * answer is cached for a few seconds, and a cold call reports the balance as
+   * unknown rather than waiting for it: the address is what the page needs to
+   * render, and the float can arrive a moment later.
+   */
+  let sessionGas: { at: number; value: string | null } = { at: 0, value: null };
+  let sessionGasBusy = false;
+  const refreshSessionGas = () => {
+    if (!sessionSigner || sessionGasBusy) return;
+    sessionGasBusy = true;
+    client.public
+      .readContract({
+        address: usdcAddress as Hex, abi: erc20Abi, functionName: "balanceOf",
+        args: [sessionSigner.account.address as Hex],
+      })
+      .then((v) => { sessionGas = { at: Date.now(), value: fmtUnits(v as bigint, 6) }; })
+      .catch(() => { sessionGas = { at: Date.now(), value: null }; })
+      .finally(() => { sessionGasBusy = false; });
+  };
+
+  app.get("/api/sessions/key", (_req, res) => {
+    // Kick off a refresh when the reading is old, and answer with what we have.
+    if (Date.now() - sessionGas.at > 10_000) refreshSessionGas();
+    const gas = sessionGas.value;
     res.json({
       ok: true,
       contract: sessionKeysAddr,
@@ -7010,15 +7028,57 @@ async function main() {
     });
   });
 
+  /*
+   * Sessions, cached briefly and never lost to one bad read.
+   *
+   * This is several contract calls behind a public RPC, and it is read on
+   * every route change, every sign-in and every keystroke of the search box.
+   * Two things follow. It has to be cheap when nothing has changed — hence a
+   * short TTL — and a read that fails must not come back as an *empty list*,
+   * because an empty list is a statement ("you have no sessions") and the
+   * truth is "we could not ask". Serving the last good answer, marked stale,
+   * is the honest version of both.
+   */
+  /**
+   * One more go before giving up on a read.
+   *
+   * A public RPC drops calls under load, and a single dropped call here is the
+   * difference between a full session list and "No sessions yet." — a sentence
+   * that is not merely unhelpful but wrong. Two short retries cost a moment
+   * and remove most of that.
+   */
+  async function retryRead<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+    let last: unknown;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await fn();
+      } catch (e) {
+        last = e;
+        if (i < attempts - 1) await new Promise((r) => setTimeout(r, 200 * (i + 1)));
+      }
+    }
+    throw last;
+  }
+
+  const sessionsCache = new Map<string, { at: number; rows: unknown[] }>();
+  const SESSIONS_TTL = live ? 10_000 : 500;
+  const sessionsInvalidate = () => sessionsCache.clear();
+
   /** Every session a wallet has opened. Public: they are the owner's own. */
   app.get("/api/sessions", async (req, res) => {
     if (!sessionKeysAddr) { res.json({ ok: true, deployed: false, sessions: [] }); return; }
     const owner = String(req.query.owner ?? "");
     if (!isAddress(owner)) { res.status(400).json({ ok: false, error: "owner must be an address" }); return; }
+    const cacheKey = owner.toLowerCase();
+    const cached = sessionsCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < SESSIONS_TTL && req.query.fresh !== "1") {
+      res.json({ ok: true, deployed: true, key: sessionSigner ? sessionSigner.account.address : null, sessions: cached.rows });
+      return;
+    }
     try {
-      const ids = (await client.public.readContract({
+      const ids = (await retryRead(() => client.public.readContract({
         address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "sessionsOf", args: [owner as Hex],
-      })) as readonly Hex[];
+      }))) as readonly Hex[];
       /*
        * All of them at once, not one after another.
        *
@@ -7028,11 +7088,42 @@ async function main() {
        * the answer arrived long after the typing stopped. The client already
        * paces and retries; handing it the whole batch lets it do that once.
        */
-      const rows = (await Promise.all(ids.map((id) => readSession(id).catch(() => null))))
-        .filter((r): r is NonNullable<typeof r> => r !== null);
+      const read = await Promise.all(ids.map((id) => retryRead(() => readSession(id)).catch(() => null)));
+      const rows = read.filter((r): r is NonNullable<typeof r> => r !== null);
+      /*
+       * A session that would not answer is a gap, not a deletion.
+       *
+       * Dropping it silently would show a shorter list than the chain holds —
+       * and the row most likely to be missing is the one somebody is looking
+       * for. If any read failed, fall back to the last good answer rather than
+       * publishing a list we know is incomplete.
+       */
+      const missing = read.length - rows.length;
+      if (missing > 0 && cached) {
+        res.json({
+          ok: true, deployed: true, stale: true,
+          key: sessionSigner ? sessionSigner.account.address : null,
+          sessions: cached.rows,
+          note: `${missing} session(s) would not answer just now, so this is the last complete reading.`,
+        });
+        return;
+      }
+      if (sessionsCache.size > 64) sessionsCache.clear();
+      sessionsCache.set(cacheKey, { at: Date.now(), rows });
       res.json({ ok: true, deployed: true, key: sessionSigner ? sessionSigner.account.address : null, sessions: rows });
     } catch (e) {
-      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+      // Same rule: a failed read is not "no sessions". Serve what we last saw
+      // and say it is stale; only a caller with nothing cached gets an error.
+      if (cached) {
+        res.json({
+          ok: true, deployed: true, stale: true,
+          key: sessionSigner ? sessionSigner.account.address : null,
+          sessions: cached.rows,
+          note: "The chain would not answer just now, so this is the last reading.",
+        });
+        return;
+      }
+      res.status(503).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
   });
 
@@ -7133,6 +7224,7 @@ async function main() {
       const amount = BigInt(String(req.body?.amount ?? "0"));
       if (amount <= 0n) { res.status(400).json({ ok: false, error: "amount must be above zero" }); return; }
       const txHash = await spendFromSession(id, to, amount);
+      sessionsInvalidate();
       logTx(req, {
         category: "defi", action: "session-spend", status: "success", txHash,
         detail: `${amount} from session ${id.slice(0, 10)}… to ${to}`,

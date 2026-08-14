@@ -149,9 +149,14 @@ const $ = (id) => document.getElementById(id);
           // and nothing it reports changes second to second.
           if (route === "dashboard" && typeof loadClaimables === "function") loadClaimables().catch(() => {});
           if (route === "gov" && typeof setGovTab === "function") setGovTab(govTab);
+          // The DeFi panes are the expensive ones, so they load when you get
+          // here rather than while you are somewhere else.
+          if (route === "defi" && typeof setDefiTab === "function") setDefiTab(defiTab, { scroll: false });
           // Balances and the task list are reads of their own; they load when
           // you arrive rather than on every poll of every other tab.
-          if (route === "wallet" && typeof loadWallet === "function") { loadWallet(); loadTasks(); loadSessions(); }
+          // Sessions first: it is the slowest of the three and the one the pane
+          // is mostly made of.
+          if (route === "wallet" && typeof loadWallet === "function") { loadSessions(); loadWallet(); loadTasks(); }
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -258,12 +263,25 @@ const $ = (id) => document.getElementById(id);
         }
         document.querySelectorAll("[data-defitab]").forEach((b) =>
           b.classList.toggle("active", b.dataset.defitab === tab));
-        if (tab === "fees") loadFees();
+        /*
+         * Load the venue's data only when the venue is on screen.
+         *
+         * This ran during initial evaluation whatever route the page had
+         * landed on, so opening #wallet fired the lending tab's holder scan,
+         * prices, backstop, auction, borrowers and emissions first — six
+         * chain-heavy requests, some of them five seconds each, ahead of the
+         * ones that draw the pane you are actually looking at. On a phone,
+         * where the browser allows six connections in total, the session table
+         * waited sixteen seconds for its turn. `showView` loads this on
+         * arrival instead, the same as every other route.
+         */
+        const onScreen = $("paneDefi") && !$("paneDefi").hidden;
+        if (tab === "fees" && onScreen) loadFees();
         // Each venue tab carries its own holder leaderboard and fee history.
         // Loaded on switch rather than up front: a holder scan is a windowed
         // log sweep, and doing four of them for tabs nobody opened is waste.
         const venueKey = { lending: "Lending", vault: "Vault", swap: "Swap", amm: "Amm" }[tab];
-        if (venueKey) loadVenuePanels(venueKey);
+        if (venueKey && onScreen) loadVenuePanels(venueKey);
         // Switching tabs shouldn't leave you halfway down the previous pane.
         if (!opts || opts.scroll !== false) {
           const dock = document.querySelector("#paneDefi .tabDock");
@@ -1604,16 +1622,25 @@ const $ = (id) => document.getElementById(id);
           if (!a) return;
           setWallet(a);
           refreshMyPositions().catch(() => {});
-          if (typeof loadClaimables === "function") loadClaimables().catch(() => {});
-          // Anything already drawn against "no address" is drawn against the
-          // wrong person, and the reward cards are the ones where that shows:
-          // they had reported the app wallet's balance with the claim button
-          // greyed out. Re-read them for whoever this actually is.
-          if (typeof loadEmissions === "function") loadEmissions().catch(() => {});
-          if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {});
           // Sessions are keyed by the connected address, so they are unreadable
-          // until there is one — and this is the moment there is.
+          // until there is one — and this is the moment there is. First,
+          // because on the Wallet route it is most of what the page shows.
           if (typeof loadSessions === "function") loadSessions().catch(() => {});
+          /*
+           * The rest only when their pane is on screen.
+           *
+           * Anything already drawn against "no address" is drawn against the
+           * wrong person, and the reward cards are where that shows — but
+           * re-reading three chain-heavy panels the visitor is not looking at
+           * just puts them in front of the one they are. Each pane reloads on
+           * arrival anyway.
+           */
+          const open = (id) => $(id) && !$(id).hidden;
+          if (open("paneDashboard") && typeof loadClaimables === "function") loadClaimables().catch(() => {});
+          if (open("paneDefi")) {
+            if (typeof loadEmissions === "function") loadEmissions().catch(() => {});
+            if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {});
+          }
         } catch { /* no wallet, or one that will not answer — leave it alone */ }
       }
 
@@ -3433,7 +3460,14 @@ const $ = (id) => document.getElementById(id);
                 `<td class="num mono">${gone ? "—" : esc(x.spendable)}</td>` +
                 `<td class="num">${gone || !isMine ? "" : `<button class="btn" data-skrev="${esc(x.id)}">Revoke</button>`}</td></tr>`;
             }).join("")
-          : emptyRow(4, q ? "No session matches that." : "No sessions yet.");
+          : emptyRow(4, q
+              ? "No session matches that."
+              // Name the address that was read. "No sessions yet" on its own
+              // is indistinguishable from a read that went to the wrong
+              // wallet, or to none at all.
+              : sessionOwnerShown
+                ? `No sessions for ${String(sessionOwnerShown).slice(0, 10)}… yet — open one above.`
+                : "Connect a wallet, or search an address, to see sessions.");
 
         const more = $("skMore");
         if (more) {
@@ -3486,22 +3520,54 @@ const $ = (id) => document.getElementById(id);
        * is the one holding the tokens.
        */
       /**
-       * Which `loadSessions` call is the current one.
+       * Whose sessions the page currently wants to be showing.
        *
-       * Reading a wallet's delegations is several paced chain calls, so two
-       * loads overlap easily — a search while a refresh is in flight, a route
-       * change while a search is. Whichever finished last used to win, which
-       * put one owner's rows on screen under another owner's heading. Only the
-       * newest call may write to the shared state.
+       * Overlapping loads are normal here — a route change, a sign-in and the
+       * wallet-detection poll all ask, and each is several paced chain calls.
+       * The first attempt at keeping them straight was a sequence number, and
+       * it was wrong in a way that made the card *worse*: two loads start at
+       * boot, the second blocks behind a slow request, and the first — the one
+       * whose data had actually arrived — was discarded for being "stale".
+       * The table stayed empty for as long as the slow one took.
+       *
+       * What actually matters is not which call is newest but which *wallet*
+       * is being shown. Any answer for the wallet on screen is a good answer,
+       * whoever asked for it; an answer for a different wallet is dropped.
        */
-      let sessionLoadSeq = 0;
+      let sessionWant = null;
+      /** The load currently running, so identical ones can share it. */
+      let sessionInflight = null;
+      /** Pending retry after a failed read, so they cannot pile up. */
+      let sessionRetry = null;
 
-      async function loadSessions() {
-        if (!$("skRows")) return;
-        const seq = ++sessionLoadSeq;
-        const stale = () => seq !== sessionLoadSeq;
-        try {
-          const key = await (await fetch("/api/sessions/key")).json();
+      function loadSessions() {
+        if (!$("skRows")) return Promise.resolve();
+        if (sessionInflight) return sessionInflight;
+        sessionInflight = loadSessionsOnce().finally(() => { sessionInflight = null; });
+        return sessionInflight;
+      }
+
+      async function loadSessionsOnce() {
+        // Set once `lookAt` is known, below.
+        let mine = null;
+        const stale = () => mine !== sessionWant;
+
+        /*
+         * The key and the list are two reads, and one must not blank the other.
+         *
+         * They were in the same `try`, so a hiccup fetching the server's key —
+         * a cold start, a slow RPC, anything — threw before the table was ever
+         * written, and the whole card came up empty with no message. That is
+         * the "sometimes nothing": not an empty wallet, an exception two lines
+         * above the render.
+         */
+        /*
+         * The key and the list are two reads, and the list is the one that
+         * draws the table. This runs alongside rather than in front of it: it
+         * used to be awaited first, holding one of the browser's six
+         * connections for as long as it took while the table showed nothing.
+         */
+        fetch("/api/sessions/key").then((x) => x.json()).then((key) => {
           $("skKeyAddr").textContent = key.key || "no session key configured on this server";
           if ($("skOpen")) $("skOpen").disabled = !key.key;
           /*
@@ -3523,7 +3589,14 @@ const $ = (id) => document.getElementById(id);
               : `Gas float: none. USDC is the gas token here, so the app will send this key ${key.gasFloat} USDC ` +
                 `from its own wallet the first time a scheduled payment runs.`;
           }
-          const from = await connectedAddress();
+        }).catch(() => {
+          // No key, or it would not answer. The sessions below are still worth
+          // reading — they exist on chain whatever this server can sign for.
+          $("skKeyAddr").textContent = "could not read the session key just now";
+        });
+
+        try {
+          const from = await connectedAddress().catch(() => null);
           /*
            * Whose sessions this table is showing.
            *
@@ -3535,8 +3608,9 @@ const $ = (id) => document.getElementById(id);
           const q = ($("skSearch") ? $("skSearch").value : "").trim();
           const searchAddr = /^0x[0-9a-fA-F]{40}$/.test(q) ? q : null;
           const lookAt = searchAddr || from;
+          mine = lookAt;
+          sessionWant = lookAt;
           sessionOwnerShown = lookAt;
-          if (stale()) return;
           if (!lookAt) {
             $("skRows").innerHTML = emptyRow(4, "Connect a wallet, or search an address, to see sessions.");
             sessionRows = [];
@@ -3548,8 +3622,30 @@ const $ = (id) => document.getElementById(id);
           // it is happening rather than leaving the previous owner's rows on
           // screen looking like the answer.
           if ($("skCount")) $("skCount").textContent = `Reading ${String(lookAt).slice(0, 10)}…'s sessions…`;
-          const r = await (await fetch(`/api/sessions?owner=${lookAt}`)).json();
+          const res = await fetch(`/api/sessions?owner=${lookAt}`);
+          const r = await res.json().catch(() => ({ ok: false }));
           if (stale()) return;
+          /*
+           * A read that failed is not an empty list.
+           *
+           * This rendered "No sessions yet." whenever the request errored,
+           * which is a statement about the wallet and was false — the
+           * delegations were there, the server just could not reach the chain
+           * for a moment. Keep what is on screen, say what happened, and try
+           * again shortly.
+           */
+          if (!r.ok) {
+            if ($("skCount")) {
+              $("skCount").style.color = "var(--warn)";
+              $("skCount").textContent = sessionAll.length
+                ? "Could not re-read your sessions just now — showing the last reading, retrying…"
+                : "Could not read your sessions just now — retrying…";
+            }
+            clearTimeout(sessionRetry);
+            sessionRetry = setTimeout(() => loadSessions(), 4000);
+            return;
+          }
+          if ($("skCount")) $("skCount").style.color = "";
           // On-chain order is creation order, so the newest is last. Newest
           // first is what a list of "what did I just open" wants.
           sessionAll = (r.sessions || []).slice().reverse();
@@ -3569,8 +3665,28 @@ const $ = (id) => document.getElementById(id);
             : sessionAll.filter(sessionUsable);
           renderSessionTable();
           renderSessionPicker();
-        } catch {
-          /* leave whatever is on screen */
+          if (r.stale && r.note && $("skCount")) {
+            $("skCount").style.color = "var(--warn)";
+            $("skCount").textContent = r.note;
+          }
+        } catch (e) {
+          /*
+           * Say something. Anything.
+           *
+           * This swallowed the error and left an empty table, which reads as
+           * "you have no sessions" — a claim about somebody's wallet made on
+           * the strength of a failed fetch. Keep the rows that are there, name
+           * the problem, and come back for another go.
+           */
+          if ($("skCount")) {
+            $("skCount").style.color = "var(--warn)";
+            $("skCount").textContent = `Could not read sessions: ${String((e && e.message) || e).slice(0, 90)} — retrying…`;
+          }
+          if (!sessionAll.length && $("skRows") && !$("skRows").innerHTML) {
+            $("skRows").innerHTML = emptyRow(4, "Could not read sessions just now — retrying.");
+          }
+          clearTimeout(sessionRetry);
+          sessionRetry = setTimeout(() => loadSessions(), 4000);
         }
       }
 
