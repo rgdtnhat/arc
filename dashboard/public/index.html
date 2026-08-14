@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v106" />
+    <meta name="tessera-shell" content="tessera-v107" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2439,6 +2439,36 @@
         <!-- ---------- OTHER ---------- -->
         <!-- ---------- GOVERNANCE ---------- -->
         <div class="tabPane" id="paneWallet" hidden>
+          <!-- One tab per wallet function, for the same reason as the DeFi
+               strip: four long cards in a column meant scrolling past three to
+               reach the fourth, and the scheduled-task table is the one people
+               come back to most. -->
+          <div class="card compact tabDock" style="padding:10px 14px">
+            <div class="sheetTabs" id="walletTabs" role="tablist" style="border-bottom:0;padding:0;margin:0">
+              <button class="sheetTab active" data-wallettab="send" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 3 10.5 13.5"/><path d="M21 3l-6.8 18-3.7-7.5L3 9.8Z"/>
+                </svg></span>Send &amp; receive
+              </button>
+              <button class="sheetTab" data-wallettab="sessions" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3.5M15.5 12v2.5"/>
+                </svg></span>Session keys
+              </button>
+              <button class="sheetTab" data-wallettab="tasks" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="8.6"/><path d="M12 7.2V12l3.2 2"/>
+                </svg></span>Scheduled tasks
+              </button>
+              <button class="sheetTab" data-wallettab="series" role="tab">
+                <span class="tabIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M9.5 14.5 14.5 9.5"/><path d="M7 12 4.9 14.1a3.6 3.6 0 0 0 5.1 5.1L12 17"/><path d="M17 12l2.1-2.1a3.6 3.6 0 0 0-5.1-5.1L12 7"/>
+                </svg></span>Task series
+              </button>
+            </div>
+          </div>
+
+          <div class="walletPane" id="walletSend">
           <div class="card">
             <h2>◫ Wallet — send and receive</h2>
             <div class="notready" id="walletNotReady" style="display:none">
@@ -2502,6 +2532,9 @@
             </div>
           </div>
 
+          </div>
+
+          <div class="walletPane" id="walletSessions" hidden>
           <div class="card" id="sessionCard">
             <h2>◎ Schedule from your own wallet</h2>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
@@ -2556,6 +2589,9 @@
             </p>
           </div>
 
+          </div>
+
+          <div class="walletPane" id="walletTasks" hidden>
           <div class="card" id="tasksCard">
             <h2>◷ Scheduled tasks — what the app does on its own</h2>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
@@ -2626,6 +2662,9 @@
             </table></div>
           </div>
 
+          </div>
+
+          <div class="walletPane" id="walletSeries" hidden>
           <div class="card" id="seriesCard">
             <h2>⛓ Task series — several tasks on one trigger</h2>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
@@ -2692,6 +2731,7 @@
                 <tbody id="serRows"></tbody>
               </table></div>
             </div>
+          </div>
           </div>
         </div><!-- /#paneWallet -->
 

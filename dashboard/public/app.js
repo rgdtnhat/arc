@@ -131,6 +131,33 @@ const $ = (id) => document.getElementById(id);
           try { localStorage.setItem(NAV_OPEN_KEY, open ? "1" : "0"); } catch {}
         }
       }
+      /**
+       * Keep the current section's name on screen at both ends of the row.
+       *
+       * The label is centred under its own icon, which is right for the five
+       * in the middle and wrong for the two at the ends: "Treasury & system"
+       * centred under the last icon runs off the right of the screen and is
+       * cut in half. CSS cannot clamp a centred absolute box to its scroll
+       * container, so this measures and nudges it back inside — the label
+       * stays under its icon wherever it can, and slides in only as far as it
+       * must to be readable.
+       */
+      function placeNavLabel() {
+        const btn = document.querySelector('#navDrawer [data-nav][aria-current="page"]');
+        const lbl = btn && btn.querySelector(".navLbl");
+        if (!lbl) return;
+        lbl.style.transform = "translateX(-50%)";
+        const inner = btn.closest(".inner") || btn.parentElement;
+        const pad = 8;
+        const r = lbl.getBoundingClientRect();
+        const bounds = inner.getBoundingClientRect();
+        let shift = 0;
+        if (r.left < bounds.left + pad) shift = bounds.left + pad - r.left;
+        else if (r.right > bounds.right - pad) shift = bounds.right - pad - r.right;
+        if (shift) lbl.style.transform = `translateX(calc(-50% + ${Math.round(shift)}px))`;
+      }
+      window.addEventListener("resize", () => placeNavLabel());
+
       function showView(route) {
         const isApp = TABS.includes(route);
         $("viewLanding").hidden = isApp;
@@ -156,9 +183,9 @@ const $ = (id) => document.getElementById(id);
           // you arrive rather than on every poll of every other tab.
           // Sessions first: it is the slowest of the three and the one the pane
           // is mostly made of.
-          if (route === "wallet" && typeof loadWallet === "function") {
-            loadSessions(); loadWallet(); loadTasks(); loadSeries();
-          }
+          // The wallet's tabs load their own data, so arriving here is just a
+          // matter of showing the one that was last open.
+          if (route === "wallet" && typeof setWalletTab === "function") setWalletTab(walletTab, { scroll: false });
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -174,6 +201,7 @@ const $ = (id) => document.getElementById(id);
           const on = b.dataset.nav === route;
           b.setAttribute("aria-current", on ? "page" : "false");
         });
+        placeNavLabel();
         // The drawer deliberately stays open across navigation — it is a menu
         // the user chose to pin, not a popup.
       }
@@ -197,6 +225,41 @@ const $ = (id) => document.getElementById(id);
        * One tab per function instead of four long cards stacked in a column.
        * Purely a view switch: no fetching hangs off it, because the DeFi panels
        * are all fed by the same `/api/state` poll. */
+      /**
+       * The Wallet pane's own tabs.
+       *
+       * Same reasoning as the DeFi strip: four long cards stacked meant
+       * scrolling past three to reach the fourth, and the scheduled-task table
+       * is the one people come back to most.
+       */
+      const WALLET_PANES = { send: "walletSend", sessions: "walletSessions", tasks: "walletTasks", series: "walletSeries" };
+      const WALLET_TAB_KEY = "tessera_wallet_tab";
+      let walletTab = (() => {
+        try { return localStorage.getItem(WALLET_TAB_KEY) || "send"; } catch { return "send"; }
+      })();
+
+      function setWalletTab(tab, opts) {
+        if (!(tab in WALLET_PANES)) tab = "send";
+        walletTab = tab;
+        try { localStorage.setItem(WALLET_TAB_KEY, tab); } catch {}
+        for (const [name, id] of Object.entries(WALLET_PANES)) {
+          const el = $(id);
+          if (el) el.hidden = name !== tab;
+        }
+        document.querySelectorAll("[data-wallettab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.wallettab === tab));
+        // Each tab's data loads when you arrive at it, not while you are on
+        // another one — the same rule the routes follow.
+        if (tab === "send" && typeof loadWallet === "function") loadWallet();
+        if (tab === "sessions" && typeof loadSessions === "function") loadSessions();
+        if (tab === "tasks" && typeof loadTasks === "function") loadTasks();
+        if (tab === "series" && typeof loadSeries === "function") { loadTasks(); loadSeries(); }
+        if (!opts || opts.scroll !== false) {
+          const dock = $("walletTabs");
+          if (dock) dock.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      }
+
       const DEFI_PANES = {
         lending: "defiLending", vault: "defiVault", swap: "defiSwap", amm: "defiAmm", fees: "defiFees",
       };
@@ -295,6 +358,19 @@ const $ = (id) => document.getElementById(id);
       }
       const headerHeight = () =>
         parseInt(getComputedStyle(document.documentElement).getPropertyValue("--headerH"), 10) || 56;
+
+      if ($("walletTabs")) {
+        document.querySelectorAll("[data-wallettab]").forEach((b) =>
+          b.addEventListener("click", () => setWalletTab(b.dataset.wallettab)));
+        // Show the remembered tab without loading anything: the route handler
+        // does that on arrival, and this runs whatever route the page opened on.
+        for (const [name, id] of Object.entries(WALLET_PANES)) {
+          const el = $(id);
+          if (el) el.hidden = name !== walletTab;
+        }
+        document.querySelectorAll("[data-wallettab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.wallettab === walletTab));
+      }
 
       if ($("defiTabs")) {
         document.querySelectorAll("[data-defitab]").forEach((b) =>
@@ -4340,8 +4416,10 @@ const $ = (id) => document.getElementById(id);
         const pane = $("paneWallet");
         if (!pane || pane.hidden || !$("taskRows")) return;
         if (document.hidden) return;
-        loadTasks();
-        loadSeries();
+        // Only the tab in front of you: polling four cards to refresh one is
+        // three requests nobody is reading.
+        if (walletTab === "tasks") loadTasks();
+        if (walletTab === "series") { loadTasks(); loadSeries(); }
       }, 5000);
 
       if ($("taskCreate")) {
