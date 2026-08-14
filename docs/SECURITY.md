@@ -120,6 +120,26 @@ The vault is deliberately conservative:
   now, and the UI's **Max** uses it — so the button never proposes an amount that
   would revert.
 
+### Transfer memos are public and permanent
+
+A transfer can carry a memo, written into the transaction's own calldata after
+the encoded `transfer(to, amount)`. Solidity ignores calldata past the arguments
+it decodes, so the payment is unchanged by it — but the memo is **on chain**:
+public, permanent, unencrypted, and attributable to both addresses forever. It
+is not the same thing as the note the app keeps beside it, which never leaves
+the server, and the UI states the difference at the point of entry.
+
+Two rules in code, because the memo is the least important thing in a payment:
+
+- The call is **simulated with the memo attached** before anything is broadcast.
+  Nothing on a chain owes Solidity's tolerance of trailing calldata — Arc's USDC
+  is the gas token at a reserved address — so tolerance is tested, not assumed.
+- If that simulation fails, the **plain transfer goes out instead** and the
+  receipt says the memo was not attached. A payment is never risked, or
+  silently skipped, for the sake of a note attached to it.
+
+Bounded at 180 bytes: calldata is paid for in gas per byte by the sender.
+
 ### Residual risks (honest limits — these are NOT eliminated)
 
 1. **Pool utilisation risk.** If pool borrowers draw down *all* free cash, the

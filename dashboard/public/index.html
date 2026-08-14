@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v97" />
+    <meta name="tessera-shell" content="tessera-v99" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2436,14 +2436,20 @@
                 <input id="walSendAmount" class="field" inputmode="decimal" placeholder="Amount" style="width:130px" />
                 <button class="btn primary" id="walSend">Send</button>
               </div>
-              <div class="row-actions" style="margin-bottom:9px">
+              <div class="row-actions" style="margin-bottom:6px">
                 <input id="walSendMsg" class="field" maxlength="200" placeholder="Note for your own records (optional)"
                        style="flex:1;min-width:200px" />
               </div>
+              <div class="row-actions" style="margin-bottom:9px">
+                <input id="walSendMemo" class="field" maxlength="180" placeholder="On-chain memo, sent with the transaction (optional)"
+                       style="flex:1;min-width:200px" />
+              </div>
               <div style="font-size:11.5px;color:var(--muted);margin-bottom:9px">
-                The note is kept by this app — it appears on the receipt and in your activity history. It is
-                <b>not</b> written to the chain: an ERC-20 transfer carries no memo field, so the recipient's wallet
-                will show the payment and not the note.
+                Two different things. The <b>note</b> is kept by this app — it appears on the receipt and in your
+                activity history, and nobody else can see it. The <b>memo</b> is written into the transaction itself,
+                so it is public, permanent, and visible to the recipient on Arcscan. It costs a little extra gas, one
+                byte at a time, and it is checked before sending — if the token will not carry it, the payment still
+                goes out and the receipt says the memo did not.
               </div>
               <div style="font-size:11.5px;color:var(--muted);margin-bottom:9px">
                 Or send the same asset to many addresses at once — one <span class="mono">address,amount</span> per

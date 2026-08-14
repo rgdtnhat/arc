@@ -3206,6 +3206,29 @@ const $ = (id) => document.getElementById(id);
        * worst option available: the transfer looks like it worked and one
        * recipient simply never hears from you.
        */
+      /**
+       * A memo as calldata, appended after a call's encoded arguments.
+       *
+       * Solidity's decoder ignores calldata beyond what the arguments need, so
+       * the call runs exactly as encoded and the extra bytes ride along in the
+       * transaction input — public, permanent, and shown by the explorer. That
+       * is the difference between this and the note beside it, which never
+       * leaves the app.
+       *
+       * Bounded at 180 bytes: every byte is paid for in gas by the sender, and
+       * a memo is a sentence rather than a payload.
+       */
+      function memoHex(memo) {
+        // Mirrors agent/src/memo.ts exactly, including the whitespace
+        // normalisation — a memo typed here and one scheduled through the
+        // server must land on chain as the same bytes.
+        const text = String(memo || "").replace(/\s+/g, " ").trim();
+        if (!text) return "";
+        const bytes = new TextEncoder().encode(text).slice(0, 180);
+        return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+      window.memoHex = memoHex;
+
       function parseRecipientList(text, decimals) {
         const rows = [];
         const bad = [];
@@ -3294,14 +3317,18 @@ const $ = (id) => document.getElementById(id);
           const btn = $("walSend");
           const raw = toRaw(human, walDecimals(asset));
           const note = ($("walSendMsg") ? $("walSendMsg").value : "").trim().slice(0, 200);
+          const memo = ($("walSendMemo") ? $("walSendMemo").value : "").trim().slice(0, 180);
           // Self-custody sends the visitor's own tokens with their own
           // signature. The server has no key for that wallet, so routing this
           // through `/api/wallet/send` would either 403 or — worse — move the
           // app wallet's money instead of theirs.
           if (selfMode()) {
             btn.disabled = true;
+            // The memo is appended to the call's own data. Solidity ignores
+            // calldata past the arguments it decodes, so the transfer executes
+            // exactly as encoded and the memo lands in the transaction input.
             await selfCustody("walMsg", `send ${human} to ${to.slice(0, 10)}…`, async (from, c) =>
-              sendTx(from, asset, callData(c.selectors.erc20Transfer, encAddr(to), encUint(raw))));
+              sendTx(from, asset, callData(c.selectors.erc20Transfer, encAddr(to), encUint(raw)) + memoHex(memo)));
             btn.disabled = false;
             $("walSendAmount").value = "";
             // Self-custody never reaches the server, so the note has nowhere
@@ -3317,8 +3344,18 @@ const $ = (id) => document.getElementById(id);
           btn.disabled = true;
           showBusy("walMsg", `sending ${human} to ${to.slice(0, 10)}…`);
           try {
-            const r = await (await postAuthed("/api/wallet/send", { asset, to, amount: raw, message: note })).json();
-            showReceipt("walMsg", Boolean(r.ok), r.ok ? `sent ${human}` : `failed: ${r.error}`, r.sent && r.sent[0] && r.sent[0].txHash);
+            const r = await (await postAuthed("/api/wallet/send", { asset, to, amount: raw, message: note, memo })).json();
+            const first = r.sent && r.sent[0];
+            showReceipt(
+              "walMsg", Boolean(r.ok),
+              r.ok
+                // Say when the memo did not make it. The payment went through
+                // either way, and claiming a memo that is not on chain is the
+                // one thing this must not do.
+                ? `sent ${human}${memo ? (first && first.memoOnChain ? " with memo" : " — the memo could not be attached, so it was not sent") : ""}`
+                : `failed: ${r.error}`,
+              first && first.txHash,
+            );
             if (r.ok) { $("walSendAmount").value = ""; loadWallet(); }
           } catch { showReceipt("walMsg", false, "request failed"); }
           finally { btn.disabled = false; }
@@ -3348,12 +3385,14 @@ const $ = (id) => document.getElementById(id);
            */
           if (selfMode()) {
             const asset = $("walSendAsset").value;
+            const memo = ($("walSendMemo") ? $("walSendMemo").value : "").trim().slice(0, 180);
             btn.disabled = true;
             for (let i = 0; i < rows.length; i++) {
               const row = rows[i];
               const ok = await selfCustody(
                 "walMsg", `send ${i + 1} of ${rows.length} to ${row.to.slice(0, 10)}…`,
-                async (from, c) => sendTx(from, asset, callData(c.selectors.erc20Transfer, encAddr(row.to), encUint(row.amount))),
+                async (from, c) => sendTx(from, asset,
+                  callData(c.selectors.erc20Transfer, encAddr(row.to), encUint(row.amount)) + memoHex(memo)),
               );
               if (!ok) break;
             }
@@ -3367,6 +3406,7 @@ const $ = (id) => document.getElementById(id);
             const r = await (await postAuthed("/api/wallet/send-bulk", {
               asset: $("walSendAsset").value, recipients: rows,
               message: ($("walSendMsg") ? $("walSendMsg").value : "").trim().slice(0, 200),
+              memo: ($("walSendMemo") ? $("walSendMemo").value : "").trim().slice(0, 180),
             })).json();
             const sent = (r.sent || []).length, failed = (r.failed || []).length;
             showReceipt("walMsg", Boolean(r.ok) && !failed,
@@ -3804,10 +3844,11 @@ const $ = (id) => document.getElementById(id);
         "swap:swap": ["asset", "tokenOut", "amount"],
         "amm:add": ["poolId", "amounts"], "amm:remove": ["poolId", "shares"],
         "amm:swap": ["poolId", "tokenIn", "tokenOut", "amountIn"],
-        "wallet:send": ["asset", "to", "amount", "message"], "wallet:bulk": ["asset", "recipients", "message"],
+        "wallet:send": ["asset", "to", "amount", "message", "memo"],
+        "wallet:bulk": ["asset", "recipients", "message", "memo"],
         // Funded by a visitor's delegation rather than the app wallet.
-        "wallet:sessionSend": ["session", "to", "amount", "message"],
-        "wallet:sessionBulk": ["session", "recipients", "message"],
+        "wallet:sessionSend": ["session", "to", "amount", "message", "memo"],
+        "wallet:sessionBulk": ["session", "recipients", "message", "memo"],
       };
 
       /**
@@ -3859,11 +3900,16 @@ const $ = (id) => document.getElementById(id);
               `<span id="taskRecipCount" style="font-size:11.5px;color:var(--muted)"></span>`;
           }
           if (f === "message") {
-            // Optional, and honest about where it goes: nothing here is written
-            // to the chain, so it must not look like something the recipient
-            // will read.
+            // Optional, and honest about where it goes: this one never leaves
+            // the app, so it must not look like something the recipient reads.
             return `<input class="field" data-tp="message" maxlength="200" placeholder="Note for your own records (optional)" ` +
               `style="min-width:200px;flex:1" />`;
+          }
+          if (f === "memo") {
+            // And this one is the opposite: written into every transaction the
+            // task sends, where the recipient and the explorer can read it.
+            return `<input class="field" data-tp="memo" maxlength="180" ` +
+              `placeholder="On-chain memo, sent with each payment (optional)" style="min-width:200px;flex:1" />`;
           }
           const ph = { amount: "Amount", amountIn: "Amount in", shares: "Shares", poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient" }[f] || f;
           return `<input class="field" data-tp="${f}" placeholder="${esc(ph)}" style="min-width:${f === "to" ? 210 : 120}px" />`;

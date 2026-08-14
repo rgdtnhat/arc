@@ -128,6 +128,46 @@ export class OwnerClient {
   }
 
   /**
+   * Send calldata this class did not build.
+   *
+   * The one caller is the transfer memo: an ABI-encoded `transfer` with the
+   * memo's bytes appended after it. Solidity's decoder ignores trailing
+   * calldata, so the call executes exactly as the encoded arguments say and
+   * the memo rides along in the transaction's input, where an explorer will
+   * show it. `writeContract` cannot express that — it encodes from the ABI —
+   * so this drops to `sendTransaction`.
+   *
+   * It keeps the two things that make the rest of this class safe: the gas
+   * margin, and waiting for a receipt rather than trusting a broadcast. The
+   * caller is expected to have simulated first; see `transferWithMemo`.
+   */
+  async sendRaw(to: Hex, data: Hex): Promise<Hex> {
+    let gas: bigint | null = null;
+    try {
+      const est = await this.pub.estimateGas({ account: this.account, to, data });
+      gas = (est * OwnerClient.GAS_NUMERATOR) / OwnerClient.GAS_DENOMINATOR + OwnerClient.GAS_FLOOR;
+    } catch {
+      // A call that will not estimate will not send either; let the send
+      // produce the real error rather than inventing a limit for it.
+    }
+    const hash = await this.wallet.sendTransaction({
+      account: this.account, chain: this.chain, to, data, ...(gas ? { gas } : {}),
+    } as never);
+    await confirm(this.pub, hash);
+    return hash;
+  }
+
+  /** Would this calldata succeed right now? Used to test a memo before sending. */
+  async callWouldSucceed(to: Hex, data: Hex): Promise<boolean> {
+    try {
+      await this.pub.call({ account: this.account, to, data });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Deploy a contract from the deployer key and wait for it to land.
    *
    * Used by the admin "create a replacement" flow. It returns the address only

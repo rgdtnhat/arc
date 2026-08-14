@@ -67,6 +67,7 @@ import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
 import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emissions-guard.js";
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
+import { memoHex } from "./memo.js";
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
@@ -7191,7 +7192,7 @@ async function main() {
     } catch { /* the ledger is not the point */ }
   }
 
-  async function spendFromSession(id: Hex, to: Hex, amount: bigint) {
+  async function spendFromSession(id: Hex, to: Hex, amount: bigint, memo = "") {
     if (!sessionKeysAddr) throw new Error("session keys are not deployed on this network");
     if (!sessionSigner) throw new Error("this server has no session key configured");
     const s = await readSession(id);
@@ -7212,6 +7213,17 @@ async function main() {
     // Last, so a refusal above costs nothing: only a spend that is going to be
     // attempted is worth funding.
     await ensureSessionGas();
+    if (memo) {
+      // Same trick as a direct transfer, on our own contract this time: the
+      // memo rides after `spend(id, to, amount)` and lands in the transaction
+      // input. Simulated first, and the spend goes out plain if it will not.
+      const data = (encodeFunctionData({
+        abi: tesseraSessionKeysAbi, functionName: "spend", args: [id, to, amount],
+      }) + memoHex(memo)) as Hex;
+      if (await sessionSigner.callWouldSucceed(sessionKeysAddr, data)) {
+        return sessionSigner.sendRaw(sessionKeysAddr, data);
+      }
+    }
     return sessionSigner.write(sessionKeysAddr, tesseraSessionKeysAbi, "spend", [id, to, amount]);
   }
 
@@ -7223,7 +7235,7 @@ async function main() {
       if (!isAddress(to)) { res.status(400).json({ ok: false, error: "bad recipient" }); return; }
       const amount = BigInt(String(req.body?.amount ?? "0"));
       if (amount <= 0n) { res.status(400).json({ ok: false, error: "amount must be above zero" }); return; }
-      const txHash = await spendFromSession(id, to, amount);
+      const txHash = await spendFromSession(id, to, amount, noteOf(req.body?.memo));
       sessionsInvalidate();
       logTx(req, {
         category: "defi", action: "session-spend", status: "success", txHash,
@@ -7258,7 +7270,12 @@ async function main() {
     list: { to: Hex; amount: bigint }[],
     /** Asked between transfers: true means send no more of them. */
     abort: () => boolean = () => false,
-  ): Promise<{ sent: { to: string; amount: string; txHash: string }[]; failed: { to: string; error: string }[] }> {
+    /** Written into each transaction, where the recipient can read it. */
+    memo = "",
+  ): Promise<{
+    sent: { to: string; amount: string; txHash: string; memoOnChain?: boolean }[];
+    failed: { to: string; error: string }[];
+  }> {
     const meta = assetMeta(asset);
     const who = agentAccount.address as Hex;
     const held = (await client.public.readContract({
@@ -7268,7 +7285,7 @@ async function main() {
     if (total > held) {
       throw new Error(`that totals ${fmtUnits(total, meta.decimals)} ${meta.symbol} and the wallet holds ${fmtUnits(held, meta.decimals)}`);
     }
-    const sent: { to: string; amount: string; txHash: string }[] = [];
+    const sent: { to: string; amount: string; txHash: string; memoOnChain?: boolean }[] = [];
     const failed: { to: string; error: string }[] = [];
     for (const row of list) {
       if (abort()) {
@@ -7276,8 +7293,11 @@ async function main() {
         continue;
       }
       try {
-        const txHash = await agentSigner.write(asset, erc20Abi, "transfer", [row.to, row.amount]);
-        sent.push({ to: row.to, amount: fmtUnits(row.amount, meta.decimals), txHash });
+        const r = await transferWithMemo(asset, row.to, row.amount, memo);
+        sent.push({
+          to: row.to, amount: fmtUnits(row.amount, meta.decimals),
+          txHash: r.txHash, memoOnChain: r.memoOnChain,
+        });
       } catch (e) {
         failed.push({ to: row.to, error: friendlyError(e) });
       }
@@ -7299,6 +7319,38 @@ async function main() {
    */
   function noteOf(v: unknown): string {
     return String(v ?? "").replace(/\s+/g, " ").trim().slice(0, TASK_LIMITS.maxMessage);
+  }
+
+  /**
+   * A transfer with the memo written into the transaction itself.
+   *
+   * Solidity ignores calldata beyond what a function's arguments need, so the
+   * memo's bytes are appended after the ABI-encoded `transfer(to, amount)` and
+   * the call executes exactly as those arguments say. The memo then lives in
+   * the transaction's input, on chain, where an explorer shows it and the
+   * recipient can read it — which is the part the app's own note cannot do.
+   *
+   * Two rules, because this is somebody's money and the memo is the least
+   * important thing in the transaction:
+   *
+   *  · It is simulated with the memo attached before anything is broadcast. A
+   *    token that refuses trailing calldata refuses it in the simulation, at
+   *    no cost.
+   *  · If that simulation fails, the plain transfer goes out instead. The
+   *    payment is never risked for the sake of the note attached to it, and
+   *    the caller is told the memo did not make it.
+   */
+  async function transferWithMemo(
+    asset: Hex, to: Hex, amount: bigint, memo: string,
+  ): Promise<{ txHash: Hex; memoOnChain: boolean }> {
+    if (!memo) return { txHash: await agentSigner.write(asset, erc20Abi, "transfer", [to, amount]), memoOnChain: false };
+    const data = (encodeFunctionData({
+      abi: erc20Abi, functionName: "transfer", args: [to, amount],
+    }) + memoHex(memo)) as Hex;
+    if (await agentSigner.callWouldSucceed(asset, data)) {
+      return { txHash: await agentSigner.sendRaw(asset, data), memoOnChain: true };
+    }
+    return { txHash: await agentSigner.write(asset, erc20Abi, "transfer", [to, amount]), memoOnChain: false };
   }
 
   /** Parse `[{to, amount}]` where amount is already in base units. */
@@ -7325,7 +7377,8 @@ async function main() {
       if (!isAddress(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
       const list = parseRecipients([{ to: req.body?.to, amount: req.body?.amount }]);
       const note = noteOf(req.body?.message);
-      const r = await sendTransfers(asset, list);
+      const memo = noteOf(req.body?.memo);
+      const r = await sendTransfers(asset, list, () => false, memo);
       const ok = r.sent.length === 1;
       logTx(req, {
         category: "defi", action: "wallet-send", status: ok ? "success" : "failed",
@@ -7345,7 +7398,8 @@ async function main() {
       const list = parseRecipients(req.body?.recipients);
       if (!list.length) { res.status(400).json({ ok: false, error: "no recipients" }); return; }
       const note = noteOf(req.body?.message);
-      const r = await sendTransfers(asset, list);
+      const memo = noteOf(req.body?.memo);
+      const r = await sendTransfers(asset, list, () => false, memo);
       logTx(req, {
         category: "defi", action: "wallet-send-bulk", status: r.failed.length ? "failed" : "success",
         assetAddress: asset, txHash: r.sent[0]?.txHash,
@@ -7469,7 +7523,7 @@ async function main() {
           for (const row of list) {
             if (stopped(t.id)) { failed.push("stopped by the operator — the rest were not sent"); break; }
             try {
-              const txHash = await spendFromSession(id, row.to, row.amount);
+              const txHash = await spendFromSession(id, row.to, row.amount, noteOf(p.memo));
               first ??= txHash;
               sent.push(`${fmtUnits(row.amount, assetMeta(a).decimals)}→${row.to.slice(0, 8)}…`);
             } catch (e) {
@@ -7487,7 +7541,7 @@ async function main() {
         const list = t.action === "send"
           ? parseRecipients([{ to: p.to, amount: p.amount }])
           : parseRecipients(p.recipients);
-        const r = await sendTransfers(a, list, () => stopped(t.id));
+        const r = await sendTransfers(a, list, () => stopped(t.id), noteOf(p.memo));
         /*
          * Every recipient, not just the first.
          *
