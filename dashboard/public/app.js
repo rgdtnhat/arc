@@ -1355,10 +1355,16 @@ const $ = (id) => document.getElementById(id);
           "background:rgba(4,7,14,.78);padding:20px";
         const card = document.createElement("div");
         card.className = "modalCard";
+        // `--text`, not `--fg`: there is no `--fg` in this stylesheet, so the
+        // fallback won — a near-white default painted on a white card in light
+        // mode, which is how "Connected as" and the address came out unreadable.
         card.style.cssText =
           "width:min(94vw,400px);max-height:86vh;overflow:auto;border-radius:18px;padding:18px 20px;" +
-          "background:var(--bg-soft,#111827);color:var(--fg,#e5e7eb);border:1px solid var(--line-strong,#374151)";
+          "background:var(--bg-soft);color:var(--text);border:1px solid var(--line-strong)";
         wrap.appendChild(card);
+        // The sheet's clicks are its own. Letting them reach `document` is
+        // what closes menus and dropdowns behind it as a side effect.
+        card.addEventListener("click", (ev) => ev.stopPropagation());
         document.body.appendChild(wrap);
         wrap.addEventListener("click", (ev) => { if (ev.target === wrap) closeWalletPicker(); });
         return {
@@ -1392,7 +1398,7 @@ const $ = (id) => document.getElementById(id);
           // The last resort, and the reason this function is shaped like this:
           // whatever threw, the tap still produced something readable.
           sheet.set(`<h3 style="margin:0 0 12px;font-size:15px">Connect a wallet</h3>` +
-            `<p style="margin:0;font-size:13px;color:var(--warn,#f59e0b)">${esc(walletError(e))}</p>` + sheetCancel);
+            `<p style="margin:0;font-size:13px;color:var(--warn)">${esc(walletError(e))}</p>` + sheetCancel);
         });
       }
 
@@ -1406,19 +1412,68 @@ const $ = (id) => document.getElementById(id);
 
         const title = `<h3 style="margin:0 0 12px;font-size:15px">Connect a wallet</h3>`;
         const live = await connectedAddress();
+        // A token in storage is not a session — it may have expired hours ago.
+        // Ask the server before telling somebody they are connected.
+        let signedIn = false;
         if (live && localStorage.getItem("tessera_token")) {
+          signedIn = await fetch("/api/auth/me", { headers: authHeaders() })
+            .then((r) => (r.ok ? r.json() : null)).then((j) => Boolean(j && j.address)).catch(() => false);
+          if (!signedIn) localStorage.removeItem("tessera_token");
+        }
+        if (live && signedIn) {
           sheet.set(title +
-            `<p class="muted" style="margin:0 0 10px;font-size:13px">Connected as</p>` +
-            `<p class="mono" style="margin:0 0 12px;font-size:12.5px;word-break:break-all">${esc(live)}</p>` +
+            `<p class="muted" style="margin:0 0 6px;font-size:13px">Connected as</p>` +
+            `<p class="mono" id="wsheetAddr" style="margin:0 0 10px;font-size:12.5px;word-break:break-all;color:var(--text)">${esc(live)}</p>` +
+            `<button class="btn" data-wsheet="copy" style="display:flex;width:100%;justify-content:center;margin-bottom:8px">Copy address</button>` +
             `<button class="btn" data-wsheet="profile" style="display:flex;width:100%;justify-content:center;margin-bottom:8px">Open profile</button>` +
             `<button class="btn" data-wsheet="signout" style="display:flex;width:100%;justify-content:center">Sign out</button>` +
             sheetCancel);
           sheet.card.addEventListener("click", async (ev) => {
             const b = ev.target.closest("[data-wsheet]");
             if (!b) return;
-            if (b.dataset.wsheet === "profile") {
-              sheet.close();
-              if (profileMenu && profileMenu.open) profileMenu.open();
+            if (b.dataset.wsheet === "copy") {
+              try {
+                await navigator.clipboard.writeText(live);
+                b.textContent = "Copied ✓";
+                setTimeout(() => { b.textContent = "Copy address"; }, 1600);
+              } catch {
+                // Clipboard access is refused in plenty of mobile contexts.
+                // Select it instead, so there is still a way to get it out.
+                const r = document.createRange();
+                r.selectNodeContents(sheet.card.querySelector("#wsheetAddr"));
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(r);
+                b.textContent = "Selected — copy it";
+              }
+            } else if (b.dataset.wsheet === "profile") {
+              /*
+               * Open the profile, or say why there is none.
+               *
+               * `#profileWrap` starts hidden and is only shown once
+               * `/api/profile` has answered. With a stale token in
+               * localStorage that call 401s, the wrap stays hidden, and
+               * opening the panel inside it added a class to something with a
+               * `display:none` parent — a button that did nothing, twice over.
+               */
+              const wrap = $("profileWrap");
+              if (!wrap || getComputedStyle(wrap).display === "none") {
+                await refreshProfile();
+              }
+              if (wrap && getComputedStyle(wrap).display !== "none") {
+                sheet.close();
+                // After this click finishes, not during it. `bindMenu` closes
+                // every menu on a document click, and this click is still
+                // travelling — opening now means opening and closing in the
+                // same tick, which is the exact dead-button this replaced.
+                setTimeout(() => { if (profileMenu && profileMenu.open) profileMenu.open(); }, 0);
+              } else {
+                sheet.set(title +
+                  `<p style="margin:0;font-size:13px;color:var(--warn)">Your sign-in has expired, so there is no ` +
+                  `profile to open. Sign out and connect again.</p>` +
+                  `<button class="btn" data-wsheet="signout" style="display:flex;width:100%;justify-content:center;margin-top:10px">Sign out</button>` +
+                  sheetCancel);
+              }
             } else if (b.dataset.wsheet === "signout") {
               await postAuthed("/api/admin/logout").catch(() => {});
               localStorage.removeItem("tessera_token");
@@ -1451,7 +1506,7 @@ const $ = (id) => document.getElementById(id);
             chosenProvider = d.provider;
             try { localStorage.setItem("tessera_wallet_rdns", d.info.rdns || ""); } catch {}
             signInWith(sheet, d.provider).catch((e) => {
-              sheet.set(title + `<p style="margin:0;font-size:13px;color:var(--warn,#f59e0b)">${esc(walletError(e))}</p>` + sheetCancel);
+              sheet.set(title + `<p style="margin:0;font-size:13px;color:var(--warn)">${esc(walletError(e))}</p>` + sheetCancel);
             });
           });
           return;
@@ -3295,6 +3350,25 @@ const $ = (id) => document.getElementById(id);
           const key = await (await fetch("/api/sessions/key")).json();
           $("skKeyAddr").textContent = key.key || "no session key configured on this server";
           if ($("skOpen")) $("skOpen").disabled = !key.key;
+          /*
+           * Whether the key can send anything at all.
+           *
+           * USDC is the gas token on Arc, so a session key holding none cannot
+           * broadcast a transaction however generous the delegation is — and it
+           * starts with none. Every scheduled payment failed on that with a
+           * message about a balance, which read as a complaint about the
+           * delegating wallet and was nothing of the kind. The app tops it up
+           * within a hard cap; this says where it stands.
+           */
+          if ($("skKeyGas") && key.key) {
+            const gas = Number(key.gas || 0);
+            $("skKeyGas").style.display = "";
+            $("skKeyGas").style.color = gas > 0 ? "var(--muted)" : "var(--warn)";
+            $("skKeyGas").textContent = gas > 0
+              ? `Gas float: ${key.gas} USDC — enough to send. The app tops this up in ${key.gasFloat} USDC steps when it runs low.`
+              : `Gas float: none. USDC is the gas token here, so the app will send this key ${key.gasFloat} USDC ` +
+                `from its own wallet the first time a scheduled payment runs.`;
+          }
           const from = await connectedAddress();
           if (!from) {
             $("skRows").innerHTML = emptyRow(4, "Connect a wallet to see or open sessions.");
@@ -3641,15 +3715,39 @@ const $ = (id) => document.getElementById(id);
         try {
           const res = await fetch("/api/tasks", { headers: authHeaders() });
           const r = await res.json();
-          if (!r.ok) { notReady(r.error || "operator sign-in required"); return; }
-          notReady(null);
+          if (!r.ok) { notReady(r.error || "sign in to schedule anything"); return; }
+          /*
+           * A connected wallet can schedule too — from its own session key.
+           *
+           * The card used to be flatly operator-only, which made the session
+           * key pointless from the visitor's side: you could delegate a
+           * spending cap and then had no way to schedule anything against it.
+           * The server decides what each caller may create; this reflects it.
+           */
+          notReady(r.operator || sessionRows.some((x) => x.ours && !x.revoked)
+            ? null
+            : "Open a session key above first — a scheduled payment from your own wallet is funded by one, " +
+              "and bounded by the cap you set.");
+          if ($("tasksOwnNote")) {
+            $("tasksOwnNote").style.display = r.operator ? "none" : "";
+            if (r.note) $("tasksOwnNote").textContent = r.note;
+          }
           taskActions = r.actions || {};
           if (r.limits) taskLimits = { ...taskLimits, ...r.limits };
           if ($("taskEveryN")) $("taskEveryN").min = "1";
           taskRowsById = new Map((r.tasks || []).map((t) => [t.id, t]));
-          if (!$("taskVenue").options.length) {
+          // Rebuild when the set of venues changes — signing in or out swaps a
+          // visitor's two verbs for the operator's full list, and a stale
+          // dropdown would offer verbs the server will refuse.
+          const venueSig = Object.keys(taskActions).join(",");
+          if ($("taskVenue").dataset.sig !== venueSig) {
+            $("taskVenue").dataset.sig = venueSig;
             $("taskVenue").innerHTML = Object.keys(taskActions)
               .map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+            $("taskAction").dataset.venue = "";
+            syncTaskForm();
+          }
+          if (!$("taskZone").options.length) {
             // Whole and half-hour offsets, which covers every zone in use.
             $("taskZone").innerHTML = Array.from({ length: 57 }, (_, i) => (i - 28) * 30)
               .map((m) => {
@@ -8885,7 +8983,26 @@ const $ = (id) => document.getElementById(id);
         const wrap = $("profileWrap"), cw = $("cfgWrap");
         if (!t) { profileState = null; if (wrap) wrap.style.display = "none"; if (cw) cw.style.display = "none"; return; }
         try {
-          const p = await (await fetch("/api/profile", { headers: authHeaders() })).json();
+          const res = await fetch("/api/profile", { headers: authHeaders() });
+          /*
+           * A token the server has stopped accepting is worse than no token.
+           *
+           * Sessions expire after twelve hours. The page kept the dead one in
+           * localStorage, hid the profile button when `/api/profile` refused
+           * it, and went on treating "a token exists" as "signed in" — so the
+           * header lost its profile icon, and everything that offered to open
+           * the profile pointed at a hidden element. Clear it, and let the
+           * page render an honest signed-out state.
+           */
+          if (res.status === 401 || res.status === 403) {
+            localStorage.removeItem("tessera_token");
+            profileState = null;
+            if (wrap) wrap.style.display = "none";
+            if (cw) cw.style.display = "none";
+            if (typeof setAdmin === "function") setAdmin(null);
+            return;
+          }
+          const p = await res.json();
           if (!p.ok) throw new Error("no session");
           profileState = p;
           /*

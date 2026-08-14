@@ -6974,11 +6974,25 @@ async function main() {
   }
 
   /** The address a visitor should delegate to, so the page can show it. */
-  app.get("/api/sessions/key", (_req, res) => {
+  app.get("/api/sessions/key", async (_req, res) => {
+    let gas: string | null = null;
+    if (sessionSigner) {
+      gas = await client.public
+        .readContract({
+          address: usdcAddress as Hex, abi: erc20Abi, functionName: "balanceOf",
+          args: [sessionSigner.account.address as Hex],
+        })
+        .then((v) => fmtUnits(v as bigint, 6))
+        .catch(() => null);
+    }
     res.json({
       ok: true,
       contract: sessionKeysAddr,
       key: sessionSigner ? (sessionSigner.account.address as Hex) : null,
+      // USDC is the gas token here, so this is the key's ability to send
+      // anything at all — separate from what any session lets it move.
+      gas,
+      gasFloat: fmtUnits(SESSION_GAS.topUp, 6),
       /*
        * Say where to look, not just what is missing.
        *
@@ -7024,6 +7038,62 @@ async function main() {
    * for. The signer is the session key, never the app wallet: an operator
    * pressing this cannot reach a wallet that has not delegated to it.
    */
+  /**
+   * Keep enough gas in the session key to send a transaction.
+   *
+   * On Arc, USDC *is* the gas token, so a session key holding nothing cannot
+   * broadcast anything — and it holds nothing by default, because it is
+   * generated as a key and never funded. Every session-funded payment failed
+   * on that, reporting "Not enough balance for that amount", which reads as a
+   * complaint about the delegating wallet's balance and is nothing of the kind.
+   *
+   * The float comes from the app wallet, so it is spending the operator's
+   * money and the bounds are in code rather than in a convention: a top-up is
+   * at most `topUp`, only happens below `floor`, and the day's total cannot
+   * exceed `dailyCap`. Past that the payment fails with a sentence naming the
+   * key and the ceiling, which is a thing an operator can act on.
+   */
+  const SESSION_GAS = {
+    floor: 50_000n,      // 0.05 USDC — a few transactions' worth
+    topUp: 100_000n,     // 0.10 USDC per top-up
+    dailyCap: 1_000_000n, // 1.00 USDC a day, whatever happens
+  };
+  let gasSpentToday = 0n;
+  let gasDay = new Date().toISOString().slice(0, 10);
+
+  async function ensureSessionGas() {
+    if (!sessionSigner) return;
+    const key = sessionSigner.account.address as Hex;
+    const held = (await client.public.readContract({
+      address: usdcAddress as Hex, abi: erc20Abi, functionName: "balanceOf", args: [key],
+    })) as bigint;
+    if (held >= SESSION_GAS.floor) return;
+
+    const today = new Date().toISOString().slice(0, 10);
+    if (today !== gasDay) { gasDay = today; gasSpentToday = 0n; }
+    if (gasSpentToday + SESSION_GAS.topUp > SESSION_GAS.dailyCap) {
+      throw new Error(
+        `the session key ${key} is out of gas and has already taken its daily float of ` +
+        `${fmtUnits(SESSION_GAS.dailyCap, 6)} USDC — fund it directly to carry on`,
+      );
+    }
+    const agentHeld = (await client.public.readContract({
+      address: usdcAddress as Hex, abi: erc20Abi, functionName: "balanceOf", args: [agentAccount.address as Hex],
+    })) as bigint;
+    if (agentHeld < SESSION_GAS.topUp) {
+      throw new Error(`the session key ${key} has no USDC for gas, and the app wallet cannot spare any`);
+    }
+    const txHash = await agentSigner.write(usdcAddress as Hex, erc20Abi, "transfer", [key, SESSION_GAS.topUp]);
+    gasSpentToday += SESSION_GAS.topUp;
+    console.log(`[sessions] topped the session key up with ${fmtUnits(SESSION_GAS.topUp, 6)} USDC for gas ${txHash}`);
+    try {
+      txlog.record({
+        actor: agentAccount.address as string, category: "defi", action: "session-key-gas",
+        status: "success", txHash, detail: `${fmtUnits(SESSION_GAS.topUp, 6)} USDC to ${key}`,
+      });
+    } catch { /* the ledger is not the point */ }
+  }
+
   async function spendFromSession(id: Hex, to: Hex, amount: bigint) {
     if (!sessionKeysAddr) throw new Error("session keys are not deployed on this network");
     if (!sessionSigner) throw new Error("this server has no session key configured");
@@ -7037,6 +7107,9 @@ async function main() {
         `that session can pay ${s.spendable} ${s.symbol} right now — its cap, the wallet's allowance or its balance, whichever binds first`,
       );
     }
+    // Last, so a refusal above costs nothing: only a spend that is going to be
+    // attempted is worth funding.
+    await ensureSessionGas();
     return sessionSigner.write(sessionKeysAddr, tesseraSessionKeysAbi, "spend", [id, to, amount]);
   }
 
@@ -7388,15 +7461,45 @@ async function main() {
     // list scan and no RPC.
   }, SCHEDULE_LIMITS.minSeconds * 1000).unref?.();
 
-  app.get("/api/tasks", requireOperator, (_req, res) => {
+  /**
+   * Who is asking, and therefore what they may schedule.
+   *
+   * `null` means the operator: the app wallet is theirs, so every venue is on
+   * the table. A connected wallet gets an address, and with it exactly one
+   * thing — payments out of a session *they* opened, through a key that can
+   * only spend inside the cap they set and can revoke from any wallet UI. The
+   * distinction is the money invariant: a task that would spend
+   * AGENT_PRIVATE_KEY stays operator-only, and a task that spends a visitor's
+   * own delegation needs no operator at all.
+   */
+  function taskScope(req: express.Request): { owner: string | null; operator: boolean } | null {
+    if (admin?.session(bearer(req))) return { owner: null, operator: true };
+    const id = identityOf(req);
+    if (id?.kind === "wallet" && id.address) return { owner: id.address.toLowerCase(), operator: false };
+    return null;
+  }
+
+  /** The verbs a caller may create. A visitor's list is one venue, two verbs. */
+  const SESSION_ACTIONS = { wallet: ["sessionSend", "sessionBulk"] };
+
+  app.get("/api/tasks", requireAuth, (req, res) => {
+    const scope = taskScope(req);
+    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
     res.json({
       ok: true,
       // `busy` is what makes Stop meaningful on the page: a control that stops
       // something in progress has to say which ones are in progress.
-      tasks: taskStore.view().map((t) => ({ ...t, busy: runningTasks.has(t.id), stopping: stopRequested.has(t.id) })),
-      actions: TASK_ACTIONS,
+      tasks: taskStore.view(Date.now(), scope.owner)
+        .map((t) => ({ ...t, busy: runningTasks.has(t.id), stopping: stopRequested.has(t.id) })),
+      actions: scope.operator ? TASK_ACTIONS : SESSION_ACTIONS,
+      operator: scope.operator,
+      owner: scope.owner,
       limits: { ...TASK_LIMITS, ...SCHEDULE_LIMITS },
       running: process.env.TESSERA_TASKS !== "off",
+      note: scope.operator
+        ? undefined
+        : "These are your own scheduled payments, funded by a session key you delegated and bounded by its cap. " +
+          "Revoking the session stops them.",
     });
   });
 
@@ -7413,9 +7516,27 @@ async function main() {
    * What has already been broadcast is on the chain and nobody can recall it.
    * The receipt says how far it got.
    */
-  app.post("/api/tasks/:id/stop", requireOperator, (req, res) => {
+  /**
+   * The task, if this caller may act on it.
+   *
+   * Answers 404 for somebody else's task rather than 403, because the id is
+   * the only thing the caller supplied and confirming that it exists tells
+   * them about a stranger's schedule.
+   */
+  function myTask(req: express.Request, res: express.Response) {
+    const scope = taskScope(req);
+    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return null; }
     const t = taskStore.get(req.params.id);
-    if (!t) { res.status(404).json({ ok: false, error: "no such task" }); return; }
+    if (!t || !taskStore.ownedBy(t.id, scope.owner)) {
+      res.status(404).json({ ok: false, error: "no such task" });
+      return null;
+    }
+    return t;
+  }
+
+  app.post("/api/tasks/:id/stop", requireAuth, (req, res) => {
+    const t = myTask(req, res);
+    if (!t) return;
     const wasRunning = runningTasks.has(t.id);
     stopRequested.add(t.id);
     taskStore.update(t.id, { enabled: false });
@@ -7466,14 +7587,43 @@ async function main() {
     parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
   }
 
-  app.post("/api/tasks", requireOperator, async (req, res) => {
+  app.post("/api/tasks", requireAuth, async (req, res) => {
+    const scope = taskScope(req);
+    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
+    const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
+    /*
+     * The choke point for who may schedule what.
+     *
+     * A visitor gets one venue and two verbs — the ones funded by their own
+     * delegation. Everything else on this list spends the app wallet, and
+     * letting a connected visitor queue one of those would be handing the
+     * agent's key to anybody who can sign a message.
+     */
+    if (!scope.operator) {
+      const allowed = SESSION_ACTIONS.wallet as string[];
+      if (body.venue !== "wallet" || !allowed.includes(String(body.action))) {
+        res.status(403).json({
+          ok: false,
+          error: "from your own wallet you can schedule sessionSend or sessionBulk — the rest spend the app's wallet and are operator-only",
+        });
+        return;
+      }
+      // And only against a session this wallet actually owns. Without this,
+      // one visitor could schedule payments out of another's delegation.
+      const sid = String(body.params?.sessionId ?? "");
+      const s0 = /^0x[0-9a-fA-F]{64}$/.test(sid) ? await readSession(sid as Hex) : null;
+      if (!s0 || String(s0.owner).toLowerCase() !== scope.owner) {
+        res.status(403).json({ ok: false, error: "that session was not opened by this wallet" });
+        return;
+      }
+    }
     try {
-      await checkTaskParams((req.body ?? {}) as Record<string, never>);
+      await checkTaskParams(body);
     } catch (e) {
       res.status(400).json({ ok: false, error: friendlyError(e) });
       return;
     }
-    const r = taskStore.create(req.body ?? {});
+    const r = taskStore.create({ ...(req.body ?? {}), owner: scope.owner });
     if (!r.ok) { res.status(400).json(r); return; }
     logTx(req, {
       category: "defi", action: "task-create", status: "success",
@@ -7482,10 +7632,27 @@ async function main() {
     res.json({ ok: true, task: r.task, scheduleText: describeSchedule(r.task.schedule) });
   });
 
-  app.post("/api/tasks/:id", requireOperator, async (req, res) => {
+  app.post("/api/tasks/:id", requireAuth, async (req, res) => {
     const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
-    const existing = taskStore.get(req.params.id);
-    if (!existing) { res.status(404).json({ ok: false, error: "no such task" }); return; }
+    const existing = myTask(req, res);
+    if (!existing) return;
+    // A visitor's edit may not walk their task into a venue that spends the
+    // app wallet — the same rule as creation, at the same choke point.
+    const scope = taskScope(req)!;
+    if (!scope.operator) {
+      const venue = body.venue ?? existing.venue;
+      const action = body.action ?? existing.action;
+      if (venue !== "wallet" || !(SESSION_ACTIONS.wallet as string[]).includes(String(action))) {
+        res.status(403).json({ ok: false, error: "from your own wallet you can schedule sessionSend or sessionBulk only" });
+        return;
+      }
+      const sid = String((body.params ?? existing.params)?.sessionId ?? "");
+      const s0 = /^0x[0-9a-fA-F]{64}$/.test(sid) ? await readSession(sid as Hex) : null;
+      if (!s0 || String(s0.owner).toLowerCase() !== scope.owner) {
+        res.status(403).json({ ok: false, error: "that session was not opened by this wallet" });
+        return;
+      }
+    }
     // Only re-check when the edit actually touches what a task does. Pausing
     // one must not be refused because a recipient it was created with has since
     // become unspendable — stopping a task is the very thing you want to still
@@ -7512,14 +7679,15 @@ async function main() {
     res.status(r.ok ? 200 : 400).json(r.ok ? { ...r, scheduleText: describeSchedule(r.task.schedule) } : r);
   });
 
-  app.post("/api/tasks/:id/delete", requireOperator, (req, res) => {
+  app.post("/api/tasks/:id/delete", requireAuth, (req, res) => {
+    if (!myTask(req, res)) return;
     res.json({ ok: taskStore.remove(req.params.id) });
   });
 
   /** Run one now, whatever its schedule says — including a manual-only task. */
-  app.post("/api/tasks/:id/run", requireOperator, async (req, res) => {
-    const t = taskStore.get(req.params.id);
-    if (!t) { res.status(404).json({ ok: false, error: "no such task" }); return; }
+  app.post("/api/tasks/:id/run", requireAuth, async (req, res) => {
+    const t = myTask(req, res);
+    if (!t) return;
     const r = await executeTask(t, "manual");
     res.status(r.ok ? 200 : 500).json({ ok: r.ok, ...r });
   });

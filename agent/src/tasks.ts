@@ -35,6 +35,15 @@ export interface Task {
   params: Record<string, unknown>;
   schedule: Schedule;
   enabled: boolean;
+  /**
+   * The wallet that owns this task, lower-cased — or null for the operator's.
+   *
+   * A visitor who has delegated a session key can schedule payments out of
+   * their *own* wallet, so tasks stop being one operator's list. This is what
+   * keeps them apart: it is stamped at creation from the authenticated session
+   * and never taken from the request body, and every later action re-checks it.
+   */
+  owner: string | null;
   createdAt: number;
   /** When it first ran, so "running since" is answerable without a log. */
   firstRunAt: number | null;
@@ -52,6 +61,8 @@ export interface TaskInput {
   params?: Record<string, unknown>;
   schedule?: unknown;
   enabled?: boolean;
+  /** Set by the server from the caller's session, never read from a request body. */
+  owner?: string | null;
 }
 
 export const TASK_LIMITS = {
@@ -104,6 +115,20 @@ export class TaskStore {
     return this.tasks.map((t) => ({ ...t }));
   }
 
+  /** Tasks belonging to one wallet — or, for the operator, all of them. */
+  listFor(owner: string | null): Task[] {
+    if (owner === null) return this.list();
+    const who = owner.toLowerCase();
+    return this.tasks.filter((t) => t.owner === who).map((t) => ({ ...t }));
+  }
+
+  /** May this caller act on this task? Operator (`null`) may act on any. */
+  ownedBy(id: string, owner: string | null): boolean {
+    const t = this.tasks.find((x) => x.id === id);
+    if (!t) return false;
+    return owner === null || t.owner === owner.toLowerCase();
+  }
+
   get(id: string): Task | null {
     const t = this.tasks.find((x) => x.id === id);
     return t ? { ...t } : null;
@@ -133,6 +158,7 @@ export class TaskStore {
       params: (input.params ?? {}) as Record<string, unknown>,
       schedule: parseSchedule(input.schedule),
       enabled: input.enabled !== false,
+      owner: input.owner ? String(input.owner).toLowerCase() : null,
       createdAt: Date.now(),
       firstRunAt: null,
       lastRunAt: null,
@@ -169,6 +195,8 @@ export class TaskStore {
     if (input.params !== undefined) t.params = input.params as Record<string, unknown>;
     if (input.schedule !== undefined) t.schedule = parseSchedule(input.schedule);
     if (input.enabled !== undefined) t.enabled = Boolean(input.enabled);
+    // `owner` is deliberately not editable. Re-homing a task is the one edit
+    // that would let somebody point another wallet's delegation at themselves.
     this.persist();
     return { ok: true, task: { ...t } };
   }
@@ -220,8 +248,8 @@ export class TaskStore {
   }
 
   /** The list as the page shows it: with the next time and the schedule in words. */
-  view(now = Date.now()): (Task & { nextRunAt: number | null; scheduleText: string })[] {
-    return this.tasks.map((t) => ({
+  view(now = Date.now(), owner: string | null = null): (Task & { nextRunAt: number | null; scheduleText: string })[] {
+    return this.listFor(owner).map((t) => ({
       ...t,
       nextRunAt: this.nextRunAt(t, now),
       scheduleText: describeSchedule(t.schedule),

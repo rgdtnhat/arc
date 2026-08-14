@@ -139,3 +139,42 @@ test("a stopped task is never due, whatever its schedule says", () => {
   assert.equal(s.due(Date.now() + 60_000).length, 0);
   assert.equal(s.nextRunAt(s.get(id)!), null);
 });
+
+test("a task belongs to the wallet that made it, and only to it", () => {
+  /*
+   * A visitor who has delegated a session key can schedule payments out of
+   * their own wallet, so the task list stopped being one operator's. This is
+   * the separation: two wallets, two lists, and neither can act on the other's.
+   */
+  const s = store();
+  const alice = "0xAAAAaaaaAAAAaaaaAAAAaaaaAAAAaaaaAAAAaaaa";
+  const bob = "0xBBBBbbbbBBBBbbbbBBBBbbbbBBBBbbbbBBBBbbbb";
+  const mine = s.create({ venue: "wallet", action: "sessionSend", owner: alice, schedule: { kind: "manual" } });
+  const theirs = s.create({ venue: "wallet", action: "sessionSend", owner: bob, schedule: { kind: "manual" } });
+  assert.ok(mine.ok && theirs.ok);
+  const mineId = (mine as { task: { id: string } }).task.id;
+
+  assert.equal(s.listFor(alice).length, 1);
+  assert.equal(s.listFor(bob).length, 1);
+  // Case must not decide ownership: a wallet address is the same address
+  // whichever way it is capitalised.
+  assert.equal(s.listFor(alice.toLowerCase()).length, 1);
+  // The operator sees both.
+  assert.equal(s.listFor(null).length, 2);
+
+  assert.equal(s.ownedBy(mineId, alice), true);
+  assert.equal(s.ownedBy(mineId, bob), false, "one wallet could act on another's task");
+  assert.equal(s.ownedBy(mineId, null), true, "the operator could not act on a visitor's task");
+});
+
+test("an edit cannot re-home a task to another wallet", () => {
+  // The one edit that would let somebody point another wallet's delegation at
+  // themselves, so `owner` is not editable at all.
+  const s = store();
+  const alice = "0xAAAAaaaaAAAAaaaaAAAAaaaaAAAAaaaaAAAAaaaa";
+  const made = s.create({ venue: "wallet", action: "sessionSend", owner: alice, schedule: { kind: "manual" } });
+  const id = (made as { task: { id: string } }).task.id;
+  s.update(id, { owner: "0xBBBBbbbbBBBBbbbbBBBBbbbbBBBBbbbbBBBBbbbb", name: "renamed" } as never);
+  assert.equal(s.get(id)!.owner, alice.toLowerCase());
+  assert.equal(s.get(id)!.name, "renamed", "the rest of the edit should still apply");
+});
