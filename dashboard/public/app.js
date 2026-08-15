@@ -245,13 +245,28 @@ const $ = (id) => document.getElementById(id);
           strip.appendChild(document.createElement("span"));
           pane.prepend(strip);
         }
-        strip.lastElementChild.textContent = label || "Reading the chain…";
+        const said = label || "Reading the chain…";
+        strip.lastElementChild.textContent = said;
         strip.style.display = "flex";
         pane.setAttribute("aria-busy", "true");
+        /*
+         * A ring that has been turning for fifteen seconds should say so.
+         *
+         * Some of these reads are genuinely slow — the fee pane's first load
+         * waits on a one-off pass over the collector's whole history — and a
+         * strip that says the same four words throughout is indistinguishable
+         * from one that is stuck. Naming it is the difference between "this is
+         * taking a while" and "this is broken".
+         */
+        const slow = setTimeout(() => {
+          strip.lastElementChild.textContent = `${said} taking longer than usual — still going.`;
+        }, 15_000);
+        slow.unref?.();
         let cleared = false;
         return () => {
           if (cleared) return;
           cleared = true;
+          clearTimeout(slow);
           strip.style.display = "none";
           pane.removeAttribute("aria-busy");
         };
@@ -4609,6 +4624,66 @@ const $ = (id) => document.getElementById(id);
         taskParamRow();
       }
 
+      /* ---- "only mine", for the operator ------------------------------------
+       *
+       * The operator sees every schedule on the deployment, which is right —
+       * somebody has to be able to find one that is misbehaving, whoever wrote
+       * it — but it means their own handful of standing orders sit among
+       * everybody's, and the list is least readable for the person who has to
+       * act on it.
+       *
+       * The choice is remembered because it is a working preference, not a
+       * one-off: an operator who wants their own list wants it every time they
+       * open the page, and having to re-tick it on every visit is the reason
+       * filters like this go unused.
+       */
+      const MINE_KEYS = { task: "tessera_tasks_mine", series: "tessera_series_mine" };
+      /** Wire one filter box: remember the choice, then re-read the list. */
+      function wireMineFilter(which, reload) {
+        const box = $(`${which === "task" ? "task" : "ser"}MineOnly`);
+        if (!box) return;
+        box.addEventListener("change", () => {
+          rememberMine(which, box.checked);
+          reload();
+        });
+      }
+      const wantsMine = (which) => {
+        try { return localStorage.getItem(MINE_KEYS[which]) === "1"; } catch { return false; }
+      };
+      const rememberMine = (which, on) => {
+        try { localStorage.setItem(MINE_KEYS[which], on ? "1" : "0"); } catch { /* private mode */ }
+      };
+      /** `?mine=1` when the box is ticked. The server ignores it for visitors. */
+      const mineQuery = (which) => (wantsMine(which) ? "?mine=1" : "");
+
+      /**
+       * Show the filter, and say what it is hiding.
+       *
+       * A list that is suddenly shorter with nothing explaining it reads as
+       * schedules having disappeared — so the count is beside the box whether
+       * it is ticked or not.
+       */
+      function renderMineFilter(which, r) {
+        const row = $(`${which === "task" ? "task" : "ser"}MineRow`);
+        const box = $(`${which === "task" ? "task" : "ser"}MineOnly`);
+        const note = $(`${which === "task" ? "task" : "ser"}MineCount`);
+        if (!row || !box) return;
+        // Only the operator sees others' rows, so only the operator needs this.
+        row.style.display = r.operator ? "" : "none";
+        if (!r.operator) return;
+        box.checked = wantsMine(which);
+        if (!note) return;
+        const total = Number(r.total ?? 0), mine = Number(r.mine ?? 0);
+        const others = total - mine;
+        const noun = which === "task" ? "task" : "series";
+        const plural = which === "task" ? "tasks" : "series";
+        note.textContent = box.checked
+          ? others
+            ? `${mine} of ${total} — ${others} from other wallets hidden`
+            : `${mine} ${mine === 1 ? noun : plural}, and nobody else has any`
+          : `${total} in total · ${mine} yours · ${others} from other wallets`;
+      }
+
       async function loadTasks() {
         if (!$("taskRows")) return;
         const notReady = (why) => {
@@ -4618,7 +4693,7 @@ const $ = (id) => document.getElementById(id);
           if ($("taskCreate")) $("taskCreate").disabled = Boolean(why);
         };
         try {
-          const res = await fetch("/api/tasks", { headers: authHeaders() });
+          const res = await fetch(`/api/tasks${mineQuery("task")}`, { headers: authHeaders() });
           const r = await res.json();
           if (!r.ok) { notReady(r.error || "sign in to schedule anything"); return; }
           /*
@@ -4639,6 +4714,7 @@ const $ = (id) => document.getElementById(id);
             if (r.note) $("tasksOwnNote").textContent = r.note;
           }
           taskActions = r.actions || {};
+          renderMineFilter("task", r);
           if (r.limits) taskLimits = { ...taskLimits, ...r.limits };
           if (r.appWallet) taskAppWallet = r.appWallet;
           if ($("taskEveryN")) $("taskEveryN").min = "1";
@@ -4757,7 +4833,11 @@ const $ = (id) => document.getElementById(id);
                   `<button class="btn" data-tdel="${esc(t.id)}">Delete</button>` +
                   `</div></td></tr>`;
               }).join("")
-            : emptyRow(4, "No tasks yet.");
+            : emptyRow(4, wantsMine("task") && r.total
+                // "No tasks yet" under a filter that is hiding some is simply
+                // untrue, and sends the reader looking for a bug.
+                ? `None of the ${r.total} scheduled task${r.total === 1 ? "" : "s"} here is yours — untick the box above to see the rest.`
+                : "No tasks yet.");
         } catch { /* the pane stays as it was */ }
       }
 
@@ -4779,6 +4859,8 @@ const $ = (id) => document.getElementById(id);
         if (walletTab === "tasks") loadTasks();
         if (walletTab === "series") loadSeries();
       }, 5000);
+
+      wireMineFilter("task", () => loadTasks());
 
       if ($("taskCreate")) {
         if ($("taskCancelEdit")) $("taskCancelEdit").addEventListener("click", () => {
@@ -5034,7 +5116,7 @@ const $ = (id) => document.getElementById(id);
       async function loadSeries() {
         if (!$("serRows")) return;
         try {
-          const r = await (await fetch("/api/series", { headers: authHeaders() })).json();
+          const r = await (await fetch(`/api/series${mineQuery("series")}`, { headers: authHeaders() })).json();
           if (!r.ok) {
             if ($("seriesNotReady")) {
               $("seriesNotReady").style.display = "";
@@ -5046,6 +5128,7 @@ const $ = (id) => document.getElementById(id);
           if ($("seriesNotReady")) $("seriesNotReady").style.display = "none";
           if ($("seriesBody")) $("seriesBody").style.display = "";
           seriesRowsById = new Map((r.series || []).map((x) => [x.id, x]));
+          renderMineFilter("series", r);
           // What a series may be told to do is the server's call, the same as
           // for a task — a visitor gets their two session verbs, an operator
           // the full list.
@@ -5104,7 +5187,9 @@ const $ = (id) => document.getElementById(id);
                   `<button class="btn" data-sdel="${esc(x.id)}">Delete</button>` +
                   `</div></td></tr>`;
               }).join("")
-            : emptyRow(4, "No series yet.");
+            : emptyRow(4, wantsMine("series") && r.total
+                ? `None of the ${r.total} series here is yours — untick the box above to see the rest.`
+                : "No series yet.");
         } catch { /* leave the card as it was */ }
       }
 
@@ -5182,6 +5267,8 @@ const $ = (id) => document.getElementById(id);
           ? `${n} step${n === 1 ? "" : "s"}, ${$("serMode").value === "sequential" ? "one after another" : "all at once"}, ${when}`
           : "add the steps this series should run";
       }
+
+      wireMineFilter("series", () => loadSeries());
 
       /* ---- the step composer ---------------------------------------------- */
       if ($("stepAdd")) {

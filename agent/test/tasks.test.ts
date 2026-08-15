@@ -236,3 +236,38 @@ test("a repoint reaches only the tasks of the wallet asking for it", () => {
   assert.equal(s.ownedBy(hit[0].id, mine), true);
   assert.equal(s.ownedBy(hit[0].id, theirs), false);
 });
+
+/*
+ * Narrowing the *view* must not narrow the *authority*.
+ *
+ * The operator can filter the list down to their own schedules, because
+ * everybody's in one table is unreadable for the person who has to act on it.
+ * That filter is a display rule and nothing more: `owner === null` selects the
+ * operator's own rows, while `ownedBy(id, null)` — the question every route
+ * asks before it does anything — must keep answering "yes" for every task,
+ * whoever wrote it. If those two ever became the same value, an operator who
+ * ticked a box would quietly lose the ability to stop a visitor's task, which
+ * is the one thing that ability exists for.
+ */
+test("filtering the list to the operator's own does not change what they may act on", () => {
+  const s = store();
+  const visitor = "0xdddddddddddddddddddddddddddddddddddddddd";
+  s.create({ name: "operator's", venue: "wallet", action: "send", owner: null, schedule: { kind: "manual" } });
+  s.create({ name: "a visitor's", venue: "wallet", action: "sessionSend", owner: visitor, schedule: { kind: "manual" } });
+
+  const all = s.listFor(null);
+  assert.equal(all.length, 2, "the operator does not see every task");
+
+  // What the filter does, and all it does.
+  const ownOnly = all.filter((t) => t.owner === null);
+  assert.deepEqual(ownOnly.map((t) => t.name), ["operator's"]);
+
+  // What it must not do.
+  const theirs = all.find((t) => t.owner === visitor)!;
+  assert.equal(s.ownedBy(theirs.id, null), true, "the operator lost the right to act on a visitor's task");
+  assert.equal(s.ownedBy(theirs.id, visitor), true);
+  assert.equal(s.ownedBy(theirs.id, "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), false);
+
+  // And a visitor never sees anybody else's, filter or no filter.
+  assert.deepEqual(s.listFor(visitor).map((t) => t.name), ["a visitor's"]);
+});

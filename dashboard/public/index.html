@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v114" />
+    <meta name="tessera-shell" content="tessera-v116" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2695,7 +2695,14 @@
             </div>
             <div class="msg" id="taskMsg" style="display:none;margin-top:9px"></div>
 
-            <div class="tblWrap auto" style="margin-top:14px"><table class="data" style="min-width:0">
+            <div class="row-actions" id="taskMineRow" style="display:none;margin-top:14px">
+              <label style="display:flex;gap:7px;align-items:center;font-size:12.5px;cursor:pointer">
+                <input type="checkbox" id="taskMineOnly" />
+                <span>Only the tasks I created</span>
+              </label>
+              <span id="taskMineCount" style="font-size:11.5px;color:var(--muted)"></span>
+            </div>
+            <div class="tblWrap auto" style="margin-top:10px"><table class="data" style="min-width:0">
               <thead><tr><th>Task</th><th>When</th><th>Last run</th><th class="num">Actions</th></tr></thead>
               <tbody id="taskRows"></tbody>
             </table></div>
@@ -2779,7 +2786,14 @@
               </div>
               <div class="msg" id="serMsg" style="display:none;margin-top:9px"></div>
 
-              <div class="tblWrap auto" style="margin-top:14px"><table class="data" style="min-width:0">
+              <div class="row-actions" id="serMineRow" style="display:none;margin-top:14px">
+                <label style="display:flex;gap:7px;align-items:center;font-size:12.5px;cursor:pointer">
+                  <input type="checkbox" id="serMineOnly" />
+                  <span>Only the series I created</span>
+                </label>
+                <span id="serMineCount" style="font-size:11.5px;color:var(--muted)"></span>
+              </div>
+              <div class="tblWrap auto" style="margin-top:10px"><table class="data" style="min-width:0">
                 <thead><tr><th>Series</th><th>When</th><th>Last run</th><th class="num">Actions</th></tr></thead>
                 <tbody id="serRows"></tbody>
               </table></div>

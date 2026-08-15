@@ -7986,14 +7986,39 @@ async function main() {
   /** The verbs a caller may create. A visitor's list is one venue, two verbs. */
   const SESSION_ACTIONS = { wallet: ["sessionSend", "sessionBulk"] };
 
+  /**
+   * Which rows to *show*, which is a different question from which to allow.
+   *
+   * The operator sees everything by design — somebody has to be able to find a
+   * schedule that is misbehaving, whoever wrote it. But their own standing
+   * orders are then a handful of rows among everybody's, and the list is
+   * hardest to read for exactly the person who has to act on it. So they can
+   * ask for just theirs.
+   *
+   * Deliberately not done by passing an owner into `listFor`: there, `null`
+   * means "the operator, who may act on any of these", and that meaning is what
+   * every permission check in this file rests on. Narrowing what is displayed
+   * must not borrow the value that decides what is permitted, or the next
+   * reader will reasonably conclude the two are the same rule.
+   *
+   * A visitor already only ever sees their own, so this is ignored for them.
+   */
+  const wantsOwnOnly = (req: express.Request, scope: { operator: boolean }) =>
+    scope.operator && String(req.query.mine ?? "") === "1";
+  /** An operator's own rows are the ones with no wallet behind them. */
+  const isOperators = (row: { owner: string | null }) => row.owner === null;
+
   app.get("/api/tasks", requireAuth, (req, res) => {
     const scope = taskScope(req);
     if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
+    const all = taskStore.view(Date.now(), scope.owner);
+    const ownOnly = wantsOwnOnly(req, scope);
+    const shown = ownOnly ? all.filter(isOperators) : all;
     res.json({
       ok: true,
       // `busy` is what makes Stop meaningful on the page: a control that stops
       // something in progress has to say which ones are in progress.
-      tasks: taskStore.view(Date.now(), scope.owner).map((t) => ({
+      tasks: shown.map((t) => ({
         ...t,
         busy: runningTasks.has(t.id),
         stopping: stopRequested.has(t.id),
@@ -8001,6 +8026,11 @@ async function main() {
         // six. Converting here means the page never has to know that.
         lastFee: t.lastFeeWei ? fmtUnits(BigInt(t.lastFeeWei), 18) : null,
       })),
+      // What the filter is hiding. A shorter list with nothing explaining it
+      // reads as tasks having disappeared.
+      total: all.length,
+      mine: all.filter(isOperators).length,
+      ownOnly,
       actions: scope.operator ? TASK_ACTIONS : SESSION_ACTIONS,
       operator: scope.operator,
       owner: scope.owner,
@@ -8352,13 +8382,20 @@ async function main() {
   app.get("/api/series", requireAuth, (req, res) => {
     const scope = taskScope(req);
     if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
+    // Same filter as the task list, for the same reason — see `wantsOwnOnly`.
+    const all = seriesStore.view(Date.now(), scope.owner);
+    const ownOnly = wantsOwnOnly(req, scope);
     res.json({
       ok: true,
-      series: seriesStore.view(Date.now(), scope.owner).map((sr) => ({
+      series: (ownOnly ? all.filter(isOperators) : all).map((sr) => ({
         ...sr,
         busy: seriesRunning.has(sr.id),
         stopping: seriesStopped.has(sr.id),
       })),
+      total: all.length,
+      mine: all.filter(isOperators).length,
+      ownOnly,
+      operator: scope.operator,
       actions: scope.operator ? TASK_ACTIONS : SESSION_ACTIONS,
       limits: SERIES_LIMITS,
     });

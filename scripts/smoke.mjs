@@ -291,15 +291,19 @@ for (const [route, attr] of [["gov", "govtab"], ["defi", "defitab"], ["wallet", 
   for (const tab of tabs) {
     await page.evaluate(([a, v]) => document.querySelector(`[data-${a}="${v}"]`)?.click(), [attr, tab]);
     /*
-     * 45 seconds, which is generous on purpose. The fee pane's first load waits
-     * on a one-off pass over the collector's whole history, and a strip that is
-     * up because the read really is still running is the strip working. Only a
-     * strip that outlives its read is the bug.
+     * Ninety seconds, which is deliberately far more than any read needs.
+     *
+     * The bug this guards against is a strip whose clear-up never runs, and
+     * that strip stays up forever — so the ceiling only has to be past the
+     * slowest legitimate read, not close to it. The fee pane's first load waits
+     * on a one-off pass over the collector's whole history and has taken most
+     * of a minute on a cold index; a tighter budget failed on that, which is a
+     * test calling correct behaviour a bug.
      */
-    let left = 90;
+    let left = 180;
     while (left-- > 0 && (await page.locator(".paneBusy:visible").count())) await page.waitForTimeout(500);
     if (await page.locator(".paneBusy:visible").count()) {
-      note("pane spinners", `${route}/${tab} was still showing its loading strip after 45s`);
+      note("pane spinners", `${route}/${tab} was still showing its loading strip after 90s`);
     }
   }
 }
