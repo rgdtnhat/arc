@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v107" />
+    <meta name="tessera-shell" content="tessera-v108" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1544,6 +1544,15 @@
                 <button class="btn primary" id="lnEmClaim">Claim</button>
               </div>
               <div class="kv" id="lnEmNote" style="margin-top:8px"></div>
+              <!-- The rule that makes these figures mean something. Stated
+                   where the number is read, not only in the docs. -->
+              <div style="font-size:11.5px;color:var(--muted);margin-top:6px">
+                What you can have unclaimed is capped at your share of the pot — your share of this market, times
+                this stream's share of the emission. So the rate is a ceiling rather than a promise when the pot is
+                thin, and nothing accrues that the pot cannot pay. It is what stops one early balance swallowing
+                every top-up before anybody else is paid: a top-up raises everybody's ceiling in proportion, whenever
+                they arrived.
+              </div>
               <!-- Shown only when the contract owes more than it holds. `claim`
                    pays min(owed, held), so that gap is the difference between a
                    figure and a payment. -->

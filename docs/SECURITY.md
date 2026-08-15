@@ -120,6 +120,37 @@ The vault is deliberately conservative:
   now, and the UI's **Max** uses it — so the button never proposes an amount that
   would revert.
 
+### Emission accrual is bounded by the pot
+
+A holder may have, unclaimed, at most their share of what the emissions contract
+actually holds:
+
+```
+pot × (this stream's rate ÷ every live rate) × (their shares ÷ all shares)
+```
+
+and every booking is bounded again by the balance not already promised to
+somebody else. Together those give an invariant worth stating on its own:
+**`totalOwed` can never exceed the contract's balance.** The same rule applies
+to the AMM's liquidity emissions.
+
+Why it is a security property and not a UI nicety: before it, accrual and
+funding were independent, so the contract booked debt it could not pay and
+`claim` settled `min(owed, held)` first come, first served. Whichever address
+had accumulated the largest unbacked balance took every top-up before anybody
+else could be paid, and a holder who arrived later was queueing behind a debt
+they could never reach the front of.
+
+What it costs: rewards no longer accrue at the posted rate when the pot is thin
+— the rate is a ceiling, and the APR figures with it. That is the honest version
+of what was already true.
+
+**Operational rule for a migration:** checkpoint holders *before* moving a pot
+to a new emissions contract. An unbooked entitlement is worth what the pot can
+back at the moment it is read, so draining the pot first leaves nothing for the
+old contract's `claimable` to report. A booked balance is counted in
+`totalOwed`, which the redeploy explicitly refuses to sweep.
+
 ### Transfer memos are public and permanent
 
 A transfer can carry a memo, written into the transaction's own calldata after

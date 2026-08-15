@@ -546,7 +546,24 @@ async function main() {
      * leak, it is the same tokens counted once on each side of a one-way
      * chain, and the alternative is sweeping away somebody's earned reward.
      */
+    /*
+     * Checkpoint holders BEFORE this runs.
+     *
+     * Accrual is bounded by the pot — a holder may have, unclaimed, at most
+     * their share of what the contract holds — so an *unbooked* entitlement is
+     * worth whatever the pot can back at the moment it is read. Moving the pot
+     * to the new contract leaves nothing behind for the old one's `claimable`
+     * to report, and `migrate` carries what it reads. A booked balance (one
+     * that has been checkpointed) is safe: it is counted in `totalOwed`, which
+     * is exactly what this step refuses to sweep.
+     *
+     * The app's keeper checkpoints holders continuously, so in practice this
+     * is already true. It is stated here because a migration that assumes it
+     * without saying so is one bad afternoon away from paying somebody less
+     * than they earned.
+     */
     if (rewardToken !== zero && EXECUTE) {
+      console.log("  note   holders must be checkpointed before this step — unbooked accrual cannot follow the pot");
       const held = await must("the old pot", rewardToken, erc20Abi, "balanceOf", [dep.tesseraEmissions]);
       const owed = await must("what the old pot owes", dep.tesseraEmissions, tesseraEmissionsAbi, "totalOwed");
       const free = held > owed ? held - owed : 0n;

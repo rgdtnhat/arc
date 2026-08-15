@@ -11,6 +11,7 @@
  * scripts read — which the runner writes to disk and points the migration at.
  */
 import hre from "hardhat";
+import { time } from "@nomicfoundation/hardhat-network-helpers";
 
 const U = (n: number, d = 6) => BigInt(Math.round(n * 10 ** d));
 
@@ -111,6 +112,23 @@ async function main() {
   await tsra.write.mint([deployer.account.address, U(10_000, 18)]);
   await tsra.write.approve([emissions.address, U(10_000, 18)]);
   await emissions.write.fund([U(10_000, 18)]);
+
+  /*
+   * Book what Alice has earned before anything moves.
+   *
+   * Accrual is bounded by the pot: a holder may have, unclaimed, at most their
+   * share of what the contract holds. So an *unbooked* balance is worth
+   * whatever the pot can back at the moment somebody asks — and a migration
+   * moves the pot to the new contract, which leaves nothing behind for the old
+   * one's `claimable` to report. Checkpointing turns the entitlement into a
+   * booked balance, which `setPrior` can carry.
+   *
+   * That is the operational rule this fixture exists to keep honest:
+   * **checkpoint holders before you drain the old pot.** The app's keeper does
+   * it continuously; a migration should not assume it just happened.
+   */
+  await time.increase(3600);
+  await emissions.write.checkpoint([alice.account.address, usdc.address, 0]);
 
   await emitter.write.addSink([emissions.address, 1, 700n, "lending emissions"]);
 
