@@ -3661,6 +3661,20 @@ const $ = (id) => document.getElementById(id);
        * everything they have ever finished with. Live at the top, newest
        * first, and the dead ones still reachable underneath.
        */
+      /*
+       * "No time limit" is the largest expiry a uint64 holds, not a flag.
+       *
+       * The contract stores one `uint64` and refuses one already past, so a
+       * session that should never lapse is one that lapses long after anything
+       * else does. Everything that reads an expiry back has to know that,
+       * because `new Date(18446744073709551615 * 1000)` is not a date — it is
+       * outside what Date can represent, and rendered as "Invalid Date".
+       */
+      const NO_EXPIRY = "18446744073709551615";
+      const FOREVER_AFTER = 32503680000; // 1 Jan 3000, in seconds
+      const isForever = (expiry) => Number(expiry) >= FOREVER_AFTER;
+      const FIXED_UNITS = { second: 1, minute: 60, hour: 3600, day: 86400, week: 604800 };
+
       function renderSessionTable() {
         const body = $("skRows");
         if (!body) return;
@@ -3680,7 +3694,7 @@ const $ = (id) => document.getElementById(id);
 
         body.innerHTML = shown.length
           ? shown.map((x) => {
-              const when = new Date(x.expiry * 1000).toLocaleDateString();
+              const when = isForever(x.expiry) ? "no expiry" : new Date(x.expiry * 1000).toLocaleDateString();
               const gone = x.revoked || x.expiry * 1000 < Date.now();
               const bad = sessionWhy(x);
               const ok = sessionUsable(x);
@@ -3698,7 +3712,8 @@ const $ = (id) => document.getElementById(id);
                 `from ${esc(owner)} <button class="btn" data-skcopy="${esc(owner)}" style="padding:0 5px;font-size:10px">copy</button></div>` +
                 `<div class="muted mono" style="font-size:10.5px">id ${esc(x.id.slice(0, 14))}…` +
                 ` <button class="btn" data-skcopy="${esc(x.id)}" style="padding:0 5px;font-size:10px">copy id</button></div>` +
-                `<div class="muted" style="font-size:11px">${x.revoked ? "revoked" : `until ${esc(when)}`}` +
+                `<div class="muted" style="font-size:11px">` +
+                `${x.revoked ? "revoked" : isForever(x.expiry) ? "no time limit" : `until ${esc(when)}`}` +
                 `${Number(x.perTxMaxRaw) > 0 ? ` · max ${esc(x.perTxMax)} each` : ""}` +
                 `${x.restricted ? " · allow-list" : ""}</div>` +
                 // Not repeated when the line above already says it — "revoked"
@@ -3708,6 +3723,12 @@ const $ = (id) => document.getElementById(id);
                 // usable again, rather than opening yet another one.
                 (isMine && x.binds === "allowance"
                   ? `<button class="btn" data-skallow="${esc(x.asset)}" style="margin-top:5px;padding:2px 8px;font-size:11px">Top up approval</button>`
+                  : "") +
+                // A bigger cap or a later expiry is a new session — the contract
+                // has no way to change either one in place. This fills the form
+                // in and says so, rather than leaving people to work it out.
+                (isMine && !gone
+                  ? ` <button class="btn" data-skext="${esc(x.id)}" style="margin-top:5px;padding:2px 8px;font-size:11px">Raise or extend</button>`
                   : "") +
                 `</td>` +
                 `<td class="num mono">${esc(x.spent)} / ${esc(x.cap)}</td>` +
@@ -3760,7 +3781,9 @@ const $ = (id) => document.getElementById(id);
       function sessionOptions() {
         if (!sessionRows.length) return `<option value="">no session this app can spend from — open one above</option>`;
         return sessionRows.map((x) => {
-          const until = new Date(x.expiry * 1000).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
+          const until = isForever(x.expiry)
+            ? "no expiry"
+            : new Date(x.expiry * 1000).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
           return `<option value="${esc(x.id)}">${esc(x.id.slice(0, 10))}… · ${esc(x.spendable)} ${esc(x.symbol)} left` +
             `${Number(x.perTxMaxRaw) > 0 ? ` · max ${esc(x.perTxMax)}` : ""} · until ${esc(until)}</option>`;
         }).join("");
@@ -3953,6 +3976,94 @@ const $ = (id) => document.getElementById(id);
         } catch { return null; }
       }
 
+      /* ---- How long a session lasts -----------------------------------------
+       *
+       * The contract stores one `uint64` expiry and refuses one already in the
+       * past, so "no time limit" is not a separate mode — it is the largest
+       * expiry the field can hold. Anything past the year 3000 is treated as
+       * that everywhere it is read back, because a session ending in the year
+       * 584 billion is not a date a reader should ever be shown.
+       *
+       * Months and years are counted on the calendar rather than as a fixed
+       * number of seconds. "One month" means the same day next month, which is
+       * what somebody typing it means, and 30 days is only that in April.
+       */
+
+      /**
+       * The expiry the form is asking for, as a unix second.
+       *
+       * @returns {{ expiry: string, forever: boolean, error?: string }}
+       *   `forever` when the box was left empty, which is the documented way to
+       *   ask for a session with no time limit at all.
+       */
+      function sessionExpiry() {
+        const raw = ($("skFor") ? $("skFor").value : "").trim();
+        if (!raw) return { expiry: NO_EXPIRY, forever: true };
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) {
+          return { expiry: "0", forever: false, error: "how long should it last? Leave it empty for no time limit." };
+        }
+        const unit = ($("skForUnit") && $("skForUnit").value) || "day";
+        const now = new Date();
+        if (unit === "month" || unit === "year") {
+          const whole = Math.floor(n);
+          const at = new Date(now);
+          if (unit === "month") at.setMonth(at.getMonth() + whole);
+          else at.setFullYear(at.getFullYear() + whole);
+          // A fractional month or year is honoured as the leftover in days,
+          // rather than silently rounded away.
+          const daysOver = (n - whole) * (unit === "month" ? 30 : 365);
+          at.setDate(at.getDate() + Math.round(daysOver));
+          return { expiry: String(Math.floor(at.getTime() / 1000)), forever: false };
+        }
+        const secs = Math.round(n * (FIXED_UNITS[unit] || 86400));
+        if (secs < 1) return { expiry: "0", forever: false, error: "that is less than a second" };
+        return { expiry: String(Math.floor(Date.now() / 1000) + secs), forever: false };
+      }
+
+      /** Say in words what the two boxes add up to, under the two boxes. */
+      function showSessionFor() {
+        const note = $("skForNote");
+        if (!note) return;
+        const r = sessionExpiry();
+        note.style.color = r.error ? "var(--warn)" : "var(--muted)";
+        note.textContent = r.error
+          ? r.error
+          : r.forever
+            ? "No time limit — the session lasts until you revoke it."
+            : `Runs until ${new Date(Number(r.expiry) * 1000).toLocaleString()}.`;
+      }
+      if ($("skFor")) $("skFor").addEventListener("input", showSessionFor);
+      if ($("skForUnit")) $("skForUnit").addEventListener("change", showSessionFor);
+      showSessionFor();
+
+      /**
+       * The session this form is replacing, when the reader asked to raise or
+       * extend one. Null while it is just opening a new session.
+       */
+      let replacing = null;
+
+      /** Say what the button is about to do, and offer a way back out. */
+      function renderReplacing() {
+        const note = $("skReplacing");
+        const btn = $("skOpen");
+        if (btn) {
+          btn.textContent = replacing ? "Approve & replace session" : "Approve & open session";
+        }
+        if (!note) return;
+        if (!replacing) { note.style.display = "none"; return; }
+        const row = sessionAll.find((x) => x.id === replacing);
+        note.style.display = "";
+        note.innerHTML =
+          `Replacing session <span class="mono">${esc(replacing.slice(0, 14))}…</span>` +
+          (row ? ` (${esc(row.cap)} ${esc(row.symbol)} cap, ${esc(row.spent)} spent)` : "") +
+          `. The new one opens first, any scheduled tasks move onto it, and only then is the old one revoked — ` +
+          `so nothing is left unable to pay. Spending already done does not carry over. ` +
+          `<button class="btn" id="skReplaceCancel" style="padding:1px 8px;font-size:11px">Cancel</button>`;
+        const cancel = $("skReplaceCancel");
+        if (cancel) cancel.addEventListener("click", () => { replacing = null; renderReplacing(); });
+      }
+
       if ($("skOpen")) {
         $("skOpen").addEventListener("click", async () => {
           const cfg = await loadDefiConfig();
@@ -3962,16 +4073,16 @@ const $ = (id) => document.getElementById(id);
           const asset = $("skAsset").value;
           const dec = walDecimals(asset);
           const cap = $("skCap").value.trim(), perTx = $("skPerTx").value.trim();
-          const days = Number($("skDays").value || 0);
+          const when = sessionExpiry();
           if (!(parseFloat(cap) > 0)) return showReceipt("skMsg", false, "set a cap above zero");
-          if (!(days > 0)) return showReceipt("skMsg", false, "set how many days it should last");
+          if (when.error) return showReceipt("skMsg", false, when.error);
           const allow = $("skAllow").value.split(/[,\s]+/).map((a) => a.trim()).filter(Boolean);
           if (allow.some((a) => !/^0x[0-9a-fA-F]{40}$/.test(a))) {
             return showReceipt("skMsg", false, "one of those allow-list entries is not an address");
           }
           const capRaw = toRaw(cap, dec);
           const perTxRaw = parseFloat(perTx) > 0 ? toRaw(perTx, dec) : "0";
-          const expiry = String(Math.floor(Date.now() / 1000) + days * 86400);
+          const expiry = when.expiry;
           /*
            * Two signatures, in this order, and the order matters.
            *
@@ -3993,22 +4104,80 @@ const $ = (id) => document.getElementById(id);
             .reduce((t, x) => t + BigInt(x.capLeftRaw || "0"), 0n);
           const approveRaw = (committed + BigInt(capRaw)).toString();
           const approveHuman = fmtUnitsStr(approveRaw, dec);
-          await selfCustody(
+          // The ids that exist before this, so the new one can be identified
+          // after: `open` returns the id to the chain, not to the wallet.
+          const before = new Set(sessionAll.map((x) => String(x.id).toLowerCase()));
+          const approved = await selfCustody(
             "skMsg",
             committed > 0n
               ? `approve ${approveHuman} — this session's ${cap} plus what your other live sessions still hold`
               : `approve ${cap} for the session`,
             async (from, c) =>
               sendTx(from, asset, callData(c.selectors.erc20Approve, encAddr(c.sessionKeys), encUint(approveRaw))));
-          await selfCustody("skMsg", `open a ${cap} session`, async (from, c) =>
-            sendTx(from, c.sessionKeys, callData(
-              c.selectors.skOpen,
-              encAddr(keyCfg.key), encAddr(asset), encUint(capRaw), encUint(perTxRaw), encUint(expiry),
-              // The allow-list is the one dynamic argument, so its offset is
-              // after the six head words.
-              encUint(192), encArray(allow.map((a) => BigInt(a))),
-            )));
+          /*
+           * Stop if the allowance did not land.
+           *
+           * This used to carry on regardless, and the result was the thing that
+           * looks most like a bug in the whole feature: a session that reads as
+           * live, with its whole cap unspent, that cannot move a cent — because
+           * the allowance it draws on was never granted.
+           */
+          if (!approved) return;
+          const opened = await selfCustody(
+            "skMsg",
+            `open a ${cap} session${when.forever ? " with no time limit" : ""}`,
+            async (from, c) =>
+              sendTx(from, c.sessionKeys, callData(
+                c.selectors.skOpen,
+                encAddr(keyCfg.key), encAddr(asset), encUint(capRaw), encUint(perTxRaw), encUint(expiry),
+                // The allow-list is the one dynamic argument, so its offset is
+                // after the six head words.
+                encUint(192), encArray(allow.map((a) => BigInt(a))),
+              )),
+          );
+          await loadSessions();
+          if (!opened || !replacing) { renderReplacing(); return; }
+
+          /*
+           * Finish the replacement: move the schedules, then end the old one.
+           *
+           * In that order, and never the reverse. Revoking first would leave
+           * every scheduled task pointing at a dead session for as long as the
+           * next two signatures take — and if the reader walks away between
+           * them, permanently.
+           */
+          const old = replacing;
+          const fresh = sessionAll.find((x) =>
+            !before.has(String(x.id).toLowerCase()) &&
+            String(x.asset).toLowerCase() === asset.toLowerCase() && !x.revoked);
+          if (!fresh) {
+            showReceipt("skMsg", false,
+              "the new session opened, but this page could not find it to move your tasks across — " +
+              "reload, then repoint them from the task list before revoking the old one");
+            replacing = null;
+            renderReplacing();
+            return;
+          }
+          let moved = 0;
+          try {
+            const r = await (await postAuthed("/api/tasks/repoint", { from: old, to: fresh.id })).json();
+            if (!r.ok) throw new Error(r.error || "could not move the tasks");
+            moved = r.moved;
+          } catch (e) {
+            showReceipt("skMsg", false,
+              `the new session is open, but your scheduled tasks could not be moved onto it ` +
+              `(${String(e.message || e)}). The old session has been left alone so they keep working.`);
+            replacing = null;
+            renderReplacing();
+            loadTasks();
+            return;
+          }
+          await selfCustody("skMsg", `revoke the session you replaced${moved ? ` — ${moved} task(s) moved across` : ""}`,
+            async (from, c) => sendTx(from, c.sessionKeys, callData(c.selectors.skRevoke, old.replace(/^0x/, ""))));
+          replacing = null;
+          renderReplacing();
           loadSessions();
+          loadTasks();
         });
 
         if ($("skMore")) {
@@ -4068,6 +4237,33 @@ const $ = (id) => document.getElementById(id);
             );
             allow.disabled = false;
             loadSessions();
+            return;
+          }
+          /*
+           * Raise a cap, or push an expiry out.
+           *
+           * `TesseraSessionKeys` has `open` and `revoke` and nothing between
+           * them, deliberately: a session's limits are what the owner signed
+           * for, and a contract that could quietly raise them would make that
+           * signature worth less. So "extend" is a replacement — open the
+           * bigger one, move the schedules onto it, then end the old one — and
+           * the page says exactly that instead of implying an edit.
+           */
+          const ext = e.target.closest("button[data-skext]");
+          if (ext) {
+            const row = sessionAll.find((x) => x.id === ext.dataset.skext);
+            if (!row) return;
+            replacing = row.id;
+            $("skAsset").value = row.asset;
+            $("skCap").value = row.cap;
+            $("skPerTx").value = Number(row.perTxMaxRaw) > 0 ? row.perTxMax : "";
+            $("skFor").value = "";
+            $("skForUnit").value = "day";
+            showSessionFor();
+            renderReplacing();
+            $("skCap").scrollIntoView({ behavior: "smooth", block: "center" });
+            $("skCap").focus();
+            $("skCap").select();
             return;
           }
           const cp = e.target.closest("button[data-skcopy]");

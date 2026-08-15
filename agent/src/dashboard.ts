@@ -7005,7 +7005,40 @@ async function main() {
   );
 
   /** Everything a page needs to show, or a task needs to spend against. */
-  async function readSession(id: Hex) {
+  /*
+   * One session, read from the chain.
+   *
+   * Four contract calls, and the same session is read several times over in a
+   * single request: saving an edited task checked the caller owned it and then
+   * validated the parameters, each reading the session again, while the tab's
+   * own list was reading all of them. On a public RPC that a ten-second task
+   * schedule is already hammering, that is the difference between a save that
+   * feels instant and one that appears to hang.
+   *
+   * So: a few seconds of memory, shared by everything that reads. It never
+   * loosens anything — the cap, the allowance and the expiry are enforced by
+   * the contract on every spend, and this is a read. The one caller that must
+   * not see a cached answer is the spend itself, which asks for a fresh one.
+   */
+  const sessionCache = new Map<string, { at: number; row: SessionRow | null }>();
+  const SESSION_TTL = live ? 5_000 : 250;
+  const sessionCacheClear = () => sessionCache.clear();
+
+  type SessionRow = Awaited<ReturnType<typeof readSessionFresh>>;
+
+  async function readSession(id: Hex, opts?: { fresh?: boolean }): Promise<SessionRow> {
+    const key = id.toLowerCase();
+    if (!opts?.fresh) {
+      const hit = sessionCache.get(key);
+      if (hit && Date.now() - hit.at < SESSION_TTL) return hit.row;
+    }
+    const row = await readSessionFresh(id);
+    if (sessionCache.size > 256) sessionCache.clear();
+    sessionCache.set(key, { at: Date.now(), row });
+    return row;
+  }
+
+  async function readSessionFresh(id: Hex) {
     if (!sessionKeysAddr) return null;
     const s = (await client.public.readContract({
       address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "sessions", args: [id],
@@ -7142,6 +7175,31 @@ async function main() {
    * that is not merely unhelpful but wrong. Two short retries cost a moment
    * and remove most of that.
    */
+  /**
+   * Answer, even when the chain will not.
+   *
+   * Saving a scheduled task validates it against the session it spends from,
+   * which is a chain read. A public RPC that a ten-second schedule is already
+   * hammering can leave that read outstanding for minutes, and the form spins
+   * the whole time. A page that spins forever is worse than one that says it
+   * could not check: the reader cannot tell slow from broken, and clicking
+   * again only adds load. Nothing has been written at this point, so failing
+   * here is safe — the answer is "not saved", not "maybe saved".
+   */
+  function withDeadline<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    const bell = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`${what} took too long — the chain is not answering. Nothing was saved; try again in a moment.`)),
+        ms,
+      );
+      timer.unref?.();
+    });
+    return Promise.race([p, bell]).finally(() => clearTimeout(timer)) as Promise<T>;
+  }
+  /** How long a form may wait on the chain before it is told to give up. */
+  const FORM_DEADLINE = 12_000;
+
   async function retryRead<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
     let last: unknown;
     for (let i = 0; i < attempts; i++) {
@@ -7157,7 +7215,8 @@ async function main() {
 
   const sessionsCache = new Map<string, { at: number; rows: unknown[] }>();
   const SESSIONS_TTL = live ? 10_000 : 500;
-  const sessionsInvalidate = () => sessionsCache.clear();
+  /** Both caches: a session that just changed must not be read from either. */
+  const sessionsInvalidate = () => { sessionsCache.clear(); sessionCacheClear(); };
 
   /** Every session a wallet has opened. Public: they are the owner's own. */
   app.get("/api/sessions", async (req, res) => {
@@ -7165,8 +7224,12 @@ async function main() {
     const owner = String(req.query.owner ?? "");
     if (!isAddress(owner)) { res.status(400).json({ ok: false, error: "owner must be an address" }); return; }
     const cacheKey = owner.toLowerCase();
+    // `?fresh=1` is the reader saying they have just changed something. It has
+    // to reach past both caches, or a page reloaded after opening a session
+    // shows the list from before it.
+    const wantFresh = req.query.fresh === "1";
     const cached = sessionsCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < SESSIONS_TTL && req.query.fresh !== "1") {
+    if (cached && Date.now() - cached.at < SESSIONS_TTL && !wantFresh) {
       res.json({ ok: true, deployed: true, key: sessionSigner ? sessionSigner.account.address : null, sessions: cached.rows });
       return;
     }
@@ -7183,7 +7246,7 @@ async function main() {
        * the answer arrived long after the typing stopped. The client already
        * paces and retries; handing it the whole batch lets it do that once.
        */
-      const read = await Promise.all(ids.map((id) => retryRead(() => readSession(id)).catch(() => null)));
+      const read = await Promise.all(ids.map((id) => retryRead(() => readSession(id, { fresh: wantFresh })).catch(() => null)));
       const rows = read.filter((r): r is NonNullable<typeof r> => r !== null);
       /*
        * A session that would not answer is a gap, not a deletion.
@@ -7289,7 +7352,9 @@ async function main() {
   async function spendFromSession(id: Hex, to: Hex, amount: bigint, memo = "") {
     if (!sessionKeysAddr) throw new Error("session keys are not deployed on this network");
     if (!sessionSigner) throw new Error("this server has no session key configured");
-    const s = await readSession(id);
+    // Straight from the chain. Everything else may read a few seconds old; the
+    // check standing immediately in front of a spend may not.
+    const s = await readSession(id, { fresh: true });
     if (!s) throw new Error("no such session");
     if (!s.ours) {
       throw new Error(
@@ -7964,12 +8029,20 @@ async function main() {
    * Shared by create and edit on purpose: an edit that skipped these checks
    * would be a way to put into a task exactly what creating one refuses.
    */
-  async function checkTaskParams(body: { venue?: string; action?: string; params?: Record<string, unknown> }) {
+  /**
+   * @param known The session the caller has already read, when it has. The two
+   *   task routes check ownership before calling this, which is the same read —
+   *   doing it twice doubled the wait on the one request people notice.
+   */
+  async function checkTaskParams(
+    body: { venue?: string; action?: string; params?: Record<string, unknown> },
+    known?: SessionRow,
+  ) {
     if (body.venue !== "wallet") return;
     if (body.action === "sessionSend" || body.action === "sessionBulk") {
       const id = String(body.params?.sessionId ?? "");
       if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("choose a session to spend from");
-      const s0 = await readSession(id as Hex);
+      const s0 = known !== undefined ? known : await readSession(id as Hex);
       if (!s0) throw new Error("no such session");
       if (!s0.ours) {
         // Say which key, and what to do. "Delegated to a different key" is true
@@ -7999,6 +8072,9 @@ async function main() {
     const scope = taskScope(req);
     if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
     const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
+    // Read once, checked twice: the ownership gate below and the parameter
+    // check after it are asking about the same session.
+    let mine: SessionRow | undefined;
     /*
      * The choke point for who may schedule what.
      *
@@ -8019,14 +8095,21 @@ async function main() {
       // And only against a session this wallet actually owns. Without this,
       // one visitor could schedule payments out of another's delegation.
       const sid = String(body.params?.sessionId ?? "");
-      const s0 = /^0x[0-9a-fA-F]{64}$/.test(sid) ? await readSession(sid as Hex) : null;
-      if (!s0 || String(s0.owner).toLowerCase() !== scope.owner) {
+      try {
+        mine = /^0x[0-9a-fA-F]{64}$/.test(sid)
+          ? await withDeadline(readSession(sid as Hex), FORM_DEADLINE, "reading that session")
+          : null;
+      } catch (e) {
+        res.status(504).json({ ok: false, error: friendlyError(e) });
+        return;
+      }
+      if (!mine || String(mine.owner).toLowerCase() !== scope.owner) {
         res.status(403).json({ ok: false, error: "that session was not opened by this wallet" });
         return;
       }
     }
     try {
-      await checkTaskParams(body);
+      await withDeadline(checkTaskParams(body, mine), FORM_DEADLINE, "checking the task");
     } catch (e) {
       res.status(400).json({ ok: false, error: friendlyError(e) });
       return;
@@ -8040,10 +8123,68 @@ async function main() {
     res.json({ ok: true, task: r.task, scheduleText: describeSchedule(r.task.schedule) });
   });
 
+  /**
+   * Move every one of the caller's tasks from one session to another.
+   *
+   * A session's cap and expiry are fixed when it is opened — the contract has
+   * `open` and `revoke` and nothing in between — so raising a limit means a new
+   * session with a new id, and every scheduled task still names the old one.
+   * Without this they would all quietly stop at the next run, which is the
+   * worst possible way to find out.
+   *
+   * Both sessions must belong to the caller's wallet. Without that check this
+   * would be a way to aim somebody else's tasks at a delegation of your own, or
+   * your tasks at theirs.
+   */
+  app.post("/api/tasks/repoint", requireAuth, async (req, res) => {
+    const scope = taskScope(req);
+    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
+    const from = String(req.body?.from ?? "");
+    const to = String(req.body?.to ?? "");
+    if (!/^0x[0-9a-fA-F]{64}$/.test(from) || !/^0x[0-9a-fA-F]{64}$/.test(to)) {
+      res.status(400).json({ ok: false, error: "both session ids are required" });
+      return;
+    }
+    if (from.toLowerCase() === to.toLowerCase()) {
+      res.json({ ok: true, moved: 0, note: "those are the same session" });
+      return;
+    }
+    let target: SessionRow;
+    try {
+      target = await withDeadline(readSession(to as Hex), FORM_DEADLINE, "reading the new session");
+    } catch (e) {
+      res.status(504).json({ ok: false, error: friendlyError(e) });
+      return;
+    }
+    if (!target) { res.status(404).json({ ok: false, error: "no such session" }); return; }
+    if (!scope.operator && String(target.owner).toLowerCase() !== scope.owner) {
+      res.status(403).json({ ok: false, error: "that session was not opened by this wallet" });
+      return;
+    }
+    if (target.revoked) { res.status(400).json({ ok: false, error: "that session has already been revoked" }); return; }
+
+    const mine = taskStore.listFor(scope.operator ? null : scope.owner);
+    const hit = mine.filter((t) => String((t.params as Record<string, unknown>)?.sessionId ?? "").toLowerCase() === from.toLowerCase());
+    let moved = 0;
+    for (const t of hit) {
+      const r = taskStore.update(t.id, { params: { ...(t.params as Record<string, unknown>), sessionId: to } });
+      if (r.ok) moved += 1;
+    }
+    if (moved) {
+      logTx(req, {
+        category: "defi", action: "task-repoint", status: "success",
+        detail: `${moved} task(s) from ${from.slice(0, 10)}… to ${to.slice(0, 10)}…`,
+      });
+    }
+    res.json({ ok: true, moved, of: hit.length });
+  });
+
   app.post("/api/tasks/:id", requireAuth, async (req, res) => {
     const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
     const existing = myTask(req, res);
     if (!existing) return;
+    // Read once, checked twice — see the note on the creation route.
+    let mine: SessionRow | undefined;
     // A visitor's edit may not walk their task into a venue that spends the
     // app wallet — the same rule as creation, at the same choke point.
     const scope = taskScope(req)!;
@@ -8055,8 +8196,15 @@ async function main() {
         return;
       }
       const sid = String((body.params ?? existing.params)?.sessionId ?? "");
-      const s0 = /^0x[0-9a-fA-F]{64}$/.test(sid) ? await readSession(sid as Hex) : null;
-      if (!s0 || String(s0.owner).toLowerCase() !== scope.owner) {
+      try {
+        mine = /^0x[0-9a-fA-F]{64}$/.test(sid)
+          ? await withDeadline(readSession(sid as Hex), FORM_DEADLINE, "reading that session")
+          : null;
+      } catch (e) {
+        res.status(504).json({ ok: false, error: friendlyError(e) });
+        return;
+      }
+      if (!mine || String(mine.owner).toLowerCase() !== scope.owner) {
         res.status(403).json({ ok: false, error: "that session was not opened by this wallet" });
         return;
       }
@@ -8067,11 +8215,11 @@ async function main() {
     // work in that situation.
     if (body.params !== undefined || body.venue !== undefined || body.action !== undefined) {
       try {
-        await checkTaskParams({
+        await withDeadline(checkTaskParams({
           venue: body.venue ?? existing.venue,
           action: body.action ?? existing.action,
           params: body.params ?? existing.params,
-        });
+        }, mine), FORM_DEADLINE, "checking the task");
       } catch (e) {
         res.status(400).json({ ok: false, error: friendlyError(e) });
         return;

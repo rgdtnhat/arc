@@ -323,8 +323,39 @@ Express matches in registration order, so a literal path registered *after* a
 `:id` sibling is unreachable. This produced a real bug once —
 `/api/notices/delete` was matched as a notice with the id `"delete"`, so bulk
 delete silently 404'd. Every collection endpoint now registers its literal
-routes first (`/delete`, `/merge`, `/archive`, `/mine`, `/transactions`) with an
-explanatory comment, and the API test suite exercises each one.
+routes first (`/delete`, `/merge`, `/archive`, `/mine`, `/transactions`,
+`/repoint`) with an explanatory comment, and the API test suite exercises each
+one.
+
+## Session keys: what can be changed, and by whom
+
+`TesseraSessionKeys` has `open` and `revoke` and nothing between them. A
+session's cap, per-payment ceiling, expiry and allow-list are fixed at the
+moment the owner signs for them, and no later call — by the owner, the session
+key, or this app — can widen any of them. That is deliberate: a delegation whose
+limits could be edited afterwards is worth less than the signature that created
+it.
+
+So "raise the cap" or "extend the expiry" is a **replacement**, not an edit: a
+new session is opened, any scheduled tasks are moved onto it, and only then is
+the old one revoked. The page says so rather than implying an edit, and the
+order matters — revoking first would leave every scheduled payment pointing at a
+dead session.
+
+| Control | Where it is enforced |
+|---|---|
+| Cap, per-payment max, expiry, allow-list | `TesseraSessionKeys.spend`, on every payment |
+| A session with no time limit | Not a mode — it is an expiry of `type(uint64).max`, which the contract accepts and which no clock reaches. Revocation remains the only way it ends, and a contract test asserts both. |
+| Which wallet a session belongs to | `open` records `msg.sender`; `revoke` refuses anybody else |
+| Moving a schedule onto another session (`/api/tasks/repoint`) | `requireAuth` plus an owner check on **both** ends: the caller must own the tasks and the destination session. Without the second check this would be a way to aim your tasks at somebody else's delegation, or theirs at yours. |
+| Scheduling a payment from a session at all | `/api/tasks` and `/api/tasks/:id` refuse any venue but `wallet` and any verb but `sessionSend`/`sessionBulk` for a non-operator, and only against a session that wallet opened |
+
+The allowance is a separate ceiling the owner controls from any wallet
+interface, and it is one shared number per (owner, token) — `approve` replaces
+rather than adds. Opening a session therefore approves the new cap **plus what
+every live session on that asset still holds**, never an unlimited amount, and
+the flow now stops if that approval does not land rather than opening a session
+that cannot pay.
 
 ## Design assumptions (not bugs, but worth stating)
 

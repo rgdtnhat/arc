@@ -41,6 +41,36 @@ async function open(
 }
 
 describe("TesseraSessionKeys", () => {
+  /*
+   * "No time limit" is not a mode this contract has — it is the largest expiry
+   * a uint64 can hold. The page offers it as an option, so the claim that the
+   * contract will actually take that number is worth checking here rather than
+   * discovering from a reverted transaction in somebody's wallet.
+   */
+  it("accepts an expiry at the top of uint64, which is how a session with no time limit is expressed", async () => {
+    const ctx = await loadFixture(fixture);
+    const { sessions, usdc, owner, sessionKey, alice } = ctx;
+    const forever = (1n << 64n) - 1n;
+    await usdc.write.approve([sessions.address, USDC("100")], { account: owner.account });
+    await sessions.write.open(
+      [sessionKey.account.address, usdc.address, USDC("100"), 0n, forever, []],
+      { account: owner.account },
+    );
+    const logs = await sessions.getEvents.SessionOpened();
+    const id = logs[logs.length - 1].args.id as `0x${string}`;
+    expect((await sessions.read.sessions([id]))[6]).to.equal(forever);
+    expect(await sessions.read.active([id])).to.equal(true);
+
+    // A century on, still live — and still revocable, which is the only thing
+    // that ends it.
+    await time.increase(100 * 365 * DAY);
+    expect(await sessions.read.active([id])).to.equal(true);
+    await sessions.write.spend([id, alice.account.address, USDC("1")], { account: sessionKey.account });
+    expect(await usdc.read.balanceOf([alice.account.address])).to.equal(USDC("1"));
+    await sessions.write.revoke([id], { account: owner.account });
+    expect(await sessions.read.active([id])).to.equal(false);
+  });
+
   it("lets the session key pay from the owner's wallet", async () => {
     const ctx = await loadFixture(fixture);
     const id = await open(ctx);

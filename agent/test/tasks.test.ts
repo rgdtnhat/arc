@@ -178,3 +178,61 @@ test("an edit cannot re-home a task to another wallet", () => {
   assert.equal(s.get(id)!.owner, alice.toLowerCase());
   assert.equal(s.get(id)!.name, "renamed", "the rest of the edit should still apply");
 });
+
+/*
+ * Repointing a schedule at a replacement session.
+ *
+ * A session's cap and expiry are fixed at the moment it is opened, so raising
+ * either one means a new session with a new id — and every task still names the
+ * old one. The route that moves them is a loop of `update({ params })`, so what
+ * matters here is that such an update carries the rest of the task across:
+ * losing an owner would re-home somebody's delegation, and losing a schedule
+ * would silently change when unattended money moves.
+ */
+test("changing only the params leaves owner, schedule and history alone", () => {
+  const s = store();
+  const owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const r = s.create({
+    name: "rent",
+    venue: "wallet",
+    action: "sessionSend",
+    owner,
+    params: { sessionId: "0x" + "1".repeat(64), to: "0x" + "b".repeat(40), amount: "1" },
+    schedule: { kind: "every", seconds: 3600 },
+  });
+  assert.equal(r.ok, true);
+  const id = (r as { task: { id: string } }).task.id;
+
+  const moved = s.update(id, {
+    params: { sessionId: "0x" + "2".repeat(64), to: "0x" + "b".repeat(40), amount: "1" },
+  });
+  assert.equal(moved.ok, true);
+  const t = (moved as { task: Record<string, unknown> }).task;
+  assert.equal((t.params as Record<string, string>).sessionId, "0x" + "2".repeat(64));
+  assert.equal((t.params as Record<string, string>).amount, "1");
+  assert.equal(t.owner, owner);
+  assert.deepEqual(t.schedule, { kind: "every", seconds: 3600 });
+  assert.equal(t.name, "rent");
+  assert.equal(t.venue, "wallet");
+  assert.equal(t.action, "sessionSend");
+});
+
+test("a repoint reaches only the tasks of the wallet asking for it", () => {
+  const s = store();
+  const mine = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const theirs = "0xcccccccccccccccccccccccccccccccccccccccc";
+  const old = "0x" + "1".repeat(64);
+  for (const owner of [mine, theirs]) {
+    s.create({
+      venue: "wallet", action: "sessionSend", owner,
+      params: { sessionId: old, to: "0x" + "b".repeat(40), amount: "1" },
+      schedule: { kind: "manual" },
+    });
+  }
+  // What the route does: list this owner's tasks, then move the matching ones.
+  const hit = s.listFor(mine).filter((t) => (t.params as { sessionId?: string }).sessionId === old);
+  assert.equal(hit.length, 1);
+  assert.equal(s.listFor(null).filter((t) => (t.params as { sessionId?: string }).sessionId === old).length, 2);
+  assert.equal(s.ownedBy(hit[0].id, mine), true);
+  assert.equal(s.ownedBy(hit[0].id, theirs), false);
+});
