@@ -221,6 +221,52 @@ const $ = (id) => document.getElementById(id);
       }
       window.addEventListener("hashchange", () => showView(routeFromHash()));
 
+      /* ---- "this pane is still reading" -----------------------------------
+       *
+       * Every sub-tab in the app is fed by chain reads, and a few of them —
+       * governance most of all — are a dozen contract calls behind a public
+       * RPC. Switching to one used to show either nothing or the previous
+       * tab's numbers until the reads landed, which is indistinguishable from
+       * a pane that failed. One strip at the top of the pane says it is
+       * working, and every tab gets it from the switcher rather than each
+       * loader having to grow its own.
+       *
+       * Built with textContent rather than a template so it can run during the
+       * script's initial evaluation, before the formatting helpers below exist.
+       */
+      function paneBusy(paneId, label) {
+        const pane = $(paneId);
+        if (!pane) return () => {};
+        let strip = pane.firstElementChild;
+        if (!strip || !strip.classList || !strip.classList.contains("paneBusy")) {
+          strip = document.createElement("div");
+          strip.className = "paneBusy";
+          strip.appendChild(Object.assign(document.createElement("span"), { className: "spin" }));
+          strip.appendChild(document.createElement("span"));
+          pane.prepend(strip);
+        }
+        strip.lastElementChild.textContent = label || "Reading the chain…";
+        strip.style.display = "flex";
+        pane.setAttribute("aria-busy", "true");
+        let cleared = false;
+        return () => {
+          if (cleared) return;
+          cleared = true;
+          strip.style.display = "none";
+          pane.removeAttribute("aria-busy");
+        };
+      }
+      /** Run a pane's loaders with its busy strip up until they all settle. */
+      function withPaneBusy(paneId, run, label) {
+        const clear = paneBusy(paneId, label);
+        let out;
+        try { out = run(); } catch (e) { clear(); throw e; }
+        return Promise.resolve(out).then(
+          (v) => { clear(); return v; },
+          (e) => { clear(); throw e; },
+        );
+      }
+
       /* ---- DeFi sub-tabs -------------------------------------------------
        * One tab per function instead of four long cards stacked in a column.
        * Purely a view switch: no fetching hangs off it, because the DeFi panels
@@ -250,10 +296,17 @@ const $ = (id) => document.getElementById(id);
           b.classList.toggle("active", b.dataset.wallettab === tab));
         // Each tab's data loads when you arrive at it, not while you are on
         // another one — the same rule the routes follow.
-        if (tab === "send" && typeof loadWallet === "function") loadWallet();
-        if (tab === "sessions" && typeof loadSessions === "function") loadSessions();
-        if (tab === "tasks" && typeof loadTasks === "function") loadTasks();
-        if (tab === "series" && typeof loadSeries === "function") { loadTasks(); loadSeries(); }
+        const pane = WALLET_PANES[tab];
+        const load =
+          tab === "send" && typeof loadWallet === "function" ? () => loadWallet()
+          : tab === "sessions" && typeof loadSessions === "function" ? () => loadSessions()
+          : tab === "tasks" && typeof loadTasks === "function" ? () => loadTasks()
+          : tab === "series" && typeof loadSeries === "function" ? () => Promise.all([loadTasks(), loadSeries()])
+          : null;
+        if (load) {
+          withPaneBusy(pane, load, tab === "sessions" ? "Reading your sessions from the chain…" : "Loading…")
+            .catch(() => {});
+        }
         if (!opts || opts.scroll !== false) {
           const dock = $("walletTabs");
           if (dock) dock.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -341,12 +394,12 @@ const $ = (id) => document.getElementById(id);
          * arrival instead, the same as every other route.
          */
         const onScreen = $("paneDefi") && !$("paneDefi").hidden;
-        if (tab === "fees" && onScreen) loadFees();
+        if (tab === "fees" && onScreen) withPaneBusy(DEFI_PANES.fees, loadFees).catch(() => {});
         // Each venue tab carries its own holder leaderboard and fee history.
         // Loaded on switch rather than up front: a holder scan is a windowed
         // log sweep, and doing four of them for tabs nobody opened is waste.
         const venueKey = { lending: "Lending", vault: "Vault", swap: "Swap", amm: "Amm" }[tab];
-        if (venueKey && onScreen) loadVenuePanels(venueKey);
+        if (venueKey && onScreen) withPaneBusy(DEFI_PANES[tab], () => loadVenuePanels(venueKey)).catch(() => {});
         // Switching tabs shouldn't leave you halfway down the previous pane.
         if (!opts || opts.scroll !== false) {
           const dock = document.querySelector("#paneDefi .tabDock");
@@ -2763,6 +2816,7 @@ const $ = (id) => document.getElementById(id);
           query = `/api/vault/withdraw?shares=${shares}`;
         }
         const btn = $("vExecute"); btn.disabled = true;
+        showBusy("vaultMsg", `${action} ${human} USDC — sending…`);
         try {
           const r = await (await postAuthed(query)).json();
           msg.style.display = "block";
@@ -3086,6 +3140,7 @@ const $ = (id) => document.getElementById(id);
           return;
         }
         btn.disabled = true;
+        showBusy("swapMsg", `swapping ${q.symIn} → ${q.symOut}…`);
         try {
           const r = await (await postAuthed(`/api/swap?tokenIn=${q.tokenIn}&tokenOut=${q.tokenOut}&amountIn=${q.amountIn}&minOut=${minOut}`)).json();
           msg.style.display = "block";
@@ -3263,10 +3318,12 @@ const $ = (id) => document.getElementById(id);
         const feeMsg = (text, colour) => {
           const m = $("feeMsg");
           m.style.display = "block"; m.textContent = text; m.style.color = colour;
+          m.removeAttribute("aria-busy");
         };
         $("feeAllocate").addEventListener("click", async () => {
           const btn = $("feeAllocate");
           btn.disabled = true;
+          showBusy("feeMsg", "Distributing the collected fees…");
           try {
             const r = await (await postAuthed("/api/fees/allocate")).json();
             showReceipt("feeMsg", r.ok, r.ok ? "distributed" : `failed: ${r.error}`, r.txHash);
@@ -3314,6 +3371,7 @@ const $ = (id) => document.getElementById(id);
           if (!human || !(parseFloat(human) > 0)) return feeMsg("Enter an amount above zero.", "var(--warn)");
           const btn = $("feeWithdraw");
           btn.disabled = true;
+          showBusy("feeMsg", `Withdrawing ${human} USDC…`);
           try {
             const raw = toRaw(human, 6); // the collector's asset is USDC
             const r = await (await postAuthed(`/api/fees/withdraw?amount=${raw}`)).json();
@@ -5404,6 +5462,9 @@ const $ = (id) => document.getElementById(id);
         const m = $("backstopMsg");
         if (!m) return;
         m.style.display = "block"; m.textContent = text; m.style.color = colour;
+        // The result usually replaces a spinner; a line that still claims
+        // aria-busy after settling reads as loading forever.
+        m.removeAttribute("aria-busy");
       }
 
       function wireBackstop() {
@@ -5483,6 +5544,9 @@ const $ = (id) => document.getElementById(id);
         const m = $("auctionMsg");
         if (!m) return;
         m.style.display = "block"; m.textContent = text; m.style.color = colour;
+        // The result usually replaces a spinner; a line that still claims
+        // aria-busy after settling reads as loading forever.
+        m.removeAttribute("aria-busy");
       }
 
       async function loadAuction() {
@@ -5552,6 +5616,7 @@ const $ = (id) => document.getElementById(id);
         const user = () => ($("auUser").value || "").trim();
         const post = async (path, body, label) => {
           if (!/^0x[0-9a-fA-F]{40}$/.test(user())) return auShow("Enter a borrower address first.", "var(--warn)");
+          showBusy("auctionMsg", `${label}…`);
           try {
             const r = await (await postJson(path, body)).json();
             showReceipt("auctionMsg", r.ok, r.ok ? label : `failed: ${r.error}`, r.txHash);
@@ -6066,6 +6131,7 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           btn.disabled = true;
+          showBusy("ammMsg", `swapping ${q.ai.symbol} → ${q.ao.symbol}…`);
           try {
             const r = await (
               await postJson("/api/amm/swap", {
@@ -6295,6 +6361,7 @@ const $ = (id) => document.getElementById(id);
           }
 
           btn.disabled = true;
+          showBusy("ammMsg", adding ? "adding liquidity…" : "withdrawing liquidity…");
           try {
             const body = adding ? { poolId: p.id, amounts } : { poolId: p.id, shares };
             const r = await (await postJson(`/api/amm/${adding ? "add" : "remove"}`, body)).json();
@@ -6956,6 +7023,9 @@ const $ = (id) => document.getElementById(id);
         const m = $(id);
         if (!m) return;
         m.style.display = "block"; m.textContent = text; m.style.color = colour || "var(--muted)";
+        // The result usually replaces a spinner; a line that still claims
+        // aria-busy after settling reads as loading forever.
+        m.removeAttribute("aria-busy");
       }
 
       const relTime = (secs) => {
@@ -6965,12 +7035,16 @@ const $ = (id) => document.getElementById(id);
         return `${d >= 0 ? "in " : ""}${n} ${unit[1]}${n === 1 ? "" : "s"}${d < 0 ? " ago" : ""}`;
       };
 
-      async function loadGovernance() {
+      /** @param {boolean} [fresh] Skip the server's short read cache — see loadGauge. */
+      async function loadGovernance(fresh) {
         const host = $("govProposals");
         if (!host) return;
         try {
           const who = String(window.__myAddress || "");
-          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
+          const parts = [];
+          if (/^0x[0-9a-fA-F]{40}$/.test(who)) parts.push(`user=${encodeURIComponent(who)}`);
+          if (fresh) parts.push("fresh=1");
+          const q = parts.length ? `?${parts.join("&")}` : "";
           const r = await (await fetch("/api/governance" + q)).json();
           window.__gov = r && r.ok ? r : null;
           if (!r || !r.ok || !r.deployed) {
@@ -7277,6 +7351,8 @@ const $ = (id) => document.getElementById(id);
         const params = {};
         document.querySelectorAll("#gbParams [data-param]").forEach((el) => { params[el.dataset.param] = el.value; });
         try {
+          if (msg) msg.className = "msg";
+          showBusy("gbMsg", "Encoding the call…");
           const res = await postAuthed("/api/governance/encode-action", {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ action: sel.value, params }),
@@ -7302,6 +7378,8 @@ const $ = (id) => document.getElementById(id);
           const enacts = gbCalls.length
             ? "\n\nIf this passes:\n" + gbCalls.map((c, i) => (i + 1) + ". " + c.summary).join("\n")
             : "";
+          if (msg) msg.className = "msg";
+          showBusy("gbMsg", "Opening the proposal…");
           const res = await postAuthed("/api/governance/propose", {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
@@ -7318,7 +7396,7 @@ const $ = (id) => document.getElementById(id);
           if ($("gbTitle")) $("gbTitle").value = "";
           if ($("gbBody")) $("gbBody").value = "";
           if (msg) { msg.style.display = "block"; msg.className = "msg ok"; msg.textContent = "Proposal opened."; }
-          loadGovernance();
+          loadGovernance(true);
         } catch (e) {
           if (msg) { msg.style.display = "block"; msg.className = "msg err"; msg.textContent = String(e.message || e); }
         }
@@ -7343,7 +7421,7 @@ const $ = (id) => document.getElementById(id);
         document.querySelectorAll("[data-govtab]").forEach((b) =>
           b.classList.toggle("active", b.dataset.govtab === tab));
         const load = GOV_LOADERS[tab];
-        if (load) Promise.resolve(load()).catch(() => {});
+        if (load) withPaneBusy("gov_" + tab, load, "Reading governance from the chain…").catch(() => {});
       }
       document.querySelectorAll("[data-govtab]").forEach((b) =>
         b.addEventListener("click", () => setGovTab(b.dataset.govtab)));
@@ -7613,10 +7691,11 @@ const $ = (id) => document.getElementById(id);
           host.querySelectorAll("[data-disc-publish]").forEach((b) =>
             b.addEventListener("click", async () => {
               try {
+                showBusy("govDiscMsg", "Opening it as a proposal…");
                 const res = await (await postJson("/api/governance/discussions/publish", { id: b.dataset.discPublish })).json();
                 govMsg("govDiscMsg", res.ok ? `Opened as proposal #${res.proposalId}. Voting is live. — ${res.txHash}` : (res.error || "failed"),
                   res.ok ? "var(--good)" : "var(--warn)");
-                if (res.ok) { loadDiscussions(); loadGovernance(); }
+                if (res.ok) { loadDiscussions(); loadGovernance(true); }
               } catch { govMsg("govDiscMsg", "Request failed.", "var(--warn)"); }
             }),
           );
@@ -7655,6 +7734,7 @@ const $ = (id) => document.getElementById(id);
             method: "personal_sign",
             params: [message, from],
           });
+          showBusy("govDiscMsg", kind === "draft" ? "Posting the draft…" : "Posting your reply…");
           const r = await (await postJson("/api/governance/discussions", {
             kind, title, body, parent, author: from, at, signature,
           })).json();
@@ -7721,7 +7801,7 @@ const $ = (id) => document.getElementById(id);
         await selfCustody("govMsg", `vote on proposal #${id}`, async (from, cfg) =>
           sendTx(from, cfg.governor, callData(cfg.selectors.govVote, encUint(id), encUint(support))),
         );
-        loadGovernance();
+        loadGovernance(true);
       }
 
       if ($("govDelegate")) {
@@ -7733,7 +7813,7 @@ const $ = (id) => document.getElementById(id);
           await selfCustody("govMsg", "activate voting power", async (from, cfg) =>
             sendTx(from, cfg.token, callData(cfg.selectors.govDelegate, encAddr(from))),
           );
-          loadGovernance();
+          loadGovernance(true);
         });
       }
 
@@ -7743,11 +7823,12 @@ const $ = (id) => document.getElementById(id);
           const description = ($("govBody").value || "").trim();
           if (!title) { govMsg("govCreateMsg", "A proposal needs a title.", "var(--warn)"); return; }
           try {
+            showBusy("govCreateMsg", "Opening the proposal…");
             const r = await (await postJson("/api/governance/propose", { title, description })).json();
             if (r.ok) {
               $("govTitle").value = ""; $("govBody").value = "";
               govMsg("govCreateMsg", "Proposal opened. Voting is live.", "var(--good)");
-              loadGovernance();
+              loadGovernance(true);
             } else govMsg("govCreateMsg", r.error || "failed", "var(--warn)");
           } catch { govMsg("govCreateMsg", "Request failed.", "var(--warn)"); }
         });
@@ -7789,6 +7870,7 @@ const $ = (id) => document.getElementById(id);
             ? Math.floor(new Date($("govEmUntil").value + "T23:59:59Z").getTime() / 1000)
             : 0;
           try {
+            showBusy("govEmMsg", "Setting the rate…");
             const r = await (await postJson("/api/lending/emissions/rate", {
               asset, side, ratePerSecond: raw, endsAt: until,
             })).json();
@@ -7898,6 +7980,7 @@ const $ = (id) => document.getElementById(id);
           if (raw == null) { govMsg("govLpMsg", parsed.error || "Enter a rate.", "var(--warn)"); return; }
           if (!Number.isInteger(poolId)) { govMsg("govLpMsg", "Pick a pool.", "var(--warn)"); return; }
           try {
+            showBusy("govLpMsg", `Setting pool ${poolId} to ${typed} per second…`);
             const r = await (await postJson("/api/amm/emissions/rate", { poolId, ratePerSecond: String(raw) })).json();
             if (r.ok) {
               showReceipt("govLpMsg", true, `pool ${poolId} now pays ${typed} per second`, r.txHash);
@@ -7983,10 +8066,11 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           try {
+            showBusy("regStatusMsg", "Recording the decision…");
             const r = await (await postJson("/api/governance/registry/status", { asset, status, reason })).json();
             govMsg("regStatusMsg", r.ok ? `Recorded. — ${r.txHash}` : (r.error || "failed"),
               r.ok ? "var(--good)" : "var(--warn)");
-            if (r.ok) { $("regStatusReason").value = ""; loadRegistry(); loadGauge(); }
+            if (r.ok) { $("regStatusReason").value = ""; loadRegistry(); loadGauge(true); }
           } catch { govMsg("regStatusMsg", "Request failed.", "var(--warn)"); }
         });
       }
@@ -8005,10 +8089,12 @@ const $ = (id) => document.getElementById(id);
           try {
             // Encode first: the parameters are checked against the pool's own
             // bounds before a vote is opened on them, not after it passes.
+            showBusy("regMsg", "Checking the parameters against the pool…");
             const enc = await (await postJson("/api/governance/registry/encode", body)).json();
             if (!enc.ok) { govMsg("regMsg", enc.error || "failed", "var(--warn)"); return; }
             $("regSummary").textContent = enc.summary;
 
+            showBusy("regMsg", `Opening the proposal to list ${enc.symbol}…`);
             const r = await (await postJson("/api/governance/propose", {
               title: `List ${enc.symbol} as a reserve`,
               description: enc.summary +
@@ -8021,7 +8107,7 @@ const $ = (id) => document.getElementById(id);
             if (r.ok) {
               govMsg("regMsg", `Listing proposal opened. Voting is live. — ${r.txHash}`, "var(--good)");
               $("regAsset").value = ""; $("regPrice").value = "";
-              loadGovernance();
+              loadGovernance(true);
             } else govMsg("regMsg", r.error || "failed", "var(--warn)");
           } catch { govMsg("regMsg", "Request failed.", "var(--warn)"); }
         });
@@ -8075,12 +8161,23 @@ const $ = (id) => document.getElementById(id);
         );
       }
 
-      async function loadGauge() {
+      /**
+       * @param {boolean} [fresh] Skip the server's short read cache.
+       *
+       * The reads behind this are ten-odd contract calls and are cached for a
+       * few seconds so the tab does not re-derive them on every poll. Right
+       * after your own vote that cache is exactly wrong, so the caller that
+       * made the transaction asks for the uncached answer.
+       */
+      async function loadGauge(fresh) {
         const card = $("govGaugeCard");
         if (!card) return;
         try {
           const who = String(window.__myAddress || "");
-          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
+          const parts = [];
+          if (/^0x[0-9a-fA-F]{40}$/.test(who)) parts.push(`user=${encodeURIComponent(who)}`);
+          if (fresh) parts.push("fresh=1");
+          const q = parts.length ? `?${parts.join("&")}` : "";
           const r = await (await fetch("/api/gauge" + q)).json();
           window.__gauge = r && r.ok && r.deployed ? r : null;
           if (!window.__gauge) { card.style.display = "none"; return; }
@@ -8304,8 +8401,8 @@ const $ = (id) => document.getElementById(id);
         await selfCustody("govDelegateMsg", `delegate to ${to.slice(0, 10)}…`, async (from, cfg) =>
           sendTx(from, cfg.token, callData(cfg.selectors.govDelegate, encAddr(to))),
         );
-        loadGovernance();
-        loadGauge();
+        loadGovernance(true);
+        loadGauge(true);
       }
 
       if ($("govDelegateRegister")) {
@@ -8329,7 +8426,7 @@ const $ = (id) => document.getElementById(id);
               encStringTail(statement),
             )),
           );
-          loadGauge();
+          loadGauge(true);
         });
       }
 
@@ -8427,7 +8524,7 @@ const $ = (id) => document.getElementById(id);
               encArray(weights),
             )),
           );
-          loadGauge();
+          loadGauge(true);
         });
       }
 
@@ -8440,7 +8537,7 @@ const $ = (id) => document.getElementById(id);
           await selfCustody("gaMsg", "take your weight back", async (from, cfg) =>
             sendTx(from, cfg.gauge, callData(cfg.selectors.gaClear)),
           );
-          loadGauge();
+          loadGauge(true);
         });
       }
 
@@ -8457,12 +8554,13 @@ const $ = (id) => document.getElementById(id);
             );
           } else {
             try {
+              showBusy("gaMsg", `Applying epoch #${epoch}…`);
               const r = await (await postJson("/api/gauge/apply", { epoch })).json();
               govMsg("gaMsg", r.ok ? `Applied. — ${r.txHash}` : (r.error || "failed"),
                 r.ok ? "var(--good)" : "var(--warn)");
             } catch { govMsg("gaMsg", "Request failed.", "var(--warn)"); }
           }
-          loadGauge();
+          loadGauge(true);
           loadEmissions();
         });
       }
@@ -8481,7 +8579,7 @@ const $ = (id) => document.getElementById(id);
         await selfCustody("gaMsg", `claim your share of the incentives on market #${marketId}`, async (from, cfg) =>
           sendTx(from, cfg.gauge, callData(cfg.selectors.gaClaimBribes, encUint(epoch), encUint(marketId))),
         );
-        loadGauge();
+        loadGauge(true);
       }
 
       /* ---- Incentives (anyone) --------------------------------------------- */
@@ -8533,7 +8631,7 @@ const $ = (id) => document.getElementById(id);
             ));
           });
           $("gaBribeAmount").value = "";
-          loadGauge();
+          loadGauge(true);
         });
       }
 
@@ -8570,10 +8668,11 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           try {
+            showBusy("gaAdminMsg", "Setting the budget…");
             const r = await (await postJson("/api/gauge/budget", { lendingPerSecond: l, ammPerSecond: a })).json();
             govMsg("gaAdminMsg", r.ok ? `Budget set. — ${r.txHash}` : (r.error || "failed"),
               r.ok ? "var(--good)" : "var(--warn)");
-            if (r.ok) loadGauge();
+            if (r.ok) loadGauge(true);
           } catch { govMsg("gaAdminMsg", "Request failed.", "var(--warn)"); }
         });
       }
@@ -8586,10 +8685,11 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           try {
+            showBusy("gaAdminMsg", "Setting the reward zone…");
             const r = await (await postJson("/api/gauge/zone", { size })).json();
             govMsg("gaAdminMsg", r.ok ? `Reward zone set to ${size}. — ${r.txHash}` : (r.error || "failed"),
               r.ok ? "var(--good)" : "var(--warn)");
-            if (r.ok) loadGauge();
+            if (r.ok) loadGauge(true);
           } catch { govMsg("gaAdminMsg", "Request failed.", "var(--warn)"); }
         });
       }
@@ -8603,10 +8703,11 @@ const $ = (id) => document.getElementById(id);
             ? { venue, poolId: ($("gaNewPool").value || "0").trim(), label }
             : { venue, asset: $("gaNewAsset").value, side: Number($("gaNewSide").value), label };
           try {
+            showBusy("gaAdminMsg", `Listing ${label}…`);
             const r = await (await postJson("/api/gauge/market", body)).json();
             govMsg("gaAdminMsg", r.ok ? `Listed. — ${r.txHash}` : (r.error || "failed"),
               r.ok ? "var(--good)" : "var(--warn)");
-            if (r.ok) { $("gaNewLabel").value = ""; loadGauge(); }
+            if (r.ok) { $("gaNewLabel").value = ""; loadGauge(true); }
           } catch { govMsg("gaAdminMsg", "Request failed.", "var(--warn)"); }
         });
       }
@@ -8615,6 +8716,7 @@ const $ = (id) => document.getElementById(id);
       async function setEmissionsPaused(which, paused) {
         const url = which === "lp" ? "/api/amm/emissions/pause" : "/api/lending/emissions/pause";
         try {
+          showBusy("govPauseMsg", `${paused ? "Pausing" : "Resuming"} ${which === "lp" ? "liquidity" : "lending"} emissions…`);
           const r = await (await postJson(url, { paused })).json();
           govMsg("govPauseMsg",
             r.ok
@@ -8648,8 +8750,8 @@ const $ = (id) => document.getElementById(id);
           await selfCustody("govDelegateMsg", typed ? `delegate to ${typed.slice(0, 10)}…` : "delegate to yourself",
             async (from, cfg) => sendTx(from, cfg.token, callData(cfg.selectors.govDelegate, encAddr(typed || from))),
           );
-          loadGovernance();
-          loadGauge();
+          loadGovernance(true);
+          loadGauge(true);
         });
       }
 
@@ -8878,12 +8980,12 @@ const $ = (id) => document.getElementById(id);
         const r = window.__feeCredit;
         if (!r) return;
         if (!selfMode()) {
-          govMsg("feeMsg", "Credit is bought out of your own wallet, so this needs it. " +
+          govMsg("feeCreditMsg", "Credit is bought out of your own wallet, so this needs it. " +
             "Switch on \"Use my own wallet\".", "var(--warn)");
           return;
         }
         const parsed = parseAmount($("feeAmount").value, 6);
-        if (!parsed.raw) { govMsg("feeMsg", parsed.error || "Enter an amount.", "var(--warn)"); return; }
+        if (!parsed.raw) { govMsg("feeCreditMsg", parsed.error || "Enter an amount.", "var(--warn)"); return; }
         const cfgAll = await loadDefiConfig();
         const asset = inTsra ? cfgAll.token : cfgAll.usdc;
         // What has to be approved differs by route: USDC is credited at par, so
@@ -8892,10 +8994,10 @@ const $ = (id) => document.getElementById(id);
         let approve = BigInt(parsed.raw);
         if (inTsra) {
           const q = await (await fetch(`/api/fees/quote?credit=${parsed.raw}`)).json();
-          if (!q.ok) { govMsg("feeMsg", q.error || "Could not price that in TSRA.", "var(--warn)"); return; }
+          if (!q.ok) { govMsg("feeCreditMsg", q.error || "Could not price that in TSRA.", "var(--warn)"); return; }
           approve = BigInt(q.costRaw);
         }
-        await selfCustody("feeMsg", `buy ${$("feeAmount").value} USDC of credit`, async (from, cfg) => {
+        await selfCustody("feeCreditMsg", `buy ${$("feeAmount").value} USDC of credit`, async (from, cfg) => {
           await ensureAllowance(from, asset, cfg.serviceFees, approve);
           return sendTx(from, cfg.serviceFees, callData(
             inTsra ? cfg.selectors.feeTopUpTsra : cfg.selectors.feeTopUpUsdc, encUint(parsed.raw),
@@ -8907,13 +9009,13 @@ const $ = (id) => document.getElementById(id);
       if ($("feeBuyUsdc")) $("feeBuyUsdc").addEventListener("click", () => buyCredit(false));
       if ($("feeBuyTsra")) $("feeBuyTsra").addEventListener("click", () => buyCredit(true));
 
-      if ($("feeWithdraw")) {
-        $("feeWithdraw").addEventListener("click", async () => {
+      if ($("feeCreditWithdraw")) {
+        $("feeCreditWithdraw").addEventListener("click", async () => {
           if (!selfMode()) {
-            govMsg("feeMsg", "A refund goes back to the address that paid — switch on \"Use my own wallet\".", "var(--warn)");
+            govMsg("feeCreditMsg", "A refund goes back to the address that paid — switch on \"Use my own wallet\".", "var(--warn)");
             return;
           }
-          await selfCustody("feeMsg", "take back your unspent credit", async (from, cfg) =>
+          await selfCustody("feeCreditMsg", "take back your unspent credit", async (from, cfg) =>
             sendTx(from, cfg.serviceFees, callData(cfg.selectors.feeWithdraw)),
           );
           loadFeeCredit();
@@ -8925,6 +9027,7 @@ const $ = (id) => document.getElementById(id);
           const tokensPerDollar = ($("feeRateTokens").value || "").trim();
           const discountBps = Number(($("feeRateDiscount").value || "0").trim());
           try {
+            showBusy("feeAdminMsg", "Setting the credit rate…");
             const r = await (await postJson("/api/fees/rate", { tokensPerDollar, discountBps })).json();
             govMsg("feeAdminMsg", r.ok ? `Rate set — credit already bought keeps the value it was bought at. ${r.txHash}` : (r.error || "failed"),
               r.ok ? "var(--good)" : "var(--warn)");
@@ -8939,6 +9042,7 @@ const $ = (id) => document.getElementById(id);
           const parsed = parseAmount($("feeChargeAmount").value, 6);
           if (!parsed.raw) { govMsg("feeAdminMsg", parsed.error || "Enter an amount.", "var(--warn)"); return; }
           try {
+            showBusy("feeAdminMsg", "Charging the account…");
             const r = await (await postJson("/api/fees/charge", {
               user, amount: parsed.raw, memo: ($("feeChargeMemo").value || "agent services").trim(),
             })).json();
@@ -8975,6 +9079,9 @@ const $ = (id) => document.getElementById(id);
         const m = $("allowanceMsg");
         if (!m) return;
         m.style.display = "block"; m.textContent = text; m.style.color = colour || "var(--muted)";
+        // The result usually replaces a spinner; a line that still claims
+        // aria-busy after settling reads as loading forever.
+        m.removeAttribute("aria-busy");
       }
 
       async function loadAllowances() {
@@ -9274,13 +9381,28 @@ const $ = (id) => document.getElementById(id);
       }
 
       /* ---- lending-reserve administration --------------------------------- */
-      function cfgLnMsg(text, good) {
-        const row = $("cfgLnMsg");
+      /**
+       * A status line in a settings drawer.
+       *
+       * The row is two cells: an icon slot and the words. In flight it holds a
+       * turning ring in the muted colour, because an admin action here sends a
+       * transaction and "Sending…" alone, on a screen that is not moving, reads
+       * as something that already finished.
+       */
+      function cfgRowMsg(id, text, good, busy) {
+        const row = $(id);
         if (!row) return;
         row.style.display = "flex";
-        row.style.color = good ? "var(--good)" : "var(--warn)";
+        row.style.color = busy ? "var(--muted)" : good ? "var(--good)" : "var(--warn)";
+        if (row.firstElementChild !== row.lastElementChild) {
+          row.firstElementChild.innerHTML = busy ? '<span class="spin" aria-hidden="true"></span>' : "";
+        }
         row.lastElementChild.textContent = text;
+        if (busy) row.setAttribute("aria-busy", "true");
+        else row.removeAttribute("aria-busy");
       }
+
+      function cfgLnMsg(text, good, busy) { cfgRowMsg("cfgLnMsg", text, good, busy); }
       const cfgLnAssets = () => (window.__lending && window.__lending.assets) || [];
       function renderCfgLending() {
         const sel = $("cfgLnAsset");
@@ -9317,7 +9439,7 @@ const $ = (id) => document.getElementById(id);
         const freeze = async (actions) => {
           const asset = $("cfgLnAsset").value;
           if (!asset) { cfgLnMsg("Pick a reserve first.", false); return; }
-          cfgLnMsg("Sending…", true);
+          cfgLnMsg("Sending…", true, true);
           try {
             const r = await (await postJson("/api/lending/admin/freeze", { asset, actions })).json();
             cfgLnMsg(
@@ -9350,7 +9472,7 @@ const $ = (id) => document.getElementById(id);
           const cur = cfgLnAssets().find((a) => a.address === asset);
           const name = prompt("Display name for this reserve (blank restores the token symbol):", cur ? cur.symbol : "");
           if (name === null) return;
-          cfgLnMsg("Sending…", true);
+          cfgLnMsg("Sending…", true, true);
           try {
             const r = await (await postJson("/api/lending/admin/rename", { asset, name: name.trim() })).json();
             cfgLnMsg(r.ok ? "Renamed ✓" : r.error, !!r.ok);
@@ -9359,7 +9481,7 @@ const $ = (id) => document.getElementById(id);
         });
 
         const visibility = async (hidden) => {
-          cfgLnMsg("Sending…", true);
+          cfgLnMsg("Sending…", true, true);
           try {
             const r = await (
               await postJson("/api/lending/admin/visibility", { asset: $("cfgLnAsset").value, hidden })
@@ -9379,7 +9501,7 @@ const $ = (id) => document.getElementById(id);
         $("cfgLnShow").addEventListener("click", () => visibility(false));
 
         const oracle = async (feed) => {
-          cfgLnMsg("Sending…", true);
+          cfgLnMsg("Sending…", true, true);
           try {
             const r = await (
               await postJson("/api/lending/admin/oracle", {
@@ -9405,13 +9527,7 @@ const $ = (id) => document.getElementById(id);
        * these operations move real money to real people, and an accidental
        * "Return funds" on the wrong record is not something you can take back. */
       let historyState = { records: [], current: {} };
-      function cfgHiMsg(text, good) {
-        const row = $("cfgHiMsg");
-        if (!row) return;
-        row.style.display = "flex";
-        row.style.color = good ? "var(--good)" : "var(--warn)";
-        row.lastElementChild.textContent = text;
-      }
+      function cfgHiMsg(text, good, busy) { cfgRowMsg("cfgHiMsg", text, good, busy); }
       const cfgHiPicked = () => [...document.querySelectorAll(".cfgHiPick:checked")].map((c) => c.value);
       const cfgHiOne = () => {
         const ids = cfgHiPicked();
@@ -9469,6 +9585,7 @@ const $ = (id) => document.getElementById(id);
           const address = $("cfgHiAddress").value.trim();
           if (!/^0x[0-9a-fA-F]{40}$/.test(address)) { cfgHiMsg("Enter the contract address.", false); return; }
           cfgHiMsg("Scanning the contract for holders — this reads event logs, so give it a moment…", true);
+          cfgHiMsg("Scanning the contract for holders…", true, true);
           try {
             const r = await (
               await postJson("/api/history/archive", {
@@ -9493,6 +9610,7 @@ const $ = (id) => document.getElementById(id);
           const rec = cfgHiOne();
           if (!rec) return;
           cfgHiMsg("Re-reading balances from chain…", true);
+          cfgHiMsg("Re-reading balances…", true, true);
           try {
             const r = await (await postJson(`/api/history/${rec.id}/refresh`, {})).json();
             cfgHiMsg(r.ok ? `Refreshed ✓ — ${r.record.outstandingCount} holder(s) outstanding` : r.error, !!r.ok);
@@ -9503,6 +9621,7 @@ const $ = (id) => document.getElementById(id);
         $("cfgHiActivate").addEventListener("click", async () => {
           const rec = cfgHiOne();
           if (!rec) return;
+          cfgHiMsg("Switching the app over…", true, true);
           try {
             const r = await (await postJson(`/api/history/${rec.id}/activate`, {})).json();
             cfgHiMsg(r.ok ? r.note : r.error, !!r.ok);
@@ -9520,7 +9639,7 @@ const $ = (id) => document.getElementById(id);
                 `says they hold. Balances are re-read first. This spends real money and cannot be undone.`,
             )
           ) return;
-          cfgHiMsg("Re-reading balances, then paying out…", true);
+          cfgHiMsg("Re-reading balances, then paying out…", true, true);
           try {
             const r = await (await postJson(`/api/history/${rec.id}/return`, {})).json();
             if (!r.ok) { cfgHiMsg(r.error, false); return; }
@@ -9549,7 +9668,7 @@ const $ = (id) => document.getElementById(id);
                 `nothing here moves their existing position.`,
             )
           ) return;
-          cfgHiMsg("Migrating…", true);
+          cfgHiMsg("Migrating…", true, true);
           try {
             const r = await (await postJson(`/api/history/${rec.id}/migrate`, { target })).json();
             if (!r.ok) { cfgHiMsg(r.error, false); return; }
@@ -9571,6 +9690,7 @@ const $ = (id) => document.getElementById(id);
           if (ids.length < 2) { cfgHiMsg("Tick at least two records of the same kind to merge.", false); return; }
           const label = prompt("Name for the merged record:", "Merged records");
           if (label === null) return;
+          cfgHiMsg("Merging the records…", true, true);
           try {
             const r = await (await postJson("/api/history/merge", { ids, label })).json();
             cfgHiMsg(r.ok ? "Merged ✓" : r.error, !!r.ok);
@@ -9589,6 +9709,7 @@ const $ = (id) => document.getElementById(id);
           if (raw === null) return;
           const addresses = raw.split(/[\s,]+/).filter(Boolean);
           if (!addresses.length) { cfgHiMsg("No addresses given.", false); return; }
+          cfgHiMsg("Splitting the record…", true, true);
           try {
             const r = await (await postJson(`/api/history/${rec.id}/split`, { addresses })).json();
             cfgHiMsg(r.ok ? `Split off ${r.record.holderCount} holder(s) ✓` : r.error, !!r.ok);
@@ -9610,6 +9731,7 @@ const $ = (id) => document.getElementById(id);
                 : `Delete ${ids.length} record(s)?`,
             )
           ) return;
+          cfgHiMsg("Deleting…", true, true);
           try {
             const r = await (await postJson("/api/history/delete", { ids })).json();
             cfgHiMsg(r.ok ? `Deleted ${r.removed} ✓` : r.error, !!r.ok);
@@ -9626,7 +9748,7 @@ const $ = (id) => document.getElementById(id);
                 `The app keeps using the existing ${kind} until you restart it.`,
             )
           ) return;
-          cfgHiMsg(`Archiving the current ${kind}, then deploying…`, true);
+          cfgHiMsg(`Archiving the current ${kind}, then deploying…`, true, true);
           try {
             const r = await (await postJson("/api/admin/deploy", { kind })).json();
             cfgHiMsg(r.ok ? r.note : r.error, !!r.ok);
@@ -9636,6 +9758,7 @@ const $ = (id) => document.getElementById(id);
 
         $("cfgHiDeleteAll").addEventListener("click", async () => {
           if (!confirm("Delete every history record, including any with funds still outstanding?")) return;
+          cfgHiMsg("Deleting every record…", true, true);
           try {
             const r = await (await postJson("/api/history/delete", { all: true })).json();
             cfgHiMsg(r.ok ? `Deleted ${r.removed} ✓` : r.error, !!r.ok);
@@ -9646,13 +9769,7 @@ const $ = (id) => document.getElementById(id);
 
       /* ---- notice authoring ------------------------------------------------ */
       const NOTICE_UNITS = { second: 1, minute: 60, hour: 3600, day: 86400, week: 604800 };
-      function cfgNoMsg(text, good) {
-        const row = $("cfgNoMsg");
-        if (!row) return;
-        row.style.display = "flex";
-        row.style.color = good ? "var(--good)" : "var(--warn)";
-        row.lastElementChild.textContent = text;
-      }
+      function cfgNoMsg(text, good, busy) { cfgRowMsg("cfgNoMsg", text, good, busy); }
       async function loadCfgNotices() {
         const host = $("cfgNoList");
         if (!host) return;
@@ -9700,7 +9817,7 @@ const $ = (id) => document.getElementById(id);
             repeatSeconds: repeat,
             endAt: $("cfgNoEnd").value ? Date.parse($("cfgNoEnd").value) : 0,
           };
-          cfgNoMsg("Publishing…", true);
+          cfgNoMsg("Publishing…", true, true);
           try {
             const r = await (await postJson("/api/notices", body)).json();
             cfgNoMsg(r.ok ? "Published ✓" : r.error, !!r.ok);
@@ -9711,6 +9828,7 @@ const $ = (id) => document.getElementById(id);
         $("cfgNoDeleteSel").addEventListener("click", async () => {
           const ids = [...document.querySelectorAll(".cfgNoPick:checked")].map((c) => c.value);
           if (!ids.length) { cfgNoMsg("Tick the notices to delete.", false); return; }
+          cfgNoMsg("Deleting…", true, true);
           try {
             const r = await (await postJson("/api/notices/delete", { ids })).json();
             cfgNoMsg(r.ok ? `Deleted ${r.removed} ✓` : r.error, !!r.ok);
@@ -9719,6 +9837,7 @@ const $ = (id) => document.getElementById(id);
         });
         $("cfgNoDeleteAll").addEventListener("click", async () => {
           if (!confirm("Delete every notice, including scheduled ones?")) return;
+          cfgNoMsg("Deleting every notice…", true, true);
           try {
             const r = await (await postJson("/api/notices/delete", { all: true })).json();
             cfgNoMsg(r.ok ? `Deleted ${r.removed} ✓` : r.error, !!r.ok);
@@ -9731,13 +9850,7 @@ const $ = (id) => document.getElementById(id);
        * Fee retuning is deliberately a separate button from "Save": it is an
        * on-chain, per-pool change, and burying it in the global save would make
        * it far too easy to retune every pool by accident. */
-      function cfgAmmMsg(text, good) {
-        const row = $("cfgAmmMsg");
-        if (!row) return;
-        row.style.display = "flex";
-        row.style.color = good ? "var(--good)" : "var(--warn)";
-        row.lastElementChild.textContent = text;
-      }
+      function cfgAmmMsg(text, good, busy) { cfgRowMsg("cfgAmmMsg", text, good, busy); }
       function renderCfgAmm() {
         const pools = amPools();
         const sel = $("cfgAmmPools");
@@ -9770,7 +9883,7 @@ const $ = (id) => document.getElementById(id);
           cfgAmmMsg("Providers always keep at least 50% — the contract rejects less.", false);
           return;
         }
-        cfgAmmMsg("Sending…", true);
+        cfgAmmMsg("Sending…", true, true);
         try {
           const r = await (
             await postJson("/api/amm/admin/configure", {
@@ -9797,7 +9910,7 @@ const $ = (id) => document.getElementById(id);
         const freeze = async (frozen) => {
           const [poolId] = cfgAmmSelectedIds();
           if (poolId === undefined) { cfgAmmMsg("Select a pool first.", false); return; }
-          cfgAmmMsg("Sending…", true);
+          cfgAmmMsg("Sending…", true, true);
           try {
             const r = await (await postJson("/api/amm/admin/freeze", { poolId, frozen })).json();
             cfgAmmMsg(
@@ -9818,7 +9931,7 @@ const $ = (id) => document.getElementById(id);
           const current = amPools().find((p) => p.id === poolId);
           const name = prompt("New name for this pool:", current ? current.name : "");
           if (name === null) return;
-          cfgAmmMsg("Sending…", true);
+          cfgAmmMsg("Sending…", true, true);
           try {
             const r = await (await postJson("/api/amm/admin/rename", { poolId, name: name.trim() })).json();
             cfgAmmMsg(r.ok ? "Renamed ✓" : r.error, !!r.ok);
@@ -9829,7 +9942,7 @@ const $ = (id) => document.getElementById(id);
         $("cfgAmmCreate").addEventListener("click", async () => {
           const assets = [...$("cfgAmmNewAssets").selectedOptions].map((o) => o.value);
           if (assets.length < 2) { cfgAmmMsg("Pick at least two assets.", false); return; }
-          cfgAmmMsg("Deploying pool…", true);
+          cfgAmmMsg("Deploying pool…", true, true);
           try {
             const r = await (
               await postJson("/api/amm/admin/create", {
@@ -10540,8 +10653,7 @@ const $ = (id) => document.getElementById(id);
 
         sellState.busy = true;
         $("sellRun").disabled = true;
-        out.style.display = "";
-        out.textContent = "Requesting a quote, escrowing on Arc, collecting… this is three transactions, give it a moment.";
+        showBusy("sellOut", "Requesting a quote, escrowing on Arc, collecting… this is three transactions, give it a moment.");
         try {
           const res = await postAuthed("/api/services/try?" + qs.toString());
           const r = await res.json();
@@ -10640,8 +10752,9 @@ const $ = (id) => document.getElementById(id);
         agTimer = null;
         const load = AG_LOADERS[tab];
         if (!load) return;
-        if (tab === "news") loadNewsTopics().then(load);
-        else if (!opts || opts.load !== false) load();
+        const pane = AG_PANES[tab];
+        if (tab === "news") withPaneBusy(pane, () => loadNewsTopics().then(load)).catch(() => {});
+        else if (!opts || opts.load !== false) withPaneBusy(pane, load).catch(() => {});
         // Only the visible tab polls.
         const every = AG_REFRESH[tab];
         if (every) {
@@ -11149,7 +11262,7 @@ const $ = (id) => document.getElementById(id);
             maxVisibleReserves: Math.max(0, parseInt($("cfgMaxReserves").value || "0", 10)),
             maxVisibleAmmPools: Math.max(0, parseInt($("cfgMaxAmmPools").value || "0", 10)),
           };
-          msg.style.display = "block";
+          showBusy("cfgMsg", "Saving, and pushing what belongs on-chain…");
           try {
             const r = await (await postAuthed("/api/app-config", {
               headers: { "content-type": "application/json" },

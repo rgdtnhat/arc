@@ -63,8 +63,15 @@ const ctx = await browser.newContext();
 const page = await ctx.newPage();
 
 let current = "(startup)";
+/*
+ * Set while a check deliberately opens panes a signed-out visitor's own
+ * navigation never would. Those panes read endpoints that require a session,
+ * so they answer 401 — correctly — and the browser logs it. Counting that as a
+ * failure would mean the check could only ever pass by not doing its job.
+ */
+let muteConsole = false;
 page.on("console", (m) => {
-  if (m.type() !== "error") return;
+  if (m.type() !== "error" || muteConsole) return;
   const text = m.text();
   if (BENIGN.some((r) => r.test(text))) return;
   note(current, `console error — ${text.slice(0, 200)}`);
@@ -255,6 +262,48 @@ if (await builder.count()) {
     console.log("  builder hidden (not signed in as operator)");
   }
 }
+
+/*
+ * Does every pane stop saying it is loading?
+ *
+ * Each sub-tab puts a spinner strip up while its reads are in flight and takes
+ * it down when they settle. A loader that throws before its clear-up, or one
+ * that resolves a promise nobody awaited, leaves that strip up forever — a page
+ * that looks permanently stuck while the data underneath it is fine. Every
+ * other check here is blind to that, because the content renders correctly.
+ *
+ * Runs last, and only over tabs a signed-out visitor can actually see: the same
+ * rule the governance tabs follow above. Clicking into an operator-only pane
+ * would fire its gated reads and report the resulting 401s as console errors,
+ * which says nothing about whether a spinner clears.
+ *
+ * The clicks are dispatched rather than pressed because several of these docks
+ * scroll off this viewport and Playwright will not click what it cannot see.
+ * The handler under test is the same either way.
+ */
+current = "pane spinners";
+muteConsole = true;
+for (const [route, attr] of [["gov", "govtab"], ["defi", "defitab"], ["wallet", "wallettab"], ["agents", "agtab"]]) {
+  await page.goto(`${BASE}/#/${route}`, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1200);
+  const tabs = await page.locator(`[data-${attr}]`).evaluateAll((els, a) =>
+    els.filter((e) => e.offsetParent !== null).map((e) => e.dataset[a]), attr);
+  for (const tab of tabs) {
+    await page.evaluate(([a, v]) => document.querySelector(`[data-${a}="${v}"]`)?.click(), [attr, tab]);
+    /*
+     * 45 seconds, which is generous on purpose. The fee pane's first load waits
+     * on a one-off pass over the collector's whole history, and a strip that is
+     * up because the read really is still running is the strip working. Only a
+     * strip that outlives its read is the bug.
+     */
+    let left = 90;
+    while (left-- > 0 && (await page.locator(".paneBusy:visible").count())) await page.waitForTimeout(500);
+    if (await page.locator(".paneBusy:visible").count()) {
+      note("pane spinners", `${route}/${tab} was still showing its loading strip after 45s`);
+    }
+  }
+}
+muteConsole = false;
 
 await browser.close();
 

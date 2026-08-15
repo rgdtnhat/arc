@@ -8384,10 +8384,47 @@ async function main() {
    * two implementations of "the top three" is how a page ends up promising a
    * market an emission it never receives.
    */
+  /**
+   * The governance reads, cached for a few seconds each.
+   *
+   * `/api/gauge` and `/api/governance` are loops of contract calls — two to
+   * four seconds each against the public RPC — and the governance pane asks
+   * for them on every tab switch and every twenty-second poll, per viewer. The
+   * emissions endpoints have had a cache for exactly this reason and these did
+   * not, which is why that pane felt slow when the ones beside it did not.
+   *
+   * Short, and cleared by anything that writes: a vote or an applied epoch
+   * changes what these report, and a stale answer after your own transaction
+   * is the one kind of staleness people actually notice.
+   */
+  const govCache = new Map<string, { at: number; body: unknown }>();
+  const GOV_TTL = live ? 10_000 : 500;
+  /** True when the caller asked for `?fresh=1`. */
+  const wantsFresh = (q: unknown): boolean =>
+    String((q as Record<string, unknown> | undefined)?.fresh ?? "") !== "";
+  const govCached = (key: string, fresh?: boolean): unknown | null => {
+    // A caller that just wrote asks for `?fresh=1`. Votes are signed in the
+    // browser and never touch this process, so the write path cannot clear the
+    // cache itself — the page that made the transaction says so instead.
+    if (fresh) return null;
+    const hit = govCache.get(key);
+    return hit && Date.now() - hit.at < GOV_TTL ? hit.body : null;
+  };
+  const govStore = (key: string, body: unknown) => {
+    if (govCache.size > 64) govCache.clear();
+    govCache.set(key, { at: Date.now(), body });
+    return body;
+  };
+  const govInvalidate = () => govCache.clear();
+
   app.get("/api/gauge", async (req, res) => {
     if (!gaugeAddr) {
       res.json({ ok: true, deployed: false, note: "No gauge on this deployment." });
       return;
+    }
+    {
+      const hit = govCached(`gauge:${String(req.query.user ?? "")}`, wantsFresh(req.query));
+      if (hit) { res.json(hit); return; }
     }
     try {
       const user = String(req.query.user ?? "");
@@ -8409,13 +8446,6 @@ async function main() {
           read<boolean>("everApplied"),
         ]);
 
-      const [total, zone, rates, epochEnd] = await Promise.all([
-        read<bigint>("totalVotes", [epoch]),
-        read<readonly bigint[]>("rewardZone", [epoch]),
-        read<readonly bigint[]>("ratesFor", [epoch]),
-        read<bigint>("epochEnd", [epoch]),
-      ]);
-
       /*
        * What one TSRA is taken to be worth, for the incentive APR only.
        *
@@ -8423,24 +8453,52 @@ async function main() {
        * reference rate — the same number the protocol charges against. It is a
        * parameter and not a price, so every figure derived from it is labelled
        * as such and is null when no rate is set.
+       *
+       * Started here rather than awaited in place: it depends on nothing above
+       * it, and a read that waits its turn for no reason is a round trip added
+       * to every load of this page.
        */
-      let tsraReferenceUsd = 0;
-      if (serviceFeesAddr) {
-        const perCredit = await client.public
-          .readContract({
-            address: serviceFeesAddr, abi: tesseraServiceFeesAbi, functionName: "quoteTsra", args: [1_000_000n],
-          })
-          .then((v) => v as bigint)
-          .catch(() => 0n);
-        // `quoteTsra(1 USDC)` is discounted TSRA per dollar; invert it.
-        if (perCredit > 0n) tsraReferenceUsd = 1 / (Number(perCredit) / 1e18);
-      }
-      const inZone = new Set(zone.map((z) => Number(z)));
-
-      const rewardMeta = await tokenMeta(
+      const tsraP = serviceFeesAddr
+        ? client.public
+            .readContract({
+              address: serviceFeesAddr, abi: tesseraServiceFeesAbi, functionName: "quoteTsra", args: [1_000_000n],
+            })
+            .then((v) => v as bigint)
+            .catch(() => 0n)
+        : Promise.resolve(0n);
+      const rewardMetaP = tokenMeta(
         (liveDeployment.tesseraToken as Hex) ?? ("0x0000000000000000000000000000000000000000" as Hex),
       );
-      const markets = await Promise.all(
+      const delegateCountP = read<bigint>("delegateCount").catch(() => 0n);
+
+      const [total, zone, rates, epochEnd, perCredit, rewardMeta] = await Promise.all([
+        read<bigint>("totalVotes", [epoch]),
+        read<readonly bigint[]>("rewardZone", [epoch]),
+        read<readonly bigint[]>("ratesFor", [epoch]),
+        read<bigint>("epochEnd", [epoch]),
+        tsraP,
+        rewardMetaP,
+      ]);
+
+      // `quoteTsra(1 USDC)` is discounted TSRA per dollar; invert it.
+      const tsraReferenceUsd = perCredit > 0n ? 1 / (Number(perCredit) / 1e18) : 0;
+      const inZone = new Set(zone.map((z) => Number(z)));
+      /*
+       * The reader's own weight does not depend on the market list, so it is
+       * asked for while the list is being assembled rather than after it.
+       */
+      const youReadsP = who
+        ? Promise.all([
+            read<bigint>("availableWeight", [who]),
+            liveDeployment.tesseraToken
+              ? (client.public.readContract({
+                  address: liveDeployment.tesseraToken as Hex, abi: tesseraTokenAbi, functionName: "getVotes", args: [who],
+                }) as Promise<bigint>)
+              : Promise.resolve(0n),
+          ])
+        : Promise.resolve(null);
+
+      const marketsP = Promise.all(
         Array.from({ length: Number(count) }, (_, i) => BigInt(i)).map(async (id) => {
           const [m, votes, mine, bribeCount, voters, eligible, assets] = await Promise.all([
             read<readonly [number, Hex, number, bigint, boolean, string]>("markets", [id]),
@@ -8454,17 +8512,22 @@ async function main() {
           const bribes = await Promise.all(
             Array.from({ length: Number(bribeCount) }, (_, i) => BigInt(i)).map(async (i) => {
               const b = await read<readonly [Hex, bigint, bigint, Hex]>("bribeAt", [epoch, id, i]);
-              const meta = await tokenMeta(b[0]);
-              const share = who ? await read<bigint>("bribeShare", [epoch, id, i, who]) : 0n;
-              // Value it at the pool's own mark, which is the mark everything
-              // else on this page is quoted at. An asset the pool cannot price
-              // contributes nothing rather than a guess.
-              const px = poolDeployment
-                ? await client.public
-                    .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [b[0]] })
-                    .then((v) => v as bigint)
-                    .catch(() => 0n)
-                : 0n;
+              // The token's metadata, the reader's share and the mark are three
+              // independent reads of the same bribe. Chained, they were three
+              // round trips per incentive per market.
+              const [meta, share, px] = await Promise.all([
+                tokenMeta(b[0]),
+                who ? read<bigint>("bribeShare", [epoch, id, i, who]) : Promise.resolve(0n),
+                // Value it at the pool's own mark, which is the mark everything
+                // else on this page is quoted at. An asset the pool cannot price
+                // contributes nothing rather than a guess.
+                poolDeployment
+                  ? client.public
+                      .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "price", args: [b[0]] })
+                      .then((v) => v as bigint)
+                      .catch(() => 0n)
+                  : Promise.resolve(0n),
+              ]);
               return {
                 index: Number(i),
                 token: b[0],
@@ -8520,16 +8583,11 @@ async function main() {
         }),
       );
 
+      const [markets, youReads, delegateCount] = await Promise.all([marketsP, youReadsP, delegateCountP]);
+
       let you: Record<string, unknown> | null = null;
-      if (who) {
-        const [available, votes] = await Promise.all([
-          read<bigint>("availableWeight", [who]),
-          (liveDeployment.tesseraToken
-            ? (client.public.readContract({
-                address: liveDeployment.tesseraToken as Hex, abi: tesseraTokenAbi, functionName: "getVotes", args: [who],
-              }) as Promise<bigint>)
-            : Promise.resolve(0n)),
-        ]);
+      if (who && youReads) {
+        const [available, votes] = youReads;
         const used = markets.reduce((t, m) => t + BigInt(m.yourVotesRaw), 0n);
         you = {
           address: who,
@@ -8542,7 +8600,6 @@ async function main() {
 
       // The directory. Voting power is read live from the token, so an entry
       // shows what somebody would actually vote with rather than a claim.
-      const delegateCount = await read<bigint>("delegateCount").catch(() => 0n);
       const delegates = await Promise.all(
         Array.from({ length: Number(delegateCount) }, (_, i) => BigInt(i)).map(async (i) => {
           const dgt = await read<readonly [Hex, string, string, boolean]>("delegates", [i]);
@@ -8566,7 +8623,7 @@ async function main() {
         }),
       );
 
-      res.json({
+      res.json(govStore(`gauge:${String(req.query.user ?? "")}`, {
         ok: true,
         deployed: true,
         address: gaugeAddr,
@@ -8593,7 +8650,7 @@ async function main() {
         },
         markets,
         you,
-      });
+      }));
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -8608,6 +8665,7 @@ async function main() {
       const lending = BigInt(String(req.body?.lendingPerSecond ?? "0"));
       const amm = BigInt(String(req.body?.ammPerSecond ?? "0"));
       const txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "setBudget", [lending, amm]);
+      govInvalidate();
       logTx(req, {
         category: "defi", action: "gauge-budget", status: "success", txHash,
         detail: `lending ${lending}/s, amm ${amm}/s`,
@@ -8628,6 +8686,7 @@ async function main() {
         return;
       }
       const txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "setRewardZoneSize", [size]);
+      govInvalidate();
       logTx(req, { category: "defi", action: "gauge-zone", status: "success", txHash, detail: String(size) });
       res.json({ ok: true, txHash });
     } catch (e) {
@@ -8660,6 +8719,7 @@ async function main() {
         if (!/^0x[0-9a-fA-F]{40}$/.test(asset)) { res.status(400).json({ ok: false, error: "bad asset" }); return; }
         txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "addLendingMarket", [asset, side, label]);
       }
+      govInvalidate();
       logTx(req, { category: "defi", action: "gauge-market", status: "success", txHash, detail: label });
       res.json({ ok: true, txHash });
     } catch (e) {
@@ -8675,6 +8735,7 @@ async function main() {
       const id = BigInt(String(req.body?.id ?? "0"));
       const active = Boolean(req.body?.active);
       const txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "setMarketActive", [id, active]);
+      govInvalidate();
       logTx(req, {
         category: "defi", action: "gauge-market-active", status: "success", txHash,
         detail: `${id} ${active ? "active" : "retired"}`,
@@ -8699,6 +8760,7 @@ async function main() {
     try {
       const epoch = BigInt(String(req.body?.epoch ?? "0"));
       const txHash = await owner.write(gaugeAddr, tesseraGaugeAbi, "applyEpoch", [epoch]);
+      govInvalidate();
       logTx(req, { category: "defi", action: "gauge-apply", status: "success", txHash, detail: `epoch ${epoch}` });
       res.json({ ok: true, txHash });
     } catch (e) {
@@ -8725,6 +8787,10 @@ async function main() {
       res.json({ ok: true, deployed: false, note: "No governor on this deployment." });
       return;
     }
+    {
+      const hit = govCached(`gov:${String(req.query.user ?? "")}`, wantsFresh(req.query));
+      if (hit) { res.json(hit); return; }
+    }
     try {
       const user = String(req.query.user ?? "");
       const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
@@ -8733,11 +8799,18 @@ async function main() {
       const T2 = <T,>(fn: string, args: unknown[] = []) =>
         client.public.readContract({ address: tokenAddr, abi: tesseraTokenAbi, functionName: fn as never, args: args as never }) as Promise<T>;
 
-      const [count, circulating, quorum, symbol, decimals] = await Promise.all([
+      /*
+       * Everything that does not depend on anything else goes out at once.
+       *
+       * `quorumBps` used to be awaited on its own line after this batch, which
+       * cost a whole round trip to a public RPC for a number nothing was
+       * waiting on. Depth is what makes this endpoint slow — not the number of
+       * calls — so each independent read joins the batch it could have been in.
+       */
+      const [count, circulating, quorum, symbol, decimals, quorumBps] = await Promise.all([
         G<bigint>("proposalCount"), G<bigint>("circulatingSupply"), G<bigint>("quorumVotes"),
-        T2<string>("symbol"), T2<number>("decimals"),
+        T2<string>("symbol"), T2<number>("decimals"), G<number>("quorumBps").catch(() => 0),
       ]);
-      const quorumBps = await G<number>("quorumBps").catch(() => 0);
       const dec = Number(decimals);
       const fmtT = (v: bigint) => fmtUnits(v, dec);
 
@@ -8747,17 +8820,18 @@ async function main() {
       const ids: number[] = [];
       for (let i = total - 1; i >= 0 && ids.length < 25; i--) ids.push(i);
 
-      const proposals = await Promise.all(
+      const proposalsP = Promise.all(
         ids.map(async (id) => {
-          const p = (await G<readonly unknown[]>("proposalInfo", [BigInt(id)])) as readonly [
+          // The reader's weight on a proposal does not depend on the proposal
+          // being read first, so it goes out in the same round.
+          const [info, mine, voted] = await Promise.all([
+            G<readonly unknown[]>("proposalInfo", [BigInt(id)]),
+            who ? G<bigint>("votingPowerFor", [BigInt(id), who]) : Promise.resolve(0n),
+            who ? G<boolean>("hasVoted", [BigInt(id), who]) : Promise.resolve(false),
+          ]);
+          const p = info as readonly [
             Hex, bigint, bigint, bigint, bigint, bigint, bigint, bigint, number, string, string, bigint,
           ];
-          const [mine, voted] = who
-            ? await Promise.all([
-                G<bigint>("votingPowerFor", [BigInt(id), who]),
-                G<boolean>("hasVoted", [BigInt(id), who]),
-              ])
-            : [0n, false];
           const cast = p[5] + p[6] + p[7];
           return {
             id,
@@ -8786,13 +8860,14 @@ async function main() {
         }),
       );
 
-      const yours = who
-        ? await Promise.all([T2<bigint>("balanceOf", [who]), T2<bigint>("getVotes", [who]), T2<Hex>("delegates", [who])])
-        : [0n, 0n, "0x0000000000000000000000000000000000000000" as Hex];
+      const yoursP = who
+        ? Promise.all([T2<bigint>("balanceOf", [who]), T2<bigint>("getVotes", [who]), T2<Hex>("delegates", [who])])
+        : Promise.resolve([0n, 0n, "0x0000000000000000000000000000000000000000" as Hex] as const);
 
       // The lock, for the panel underneath.
-      let lock: Record<string, unknown> | null = null;
-      if (emitterAddr2) {
+      const lockP = (async (): Promise<Record<string, unknown> | null> => {
+        let lock: Record<string, unknown> | null = null;
+        if (emitterAddr2) {
         const E = <T,>(fn: string, args: unknown[] = []) =>
           client.public.readContract({ address: emitterAddr2, abi: tesseraEmitterAbi, functionName: fn as never, args: args as never }) as Promise<T>;
         try {
@@ -8802,10 +8877,14 @@ async function main() {
           ]);
           const sinks = await Promise.all(
             Array.from({ length: Number(sinkCount) }, (_, i) => i).map(async (i) => {
-              const sk = (await E<readonly unknown[]>("sinks", [BigInt(i)])) as readonly [Hex, number, bigint, string];
+              const [raw, pending] = await Promise.all([
+                E<readonly unknown[]>("sinks", [BigInt(i)]),
+                E<bigint>("pendingOf", [BigInt(i)]),
+              ]);
+              const sk = raw as readonly [Hex, number, bigint, string];
               return {
                 label: sk[3], to: sk[0], kind: sk[1] === 1 ? "fund" : "send", weight: Number(sk[2]),
-                pending: fmtT(await E<bigint>("pendingOf", [BigInt(i)])),
+                pending: fmtT(pending),
               };
             }),
           );
@@ -8820,9 +8899,18 @@ async function main() {
             sinks,
           };
         } catch { lock = null; }
-      }
+        }
+        return lock;
+      })();
 
-      res.json({
+      /*
+       * Three independent trees: the proposal list, the reader's own balances
+       * and the emitter panel. They used to be awaited one after another, so a
+       * page that needed all three paid for all three in series.
+       */
+      const [proposals, yours, lock] = await Promise.all([proposalsP, yoursP, lockP]);
+
+      res.json(govStore(`gov:${String(req.query.user ?? "")}`, {
         ok: true,
         deployed: true,
         address: governorAddr,
@@ -8835,7 +8923,7 @@ async function main() {
         you: { balance: fmtT(yours[0] as bigint), votes: fmtT(yours[1] as bigint), delegate: yours[2] as Hex },
         proposals,
         lock,
-      });
+      }));
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
     }
@@ -10081,6 +10169,7 @@ async function main() {
         `${draft.body}\n\nOpened from discussion by ${draft.author}.`,
         [], [],
       ]);
+      govInvalidate();
       draft.proposalId = Number(before);
       saveDiscussions();
       logTx(req, {
@@ -10582,6 +10671,7 @@ async function main() {
       const txHash = await owner.write(
         governorAddr, tesseraGovernorAbi, "propose", [title, description, targets, calldatas],
       );
+      govInvalidate();
       logTx(req, {
         category: "defi", action: "gov-propose", status: "success", txHash,
         detail: `${title}${targets.length ? ` (${targets.length} call${targets.length === 1 ? "" : "s"})` : ""}`,
@@ -10837,6 +10927,7 @@ async function main() {
     try {
       const id = BigInt(String(req.body?.id ?? "0"));
       const txHash = await owner.write(governorAddr, tesseraGovernorAbi, "cancel", [id]);
+      govInvalidate();
       logTx(req, { category: "defi", action: "gov-cancel", status: "success", txHash, detail: `#${id}` });
       res.json({ ok: true, txHash });
     } catch (e) {
