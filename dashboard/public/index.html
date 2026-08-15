@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v113" />
+    <meta name="tessera-shell" content="tessera-v114" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2709,13 +2709,13 @@
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">
               A task answers <i>“do this, then”</i>. A series answers <i>“do these, then”</i> — payroll on the 1st, a
               rebalance that supplies before it borrows, a batch of standing orders that should go out together.
-              Every member is an ordinary task that still works on its own; the series only decides when they fire
-              and in what relation to each other.
+              The steps belong to the series and are written here: nothing in the scheduled-task list above can
+              pause one, shorten one, or run one twice.
             </div>
             <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
               <b>One after another</b> waits for each step to finish on chain before starting the next, and stops if
               one fails — for steps that depend on each other. <b>All at once</b> starts every step together and lets
-              the rest finish even if one fails. A paused member is stepped over either way, and named on the
+              the rest finish even if one fails. A step turned off is stepped over either way, and named on the
               receipt. (Two transactions from the same wallet are still ordered by nonce, so “at once” means nobody
               waits for anybody else’s <i>result</i> — not that they land in the same instant.)
             </div>
@@ -2728,8 +2728,22 @@
                   <option value="parallel">All at once</option>
                 </select>
               </div>
-              <div class="kv" style="margin-bottom:5px">Tasks in this series</div>
-              <div id="serPick" style="display:flex;flex-direction:column;gap:5px;margin-bottom:10px"></div>
+              <div class="kv" style="margin-bottom:5px">Steps, in the order they run</div>
+              <div id="serSteps" style="display:flex;flex-direction:column;gap:6px;margin-bottom:9px"></div>
+
+              <div class="menuSep" style="margin:4px 0 9px"></div>
+              <div class="kv" style="margin-bottom:5px" id="stepHead">Add a step</div>
+              <div class="row-actions" style="margin-bottom:7px">
+                <input id="stepName" class="field" placeholder="Step name (optional)" style="min-width:140px;flex:1" />
+                <select id="stepVenue" class="field"></select>
+                <select id="stepAction" class="field"></select>
+              </div>
+              <div class="row-actions" id="stepParamRow" style="margin-bottom:7px;flex-wrap:wrap"></div>
+              <div class="row-actions" style="margin-bottom:11px">
+                <button class="btn" id="stepAdd">Add step</button>
+                <button class="btn" id="stepCancel" style="display:none">Cancel</button>
+                <span id="stepHint" style="font-size:11.5px;color:var(--muted)"></span>
+              </div>
               <div class="row-actions" style="margin-bottom:9px">
                 <select id="serKind" class="field">
                   <option value="manual">Only when I run it</option>

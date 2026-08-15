@@ -327,6 +327,35 @@ routes first (`/delete`, `/merge`, `/archive`, `/mine`, `/transactions`,
 `/repoint`) with an explanatory comment, and the API test suite exercises each
 one.
 
+## One gate for everything that gets scheduled
+
+A scheduled task and a step of a task series ask the same question — *run this
+verb later, with the app's key or with a delegation of mine* — so both go
+through one function, `gateScheduled` in `agent/src/dashboard.ts`. It checks, in
+this order: the venue and verb exist; a non-operator is confined to `wallet` and
+`sessionSend`/`sessionBulk`; the session named is one **their own wallet**
+opened; and the parameters describe something that could actually run.
+
+This mattered when series stopped borrowing tasks and started owning their
+steps. Previously a series could only name tasks that had already been through
+the task gate, so the tasks *were* the choke point. A series that carries its
+own steps would have been a second door onto the same spending, with whatever
+checks its own route happened to remember — so the rule moved into one place
+that both routes call. There is no path that schedules a spend without passing
+it.
+
+Running a step goes through the same door for the same reason: `executeSeries`
+hands each step to `executeTask`, the function a scheduled task has always gone
+through. A series has no executor of its own, so it cannot have a weaker one —
+each step is validated, logged to the ledger, and honours the same stop flag.
+
+| Question | Answered by |
+|---|---|
+| May this caller schedule this verb at all? | `gateScheduled`, called by `/api/tasks`, `/api/tasks/:id`, `/api/series`, `/api/series/:id` |
+| Whose funds does it move? | The venue: `wallet:send`/`bulk` and everything outside `wallet` spend the app's wallet and are operator-only; `sessionSend`/`sessionBulk` spend the caller's own delegation and nothing else |
+| Whose delegation may it name? | The session's on-chain `owner` must equal the authenticated wallet |
+| What actually spends? | `executeTask` → `runTask`, for a task and a series step alike |
+
 ## Session keys: what can be changed, and by whom
 
 `TesseraSessionKeys` has `open` and `revoke` and nothing between them. A

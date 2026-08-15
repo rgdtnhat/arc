@@ -68,7 +68,7 @@ import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emiss
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
-import { SeriesStore, SERIES_LIMITS, type TaskSeries } from "./series.js";
+import { SeriesStore, SERIES_LIMITS, type TaskSeries, type SeriesStep } from "./series.js";
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
@@ -7575,6 +7575,24 @@ async function main() {
   const taskStore = new TaskStore(statePath(".tessera-tasks.json"));
   const seriesStore = new SeriesStore(statePath(".tessera-series.json"));
 
+  /*
+   * Series written before they owned their steps.
+   *
+   * Those records name scheduled tasks by id. Dropping them silently would
+   * delete somebody's standing orders, so each one is copied in as a step the
+   * series owns, once, at boot. The tasks themselves are left exactly as they
+   * are — they were separately schedulable things before this and they still
+   * are; the series just no longer reaches into them.
+   */
+  {
+    const { carried, lost } = seriesStore.adoptTaskMembers((id) => {
+      const t = taskStore.get(id);
+      return t ? { name: t.name, venue: t.venue, action: t.action, params: t.params } : null;
+    });
+    if (carried.length) console.log(`[series] carried ${carried.length} member(s) onto their own steps — ${carried.join(", ")}`);
+    if (lost.length) console.warn(`[series] ${lost.length} member(s) named a task that no longer exists and could not be carried`);
+  }
+
   /**
    * Carry out one task, whatever venue it belongs to.
    *
@@ -7800,60 +7818,90 @@ async function main() {
    * nobody asked for. Parallel reports each failure and lets the rest finish,
    * because there was no dependency to break.
    *
-   * Members are re-read at the moment they run. A task deleted, paused or
-   * stopped since the series was written is skipped and named in the receipt,
-   * rather than the series either failing wholesale or quietly running a
-   * shorter list than it says it has.
+   * The steps belong to the series, so nothing can delete one out from under a
+   * run. A step that has been *turned off* is stepped over and named in the
+   * receipt, rather than the series quietly running a shorter list than the
+   * page says it has.
+   *
+   * Each step goes through `executeTask` — the same function a scheduled task
+   * goes through, with the same validation, ledger entry and stop flag. A
+   * series has no spend path of its own, by construction: it hands each step to
+   * the one that already exists.
    */
   async function executeSeries(sr: TaskSeries, source: "schedule" | "manual") {
     seriesRunning.add(sr.id);
     const done: string[] = [];
     const failed: string[] = [];
     const skipped: string[] = [];
+    const wanted = sr.steps.filter((x) => x.enabled).length;
     /*
      * Three outcomes, not two.
      *
-     * A member that is *paused* has not failed — somebody turned it off on
-     * purpose — so a sequential series steps over it and carries on. Only a
-     * member that actually tried and failed stops the chain, because that is
-     * the case where the next step may have been relying on it.
+     * A step that is *turned off* has not failed — somebody did that on purpose
+     * — so a sequential series steps over it and carries on. Only a step that
+     * actually tried and failed stops the chain, because that is the case where
+     * the next step may have been relying on it.
      */
-    const runOne = async (id: string): Promise<"ok" | "failed" | "skipped"> => {
-      const t = taskStore.get(id);
-      if (!t) { skipped.push("a task that no longer exists"); return "skipped"; }
-      if (!t.enabled) { skipped.push(`${t.name} (paused)`); return "skipped"; }
-      const r = await executeTask(t, source);
-      if (r.ok) { done.push(t.name); return "ok"; }
-      failed.push(`${t.name}: ${r.detail}`);
+    const runOne = async (step: SeriesStep): Promise<"ok" | "failed" | "skipped"> => {
+      if (!step.enabled) {
+        skipped.push(`${step.name} (turned off)`);
+        seriesStore.markStep(sr.id, step.id, "skipped", "turned off");
+        return "skipped";
+      }
+      /*
+       * A step, dressed as the task the runner takes.
+       *
+       * Not stored anywhere and never persisted: `executeTask` records the run
+       * against `taskStore`, which has no record with this id and so ignores
+       * it, and the outcome is written to the step instead. Doing it this way
+       * rather than copying the runner is the whole point — one function
+       * spends, and it is the one that has always spent.
+       */
+      const asTask: Task = {
+        id: `${sr.id}:${step.id}`,
+        name: `${sr.name} · ${step.name}`,
+        venue: step.venue,
+        action: step.action,
+        params: step.params,
+        schedule: { kind: "manual" },
+        enabled: true,
+        owner: sr.owner,
+        createdAt: sr.createdAt,
+        firstRunAt: null, lastRunAt: null, lastStatus: null, lastDetail: "",
+        lastTxHash: null, lastFeeWei: null, runs: 0,
+      };
+      const r = await executeTask(asTask, source);
+      seriesStore.markStep(sr.id, step.id, r.ok ? "ok" : "failed", r.detail, r.txHash);
+      if (r.ok) { done.push(step.name); return "ok"; }
+      failed.push(`${step.name}: ${r.detail}`);
       return "failed";
     };
     try {
       if (sr.mode === "parallel") {
-        await Promise.all(sr.taskIds.map((id) => runOne(id).catch(() => "failed" as const)));
+        await Promise.all(sr.steps.map((step) => runOne(step).catch(() => "failed" as const)));
       } else {
-        for (const id of sr.taskIds) {
+        for (const [at, step] of sr.steps.entries()) {
           if (seriesStopped.has(sr.id)) { skipped.push("stopped by the operator"); break; }
-          const outcome = await runOne(id);
+          const outcome = await runOne(step);
           if (outcome === "failed") {
             // Name the ones that never got a turn, so the receipt is the whole
             // story rather than the point it stopped telling it.
-            const at = sr.taskIds.indexOf(id);
-            for (const rest of sr.taskIds.slice(at + 1)) {
-              const t = taskStore.get(rest);
-              skipped.push(`${t ? t.name : rest} (an earlier step failed)`);
+            for (const rest of sr.steps.slice(at + 1)) {
+              skipped.push(`${rest.name} (an earlier step failed)`);
+              seriesStore.markStep(sr.id, rest.id, "skipped", "an earlier step failed");
             }
             break;
           }
         }
       }
       const detail =
-        `${done.length}/${sr.taskIds.length} ran` +
+        `${done.length}/${wanted} ran` +
         (done.length ? `: ${done.join(", ")}` : "") +
         (failed.length ? ` · failed — ${failed.join("; ")}` : "") +
         (skipped.length ? ` · skipped — ${skipped.join("; ")}` : "");
-      // A partial run is not a success. Every member either ran or it did not,
+      // A partial run is not a success. Every step either ran or it did not,
       // and "2 of 3" with a green tick is how a missed payment goes unnoticed.
-      const ok = failed.length === 0 && done.length === sr.taskIds.length;
+      const ok = failed.length === 0 && done.length === wanted;
       seriesStore.markRun(sr.id, ok ? "ok" : "failed", detail);
       try {
         txlog.record({
@@ -8068,51 +8116,99 @@ async function main() {
     parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
   }
 
-  app.post("/api/tasks", requireAuth, async (req, res) => {
-    const scope = taskScope(req);
-    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
-    const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
-    // Read once, checked twice: the ownership gate below and the parameter
-    // check after it are asking about the same session.
-    let mine: SessionRow | undefined;
+  /**
+   * May this caller schedule this, and are its parameters usable?
+   *
+   * The one gate for everything that gets scheduled — a task, and now each step
+   * of a series. Both are the same question ("run this verb later, with the
+   * app's key or with a delegation of yours"), so both go through here rather
+   * than each route carrying its own copy of the rule. A second copy is how the
+   * next spend path silently gets a weaker check than the first.
+   *
+   * Two things are checked, in this order:
+   *  1. **Authority.** A visitor gets one venue and two verbs — the ones funded
+   *     by their own delegation — and only against a session their own wallet
+   *     opened. Everything else on the list spends the app's wallet, and letting
+   *     a connected visitor queue one of those would hand the agent's key to
+   *     anybody who can sign a message.
+   *  2. **Sense.** The parameters have to describe something that could run:
+   *     a real session, a parseable recipient, an amount above zero.
+   *
+   * @throws A `Gate` carrying the status the caller should answer with.
+   */
+  class Gate extends Error {
+    constructor(readonly status: number, message: string) { super(message); }
+  }
+
+  async function gateScheduled(
+    scope: { owner: string | null; operator: boolean },
+    what: { venue?: string; action?: string; params?: Record<string, unknown> },
+    where = "",
+  ): Promise<void> {
+    const at = where ? `${where}: ` : "";
     /*
-     * The choke point for who may schedule what.
+     * Nothing has been sent, so nothing here reads as a failed transaction.
      *
-     * A visitor gets one venue and two verbs — the ones funded by their own
-     * delegation. Everything else on this list spends the app wallet, and
-     * letting a connected visitor queue one of those would be handing the
-     * agent's key to anybody who can sign a message.
+     * `friendlyError` exists to translate a chain revert, and running a form
+     * refusal through it produced "That transaction didn't go through. row 1
+     * is not an address" — which describes a spend that never happened and
+     * buries the one sentence that tells the reader what to fix.
      */
+    const why = (e: unknown) => String((e as { message?: string })?.message ?? e);
+
+    // The verb first: an unknown one makes every later check nonsense, and
+    // "wallet cannot abscond" is a better answer than a complaint about the
+    // parameters that verb would have needed.
+    const venue = String(what.venue ?? "");
+    const verbs = (TASK_ACTIONS as Record<string, string[]>)[venue];
+    if (!verbs) throw new Gate(400, `${at}unknown venue "${what.venue}"`);
+    if (!verbs.includes(String(what.action))) {
+      throw new Gate(400, `${at}${venue} cannot "${what.action}" — try ${verbs.join(", ")}`);
+    }
+
+    let mine: SessionRow | undefined;
     if (!scope.operator) {
       const allowed = SESSION_ACTIONS.wallet as string[];
-      if (body.venue !== "wallet" || !allowed.includes(String(body.action))) {
-        res.status(403).json({
-          ok: false,
-          error: "from your own wallet you can schedule sessionSend or sessionBulk — the rest spend the app's wallet and are operator-only",
-        });
-        return;
+      if (what.venue !== "wallet" || !allowed.includes(String(what.action))) {
+        throw new Gate(403,
+          `${at}from your own wallet you can schedule sessionSend or sessionBulk — ` +
+          "the rest spend the app's wallet and are operator-only");
       }
-      // And only against a session this wallet actually owns. Without this,
-      // one visitor could schedule payments out of another's delegation.
-      const sid = String(body.params?.sessionId ?? "");
+      const sid = String(what.params?.sessionId ?? "");
       try {
         mine = /^0x[0-9a-fA-F]{64}$/.test(sid)
           ? await withDeadline(readSession(sid as Hex), FORM_DEADLINE, "reading that session")
           : null;
       } catch (e) {
-        res.status(504).json({ ok: false, error: friendlyError(e) });
-        return;
+        throw new Gate(504, `${at}${why(e)}`);
       }
       if (!mine || String(mine.owner).toLowerCase() !== scope.owner) {
-        res.status(403).json({ ok: false, error: "that session was not opened by this wallet" });
-        return;
+        throw new Gate(403, `${at}that session was not opened by this wallet`);
       }
     }
     try {
-      await withDeadline(checkTaskParams(body, mine), FORM_DEADLINE, "checking the task");
+      await withDeadline(checkTaskParams(what, mine), FORM_DEADLINE, "checking it");
     } catch (e) {
-      res.status(400).json({ ok: false, error: friendlyError(e) });
-      return;
+      throw new Gate(400, `${at}${why(e)}`);
+    }
+  }
+
+  /** Answer a `Gate` refusal with its own status; re-throw anything else. */
+  function sendGate(res: express.Response, e: unknown): boolean {
+    if (!(e instanceof Gate)) return false;
+    res.status(e.status).json({ ok: false, error: e.message });
+    return true;
+  }
+
+  app.post("/api/tasks", requireAuth, async (req, res) => {
+    const scope = taskScope(req);
+    if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
+    const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
+    try {
+      await gateScheduled(scope, body);
+    } catch (e) {
+      if (sendGate(res, e)) return;
+      throw e;
     }
     const r = taskStore.create({ ...(req.body ?? {}), owner: scope.owner });
     if (!r.ok) { res.status(400).json(r); return; }
@@ -8183,46 +8279,24 @@ async function main() {
     const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
     const existing = myTask(req, res);
     if (!existing) return;
-    // Read once, checked twice — see the note on the creation route.
-    let mine: SessionRow | undefined;
-    // A visitor's edit may not walk their task into a venue that spends the
-    // app wallet — the same rule as creation, at the same choke point.
     const scope = taskScope(req)!;
-    if (!scope.operator) {
-      const venue = body.venue ?? existing.venue;
-      const action = body.action ?? existing.action;
-      if (venue !== "wallet" || !(SESSION_ACTIONS.wallet as string[]).includes(String(action))) {
-        res.status(403).json({ ok: false, error: "from your own wallet you can schedule sessionSend or sessionBulk only" });
-        return;
-      }
-      const sid = String((body.params ?? existing.params)?.sessionId ?? "");
-      try {
-        mine = /^0x[0-9a-fA-F]{64}$/.test(sid)
-          ? await withDeadline(readSession(sid as Hex), FORM_DEADLINE, "reading that session")
-          : null;
-      } catch (e) {
-        res.status(504).json({ ok: false, error: friendlyError(e) });
-        return;
-      }
-      if (!mine || String(mine.owner).toLowerCase() !== scope.owner) {
-        res.status(403).json({ ok: false, error: "that session was not opened by this wallet" });
-        return;
-      }
-    }
-    // Only re-check when the edit actually touches what a task does. Pausing
-    // one must not be refused because a recipient it was created with has since
-    // become unspendable — stopping a task is the very thing you want to still
-    // work in that situation.
+    /*
+     * Only re-check when the edit touches what the task *does*.
+     *
+     * Pausing one must not be refused because a recipient it was created with
+     * has since become unspendable — stopping a task is the very thing you want
+     * to still work in that situation.
+     */
     if (body.params !== undefined || body.venue !== undefined || body.action !== undefined) {
       try {
-        await withDeadline(checkTaskParams({
+        await gateScheduled(scope, {
           venue: body.venue ?? existing.venue,
           action: body.action ?? existing.action,
           params: body.params ?? existing.params,
-        }, mine), FORM_DEADLINE, "checking the task");
+        });
       } catch (e) {
-        res.status(400).json({ ok: false, error: friendlyError(e) });
-        return;
+        if (sendGate(res, e)) return;
+        throw e;
       }
     }
     const r = taskStore.update(req.params.id, body);
@@ -8237,11 +8311,9 @@ async function main() {
 
   app.post("/api/tasks/:id/delete", requireAuth, (req, res) => {
     if (!myTask(req, res)) return;
-    const gone = taskStore.remove(req.params.id);
-    // A series holding a deleted task would report a failure on every run for
-    // something nobody can find. Drop it from the lists that name it.
-    if (gone) seriesStore.forgetTask(req.params.id);
-    res.json({ ok: gone });
+    // Nothing else to clean up: a series carries its own steps now, so deleting
+    // a task cannot leave one pointing at something that is gone.
+    res.json({ ok: taskStore.remove(req.params.id) });
   });
 
   /* ---- Task series: several tasks, triggered as one --------------------- */
@@ -8259,20 +8331,22 @@ async function main() {
   }
 
   /**
-   * Every member must be a task this caller may run.
+   * Every step goes through the gate a task goes through.
    *
-   * Without it a visitor could name the operator's tasks in their own series
-   * and have the server run them — the tasks are the choke point for *what*
-   * may be scheduled, and the series must not be a way around it.
+   * When a series held task ids, the tasks themselves were the choke point:
+   * whatever a visitor was allowed to create, a series could only ever name one
+   * of those. Now that a series carries its own steps, that protection has to
+   * be here — otherwise a series would be a second, weaker door onto the same
+   * spending, which is exactly what the choke point exists to prevent.
+   *
+   * Each step is checked separately so the refusal names the one at fault.
    */
-  function checkMembers(ids: unknown, owner: string | null): string | null {
-    const list = Array.isArray(ids) ? ids : [];
-    for (const raw of list) {
-      const id = String(raw ?? "");
-      if (!taskStore.get(id)) return "one of those tasks no longer exists";
-      if (!taskStore.ownedBy(id, owner)) return "one of those tasks is not yours to run";
+  async function gateSteps(scope: { owner: string | null; operator: boolean }, steps: unknown): Promise<void> {
+    const list = Array.isArray(steps) ? steps : [];
+    for (const [i, raw] of list.entries()) {
+      const step = (raw ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
+      await gateScheduled(scope, step, `step ${i + 1}`);
     }
-    return null;
   }
 
   app.get("/api/series", requireAuth, (req, res) => {
@@ -8284,38 +8358,44 @@ async function main() {
         ...sr,
         busy: seriesRunning.has(sr.id),
         stopping: seriesStopped.has(sr.id),
-        // The member names, so a row can say what it will do without the page
-        // having to join two lists itself.
-        members: sr.taskIds.map((id) => {
-          const t = taskStore.get(id);
-          return { id, name: t ? t.name : "(deleted)", venue: t?.venue ?? "", action: t?.action ?? "", missing: !t };
-        }),
       })),
+      actions: scope.operator ? TASK_ACTIONS : SESSION_ACTIONS,
       limits: SERIES_LIMITS,
     });
   });
 
-  app.post("/api/series", requireAuth, (req, res) => {
+  app.post("/api/series", requireAuth, async (req, res) => {
     const scope = taskScope(req);
     if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
-    const bad = checkMembers(req.body?.taskIds, scope.owner);
-    if (bad) { res.status(400).json({ ok: false, error: bad }); return; }
+    try {
+      await gateSteps(scope, req.body?.steps);
+    } catch (e) {
+      if (sendGate(res, e)) return;
+      throw e;
+    }
     const r = seriesStore.create({ ...(req.body ?? {}), owner: scope.owner });
     if (!r.ok) { res.status(400).json(r); return; }
     logTx(req, {
       category: "defi", action: "series-create", status: "success",
-      detail: `${r.series.name}: ${r.series.taskIds.length} task(s), ${r.series.mode}, ${describeSchedule(r.series.schedule)}`,
+      detail: `${r.series.name}: ${r.series.steps.length} step(s), ${r.series.mode}, ${describeSchedule(r.series.schedule)}`,
     });
     res.json({ ok: true, series: r.series, scheduleText: describeSchedule(r.series.schedule) });
   });
 
-  app.post("/api/series/:id", requireAuth, (req, res) => {
+  app.post("/api/series/:id", requireAuth, async (req, res) => {
     const scope = taskScope(req);
     const existing = mySeries(req, res);
     if (!existing || !scope) return;
-    if (req.body?.taskIds !== undefined) {
-      const bad = checkMembers(req.body.taskIds, scope.owner);
-      if (bad) { res.status(400).json({ ok: false, error: bad }); return; }
+    // Same rule as editing a task: only re-check when the edit touches what the
+    // series *does*, so pausing one can never be refused by a step that has
+    // since become unrunnable.
+    if (req.body?.steps !== undefined) {
+      try {
+        await gateSteps(scope, req.body.steps);
+      } catch (e) {
+        if (sendGate(res, e)) return;
+        throw e;
+      }
     }
     const r = seriesStore.update(req.params.id, req.body ?? {});
     if (!r.ok) { res.status(400).json(r); return; }
@@ -8351,8 +8431,9 @@ async function main() {
     const wasRunning = seriesRunning.has(sr.id);
     seriesStopped.add(sr.id);
     seriesStore.update(sr.id, { enabled: false });
-    // Stop the member tasks too, so one already sending stops mid-list.
-    for (const id of sr.taskIds) stopRequested.add(id);
+    // Stop the step that is running too, so one already sending stops mid-list.
+    // The id is the one `executeSeries` runs each step under.
+    for (const step of sr.steps) stopRequested.add(`${sr.id}:${step.id}`);
     logTx(req, {
       category: "defi", action: "series-stop", status: "success",
       detail: `${sr.name}: ${wasRunning ? "stopped mid-run" : "stopped"}`,

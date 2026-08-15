@@ -297,11 +297,24 @@ const $ = (id) => document.getElementById(id);
         // Each tab's data loads when you arrive at it, not while you are on
         // another one — the same rule the routes follow.
         const pane = WALLET_PANES[tab];
+        /*
+         * A form needs what it offers, not just what it lists.
+         *
+         * Both the task form and the series step composer pick an asset and a
+         * session, and those come from `loadWallet` and `loadSessions` — so
+         * arriving straight at either tab used to show a form whose dropdowns
+         * were empty until some other tab happened to fill them. They load
+         * what they need, on arrival, like everything else.
+         */
+        const forForm = () => Promise.all([
+          typeof loadWallet === "function" ? loadWallet() : null,
+          typeof loadSessions === "function" ? loadSessions() : null,
+        ]);
         const load =
           tab === "send" && typeof loadWallet === "function" ? () => loadWallet()
           : tab === "sessions" && typeof loadSessions === "function" ? () => loadSessions()
-          : tab === "tasks" && typeof loadTasks === "function" ? () => loadTasks()
-          : tab === "series" && typeof loadSeries === "function" ? () => Promise.all([loadTasks(), loadSeries()])
+          : tab === "tasks" && typeof loadTasks === "function" ? () => Promise.all([loadTasks(), forForm()])
+          : tab === "series" && typeof loadSeries === "function" ? () => Promise.all([loadSeries(), forForm()])
           : null;
         if (load) {
           withPaneBusy(pane, load, tab === "sessions" ? "Reading your sessions from the chain…" : "Loading…")
@@ -3489,9 +3502,15 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
+      const walAsset = (addr) =>
+        walletAssets.find((x) => String(x.address).toLowerCase() === String(addr).toLowerCase()) || null;
       const walDecimals = (addr) => {
-        const a = walletAssets.find((x) => String(x.address).toLowerCase() === String(addr).toLowerCase());
+        const a = walAsset(addr);
         return a ? a.decimals : 6;
+      };
+      const walSymbol = (addr) => {
+        const a = walAsset(addr);
+        return a ? a.symbol : "";
       };
 
       if ($("walletCopy")) {
@@ -3761,13 +3780,21 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
-      /** Fill the task form's session picker from whatever is spendable. */
+      /**
+       * Fill the session pickers from whatever is spendable.
+       *
+       * Both forms that can spend a delegation have one — the scheduled task
+       * and a series step — and both are rebuilt here so the labels cannot
+       * disagree depending on which was drawn last.
+       */
       function renderSessionPicker() {
-        const sel = $("taskSession");
-        if (!sel) return;
-        const keep = sel.value;
-        sel.innerHTML = sessionOptions();
-        if (keep && sessionRows.some((x) => x.id === keep)) sel.value = keep;
+        for (const id of ["taskSession", "stepSession"]) {
+          const sel = $(id);
+          if (!sel) continue;
+          const keep = sel.value;
+          sel.innerHTML = sessionOptions();
+          if (keep && sessionRows.some((x) => x.id === keep)) sel.value = keep;
+        }
       }
 
       /**
@@ -4322,10 +4349,17 @@ const $ = (id) => document.getElementById(id);
        * an undefined address. Values are carried across a rebuild, and a
        * rebuild that would change nothing does not happen at all.
        */
-      function taskParamRow() {
-        const venue = $("taskVenue").value, action = $("taskAction").value;
+      /**
+       * @param {string} [prefix] Which form: `"task"` for the scheduled-task
+       *   form, `"step"` for the series step composer. Both ask for exactly the
+       *   same parameters for a given verb — one builder, so a field added for
+       *   one can never quietly be missing from the other.
+       */
+      function taskParamRow(prefix = "task") {
+        const venue = $(`${prefix}Venue`).value, action = $(`${prefix}Action`).value;
         const fields = TASK_FIELDS[`${venue}:${action}`] || [];
-        const row = $("taskParamRow");
+        const row = $(`${prefix}ParamRow`);
+        if (!row) return;
         const assetOptions = walletAssets.map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`).join("");
         // Signature of what the row would contain. Same signature, same DOM —
         // and rebuilding identical DOM is how a half-typed form gets wiped.
@@ -4343,7 +4377,7 @@ const $ = (id) => document.getElementById(id);
             // a form change and again in `loadSessions` when the chain answers,
             // and two renderers meant the labels disagreed depending on which
             // ran last.
-            return `<select class="field" id="taskSession" data-tp="sessionId">${sessionOptions()}</select>`;
+            return `<select class="field" id="${prefix}Session" data-tp="sessionId">${sessionOptions()}</select>`;
           }
           if (f === "recipients") {
             /*
@@ -4357,7 +4391,7 @@ const $ = (id) => document.getElementById(id);
              */
             return `<textarea class="field" data-tp="${f}" rows="4" placeholder="0xabc…,1.5&#10;0xdef…,2" ` +
               `style="width:100%;font-family:var(--mono,monospace);font-size:12px"></textarea>` +
-              `<span id="taskRecipCount" style="font-size:11.5px;color:var(--muted)"></span>`;
+              `<span id="${prefix}RecipCount" style="font-size:11.5px;color:var(--muted)"></span>`;
           }
           if (f === "message") {
             // Optional, and honest about where it goes: this one never leaves
@@ -4385,10 +4419,25 @@ const $ = (id) => document.getElementById(id);
         });
       }
 
-      function taskParams() {
-        const venue = $("taskVenue").value, action = $("taskAction").value;
+      /** Live count of a recipient list, and which lines will not parse. */
+      function countRecipientsIn(prefix) {
+        const row = $(`${prefix}ParamRow`);
+        if (!row) return;
+        row.addEventListener("input", (e) => {
+          if (!e.target.matches('[data-tp="recipients"]')) return;
+          const el = $(`${prefix}RecipCount`);
+          if (!el) return;
+          const { rows, bad } = parseRecipientList(e.target.value, 6);
+          el.textContent = `${rows.length} recipient${rows.length === 1 ? "" : "s"}` +
+            (bad.length ? ` · line ${bad.join(", ")} unreadable` : "");
+        });
+      }
+
+      /** @param {string} [prefix] See `taskParamRow`. */
+      function taskParams(prefix = "task") {
+        const venue = $(`${prefix}Venue`).value, action = $(`${prefix}Action`).value;
         const out = {};
-        $("taskParamRow").querySelectorAll("[data-tp]").forEach((el) => { out[el.dataset.tp] = el.value.trim(); });
+        $(`${prefix}ParamRow`).querySelectorAll("[data-tp]").forEach((el) => { out[el.dataset.tp] = el.value.trim(); });
         // Amounts are stored in base units: a task outlives the form that made
         // it, and a decimal re-read against a different asset would be wrong.
         const session = sessionRows.find((x) => x.id === out.sessionId);
@@ -4709,8 +4758,6 @@ const $ = (id) => document.getElementById(id);
                   `</div></td></tr>`;
               }).join("")
             : emptyRow(4, "No tasks yet.");
-          // The series picker is built from this list, so it follows it.
-          if (typeof renderSeriesPicker === "function") renderSeriesPicker();
         } catch { /* the pane stays as it was */ }
       }
 
@@ -4730,7 +4777,7 @@ const $ = (id) => document.getElementById(id);
         // Only the tab in front of you: polling four cards to refresh one is
         // three requests nobody is reading.
         if (walletTab === "tasks") loadTasks();
-        if (walletTab === "series") { loadTasks(); loadSeries(); }
+        if (walletTab === "series") loadSeries();
       }, 5000);
 
       if ($("taskCreate")) {
@@ -4778,14 +4825,7 @@ const $ = (id) => document.getElementById(id);
         window.previewTask = previewTask;
 
         // Count the list as it is typed, and name the lines that will not parse.
-        $("taskParamRow").addEventListener("input", (e) => {
-          if (!e.target.matches('[data-tp="recipients"]')) return;
-          const el = $("taskRecipCount");
-          if (!el) return;
-          const { rows, bad } = parseRecipientList(e.target.value, 6);
-          el.textContent = `${rows.length} recipient${rows.length === 1 ? "" : "s"}` +
-            (bad.length ? ` · line ${bad.join(", ")} unreadable` : "");
-        });
+        countRecipientsIn("task");
 
         $("taskCreate").addEventListener("click", async () => {
           const btn = $("taskCreate");
@@ -4916,21 +4956,80 @@ const $ = (id) => document.getElementById(id);
       }
 
       /** The tasks to choose from, with the order they were ticked preserved. */
-      function renderSeriesPicker() {
-        const host = $("serPick");
-        if (!host) return;
-        const chosen = [...host.querySelectorAll("input:checked")].map((i) => i.value);
-        const rows = [...taskRowsById.values()];
-        host.innerHTML = rows.length
-          ? rows.map((t) =>
-              `<label style="display:flex;gap:8px;align-items:center;font-size:12.5px">` +
-              `<input type="checkbox" value="${esc(t.id)}"${chosen.includes(t.id) ? " checked" : ""} />` +
-              `<span><b>${esc(t.name)}</b> <span class="muted">${esc(t.venue)} · ${esc(t.action)}</span></span></label>`).join("")
-          : `<span class="muted" style="font-size:12px">Create a task first — a series triggers tasks you already have.</span>`;
+      /* ---- the steps of a series ------------------------------------------
+       *
+       * The steps are the series'. They used to be ids ticked out of the
+       * scheduled-task list, which made every step two things at once — a
+       * member here and a task with its own schedule, pause switch and history
+       * over there. Pausing that task silently shortened the series; deleting
+       * it silently emptied it; and a step that only ever runs inside a series
+       * still had to be given a schedule that would never be used.
+       *
+       * So the series composes its own, with the same editor the task form
+       * uses (`taskParamRow("step")`) so the two can never drift apart.
+       */
+      let serSteps = [];
+      /** The server's own ceiling on how many steps one series may carry. */
+      let seriesLimits = { maxSeries: 50, maxMembers: 25, maxName: 80 };
+      /** The step being edited, by id — null while the composer adds a new one. */
+      let editingStep = null;
+
+      /** The venue and verb dropdowns, from whatever the server says we may run. */
+      function syncStepForm() {
+        if (!$("stepVenue")) return;
+        const venueSig = Object.keys(taskActions).join(",");
+        if ($("stepVenue").dataset.sig !== venueSig) {
+          $("stepVenue").dataset.sig = venueSig;
+          $("stepVenue").innerHTML = Object.keys(taskActions)
+            .map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+          $("stepAction").dataset.venue = "";
+        }
+        const v = $("stepVenue").value;
+        const acts = taskActions[v] || [];
+        if ($("stepAction").dataset.venue !== v) {
+          $("stepAction").innerHTML = acts.map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
+          $("stepAction").dataset.venue = v;
+        }
+        taskParamRow("step");
       }
 
-      /** Ticked members, in the order the list shows them. */
-      const serChosen = () => [...$("serPick").querySelectorAll("input:checked")].map((i) => i.value);
+      /** One line per step: what it does, and the controls to move or drop it. */
+      function renderSteps() {
+        const host = $("serSteps");
+        if (!host) return;
+        host.innerHTML = serSteps.length
+          ? serSteps.map((st, i) => {
+              const off = st.enabled === false;
+              const last = st.lastStatus
+                ? `<div class="muted" style="font-size:10.5px">last: ${esc(st.lastStatus)}${st.lastDetail ? ` — ${esc(st.lastDetail)}` : ""}</div>`
+                : "";
+              return `<div class="row-actions" style="align-items:flex-start;gap:6px;flex-wrap:wrap">` +
+                `<span class="muted" style="font-size:12px;min-width:18px">${i + 1}.</span>` +
+                `<span style="flex:1;min-width:150px;font-size:12.5px${off ? ";opacity:.55" : ""}">` +
+                `<b>${esc(st.name)}</b>${off ? ' <span style="color:var(--warn);font-size:10.5px">off</span>' : ""}` +
+                `<div class="muted" style="font-size:11px">${esc(st.venue)} · ${esc(st.action)}${stepSummary(st)}</div>${last}</span>` +
+                `<button class="btn" data-stepup="${i}" ${i === 0 ? "disabled" : ""} style="padding:1px 7px;font-size:11px">↑</button>` +
+                `<button class="btn" data-stepdown="${i}" ${i === serSteps.length - 1 ? "disabled" : ""} style="padding:1px 7px;font-size:11px">↓</button>` +
+                `<button class="btn" data-stepedit="${i}" style="padding:1px 8px;font-size:11px">Edit</button>` +
+                `<button class="btn" data-steptoggle="${i}" style="padding:1px 8px;font-size:11px">${off ? "Turn on" : "Turn off"}</button>` +
+                `<button class="btn warn" data-stepdel="${i}" style="padding:1px 8px;font-size:11px">Remove</button>` +
+                `</div>`;
+            }).join("")
+          : `<span class="muted" style="font-size:12px">No steps yet — add the first one below.</span>`;
+      }
+
+      /** The part of a step worth reading at a glance: who, and how much. */
+      function stepSummary(st) {
+        const p = st.params || {};
+        const bits = [];
+        const session = sessionRows.find((x) => x.id === p.sessionId);
+        const dec = session ? session.decimals : 6;
+        const sym = session ? session.symbol : walSymbol(p.asset);
+        if (p.amount) bits.push(`${fmtUnitsStr(String(p.amount), dec)}${sym ? ` ${sym}` : ""}`);
+        if (Array.isArray(p.recipients)) bits.push(`${p.recipients.length} recipient${p.recipients.length === 1 ? "" : "s"}`);
+        if (p.to) bits.push(`to ${String(p.to).slice(0, 10)}…`);
+        return bits.length ? ` · ${esc(bits.join(" · "))}` : "";
+      }
 
       async function loadSeries() {
         if (!$("serRows")) return;
@@ -4947,13 +5046,19 @@ const $ = (id) => document.getElementById(id);
           if ($("seriesNotReady")) $("seriesNotReady").style.display = "none";
           if ($("seriesBody")) $("seriesBody").style.display = "";
           seriesRowsById = new Map((r.series || []).map((x) => [x.id, x]));
+          // What a series may be told to do is the server's call, the same as
+          // for a task — a visitor gets their two session verbs, an operator
+          // the full list.
+          if (r.actions) taskActions = r.actions;
+          if (r.limits) seriesLimits = { ...seriesLimits, ...r.limits };
           if (!$("serZone").options.length) {
             $("serZone").innerHTML = $("taskZone").innerHTML;
             $("serDays").innerHTML = DAY_NAMES.map((d, i) =>
               `<label style="font-size:12px;margin-right:7px"><input type="checkbox" value="${i}" /> ${d}</label>`).join("");
             syncSeriesForm();
           }
-          renderSeriesPicker();
+          syncStepForm();
+          renderSteps();
           const when = (ms) => new Date(ms).toLocaleString(undefined, {
             year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
           });
@@ -4970,13 +5075,22 @@ const $ = (id) => document.getElementById(id);
                       `${x.firstRunAt ? ` · first ran ${esc(when(x.firstRunAt))}` : ""}</div>` +
                     `<div style="font-size:11px;margin-top:2px">${esc(x.lastDetail || "")}</div>`
                   : `<span class="muted">never run</span>`;
-                const steps = (x.members || []).map((m, i) =>
-                  `<div class="muted" style="font-size:11px">${x.mode === "sequential" ? `${i + 1}. ` : "· "}` +
-                  `${esc(m.name)}${m.missing ? ' <span style="color:var(--warn)">(deleted)</span>' : ""}</div>`).join("");
+                const mine = x.steps || [];
+                const steps = mine.map((m, i) => {
+                  const tick = m.lastStatus === "ok" ? ' <span style="color:var(--good)">✓</span>'
+                    : m.lastStatus === "failed" ? ' <span style="color:var(--warn)">✗</span>'
+                    : m.lastStatus === "skipped" ? ' <span class="muted">–</span>' : "";
+                  return `<div class="muted" style="font-size:11px${m.enabled === false ? ";opacity:.55" : ""}">` +
+                    `${x.mode === "sequential" ? `${i + 1}. ` : "· "}${esc(m.name)}${tick}` +
+                    `${m.enabled === false ? ' <span style="color:var(--warn)">off</span>' : ""}` +
+                    `${m.lastDetail ? ` <span class="muted">— ${esc(m.lastDetail)}</span>` : ""}</div>`;
+                }).join("");
+                const on = mine.filter((m) => m.enabled !== false).length;
                 return `<tr><td><b>${esc(x.name)}</b>` +
                   `<div class="muted" style="font-size:11px">` +
                   `${x.mode === "sequential" ? "one after another" : "all at once"} · ` +
-                  `${(x.members || []).length} task${(x.members || []).length === 1 ? "" : "s"}${state}</div>${steps}</td>` +
+                  `${on} step${on === 1 ? "" : "s"}` +
+                  `${on === mine.length ? "" : ` (${mine.length - on} off)`}${state}</div>${steps}</td>` +
                   `<td style="font-size:12px">${esc(x.scheduleText)}<div class="muted" style="font-size:11px">next ${esc(next)}</div></td>` +
                   `<td style="font-size:11.5px">${last}</td></tr>` +
                   `<tr><td colspan="3" style="padding-top:0">` +
@@ -5000,8 +5114,10 @@ const $ = (id) => document.getElementById(id);
         editingSeries = id;
         $("serName").value = x.name || "";
         $("serMode").value = x.mode;
-        renderSeriesPicker();
-        $("serPick").querySelectorAll("input").forEach((i) => { i.checked = (x.taskIds || []).includes(i.value); });
+        // A copy: editing the form must not change the loaded row underneath it.
+        serSteps = (x.steps || []).map((st) => ({ ...st, params: { ...st.params } }));
+        if (window.__stopEditingStep) window.__stopEditingStep();
+        renderSteps();
         const sc = x.schedule || { kind: "manual" };
         $("serKind").value = sc.kind;
         if (sc.kind === "every") {
@@ -5033,7 +5149,9 @@ const $ = (id) => document.getElementById(id);
       function stopEditingSeries() {
         editingSeries = null;
         $("serName").value = "";
-        $("serPick").querySelectorAll("input").forEach((i) => { i.checked = false; });
+        serSteps = [];
+        if (window.__stopEditingStep) window.__stopEditingStep();
+        renderSteps();
         $("serCreate").textContent = "Create series";
         if ($("serCancelEdit")) $("serCancelEdit").style.display = "none";
         previewSeries();
@@ -5041,7 +5159,7 @@ const $ = (id) => document.getElementById(id);
 
       function previewSeries() {
         const sc = serSchedule();
-        const n = serChosen().length;
+        const n = serSteps.filter((x) => x.enabled !== false).length;
         const zone = (o) => {
           const sign = o < 0 ? "-" : "+", a = Math.abs(o);
           return `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
@@ -5061,8 +5179,139 @@ const $ = (id) => document.getElementById(id);
           : sc.kind === "monthly" ? `day ${sc.day} of each month at ${at()}`
           : `${sc.month}/${sc.day} each year at ${at()}`;
         $("serPreview").textContent = n
-          ? `${n} task${n === 1 ? "" : "s"}, ${$("serMode").value === "sequential" ? "one after another" : "all at once"}, ${when}`
-          : "tick the tasks this series should run";
+          ? `${n} step${n === 1 ? "" : "s"}, ${$("serMode").value === "sequential" ? "one after another" : "all at once"}, ${when}`
+          : "add the steps this series should run";
+      }
+
+      /* ---- the step composer ---------------------------------------------- */
+      if ($("stepAdd")) {
+        countRecipientsIn("step");
+        ["stepVenue", "stepAction"].forEach((id) =>
+          $(id).addEventListener("change", () => { syncStepForm(); }));
+
+        /** Back to adding, with the composer emptied. */
+        function stopEditingStep() {
+          editingStep = null;
+          $("stepName").value = "";
+          $("stepAdd").textContent = "Add step";
+          $("stepCancel").style.display = "none";
+          $("stepHead").textContent = "Add a step";
+          $("stepHint").textContent = "";
+          // Blank the parameters properly rather than leaving the last step's
+          // recipient sitting in a form that now reads as a new one.
+          const row = $("stepParamRow");
+          if (row) {
+            row.querySelectorAll("[data-tp]").forEach((el) => { el.value = ""; });
+            row.dataset.sig = "";
+            taskParamRow("step");
+          }
+          if ($("stepRecipCount")) $("stepRecipCount").textContent = "";
+        }
+        window.__stopEditingStep = stopEditingStep;
+
+        $("stepCancel").addEventListener("click", () => {
+          stopEditingStep();
+          $("stepHint").textContent = "edit cancelled — the step is unchanged";
+        });
+
+        $("stepAdd").addEventListener("click", () => {
+          const venue = $("stepVenue").value, action = $("stepAction").value;
+          if (!venue || !action) { $("stepHint").textContent = "pick what this step should do"; return; }
+          const recipEl = $("stepParamRow").querySelector('[data-tp="recipients"]');
+          if (recipEl) {
+            const { rows, bad } = parseRecipientList(recipEl.value, 6);
+            if (bad.length) { $("stepHint").textContent = `line ${bad.join(", ")} is not "address,amount"`; return; }
+            if (!rows.length) { $("stepHint").textContent = "add at least one recipient"; return; }
+          }
+          const toEl = $("stepParamRow").querySelector('[data-tp="to"]');
+          if (toEl && !/^0x[0-9a-fA-F]{40}$/.test(toEl.value.trim())) {
+            $("stepHint").textContent = "that is not an address";
+            return;
+          }
+          if (serSteps.length >= (seriesLimits.maxMembers || 25) && !editingStep) {
+            $("stepHint").textContent = `that is the ${seriesLimits.maxMembers}-step limit for one series`;
+            return;
+          }
+          const step = {
+            // Kept when editing, so the step's run history survives a rename.
+            id: editingStep || undefined,
+            name: $("stepName").value.trim(),
+            venue, action,
+            params: taskParams("step"),
+            enabled: true,
+          };
+          const at = editingStep ? serSteps.findIndex((x) => x.id === editingStep) : -1;
+          if (at >= 0) serSteps[at] = { ...serSteps[at], ...step };
+          else serSteps.push(step);
+          stopEditingStep();
+          renderSteps();
+          previewSeries();
+        });
+
+        $("serSteps").addEventListener("click", (e) => {
+          const btn = e.target.closest("button");
+          if (!btn) return;
+          const d = btn.dataset;
+          const at = Number(d.stepup ?? d.stepdown ?? d.stepedit ?? d.steptoggle ?? d.stepdel);
+          if (!Number.isInteger(at) || !serSteps[at]) return;
+          if (d.stepup !== undefined) {
+            [serSteps[at - 1], serSteps[at]] = [serSteps[at], serSteps[at - 1]];
+          } else if (d.stepdown !== undefined) {
+            [serSteps[at + 1], serSteps[at]] = [serSteps[at], serSteps[at + 1]];
+          } else if (d.steptoggle !== undefined) {
+            serSteps[at].enabled = serSteps[at].enabled === false;
+          } else if (d.stepdel !== undefined) {
+            if (editingStep === serSteps[at].id) stopEditingStep();
+            serSteps.splice(at, 1);
+          } else if (d.stepedit !== undefined) {
+            const st = serSteps[at];
+            // A step added in this sitting has no id yet; give it one so the
+            // edit can find it again after the list is re-rendered.
+            if (!st.id) st.id = `new-${Math.random().toString(36).slice(2, 10)}`;
+            editingStep = st.id;
+            $("stepName").value = st.name || "";
+            $("stepVenue").value = st.venue;
+            $("stepAction").dataset.venue = "";
+            syncStepForm();
+            fillParams("step", st.params || {});
+            $("stepAdd").textContent = "Save step";
+            $("stepCancel").style.display = "";
+            $("stepHead").textContent = `Editing step ${at + 1}`;
+            $("stepHint").textContent = "";
+            $("stepName").scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+          renderSteps();
+          previewSeries();
+        });
+      }
+
+      /**
+       * Put stored parameters back into a form.
+       *
+       * The inverse of `taskParams`: amounts come back out of base units
+       * against the same asset they went in against, so editing a step shows
+       * the number that was typed rather than the raw integer.
+       */
+      function fillParams(prefix, params) {
+        const row = $(`${prefix}ParamRow`);
+        if (!row) return;
+        const session = sessionRows.find((x) => x.id === params.sessionId);
+        const dec = (a) => (session ? session.decimals : walDecimals(a || params.asset));
+        row.querySelectorAll("[data-tp]").forEach((el) => {
+          const k = el.dataset.tp;
+          let v = params[k];
+          if (v === undefined || v === null) { el.value = ""; return; }
+          if (k === "amount") v = fmtUnitsStr(String(v), dec(params.asset));
+          else if (k === "amountIn") v = fmtUnitsStr(String(v), dec(params.tokenIn));
+          else if (k === "recipients" && Array.isArray(v)) {
+            v = v.map((r) => `${r.to},${fmtUnitsStr(String(r.amount), dec(params.asset))}`).join("\n");
+          } else if (k === "amounts" && Array.isArray(v)) {
+            const pool = ((window.__amm && window.__amm.pools) || []).find((x) => String(x.id) === String(params.poolId ?? 0));
+            v = v.map((x, i) => fmtUnitsStr(String(x), pool ? pool.assets[i].decimals : 6)).join(", ");
+          }
+          if (el.tagName === "SELECT" && ![...el.options].some((o) => o.value === String(v))) return;
+          el.value = String(v);
+        });
       }
 
       if ($("serCreate")) {
@@ -5070,20 +5319,28 @@ const $ = (id) => document.getElementById(id);
         ["serEveryN", "serEveryUnit", "serHour", "serMinute", "serZone", "serDom", "serMonth"].forEach((id) =>
           $(id).addEventListener("input", previewSeries));
         $("serDays").addEventListener("change", previewSeries);
-        $("serPick").addEventListener("change", previewSeries);
+
         if ($("serCancelEdit")) $("serCancelEdit").addEventListener("click", () => {
           stopEditingSeries();
           showReceipt("serMsg", true, "edit cancelled — the series is unchanged");
         });
 
         $("serCreate").addEventListener("click", async () => {
-          const taskIds = serChosen();
-          if (!taskIds.length) return showReceipt("serMsg", false, "tick at least one task");
+          if (!serSteps.length) return showReceipt("serMsg", false, "add at least one step");
+          if (editingStep) {
+            return showReceipt("serMsg", false,
+              "finish the step you are editing first — Save step, or Cancel to leave it as it was");
+          }
           const btn = $("serCreate");
           btn.disabled = true;
           showBusy("serMsg", editingSeries ? "saving your changes…" : "saving the series…");
           try {
-            const body = { name: $("serName").value.trim(), mode: $("serMode").value, taskIds, schedule: serSchedule() };
+            const steps = serSteps.map((st) => ({
+              // A locally-minted id means "new"; the server gives it a real one.
+              id: String(st.id || "").startsWith("new-") ? undefined : st.id,
+              name: st.name, venue: st.venue, action: st.action, params: st.params, enabled: st.enabled !== false,
+            }));
+            const body = { name: $("serName").value.trim(), mode: $("serMode").value, steps, schedule: serSchedule() };
             const r = await (await postAuthed(editingSeries ? `/api/series/${editingSeries}` : "/api/series", body)).json();
             showReceipt("serMsg", Boolean(r.ok),
               r.ok ? `${editingSeries ? "saved" : "created"} — ${r.scheduleText}` : `failed: ${r.error}`);
