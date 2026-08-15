@@ -4677,11 +4677,13 @@ const $ = (id) => document.getElementById(id);
         const others = total - mine;
         const noun = which === "task" ? "task" : "series";
         const plural = which === "task" ? "tasks" : "series";
+        // Name the two kinds by what pays for them, which is the distinction
+        // that matters: the app wallet's, and visitors' own delegations.
         note.textContent = box.checked
           ? others
-            ? `${mine} of ${total} — ${others} from other wallets hidden`
-            : `${mine} ${mine === 1 ? noun : plural}, and nobody else has any`
-          : `${total} in total · ${mine} yours · ${others} from other wallets`;
+            ? `${mine} of ${total} — ${others} funded by visitors' own wallets, hidden`
+            : `${mine} ${mine === 1 ? noun : plural}, and no visitor has any`
+          : `${total} in total · ${mine} the app wallet's · ${others} from visitors' own wallets`;
       }
 
       async function loadTasks() {
@@ -4836,7 +4838,7 @@ const $ = (id) => document.getElementById(id);
             : emptyRow(4, wantsMine("task") && r.total
                 // "No tasks yet" under a filter that is hiding some is simply
                 // untrue, and sends the reader looking for a bug.
-                ? `None of the ${r.total} scheduled task${r.total === 1 ? "" : "s"} here is yours — untick the box above to see the rest.`
+                ? `None of the ${r.total} scheduled task${r.total === 1 ? "" : "s"} here runs on the app wallet — untick the box above to see the rest.`
                 : "No tasks yet.");
         } catch { /* the pane stays as it was */ }
       }
@@ -5188,7 +5190,7 @@ const $ = (id) => document.getElementById(id);
                   `</div></td></tr>`;
               }).join("")
             : emptyRow(4, wantsMine("series") && r.total
-                ? `None of the ${r.total} series here is yours — untick the box above to see the rest.`
+                ? `None of the ${r.total} series here runs on the app wallet — untick the box above to see the rest.`
                 : "No series yet.");
         } catch { /* leave the card as it was */ }
       }

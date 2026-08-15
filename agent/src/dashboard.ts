@@ -8005,8 +8005,17 @@ async function main() {
    */
   const wantsOwnOnly = (req: express.Request, scope: { operator: boolean }) =>
     scope.operator && String(req.query.mine ?? "") === "1";
-  /** An operator's own rows are the ones with no wallet behind them. */
-  const isOperators = (row: { owner: string | null }) => row.owner === null;
+  /**
+   * An operator's own rows are the ones with no wallet behind them.
+   *
+   * `== null` rather than `=== null`, and on purpose: a schedule written before
+   * tasks had an owner has no such field, and strict equality reported the app
+   * wallet's own oldest tasks as somebody else's — hiding exactly the rows this
+   * filter exists to show. The store normalises on load as well; this is
+   * belt-and-braces, because the cost of being wrong here is an operator who
+   * cannot find their own standing orders.
+   */
+  const isOperators = (row: { owner?: string | null }) => row.owner == null;
 
   app.get("/api/tasks", requireAuth, (req, res) => {
     const scope = taskScope(req);

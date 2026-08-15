@@ -104,7 +104,23 @@ export class TaskStore {
   constructor(private readonly file: string) {
     try {
       const raw = JSON.parse(readFileSync(file, "utf8"));
-      if (Array.isArray(raw)) this.tasks = raw.filter((t) => t && typeof t.id === "string");
+      /*
+       * Normalise `owner` on the way in.
+       *
+       * Tasks predate the field, and `JSON.stringify` omits an undefined one —
+       * so the app wallet's oldest schedules are on disk with no `owner` key at
+       * all. Every check that asks "whose is this" then has to decide what
+       * `undefined` means, and one of them got it wrong: the operator's
+       * "only mine" filter tested `owner === null`, which is false for a
+       * missing field, so the very tasks the app wallet runs were the ones it
+       * hid. Answering the question once, here, is the fix — not teaching each
+       * reader about a third value.
+       */
+      if (Array.isArray(raw)) {
+        this.tasks = raw
+          .filter((t) => t && typeof t.id === "string")
+          .map((t) => ({ ...t, owner: t.owner ?? null }));
+      }
     } catch {
       /* first run */
     }

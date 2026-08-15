@@ -174,7 +174,10 @@ export class SeriesStore {
         // an empty list than have to keep asking whether the field exists.
         this.series = raw
           .filter((s) => s && typeof s.id === "string")
-          .map((s) => ({ ...s, steps: Array.isArray(s.steps) ? s.steps : [] }));
+          // `owner` for the same reason as in `tasks.ts`: a record written
+          // before the field existed has no key, and "no wallet behind it" is
+          // one value here, not two.
+          .map((s) => ({ ...s, owner: s.owner ?? null, steps: Array.isArray(s.steps) ? s.steps : [] }));
       }
     } catch {
       /* first run */

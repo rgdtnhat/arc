@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { TaskStore, TASK_ACTIONS } from "../src/tasks.js";
@@ -270,4 +270,52 @@ test("filtering the list to the operator's own does not change what they may act
 
   // And a visitor never sees anybody else's, filter or no filter.
   assert.deepEqual(s.listFor(visitor).map((t) => t.name), ["a visitor's"]);
+});
+
+/*
+ * The app wallet's oldest tasks have no `owner` field at all.
+ *
+ * Tasks predate the field and `JSON.stringify` omits an undefined one, so those
+ * records are on disk with the key simply missing. Every reader then has to
+ * decide what that means, and the operator's "only mine" filter got it wrong:
+ * it tested `owner === null`, which is false for a missing field, so a task the
+ * app wallet had been running for months was reported as belonging to somebody
+ * else and hidden from the one person who could stop it. Found on the live
+ * deployment — a `wallet send` task with no owner key, counted as nobody's.
+ */
+test("a task stored before owners existed belongs to the operator, not to nobody", () => {
+  const f = path.join(mkdtempSync(path.join(tmpdir(), "tessera-tasks-")), "tasks.json");
+  writeFileSync(f, JSON.stringify([
+    // Exactly the shape found live: no `owner` key.
+    {
+      id: "legacy", name: "Ally", venue: "wallet", action: "send",
+      params: { to: "0x" + "a".repeat(40), amount: "1" },
+      schedule: { kind: "every", seconds: 3600 }, enabled: true,
+      createdAt: 1, firstRunAt: null, lastRunAt: null,
+      lastStatus: null, lastDetail: "", lastTxHash: null, lastFeeWei: null, runs: 0,
+    },
+    {
+      id: "theirs", name: "a visitor's", venue: "wallet", action: "sessionSend",
+      params: {}, schedule: { kind: "manual" }, enabled: true,
+      owner: "0xdddddddddddddddddddddddddddddddddddddddd",
+      createdAt: 1, firstRunAt: null, lastRunAt: null,
+      lastStatus: null, lastDetail: "", lastTxHash: null, lastFeeWei: null, runs: 0,
+    },
+  ]));
+  const s = new TaskStore(f);
+
+  // Read back as null, not undefined — one value for "no wallet behind it".
+  const legacy = s.get("legacy")!;
+  assert.equal(legacy.owner, null);
+  assert.equal("owner" in legacy, true, "the field is still missing after loading");
+
+  // Which is what the operator's filter selects on.
+  const own = s.listFor(null).filter((t) => t.owner == null);
+  assert.deepEqual(own.map((t) => t.name), ["Ally"]);
+
+  // And a visitor still cannot see or act on it.
+  const visitor = "0xdddddddddddddddddddddddddddddddddddddddd";
+  assert.deepEqual(s.listFor(visitor).map((t) => t.name), ["a visitor's"]);
+  assert.equal(s.ownedBy("legacy", visitor), false);
+  assert.equal(s.ownedBy("legacy", null), true);
 });
