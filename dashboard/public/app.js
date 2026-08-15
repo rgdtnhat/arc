@@ -1718,6 +1718,9 @@ const $ = (id) => document.getElementById(id);
           if (open("paneDefi")) {
             if (typeof loadEmissions === "function") loadEmissions().catch(() => {});
             if (typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {});
+            // The retired contract's balance is keyed by address too, and it is
+            // the one nobody would think to go looking for.
+            if (typeof loadLegacyEmissions === "function") loadLegacyEmissions().catch(() => {});
           }
         } catch { /* no wallet, or one that will not answer — leave it alone */ }
       }
@@ -1891,6 +1894,7 @@ const $ = (id) => document.getElementById(id);
        * test of anything.
        */
       window.loadEmissions = loadEmissions;
+      window.loadLegacyEmissions = loadLegacyEmissions;
       async function loadEmissions() {
         const card = $("lnEmissions");
         if (!card) return;
@@ -2003,6 +2007,59 @@ const $ = (id) => document.getElementById(id);
         } catch {
           if (!card.dataset.everShown) card.style.display = "none";
         }
+      }
+
+      /**
+       * The balance left behind on the contract the live one replaced.
+       *
+       * The migration to bounded accrual deliberately did not chain the two:
+       * the old book was thirty times its own pot, and carrying that across
+       * would have put the new contract in the same hole immediately. Nothing
+       * was swept, so the old contract keeps its pot *and* its book and those
+       * balances are still real — this is what stops them being invisible.
+       *
+       * Deliberately a closing balance rather than a card that looks live: the
+       * pot is fixed, paid first come first served, and never topped up again.
+       * Saying so is more useful than a figure that implies otherwise.
+       */
+      async function loadLegacyEmissions() {
+        const box = $("lnEmLegacy");
+        if (!box) return;
+        try {
+          const who = String(window.__myAddress || "");
+          const q = /^0x[0-9a-fA-F]{40}$/.test(who) ? `?user=${encodeURIComponent(who)}` : "";
+          const r = await (await fetch("/api/lending/emissions/legacy" + q)).json();
+          window.__legacyEmissions = r && r.ok && r.deployed ? r : null;
+          if (!r.ok || !r.deployed || BigInt(r.yoursRaw || "0") === 0n) { box.style.display = "none"; return; }
+          box.style.display = "";
+          $("lnEmLegacyBody").innerHTML =
+            `You are owed <b>${esc(r.yours)} ${esc(r.symbol)}</b> on ${esc(String(r.address).slice(0, 10))}…, the ` +
+            `contract retired when accrual became bounded by the pot. It holds ${esc(r.pot)} ${esc(r.symbol)} against ` +
+            `${esc(r.owed)} owed to everyone, is never topped up again, and pays first come first served — so a claim ` +
+            `now hands over up to <b>${esc(r.payable)} ${esc(r.symbol)}</b>.`;
+          $("lnEmLegacyClaim").disabled = BigInt(r.payableRaw || "0") === 0n;
+        } catch { /* leave whatever is on screen */ }
+      }
+
+      if ($("lnEmLegacyClaim")) {
+        $("lnEmLegacyClaim").addEventListener("click", async () => {
+          const r = window.__legacyEmissions;
+          if (!r) return;
+          // Every side of every asset: the contract skips the empty ones, and a
+          // closing balance is not worth making somebody pick through.
+          const assets = [], sides = [];
+          for (const a of r.assets || []) for (const side of [0, 1, 2]) { assets.push(a); sides.push(side); }
+          const btn = $("lnEmLegacyClaim");
+          btn.disabled = true;
+          await selfCustody("lnEmLegacyMsg", `claim up to ${r.payable} ${r.symbol} from the retired contract`,
+            async (from, cfg) => sendTx(from, r.address, callData(
+              cfg.selectors.emClaim,
+              encUint(64), encUint(64 + 32 + assets.length * 32),
+              encArray(assets.map((a) => BigInt(a))), encArray(sides.map((x) => BigInt(x))),
+            )));
+          btn.disabled = false;
+          loadLegacyEmissions();
+        });
       }
 
       if ($("lnEmClaim")) {
@@ -5544,7 +5601,10 @@ const $ = (id) => document.getElementById(id);
         }
         loadHolders(key);
         loadVenueChart(key);
-        if (key === "Lending") { loadPoolPrices(); loadBackstop(); loadAuction(); loadBorrowers(); loadEmissions(); }
+        if (key === "Lending") {
+          loadPoolPrices(); loadBackstop(); loadAuction(); loadBorrowers(); loadEmissions();
+          if (typeof loadLegacyEmissions === "function") loadLegacyEmissions().catch(() => {});
+        }
         if (key === "Amm" && typeof loadLpEmissions === "function") loadLpEmissions().catch(() => {});
       }
 

@@ -260,4 +260,30 @@ describe("TesseraEmissions — a holder's share of the pot", () => {
     await time.increase(30 * 24 * 3600);
     expect(await claimable(f, f.alice)).to.equal(before, "an accrued balance was reduced");
   });
+
+  it("carries a balance across a redeploy, bounded by the new pot", async () => {
+    /*
+     * `migrate` reads what the *old* contract says is owed, and an old
+     * contract running unbounded accrual can say almost anything. Importing
+     * that whole would break the invariant on the first block and leave
+     * everybody else accruing nothing until a pot that was never funded caught
+     * up with it. The carry is bounded like any other booking.
+     */
+    const f = await loadFixture(fixture);
+    const old = await hre.viem.deployContract("MockEmissionsPrior");
+    // The old contract claims a balance thirty times the new pot — roughly
+    // what the live deployment actually had.
+    await old.write.setClaimable([f.alice.account.address, f.usdc.address, SUPPLY, RWD(3000)]);
+
+    await shares(f, [[f.alice, 1000]]);
+    await f.em.write.fund([RWD(100)]);
+    await f.em.write.setRate([f.usdc.address, SUPPLY, RWD(1)]);
+    await f.em.write.setPrior([old.address]);
+    await f.em.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY]);
+
+    // Her share of the new pot, not the number the old contract remembered.
+    expect(await f.em.read.totalOwed()).to.equal(RWD(100));
+    const held = await f.reward.read.balanceOf([f.em.address]);
+    expect(await f.em.read.totalOwed() <= held).to.equal(true);
+  });
 });

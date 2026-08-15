@@ -62,6 +62,7 @@ const NOT_EXPORTED = {
   MockActivity: "test-only stand-in for pool and AMM activity, used from the emitter tests directly",
   MockAmmPool: "test-only stand-in for the AMM's share accounting, used from the LP emissions tests directly",
   MockEmitterSinks: "test-only stand-in for the emitter's sinks, used from the keeper tests directly",
+  MockEmissionsPrior: "test-only stand-in for a retired emissions contract, so a migration can be tested against a balance far larger than the new pot",
 };
 
 // --- 1. structural ----------------------------------------------------------

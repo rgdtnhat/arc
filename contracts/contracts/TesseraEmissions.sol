@@ -307,6 +307,28 @@ contract TesseraEmissions is ReentrancyGuard {
         }
         if (amount == 0) return 0;
 
+        /*
+         * A carried balance obeys the same ceiling as an earned one.
+         *
+         * The comment below is right that a migrated balance is a real claim
+         * honoured from the same pot in the same order — which is exactly why
+         * it cannot be exempt from the rule that bounds that pot. A prior
+         * running the old unbounded code can report a balance many times what
+         * this contract holds; importing it whole would break the invariant on
+         * the first block and leave everybody else accruing nothing until the
+         * pot caught up with a debt that was never funded.
+         *
+         * So the carry is bounded like any other booking: at most this
+         * holder's share of the pot, and at most what is not already promised.
+         * What does not come across was never backed by anything, and it stays
+         * where it is — the prior keeps its own balance and can still pay from
+         * it. Nothing payable is taken away; an unpayable number is simply not
+         * copied forward.
+         */
+        uint256 room = _headroom(user, asset, side, positions[asset][side][user].accrued);
+        if (amount > room) amount = room;
+        if (amount == 0) return 0;
+
         positions[asset][side][user].accrued += amount;
         totalOwed += amount;
         totalMigrated += amount;

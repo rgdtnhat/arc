@@ -5960,6 +5960,18 @@ async function main() {
   /* ---- Pool emissions -------------------------------------------------- */
 
   const emissionsAddr = (liveDeployment.tesseraEmissions as Hex) ?? null;
+  /**
+   * The emissions contract this one replaced, if it still owes anybody.
+   *
+   * The migration to bounded accrual deliberately did not chain the new
+   * contract to the old: the old book was 558,057 TSRA against a pot of
+   * 18,382, and importing thirty times the balance would have put the new
+   * contract in the same hole on its first block. Nothing was swept — the old
+   * contract keeps its pot *and* its book — so those balances are still real
+   * and still payable, and the only thing that changed is that the app stopped
+   * looking at them. This is the app looking at them.
+   */
+  const legacyEmissionsAddr = (liveDeployment.tesseraEmissionsLegacy as Hex) ?? null;
   const SIDE = { supply: 0, borrow: 1, backstop: 2 } as const;
 
   /*
@@ -6361,6 +6373,53 @@ async function main() {
    * address with a different (probably empty) position, and claiming as it
    * would revert `NothingToClaim` while looking like a permissions problem.
    */
+  /**
+   * What the retired emissions contract still owes this wallet.
+   *
+   * Read-only, public, and separate from the live card on purpose: it is a
+   * closing balance, not an ongoing rate. The pot behind it is fixed at
+   * whatever the old contract holds and is paid first come, first served, so
+   * the answer people need is "how much is there, and how much of it is mine".
+   */
+  app.get("/api/lending/emissions/legacy", async (req, res) => {
+    if (!legacyEmissionsAddr) { res.json({ ok: true, deployed: false }); return; }
+    try {
+      const user = String(req.query.user ?? "");
+      const who = /^0x[0-9a-fA-F]{40}$/.test(user) ? (user as Hex) : null;
+      const read = <T,>(fn: string, args: unknown[] = []): Promise<T> =>
+        client.public.readContract({
+          address: legacyEmissionsAddr, abi: tesseraEmissionsAbi, functionName: fn, args,
+        }) as Promise<T>;
+      const reward = await read<Hex>("rewardToken");
+      const meta = assetMeta(reward);
+      const [owed, held, yours] = await Promise.all([
+        read<bigint>("totalOwed"),
+        client.public.readContract({
+          address: reward, abi: erc20Abi, functionName: "balanceOf", args: [legacyEmissionsAddr],
+        }) as Promise<bigint>,
+        who ? read<bigint>("claimableTotal", [who]) : Promise.resolve(0n),
+      ]);
+      // What a claim would actually hand over: the contract pays min(owed,
+      // held), and the pot is never topped up again.
+      const payable = yours < held ? yours : held;
+      res.json({
+        ok: true,
+        deployed: true,
+        address: legacyEmissionsAddr,
+        symbol: meta.symbol,
+        pot: fmtUnits(held, meta.decimals),
+        owed: fmtUnits(owed, meta.decimals),
+        yours: fmtUnits(yours, meta.decimals),
+        yoursRaw: yours.toString(),
+        payable: fmtUnits(payable, meta.decimals),
+        payableRaw: payable.toString(),
+        assets: (poolDeployment?.assets ?? []).map((a) => a.address),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
+    }
+  });
+
   app.post("/api/lending/emissions/claim", requireOperator, async (req, res) => {
     if (!emissionsAddr) { res.status(404).json({ ok: false, error: "emissions not deployed" }); return; }
     try {
