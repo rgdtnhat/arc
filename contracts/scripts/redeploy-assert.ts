@@ -152,21 +152,6 @@ async function main() {
   }
   ok("the rate setter is restored", (await newEm.read.rateSetter()).toLowerCase() === String(before.tesseraGauge).toLowerCase());
 
-  /*
-   * The reason `setPrior` exists. Alice earned on the old contract; after the
-   * move that balance has to still be hers, claimable from the new one,
-   * without her doing anything but claiming.
-   */
-  const owedBefore = await oldEm.read.claimable([alice.account.address, usdc, 0]);
-  const aliceEm = await hre.viem.getContractAt("TesseraEmissions", after.tesseraEmissions, { client: { wallet: alice } });
-  await aliceEm.write.migrate([alice.account.address, usdc, 0]);
-  const carried = await newEm.read.claimable([alice.account.address, usdc, 0]);
-  ok(
-    "an earned reward balance survives the redeploy",
-    owedBefore > 0n && carried >= owedBefore,
-    `${owedBefore} on the old contract, ${carried} on the new`,
-  );
-
   const emitter = await hre.viem.getContractAt("TesseraEmitter", before.tesseraEmitter);
   ok("the old emissions sink is retired", (await emitter.read.sinks([0n]))[2] === 0n);
   const added = await emitter.read.sinks([1n]);
@@ -200,6 +185,27 @@ async function main() {
     "supplyFor reproduces a position in the new pool",
     (await newPool.read.supplyBalance([usdc, alice.account.address])) === aliceOld,
     `${aliceOld}`,
+  );
+
+  /*
+   * The reason `setPrior` exists — asserted *after* the position moved.
+   *
+   * A carried balance is bounded by the holder's share of the new contract's
+   * pot, and their share is measured against the new *pool*. Until
+   * `migrate:pool` has re-created the position there, that share is zero and a
+   * carry moves nothing. So the operational order is: deploy and fund the new
+   * emissions, move the positions, then carry the balances. Running the carry
+   * first is not an error anybody would see — it silently carries zero — which
+   * is exactly why it is pinned here.
+   */
+  const owedBefore = await oldEm.read.claimable([alice.account.address, usdc, 0]);
+  const aliceEm = await hre.viem.getContractAt("TesseraEmissions", after.tesseraEmissions, { client: { wallet: alice } });
+  await aliceEm.write.migrate([alice.account.address, usdc, 0]);
+  const carried = await newEm.read.claimable([alice.account.address, usdc, 0]);
+  ok(
+    "an earned reward balance survives the redeploy",
+    owedBefore > 0n && carried >= owedBefore,
+    `${owedBefore} on the old contract, ${carried} on the new`,
   );
 
   /*

@@ -564,6 +564,8 @@ async function main() {
      */
     if (rewardToken !== zero && EXECUTE) {
       console.log("  note   holders must be checkpointed before this step — unbooked accrual cannot follow the pot");
+      console.log("  note   and balances must be carried AFTER migrate:pool — a carry is bounded by the holder's");
+      console.log("         share of the new pool, which is zero until their position exists there");
       const held = await must("the old pot", rewardToken, erc20Abi, "balanceOf", [dep.tesseraEmissions]);
       const owed = await must("what the old pot owes", dep.tesseraEmissions, tesseraEmissionsAbi, "totalOwed");
       const free = held > owed ? held - owed : 0n;

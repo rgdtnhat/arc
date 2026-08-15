@@ -493,24 +493,45 @@ describe("TesseraEmissions (rewards that cannot outrun the pot)", () => {
 
       const next = await hre.viem.deployContract("TesseraEmissions", [f.pool.address, f.deployer.account.address]);
       await next.write.setRewardToken([f.reward.address]);
+      /*
+       * Fund and rate the destination before carrying anything into it.
+       *
+       * A carried balance obeys the same ceiling as an earned one — at most the
+       * holder's share of what the new contract holds — so a migration into an
+       * empty contract carries nothing, correctly. That is the operational
+       * order this fixture now models: the destination is funded first, and
+       * then balances move. Without it the tests below would be asserting on a
+       * migration nobody should perform.
+       */
+      await f.reward.write.approve([next.address, RWD(10_000)]);
+      await next.write.fund([RWD(1000)]);
+      await next.write.setRate([f.usdc.address, SUPPLY, RWD(1)]);
+      await next.write.setRate([f.usdc.address, BORROW, RWD(1)]);
       await next.write.setPrior([f.em.address]);
       return { ...f, next, owed };
     }
 
-    it("credits what the old contract says is owed", async () => {
+    it("credits what the old contract says is owed, up to what the new pot can back", async () => {
+      /*
+       * The ceiling applies to a carry like any other booking. Here the old
+       * balance is ~100 and the new pot is 1000 split across two sides, so the
+       * whole balance fits and this reads as it always did — the bound is
+       * checked where it bites, in TesseraEmissionsFairShare.test.ts.
+       */
       const f = await withPrior();
       await f.next.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY]);
       const carried = await f.next.read.claimable([f.alice.account.address, f.usdc.address, SUPPLY]);
       expect(carried >= f.owed).to.equal(true);
       expect(await f.next.read.totalOwed() >= f.owed).to.equal(true);
+      // And never beyond what the contract holds.
+      const held = await f.reward.read.balanceOf([f.next.address]);
+      expect(await f.next.read.totalOwed() <= held).to.equal(true);
     });
 
     it("pays a migrated balance out of the same pot, like any other", async () => {
       // A migrated claim is a real claim, not an IOU with different rules.
       const f = await withPrior();
       await f.next.write.migrate([f.alice.account.address, f.usdc.address, SUPPLY]);
-      await f.reward.write.approve([f.next.address, RWD(10_000)]);
-      await f.next.write.fund([RWD(1000)]);
 
       const before = await f.reward.read.balanceOf([f.alice.account.address]);
       const a = await hre.viem.getContractAt("TesseraEmissions", f.next.address, { client: { wallet: f.alice } });
