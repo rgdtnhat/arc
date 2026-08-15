@@ -120,7 +120,15 @@ describe("TesseraLpEmissions (the AMM sink that pays providers, not an address)"
     expect(due < RWD(30)).to.equal(true); // ~10, not ~1010
   });
 
-  it("pays what the pot holds and keeps owing the rest", async () => {
+  it("pays what the pot holds, and never books a debt beyond it", async () => {
+    /*
+     * This asserted the opposite half of the sentence — that the shortfall was
+     * "a debt, not a silence". It was the honest reading of the old design and
+     * the source of its unfairness: the debt booked was whatever the earliest
+     * provider happened to accumulate, and every later top-up disappeared into
+     * it before anybody else could be paid. Accrual is now bounded by the
+     * provider's share of the balance, so the shortfall is never booked.
+     */
     const f = await loadFixture(deployFixture);
     await f.amm.write.setShares([0n, f.alice.account.address, 1000n]);
     await f.amm.write.setTotalShares([0n, 1000n]);
@@ -132,8 +140,7 @@ describe("TesseraLpEmissions (the AMM sink that pays providers, not an address)"
     const a = await f.emAs(f.alice);
     await a.write.claim([[0n]]);
     expect(await f.reward.read.balanceOf([f.alice.account.address])).to.equal(RWD(10));
-    // The shortfall is a debt, not a silence.
-    expect(await f.em.read.totalOwed() > 0n).to.equal(true);
+    expect(await f.em.read.totalOwed()).to.equal(0n);
   });
 
   it("will not let the owner sweep what is already owed", async () => {

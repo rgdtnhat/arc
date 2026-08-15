@@ -275,6 +275,9 @@ contract TesseraLpEmissions is ReentrancyGuard {
             uint256 basis = p.shares < nowShares ? p.shares : nowShares; // the safe side
             if (basis != 0 && s.index > p.index) {
                 uint256 gained = (basis * (uint256(s.index) - uint256(p.index))) / INDEX_SCALE;
+                // Never more than this provider's share of what is there.
+                uint256 room = _headroom(user, poolId, p.accrued);
+                if (gained > room) gained = room;
                 if (gained != 0) {
                     p.accrued += gained;
                     totalOwed += gained;
@@ -351,6 +354,10 @@ contract TesseraLpEmissions is ReentrancyGuard {
             uint256 basis = p.shares < nowShares ? p.shares : nowShares;
             if (basis != 0 && index > p.index) {
                 gained = (basis * (index - uint256(p.index))) / INDEX_SCALE;
+                // The same ceiling the settlement applies: a preview that
+                // disagreed with a checkpoint would be worse than none.
+                uint256 room = _headroom(user, poolId, p.accrued);
+                if (gained > room) gained = room;
             }
         }
         return p.accrued + gained;
@@ -361,14 +368,68 @@ contract TesseraLpEmissions is ReentrancyGuard {
         for (uint256 i = 0; i < n; i++) total += claimable(user, streamedPools[i]);
     }
 
-    function totalRatePerSecond() external view returns (uint256 total) {
+    function totalRatePerSecond() external view returns (uint256) {
         if (paused) return 0;
+        return _liveRateTotal();
+    }
+
+    /**
+     * @notice Every live pool's rate, added up — regardless of `paused`.
+     *
+     * The public view reports zero while paused, which is right for a runway
+     * display and wrong for dividing the pot: a paused emission still has
+     * streams whose relative weights decide whose share of the pot is whose.
+     */
+    function _liveRateTotal() internal view returns (uint256 total) {
         uint256 n = streamedPools.length;
         for (uint256 i = 0; i < n; i++) {
             Stream storage s = streams[streamedPools[i]];
             if (s.endsAt != 0 && s.endsAt <= block.timestamp) continue;
             total += s.ratePerSecond;
         }
+    }
+
+    /**
+     * @notice The most this provider may have unclaimed on this pool.
+     *
+     * The same rule as `TesseraEmissions.shareOfPot`, for the same reason:
+     * accrual and funding were independent, so a rate booked debt whether or
+     * not the contract held a token and the first claimant after a top-up took
+     * the lot. A provider may hold, unclaimed, at most
+     *
+     *     pot × (this pool's rate ÷ every live rate) × (their shares ÷ all shares)
+     *
+     * See the lending twin for the full argument, including what it costs: the
+     * posted rate becomes a ceiling rather than a promise when the pot is thin.
+     */
+    function shareOfPot(address user, uint256 poolId) public view returns (uint256) {
+        if (address(rewardToken) == address(0)) return 0;
+        uint256 rateTotal = _liveRateTotal();
+        if (rateTotal == 0) return 0;
+        Stream storage s = streams[poolId];
+        if (s.endsAt != 0 && s.endsAt <= block.timestamp) return 0;
+        uint256 pot = rewardToken.balanceOf(address(this));
+        if (pot == 0) return 0;
+        uint256 total = _totalShares(poolId);
+        if (total == 0) return 0;
+        uint256 poolBudget = (pot * uint256(s.ratePerSecond)) / rateTotal;
+        return (poolBudget * amm.sharesOf(poolId, user)) / total;
+    }
+
+    /**
+     * @notice How much more this provider may accrue: the lesser of two ceilings.
+     *
+     * Their share of the pot, and the balance not already promised to somebody
+     * else. The second is what makes `totalOwed <= balance` hold whatever order
+     * providers arrive in — shares move, so shares-based caps taken at
+     * different moments need not sum to the pot.
+     */
+    function _headroom(address user, uint256 poolId, uint256 accrued) internal view returns (uint256) {
+        uint256 cap = shareOfPot(user, poolId);
+        uint256 room = cap > accrued ? cap - accrued : 0;
+        uint256 pot = rewardToken.balanceOf(address(this));
+        uint256 free = pot > totalOwed ? pot - totalOwed : 0;
+        return room < free ? room : free;
     }
 
     /// @notice Seconds the pot sustains the current rates. Max when idle.

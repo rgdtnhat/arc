@@ -133,7 +133,21 @@ describe("TesseraEmissions (rewards that cannot outrun the pot)", () => {
     expect(due < RWD(20)).to.equal(true); // ten seconds, not a thousand
   });
 
-  it("pays what the pot holds and keeps owing the rest", async () => {
+  it("pays what the pot holds, and never books a debt beyond it", async () => {
+    /*
+     * This used to assert the opposite half of the sentence: that a rate
+     * outrunning its pot left the shortfall "on the books rather than quietly
+     * forgiven". That was the honest reading of the old design and it was the
+     * source of the unfairness — the booked shortfall was whatever the earliest
+     * holder happened to accumulate, and every later top-up vanished into it
+     * before anybody else could be paid.
+     *
+     * Accrual is now bounded by the holder's share of the balance, so the
+     * shortfall is never booked in the first place. What a thin pot costs is
+     * rewards that stop at what it can back; what it no longer costs is a
+     * queue nobody behind the first place in it can clear. See
+     * `TesseraEmissionsFairShare.test.ts`.
+     */
     const f = await loadFixture(deployFixture);
     await f.pool.write.setShares([f.usdc.address, f.alice.account.address, 1000n, 0n]);
     await f.pool.write.setTotals([f.usdc.address, 1000n, 0n]);
@@ -145,11 +159,14 @@ describe("TesseraEmissions (rewards that cannot outrun the pot)", () => {
 
     const a = await f.emAs(f.alice);
     await a.write.claim([[f.usdc.address], [SUPPLY]]);
+    // A hundred seconds at one per second, against a pot of five: she is paid
+    // the five, and the ninety-five that were never funded were never promised.
     expect(await f.reward.read.balanceOf([f.alice.account.address])).to.equal(RWD(5));
-    // The shortfall stays on the books rather than being quietly forgiven.
-    expect(await f.em.read.totalOwed() > 0n).to.equal(true);
+    expect(await f.em.read.totalOwed()).to.equal(0n);
 
+    // And a top-up resumes accrual rather than disappearing into a backlog.
     await f.em.write.fund([RWD(1000)]);
+    await time.increase(100);
     await a.write.claim([[f.usdc.address], [SUPPLY]]);
     expect(await f.reward.read.balanceOf([f.alice.account.address]) > RWD(90)).to.equal(true);
   });

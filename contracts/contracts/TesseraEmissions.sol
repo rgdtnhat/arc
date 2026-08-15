@@ -509,6 +509,10 @@ contract TesseraEmissions is ReentrancyGuard {
             uint256 basis = p.shares < nowShares ? p.shares : nowShares; // the safe side
             if (basis != 0 && s.index > p.index) {
                 uint256 gained = (basis * (uint256(s.index) - uint256(p.index))) / INDEX_SCALE;
+                // Never more than this holder's share of what is actually
+                // there. See `shareOfPot` for why, and for what it costs.
+                uint256 room = _headroom(user, asset, side, p.accrued);
+                if (gained > room) gained = room;
                 if (gained != 0) {
                     p.accrued += gained;
                     totalOwed += gained;
@@ -601,6 +605,11 @@ contract TesseraEmissions is ReentrancyGuard {
             uint256 basis = p.shares < nowShares ? p.shares : nowShares;
             if (basis != 0 && index > p.index) {
                 gained = (basis * (index - uint256(p.index))) / INDEX_SCALE;
+                // The same ceiling the settlement applies. A preview that
+                // disagreed with what a checkpoint would book would be worse
+                // than no preview at all.
+                uint256 room = _headroom(user, asset, side, p.accrued);
+                if (gained > room) gained = room;
             }
         }
         return p.accrued + gained;
@@ -617,8 +626,20 @@ contract TesseraEmissions is ReentrancyGuard {
     }
 
     /// @notice Reward units per second currently promised across every stream.
-    function totalRatePerSecond() external view returns (uint256 total) {
+    function totalRatePerSecond() external view returns (uint256) {
         if (paused) return 0; // paused is not "slow", it is "stopped"
+        return _liveRateTotal();
+    }
+
+    /**
+     * @notice Every live stream's rate, added up — regardless of `paused`.
+     *
+     * The public view above reports zero while paused, which is the right
+     * answer for a runway display and the wrong one for dividing the pot: a
+     * paused emission still has streams with rates, and their relative weights
+     * are what decides whose share of the pot is whose.
+     */
+    function _liveRateTotal() internal view returns (uint256 total) {
         uint256 n = streamedAssets.length;
         for (uint256 i = 0; i < n; i++) {
             for (uint8 side = SIDE_SUPPLY; side <= SIDE_BACKSTOP; side++) {
@@ -629,6 +650,84 @@ contract TesseraEmissions is ReentrancyGuard {
                 total += s.ratePerSecond;
             }
         }
+    }
+
+    /**
+     * @notice The most this holder may have unclaimed on this stream.
+     *
+     * ## Why a ceiling exists at all
+     * Accrual and funding were independent: a rate kept booking debt whether or
+     * not the pot could pay it, so `totalOwed` grew past the balance and the
+     * first claimant after a top-up took the lot. Everyone who arrived later
+     * was accruing against a debt that had already been promised to somebody
+     * else — the card said they had earned thousands, and there was nothing
+     * behind it. Pausing the emission when the pot runs dry (see the guard)
+     * stops the promise growing; it does not make the promise *fair*, because
+     * the balance already booked is whatever the earliest holders happened to
+     * accumulate.
+     *
+     * ## The rule
+     * A holder may hold, unclaimed, at most their share of what the contract
+     * actually has:
+     *
+     *     pot × (this stream's rate ÷ every live rate) × (their shares ÷ all shares)
+     *
+     * The first factor is the stream's claim on the pot — it draws at its rate,
+     * so it is owed in proportion to it. The second is the holder's claim
+     * inside the stream. Summed over every holder of every stream the two
+     * factors telescope to exactly the pot, which is the property that matters:
+     * **`totalOwed` can never exceed the balance**. The contract stops being
+     * able to promise what it does not hold.
+     *
+     * ## What it costs
+     * Rewards no longer accrue at the posted rate when the pot is thin — the
+     * rate becomes a ceiling rather than a promise, and the APR figures with
+     * it. That is the honest version of what was already true: the old numbers
+     * were unbacked, and paying them was first come, first served.
+     *
+     * A holder already above their ceiling keeps every wei of it. Nothing here
+     * ever reduces an accrued balance; it only declines to add to one.
+     */
+    function shareOfPot(address user, address asset, uint8 side) public view returns (uint256) {
+        if (side > SIDE_BACKSTOP || address(rewardToken) == address(0)) return 0;
+        uint256 rateTotal = _liveRateTotal();
+        if (rateTotal == 0) return 0;
+        Stream storage s = streams[asset][side];
+        if (s.endsAt != 0 && s.endsAt <= block.timestamp) return 0;
+        uint256 pot = rewardToken.balanceOf(address(this));
+        if (pot == 0) return 0;
+        uint256 total = _totalShares(asset, side);
+        if (total == 0) return 0;
+        // Multiply before dividing, in this order, so the two ratios keep as
+        // much precision as the 256-bit intermediate allows.
+        uint256 streamBudget = (pot * uint256(s.ratePerSecond)) / rateTotal;
+        return (streamBudget * _userShares(asset, side, user)) / total;
+    }
+
+    /**
+     * How much more this holder may accrue: the lesser of two ceilings.
+     *
+     * The proportional one is `shareOfPot` — nobody books more than their slice
+     * of the balance. The absolute one is the balance that is not already
+     * promised to somebody else, and it is what makes the invariant hold
+     * *unconditionally*: shares move, so caps computed at different moments do
+     * not have to sum to the pot, and without this a holder who books their
+     * share and a newcomer who books theirs can between them be owed more than
+     * exists. Bounding every booking by the free balance means `totalOwed` can
+     * never exceed what the contract holds, whatever order things happen in.
+     *
+     * The consequence, stated plainly: emissions that accrued while somebody
+     * was the only holder belong to them. A latecomer does not get a share of
+     * those — they get their share of everything the pot is given from the
+     * moment they arrive, which is the thing that was actually broken. Before
+     * this, one address's unbounded balance swallowed every top-up forever.
+     */
+    function _headroom(address user, address asset, uint8 side, uint256 accrued) internal view returns (uint256) {
+        uint256 cap = shareOfPot(user, asset, side);
+        uint256 room = cap > accrued ? cap - accrued : 0;
+        uint256 pot = rewardToken.balanceOf(address(this));
+        uint256 free = pot > totalOwed ? pot - totalOwed : 0;
+        return room < free ? room : free;
     }
 
     /**
