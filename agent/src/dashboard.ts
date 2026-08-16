@@ -7616,6 +7616,120 @@ async function main() {
   /** Ids currently inside `executeTask`, so the page can show what is live. */
   const runningTasks = new Set<string>();
 
+  /**
+   * A scheduled action funded by a visitor's own wallet, not the app's.
+   *
+   * ## Why this shape, and not something simpler
+   * A session key can do exactly one thing: `transferFrom(owner, to, amount)`,
+   * bounded by a cap, a per-payment ceiling, an optional allow-list and an
+   * expiry the owner set. It cannot call the pool. So a visitor's scheduled
+   * supply cannot be one transaction — the money has to move, and then be paid
+   * in, and something has to do the paying in.
+   *
+   * The pool, the vault and the AMM each carry a `…For` entry point whose
+   * contract comment says it plainly: *you pay, they get the position*, and it
+   * is permissionless because giving somebody your money can only help them.
+   * That is what makes this honest rather than custodial in effect: the app
+   * wallet pays in, and the shares are minted to **the visitor**. There is no
+   * moment at which the position is the app's, and no admin primitive anywhere
+   * in those contracts that could move it afterwards — deliberately, because
+   * that primitive is indistinguishable from a rug pull.
+   *
+   * ## The window, and what closes it
+   * Between the two transactions the visitor's funds sit in the app wallet.
+   * That window is the whole risk of this feature, so:
+   *
+   *  1. the second leg is **simulated first**, and nothing moves if it would
+   *     revert — the common failures (frozen reserve, supply cap, unknown
+   *     asset) are all caught here, before the visitor's money has left;
+   *  2. if it fails anyway, the funds are **sent straight back** to the wallet
+   *     they came from;
+   *  3. if even that fails, the task is recorded as failed naming the amount
+   *     and the address holding it, because an operator who cannot see stranded
+   *     funds cannot return them.
+   *
+   * The amount is never more than the session's own remaining cap; that ceiling
+   * is the contract's, checked on chain in leg one, not this function's.
+   */
+  async function runSessionFunded(
+    t: Task,
+    hashes: Hex[],
+    plan: {
+      /** Describes the second leg for a simulation, and then performs it. */
+      label: string;
+      simulate: (owner: Hex, amount: bigint) => Promise<true | string>;
+      settle: (owner: Hex, amount: bigint) => Promise<Hex>;
+    },
+  ): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
+    const p = t.params ?? {};
+    const id = String(p.sessionId ?? "") as Hex;
+    if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("that task has no session id");
+    const amount = BigInt(String(p.amount ?? "0"));
+    if (amount <= 0n) throw new Error("amount must be above zero");
+
+    const s = await readSession(id, { fresh: true });
+    if (!s) throw new Error("no such session");
+    const ownerAddr = s.owner as Hex;
+    /*
+     * The session's asset is the only one it can move, so it is the asset this
+     * runs against — not whatever the form last had selected. A mismatch here
+     * would spend one token and credit a position in another.
+     */
+    const wanted = String(p.asset ?? s.asset).toLowerCase();
+    if (wanted !== String(s.asset).toLowerCase()) {
+      throw new Error(
+        `that session pays in ${s.symbol}, and this task is set to ${wanted.slice(0, 10)}… — ` +
+        "open a session for that asset, or point the task at this one",
+      );
+    }
+
+    const dry = await plan.simulate(ownerAddr, amount);
+    if (dry !== true) {
+      // Nothing has moved. Say why, in the pool's own words where it has any.
+      throw new Error(`${plan.label} would fail, so nothing was taken from the delegated wallet: ${dry}`);
+    }
+
+    const pulled = await spendFromSession(id, agentAccount.address as Hex, amount, noteOf(p.memo));
+    hashes.push(pulled as Hex);
+    sessionsInvalidate();
+
+    const human = `${fmtUnits(amount, s.decimals)} ${s.symbol}`;
+    try {
+      const done = await plan.settle(ownerAddr, amount);
+      hashes.push(done as Hex);
+      return {
+        ok: true,
+        detail: `${plan.label} ${human} for ${ownerAddr.slice(0, 8)}… from their own wallet`,
+        txHash: done,
+      };
+    } catch (e) {
+      const why = friendlyError(e);
+      try {
+        const back = await agentSigner.write(s.asset as Hex, erc20Abi, "transfer", [ownerAddr, amount]);
+        hashes.push(back as Hex);
+        return {
+          ok: false,
+          detail: `${plan.label} failed (${why}) — the ${human} taken from the delegated wallet was returned to ${ownerAddr.slice(0, 8)}…`,
+          txHash: back,
+        };
+      } catch (backErr) {
+        // The one case an operator has to see. Loud, named, and with the amount.
+        const stranded =
+          `${plan.label} failed (${why}) AND the ${human} could not be returned ` +
+          `(${friendlyError(backErr)}). It is held by the app wallet ${agentAccount.address} ` +
+          `and is owed to ${ownerAddr}.`;
+        console.error(`[tasks] STRANDED FUNDS — ${stranded}`);
+        try {
+          txlog.record({
+            actor: agentAccount.address as string, category: "defi", action: "session-funded-stranded",
+            status: "failed", txHash: pulled, detail: stranded,
+          });
+        } catch { /* the ledger is not the point */ }
+        return { ok: false, detail: stranded, txHash: pulled };
+      }
+    }
+  }
+
   async function runTask(
     t: Task,
     /** Every transaction this run broadcast, so the caller can price it. */
@@ -7634,6 +7748,23 @@ async function main() {
         if (!poolClient) throw new Error("lending is not available on this deployment");
         const a = asset();
         const amt = amount();
+        /*
+         * The same two verbs, funded from two different wallets.
+         *
+         * `supply`/`repay` spend the app's. `sessionSupply`/`sessionRepay`
+         * spend a visitor's, through the session they opened — and the position
+         * is created in *their* name by the pool's `…For` entry point, so at no
+         * point does the app hold it.
+         */
+        if (t.action === "sessionSupply" || t.action === "sessionRepay") {
+          const fn = t.action === "sessionSupply" ? "supplyFor" : "repayFor";
+          return runSessionFunded(t, hashes, {
+            label: t.action === "sessionSupply" ? "supply" : "repay",
+            simulate: (who, value) => poolClient.wouldSucceed(fn, [a, who, value]),
+            settle: (who, value) =>
+              t.action === "sessionSupply" ? poolClient.supplyFor(a, who, value) : poolClient.repayFor(a, who, value),
+          });
+        }
         const txHash =
           t.action === "supply" ? await poolClient.supply(a, amt)
           : t.action === "withdraw" ? await poolClient.withdraw(a, amt)
@@ -7647,6 +7778,14 @@ async function main() {
       }
       case "vault": {
         if (!vaultClient) throw new Error("the vault is not deployed");
+        // Same rule as lending: the shares are minted to the visitor.
+        if (t.action === "sessionDeposit") {
+          return runSessionFunded(t, hashes, {
+            label: "deposit",
+            simulate: (who, value) => vaultClient.wouldSucceed("depositFor", [who, value]),
+            settle: (who, value) => vaultClient.depositFor(who, value),
+          });
+        }
         const txHash = t.action === "deposit"
           ? await vaultClient.deposit(amount())
           : await vaultClient.withdrawShares(BigInt(String(p.shares ?? "0")));
@@ -7983,8 +8122,25 @@ async function main() {
     return null;
   }
 
-  /** The verbs a caller may create. A visitor's list is one venue, two verbs. */
-  const SESSION_ACTIONS = { wallet: ["sessionSend", "sessionBulk"] };
+  /**
+   * The verbs a visitor may schedule, by venue.
+   *
+   * Every one is funded by a session key they opened: their wallet pays, within
+   * a cap they set and can revoke, and — for the DeFi verbs — the position is
+   * created in their own name by the venue's `…For` entry point. Nothing here
+   * can spend the app's wallet, which is the whole reason the list is explicit
+   * rather than "anything except…".
+   *
+   * What is deliberately absent: withdraw, borrow, swap, and removing
+   * liquidity. Those pay *out*, and the contracts credit `msg.sender` with no
+   * third-party variant, so there is no way for this server to do one on a
+   * visitor's behalf. Their own wallet signs those, from the DeFi tab.
+   */
+  const SESSION_ACTIONS: Record<string, string[]> = {
+    wallet: ["sessionSend", "sessionBulk"],
+    lending: ["sessionSupply", "sessionRepay"],
+    vault: ["sessionDeposit"],
+  };
 
   /**
    * Which rows to *show*, which is a different question from which to allow.
@@ -8050,8 +8206,11 @@ async function main() {
       running: process.env.TESSERA_TASKS !== "off",
       note: scope.operator
         ? undefined
-        : "These are your own scheduled payments, funded by a session key you delegated and bounded by its cap. " +
-          "Revoking the session stops them.",
+        : "These are your own standing instructions, funded by a session key you delegated and bounded by its " +
+          "cap. As well as paying an address, they can supply to the pool, repay a loan or deposit to the vault — " +
+          "the position is created in your name, not the app's, and your tokens stay in your wallet until each " +
+          "run. Withdrawing, borrowing and swapping are not on the list because those pay out to whoever signs " +
+          "them, which has to be you: do those from the DeFi tab. Revoking the session stops all of it.",
     });
   });
 
@@ -8121,12 +8280,40 @@ async function main() {
    *   task routes check ownership before calling this, which is the same read —
    *   doing it twice doubled the wait on the one request people notice.
    */
+  /**
+   * Would this session pay this address?
+   *
+   * Only meaningful for a restricted session — an unrestricted one pays anyone.
+   * Asked before a session-funded DeFi task is saved, because the money reaches
+   * the venue through the app wallet, and a session whose allow-list omits it
+   * would revert on every single run with nothing on the form having warned.
+   */
+  async function sessionAllows(id: Hex, to: Hex): Promise<boolean> {
+    if (!sessionKeysAddr) return false;
+    try {
+      return (await client.public.readContract({
+        address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "allowed", args: [id, to],
+      })) as boolean;
+    } catch {
+      // Unreadable is not "not allowed": refusing to save on a flaky RPC would
+      // be worse than letting the chain answer at run time.
+      return true;
+    }
+  }
+
   async function checkTaskParams(
     body: { venue?: string; action?: string; params?: Record<string, unknown> },
     known?: SessionRow,
   ) {
-    if (body.venue !== "wallet") return;
-    if (body.action === "sessionSend" || body.action === "sessionBulk") {
+    const action = String(body.action ?? "");
+    /*
+     * Anything session-funded is checked the same way, whatever venue it is in.
+     *
+     * The session is the funding, so its health is the question — delegated to
+     * a key this server still holds, not revoked, and paying in the asset the
+     * task names. Then the venue's own parameters on top.
+     */
+    if (action.startsWith("session")) {
       const id = String(body.params?.sessionId ?? "");
       if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("choose a session to spend from");
       const s0 = known !== undefined ? known : await readSession(id as Hex);
@@ -8141,13 +8328,44 @@ async function main() {
         );
       }
       if (s0.revoked) throw new Error("that session has been revoked");
-      if (body.action === "sessionBulk") {
+      if (action === "sessionBulk") {
         if (!parseRecipients(body.params?.recipients).length) throw new Error("no recipients");
-      } else {
+        return;
+      }
+      if (action === "sessionSend") {
         parseRecipients([{ to: body.params?.to, amount: body.params?.amount }]);
+        return;
+      }
+      /*
+       * A DeFi verb funded by a session: supply, repay, deposit.
+       *
+       * The money reaches the venue through the app wallet, which is why the
+       * asset has to be the session's own — spending one token and crediting a
+       * position in another is a mistake nothing downstream could detect. And
+       * a restricted session has to actually permit paying the app wallet, or
+       * every run would revert at the first leg; better to say so now.
+       */
+      let value: bigint;
+      try {
+        value = BigInt(String(body.params?.amount ?? "0"));
+      } catch {
+        throw new Error(`"${String(body.params?.amount)}" is not an amount`);
+      }
+      if (value <= 0n) throw new Error("the amount must be above zero");
+      const named = String(body.params?.asset ?? s0.asset).toLowerCase();
+      if (named !== String(s0.asset).toLowerCase()) {
+        throw new Error(`that session pays in ${s0.symbol} — pick a session for the asset this task uses`);
+      }
+      if (s0.restricted && !(await sessionAllows(id as Hex, agentAccount.address as Hex))) {
+        throw new Error(
+          "that session only pays an allow-list, and the app wallet is not on it. A supply, repay or " +
+          `deposit reaches the pool through ${agentAccount.address}, so it has to be allowed — ` +
+          "or open a session without an allow-list for this.",
+        );
       }
       return;
     }
+    if (body.venue !== "wallet") return;
     if (body.action === "bulk") {
       if (!parseRecipients(body.params?.recipients).length) throw new Error("no recipients");
       return;
@@ -8207,11 +8425,15 @@ async function main() {
 
     let mine: SessionRow | undefined;
     if (!scope.operator) {
-      const allowed = SESSION_ACTIONS.wallet as string[];
-      if (what.venue !== "wallet" || !allowed.includes(String(what.action))) {
+      const allowed = SESSION_ACTIONS[venue] ?? [];
+      if (!allowed.includes(String(what.action))) {
+        const offer = Object.entries(SESSION_ACTIONS)
+          .map(([v, list]) => `${v}: ${list.join(", ")}`)
+          .join(" · ");
         throw new Gate(403,
-          `${at}from your own wallet you can schedule sessionSend or sessionBulk — ` +
-          "the rest spend the app's wallet and are operator-only");
+          `${at}from your own wallet you can schedule ${offer}. ` +
+          "Everything else either spends the app's wallet, or pays out to whoever signs it — " +
+          "which has to be you, from the DeFi tab.");
       }
       const sid = String(what.params?.sessionId ?? "");
       try {

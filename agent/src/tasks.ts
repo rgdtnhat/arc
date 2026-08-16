@@ -87,14 +87,27 @@ export const TASK_LIMITS = {
 const VENUES: TaskVenue[] = ["lending", "amm", "vault", "swap", "wallet"];
 
 /** What each venue will actually carry out. Anything else is refused at creation. */
+/*
+ * Every verb, and which wallet pays for it.
+ *
+ * The `session…` verbs pay out of a *visitor's* wallet through a session key
+ * they delegated, rather than out of the app wallet: same shape, different
+ * funding address, and a cap the visitor set and can revoke at any moment.
+ *
+ * They exist only where the venue has a `…For` entry point that credits a third
+ * party — `supplyFor`, `repayFor`, `depositFor`. Those are the ones where a
+ * visitor's money can go in and the position comes out in *their* name. There
+ * is deliberately no `sessionWithdraw`, `sessionBorrow` or `sessionSwap`: every
+ * one of those pays *out*, and the contracts credit `msg.sender` with no
+ * third-party variant anywhere, because a primitive that moved an existing
+ * holder's position is indistinguishable from a rug pull. A visitor's own
+ * wallet has to sign for those, and does — from the DeFi tab.
+ */
 export const TASK_ACTIONS: Record<TaskVenue, string[]> = {
-  lending: ["supply", "withdraw", "borrow", "repay"],
+  lending: ["supply", "withdraw", "borrow", "repay", "sessionSupply", "sessionRepay"],
   amm: ["add", "remove", "swap"],
-  vault: ["deposit", "withdraw"],
+  vault: ["deposit", "withdraw", "sessionDeposit"],
   swap: ["swap"],
-  // `sessionSend` and `sessionBulk` pay out of a *visitor's* wallet through a
-  // session key they delegated, rather than out of the app wallet. Same shape,
-  // different funding address and a cap the visitor set and can revoke.
   wallet: ["send", "bulk", "sessionSend", "sessionBulk"],
 };
 

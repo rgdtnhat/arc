@@ -123,6 +123,30 @@ export class TesseraPoolClient {
     await confirm(this.public, hash);
   }
 
+  /**
+   * Would this call succeed, without sending it?
+   *
+   * Used before a session-funded supply: the visitor's money moves in one
+   * transaction and lands in the pool in the next, so the second is simulated
+   * first. A revert discovered afterwards would leave their funds sitting in
+   * the app's wallet, which is the one outcome this flow must not have.
+   */
+  async wouldSucceed(functionName: string, args: unknown[]): Promise<true | string> {
+    try {
+      await this.public.simulateContract({
+        address: this.pool,
+        abi: tesseraPoolAbi,
+        functionName: functionName as never,
+        args: args as never,
+        account: this.account,
+      });
+      return true;
+    } catch (e) {
+      const m = e as { shortMessage?: string; message?: string };
+      return m.shortMessage ?? m.message ?? String(e);
+    }
+  }
+
   private async write(functionName: string, args: unknown[]): Promise<Hex> {
     const { request } = await this.public.simulateContract({
       address: this.pool,
@@ -140,6 +164,20 @@ export class TesseraPoolClient {
     await this.ensureApproval(asset, amount);
     return this.write("supply", [asset, amount]);
   }
+  /**
+   * Supply so that **`user`** holds the position, paid for from this wallet.
+   *
+   * The pool's own words: you pay, they get the position, and it is
+   * permissionless because handing somebody your money can only help them.
+   * What it makes possible here is a scheduled supply funded by a *visitor's*
+   * session key — their USDC comes through the delegation, this wallet passes
+   * it straight into the pool, and the shares are minted to them. There is no
+   * step at which the position belongs to the app.
+   */
+  async supplyFor(asset: Hex, user: Hex, amount: bigint): Promise<Hex> {
+    await this.ensureApproval(asset, amount);
+    return this.write("supplyFor", [asset, user, amount]);
+  }
   async withdraw(asset: Hex, amount: bigint): Promise<Hex> {
     return this.write("withdraw", [asset, amount]);
   }
@@ -149,6 +187,11 @@ export class TesseraPoolClient {
   async repay(asset: Hex, amount: bigint): Promise<Hex> {
     await this.ensureApproval(asset, amount);
     return this.write("repay", [asset, amount]);
+  }
+  /** Repay **`user`'s** debt out of this wallet. See `supplyFor`. */
+  async repayFor(asset: Hex, user: Hex, amount: bigint): Promise<Hex> {
+    await this.ensureApproval(asset, amount);
+    return this.write("repayFor", [asset, user, amount]);
   }
 
   // --- backstop (first-loss capital) ----------------------------------------

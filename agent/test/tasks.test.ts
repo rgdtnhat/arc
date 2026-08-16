@@ -319,3 +319,56 @@ test("a task stored before owners existed belongs to the operator, not to nobody
   assert.equal(s.ownedBy("legacy", visitor), false);
   assert.equal(s.ownedBy("legacy", null), true);
 });
+
+/*
+ * Which verbs a visitor's own wallet may be scheduled for.
+ *
+ * A session key can do one thing — `transferFrom(owner, to, amount)` under a
+ * cap the owner set. So a visitor's scheduled DeFi action only exists where the
+ * venue has a `…For` entry point that credits a third party: the app wallet
+ * pays in, and the position is minted to the visitor. Where there is no such
+ * entry point, there is no safe way for this server to act for them, and the
+ * verb must not be offered at any price — an operator-only verb reachable by a
+ * visitor spends the app's wallet, which is the failure this whole split
+ * exists to prevent.
+ */
+test("every verb a visitor may schedule pays in; none of them pays out", () => {
+  // The server's own list, mirrored here so a verb added to one without
+  // thinking about the other fails a test rather than shipping.
+  const visitorMay: Record<string, string[]> = {
+    wallet: ["sessionSend", "sessionBulk"],
+    lending: ["sessionSupply", "sessionRepay"],
+    vault: ["sessionDeposit"],
+  };
+  for (const [venue, verbs] of Object.entries(visitorMay)) {
+    for (const verb of verbs) {
+      assert.ok(
+        TASK_ACTIONS[venue as keyof typeof TASK_ACTIONS].includes(verb),
+        `${venue}:${verb} is offered to visitors but the executor has no such verb`,
+      );
+      assert.ok(verb.startsWith("session"), `${venue}:${verb} does not name itself as session-funded`);
+    }
+  }
+  // The ones that pay out. None may ever appear above.
+  const paysOut = ["withdraw", "borrow", "swap", "remove", "sessionWithdraw", "sessionBorrow", "sessionSwap"];
+  const offered = Object.values(visitorMay).flat();
+  for (const verb of paysOut) {
+    assert.equal(offered.includes(verb), false, `a visitor was offered "${verb}", which pays out to whoever signs it`);
+  }
+});
+
+test("a verb that spends the app wallet is never one of the visitor's", () => {
+  const visitorVerbs = new Set(["sessionSend", "sessionBulk", "sessionSupply", "sessionRepay", "sessionDeposit"]);
+  // Everything the executor knows how to do, minus the visitor's list, spends
+  // the app's own wallet — so none of those may be named `session…` either, or
+  // the gate's prefix check would let one through.
+  for (const [venue, verbs] of Object.entries(TASK_ACTIONS)) {
+    for (const verb of verbs) {
+      if (visitorVerbs.has(verb)) continue;
+      assert.equal(
+        verb.startsWith("session"), false,
+        `${venue}:${verb} is named like a session verb but is not one a visitor may schedule`,
+      );
+    }
+  }
+});

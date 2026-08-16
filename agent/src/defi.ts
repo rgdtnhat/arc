@@ -73,6 +73,29 @@ export class VaultClient {
     return hash;
   }
 
+  /** Deposit so that **`user`** holds the shares, paid from this wallet. */
+  async depositFor(user: Hex, assets: bigint): Promise<Hex> {
+    await this.ensureApproval(assets);
+    return this.write("depositFor", [user, assets]);
+  }
+
+  /** See `TesseraPoolClient.wouldSucceed` — a dry run before money moves. */
+  async wouldSucceed(functionName: string, args: unknown[]): Promise<true | string> {
+    try {
+      await this.public.simulateContract({
+        address: this.vault,
+        abi: tesseraVaultAbi,
+        functionName: functionName as never,
+        args: args as never,
+        account: this.cfg.account,
+      });
+      return true;
+    } catch (e) {
+      const m = e as { shortMessage?: string; message?: string };
+      return m.shortMessage ?? m.message ?? String(e);
+    }
+  }
+
   async deposit(assets: bigint): Promise<Hex> {
     await this.ensureApproval(assets);
     return this.write("deposit", [assets]);

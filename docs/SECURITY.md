@@ -352,9 +352,61 @@ each step is validated, logged to the ledger, and honours the same stop flag.
 | Question | Answered by |
 |---|---|
 | May this caller schedule this verb at all? | `gateScheduled`, called by `/api/tasks`, `/api/tasks/:id`, `/api/series`, `/api/series/:id` |
-| Whose funds does it move? | The venue: `wallet:send`/`bulk` and everything outside `wallet` spend the app's wallet and are operator-only; `sessionSend`/`sessionBulk` spend the caller's own delegation and nothing else |
+| Whose funds does it move? | The verb. Everything not named `session…` spends the app's wallet and is operator-only; the `session…` verbs spend the caller's own delegation and nothing else |
 | Whose delegation may it name? | The session's on-chain `owner` must equal the authenticated wallet |
 | What actually spends? | `executeTask` → `runTask`, for a task and a series step alike |
+
+## Scheduling DeFi out of a visitor's own wallet
+
+A session key can do exactly one thing: `transferFrom(owner, to, amount)`,
+bounded by a cap, a per-payment ceiling, an optional allow-list and an expiry
+the owner set. It cannot call the pool. So a visitor's scheduled supply cannot
+be one transaction — the money has to move, and then be paid in.
+
+What makes that safe rather than custodial in effect is that the pool, the vault
+and the AMM each carry a `…For` entry point whose contract comment says it
+plainly: *you pay, they get the position*, permissionless because giving
+somebody your money can only help them. The app wallet pays in and the position
+is minted to **the visitor**. At no point is the position the app's, and there
+is no admin primitive in any of those contracts that could move it afterwards —
+deliberately, because that primitive is indistinguishable from a rug pull.
+
+| Verb | Legs | Who ends up holding it |
+|---|---|---|
+| `lending:sessionSupply` | `spend(session → app)` then `pool.supplyFor(asset, visitor, amount)` | the visitor |
+| `lending:sessionRepay` | `spend(session → app)` then `pool.repayFor(asset, visitor, amount)` | the visitor's debt is reduced |
+| `vault:sessionDeposit` | `spend(session → app)` then `vault.depositFor(visitor, amount)` | the visitor |
+
+### The window between the two legs, and what closes it
+
+Between them the visitor's funds sit in the app wallet. That window is the whole
+risk of the feature, so `runSessionFunded` in `agent/src/dashboard.ts`:
+
+1. **simulates the second leg first**, and moves nothing if it would revert —
+   frozen reserve, supply cap, unknown asset, zero amount are all caught here,
+   before the visitor's money has left their wallet;
+2. **returns the funds** to the wallet they came from if it fails anyway;
+3. **records stranded funds loudly** if even the return fails — naming the
+   amount, the address holding it and the address owed — because an operator
+   who cannot see stranded funds cannot return them.
+
+The amount is never more than the session's own remaining cap. That ceiling is
+the contract's, enforced on chain in the first leg, not this function's.
+
+Two things are refused at the form rather than at run time: an asset that is not
+the session's own (spending one token and crediting a position in another is a
+mistake nothing downstream could detect), and a restricted session whose
+allow-list omits the app wallet (every run would revert at the first leg).
+
+### What a visitor cannot schedule, and why
+
+Withdraw, borrow, swap, and removing liquidity. Every one of them pays *out*,
+and the contracts credit `msg.sender` with no third-party variant anywhere —
+for the same reason the `…For` functions have no counterpart that moves an
+existing holder's position. There is no way for this server to perform one on a
+visitor's behalf, so the verbs do not exist rather than existing in a weakened
+form. A visitor's own wallet signs those, from the DeFi tab, where it always
+could.
 
 ## Session keys: what can be changed, and by whom
 

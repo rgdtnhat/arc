@@ -4351,6 +4351,16 @@ const $ = (id) => document.getElementById(id);
         // Funded by a visitor's delegation rather than the app wallet.
         "wallet:sessionSend": ["session", "to", "amount", "message", "memo"],
         "wallet:sessionBulk": ["session", "recipients", "message", "memo"],
+        /*
+         * The same, into a venue rather than to an address.
+         *
+         * No asset picker: a session names the one token it can move, so the
+         * asset is the session's and offering a second choice could only ever
+         * be a way to get it wrong.
+         */
+        "lending:sessionSupply": ["session", "amount", "message", "memo"],
+        "lending:sessionRepay": ["session", "amount", "message", "memo"],
+        "vault:sessionDeposit": ["session", "amount", "message", "memo"],
       };
 
       /**
