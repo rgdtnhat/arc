@@ -414,6 +414,35 @@ export class AmmClient {
     return this.write("addLiquidity", [BigInt(poolId), amounts, minShares]);
   }
 
+  /**
+   * Add liquidity so that **`to`** holds the shares, paid for from this wallet.
+   *
+   * The pool's own words again: you pay, they get the shares. What it allows
+   * here is a scheduled deposit funded by a visitor's session keys — note the
+   * plural, because `_addLiquidity` requires every asset's amount to be above
+   * zero, so a pool of two assets needs a delegation for each.
+   */
+  async addLiquidityFor(
+    poolId: number, to: Hex, assets: Hex[], amounts: bigint[], minShares = 0n,
+  ): Promise<Hex> {
+    for (let i = 0; i < assets.length; i++) await this.ensureApproval(assets[i], amounts[i]);
+    return this.write("addLiquidityFor", [BigInt(poolId), to, amounts, minShares]);
+  }
+
+  /** See `TesseraPoolClient.wouldSucceed` — a dry run before money moves. */
+  async wouldSucceed(functionName: string, args: unknown[]): Promise<true | string> {
+    try {
+      await this.public.simulateContract({
+        address: this.amm, abi: tesseraAmmAbi,
+        functionName: functionName as never, args: args as never, account: this.cfg.account,
+      });
+      return true;
+    } catch (e) {
+      const m = e as { shortMessage?: string; message?: string };
+      return m.shortMessage ?? m.message ?? String(e);
+    }
+  }
+
   async removeLiquidity(poolId: number, shares: bigint, minAmounts: bigint[]): Promise<Hex> {
     return this.write("removeLiquidity", [BigInt(poolId), shares, minAmounts]);
   }

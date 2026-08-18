@@ -7617,117 +7617,348 @@ async function main() {
   const runningTasks = new Set<string>();
 
   /**
+   * How much of a fresh quote a scheduled swap will accept, in basis points.
+   *
+   * Defaults to 1%, and is clamped: zero would make every run revert on the
+   * ordinary rounding between quoting and landing, and anything past 10% is not
+   * slippage protection, it is a note saying "take what you like".
+   */
+  const slippageBps = (p: Record<string, unknown>) => {
+    const raw = Number(p.maxSlippageBps ?? 100);
+    if (!Number.isFinite(raw)) return 100;
+    return Math.min(1000, Math.max(10, Math.round(raw)));
+  };
+
+  /** What the router would pay out for a trade right now. */
+  const quoteRouter = async (tokenIn: Hex, tokenOut: Hex, amountIn: bigint): Promise<bigint> => {
+    if (!routerClient) return 0n;
+    try {
+      const [out] = await routerClient.estimate(tokenIn, tokenOut, amountIn);
+      return out;
+    } catch {
+      return 0n;
+    }
+  };
+
+  /**
+   * Hand a swap's output to the visitor it belongs to.
+   *
+   * Nothing in the AMM or the router takes a recipient, so the output lands in
+   * the app wallet and has to be forwarded. This is the one leg that can leave
+   * money here after the input is already spent — there is nothing to refund at
+   * that point, only something to hand over — which is why a failure raises
+   * `Stranded` rather than falling into the ordinary give-it-back path.
+   */
+  const deliverOutput = async (
+    who: Hex, outAsset: Hex, swapHash: Hex, hashes: Hex[], label: string,
+    /** This wallet's balance of the output token *before* the swap. */
+    heldBefore: bigint,
+  ): Promise<{ txHash: Hex; note?: string }> => {
+    const meta = assetMeta(outAsset);
+    // Read what the swap actually paid rather than trusting the quote: the
+    // amount forwarded has to be the amount that arrived.
+    const got = await swapProceeds(swapHash, outAsset, heldBefore);
+    if (got <= 0n) {
+      throw new Stranded(`the proceeds of a ${label}`, who,
+        `${label} landed but its output could not be measured`);
+    }
+    try {
+      const send = await agentSigner.write(outAsset, erc20Abi, "transfer", [who, got]);
+      hashes.push(send as Hex);
+      return { txHash: send, note: `${fmtUnits(got, meta.decimals)} ${meta.symbol} sent on to ${who.slice(0, 8)}…` };
+    } catch (e) {
+      throw new Stranded(`${fmtUnits(got, meta.decimals)} ${meta.symbol}`, who,
+        `${label} succeeded but the proceeds could not be sent on: ${friendlyError(e)}`);
+    }
+  };
+
+  /**
+   * What a swap actually paid out, from its own receipt.
+   *
+   * The transfer logs name the amount that reached this wallet, which is the
+   * only figure worth forwarding — a quote is what it *should* have been, and
+   * on a pool that moved between quoting and landing those are different
+   * numbers.
+   *
+   * The fallback is the **difference** the swap made to this wallet's balance,
+   * never the balance itself. That distinction is the whole safety of this
+   * function: the app wallet holds its own funds in these same tokens — several
+   * hundred EURC on the live deployment — and forwarding a balance rather than
+   * a delta would hand a visitor every last one of them the first time a
+   * receipt could not be read.
+   */
+  const swapProceeds = async (txHash: Hex, outAsset: Hex, heldBefore: bigint): Promise<bigint> => {
+    try {
+      const rec = await client.public.getTransactionReceipt({ hash: txHash });
+      const me = (agentAccount.address as string).toLowerCase().slice(2).padStart(64, "0");
+      let sum = 0n;
+      for (const log of rec.logs) {
+        if (String(log.address).toLowerCase() !== String(outAsset).toLowerCase()) continue;
+        // Transfer(address,address,uint256), with `to` as the second topic.
+        if (log.topics.length < 3) continue;
+        if (String(log.topics[2]).toLowerCase().slice(2) !== me) continue;
+        sum += BigInt(log.data);
+      }
+      if (sum > 0n) return sum;
+    } catch { /* the delta below is the safe fallback */ }
+    try {
+      const now = (await client.public.readContract({
+        address: outAsset, abi: erc20Abi, functionName: "balanceOf", args: [agentAccount.address as Hex],
+      })) as bigint;
+      return now > heldBefore ? now - heldBefore : 0n;
+    } catch {
+      return 0n;
+    }
+  };
+
+  /** This wallet's balance of one token, or zero if it cannot be read. */
+  const heldNow = async (asset: Hex): Promise<bigint> => {
+    try {
+      return (await client.public.readContract({
+        address: asset, abi: erc20Abi, functionName: "balanceOf", args: [agentAccount.address as Hex],
+      })) as bigint;
+    } catch {
+      return 0n;
+    }
+  };
+
+  /**
+   * Funds pulled from a visitor's delegation, and where they are.
+   *
+   * Carried through the whole flow so a failure at any point can say which
+   * assets moved and how much, rather than "something went wrong".
+   */
+  type Pulled = { sessionId: Hex; asset: Hex; amount: bigint; symbol: string; decimals: number };
+
+  /**
+   * Thrown when funds are in the app's hands and could not be given back.
+   *
+   * The one outcome this whole design exists to make rare and, when it happens,
+   * impossible to miss. It is a distinct type because the generic refund path
+   * must not try to "return" something already spent — after a swap, the input
+   * is gone and it is the *output* that is held.
+   */
+  class Stranded extends Error {
+    constructor(readonly held: string, readonly owed: Hex, message: string) { super(message); }
+  }
+
+  /**
    * A scheduled action funded by a visitor's own wallet, not the app's.
    *
    * ## Why this shape, and not something simpler
    * A session key can do exactly one thing: `transferFrom(owner, to, amount)`,
    * bounded by a cap, a per-payment ceiling, an optional allow-list and an
-   * expiry the owner set. It cannot call the pool. So a visitor's scheduled
-   * supply cannot be one transaction — the money has to move, and then be paid
-   * in, and something has to do the paying in.
+   * expiry the owner set. It cannot call the pool, the vault or the AMM. So a
+   * visitor's scheduled supply cannot be one transaction — the money has to
+   * move, and then be paid in, and something has to do the paying in.
    *
    * The pool, the vault and the AMM each carry a `…For` entry point whose
    * contract comment says it plainly: *you pay, they get the position*, and it
    * is permissionless because giving somebody your money can only help them.
    * That is what makes this honest rather than custodial in effect: the app
-   * wallet pays in, and the shares are minted to **the visitor**. There is no
-   * moment at which the position is the app's, and no admin primitive anywhere
-   * in those contracts that could move it afterwards — deliberately, because
-   * that primitive is indistinguishable from a rug pull.
+   * wallet pays in, and the position is created for **the visitor**. There is
+   * no moment at which it is the app's, and no admin primitive anywhere in
+   * those contracts that could move it afterwards — deliberately, because that
+   * primitive is indistinguishable from a rug pull.
+   *
+   * A swap is the exception that proves it: nothing in the AMM or the router
+   * takes a recipient, so the output lands here and is forwarded on. That third
+   * leg is why `Stranded` exists.
    *
    * ## The window, and what closes it
-   * Between the two transactions the visitor's funds sit in the app wallet.
-   * That window is the whole risk of this feature, so:
+   * Between the legs the visitor's funds sit in the app wallet. That window is
+   * the whole risk of this feature, so:
    *
-   *  1. the second leg is **simulated first**, and nothing moves if it would
-   *     revert — the common failures (frozen reserve, supply cap, unknown
-   *     asset) are all caught here, before the visitor's money has left;
-   *  2. if it fails anyway, the funds are **sent straight back** to the wallet
-   *     they came from;
+   *  1. the settling leg is **simulated first**, and nothing moves if it would
+   *     revert — a frozen reserve, a supply cap, an unknown asset, a slippage
+   *     floor that cannot be met are all caught here, before the visitor's
+   *     money has left;
+   *  2. if it fails anyway, everything pulled is **sent straight back** to the
+   *     wallet it came from;
    *  3. if even that fails, the task is recorded as failed naming the amount
    *     and the address holding it, because an operator who cannot see stranded
    *     funds cannot return them.
    *
-   * The amount is never more than the session's own remaining cap; that ceiling
-   * is the contract's, checked on chain in leg one, not this function's.
+   * No amount is ever more than the session's own remaining cap; that ceiling
+   * is the contract's, checked on chain as each pull happens, not this
+   * function's.
    */
   async function runSessionFunded(
     t: Task,
     hashes: Hex[],
     plan: {
-      /** Describes the second leg for a simulation, and then performs it. */
+      /** Names the action in receipts: "supply", "swap", "add liquidity". */
       label: string;
-      simulate: (owner: Hex, amount: bigint) => Promise<true | string>;
-      settle: (owner: Hex, amount: bigint) => Promise<Hex>;
+      /** One per asset the action needs. The AMM wants every asset of a pool. */
+      sessions: { sessionId: string; amount: bigint }[];
+      /** Checked before anything moves. `true`, or the reason it would revert. */
+      simulate: (owner: Hex, pulled: Pulled[]) => Promise<true | string>;
+      /** Performs the action. May throw `Stranded` if it holds funds it cannot return. */
+      settle: (owner: Hex, pulled: Pulled[]) => Promise<{ txHash: Hex; note?: string }>;
     },
   ): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
     const p = t.params ?? {};
-    const id = String(p.sessionId ?? "") as Hex;
-    if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("that task has no session id");
-    const amount = BigInt(String(p.amount ?? "0"));
-    if (amount <= 0n) throw new Error("amount must be above zero");
+    if (!plan.sessions.length) throw new Error("that task names no session to spend from");
 
-    const s = await readSession(id, { fresh: true });
-    if (!s) throw new Error("no such session");
-    const ownerAddr = s.owner as Hex;
-    /*
-     * The session's asset is the only one it can move, so it is the asset this
-     * runs against — not whatever the form last had selected. A mismatch here
-     * would spend one token and credit a position in another.
-     */
-    const wanted = String(p.asset ?? s.asset).toLowerCase();
-    if (wanted !== String(s.asset).toLowerCase()) {
-      throw new Error(
-        `that session pays in ${s.symbol}, and this task is set to ${wanted.slice(0, 10)}… — ` +
-        "open a session for that asset, or point the task at this one",
-      );
+    // Read them all first: every session must belong to the same wallet, or
+    // this would be a way to pool two people's money into one position.
+    const rows: { id: Hex; s: NonNullable<SessionRow>; amount: bigint }[] = [];
+    for (const want of plan.sessions) {
+      const id = String(want.sessionId ?? "") as Hex;
+      if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("that task has a session id it cannot read");
+      if (want.amount <= 0n) throw new Error("every amount must be above zero");
+      const s = await readSession(id, { fresh: true });
+      if (!s) throw new Error("one of those sessions no longer exists");
+      rows.push({ id, s, amount: want.amount });
+    }
+    const ownerAddr = rows[0].s.owner as Hex;
+    if (rows.some((r) => String(r.s.owner).toLowerCase() !== ownerAddr.toLowerCase())) {
+      throw new Error("those sessions belong to different wallets — one task spends one wallet");
     }
 
-    const dry = await plan.simulate(ownerAddr, amount);
-    if (dry !== true) {
-      // Nothing has moved. Say why, in the pool's own words where it has any.
+    const pulled: Pulled[] = rows.map((r) => ({
+      sessionId: r.id, asset: r.s.asset as Hex, amount: r.amount,
+      symbol: r.s.symbol, decimals: r.s.decimals,
+    }));
+    const human = pulled.map((x) => `${fmtUnits(x.amount, x.decimals)} ${x.symbol}`).join(" + ");
+
+    /*
+     * The dry run, and the one thing it cannot tell you on its own.
+     *
+     * Every settling call pulls the tokens from *this* wallet, so simulating it
+     * before the visitor's funds have arrived reports a failure for a reason
+     * that is about to stop being true. Asking "do we hold enough already?"
+     * separates the two: if we do, a failed simulation is a real refusal and
+     * nothing should move; if we do not, the answer is unknown and the check
+     * has to happen again once the funds are here.
+     *
+     * Either way the settling call is never broadcast without a simulation
+     * agreeing to it first — the difference is only whether a refusal costs a
+     * refund or costs nothing.
+     */
+    const holdsAlready = await holdsAtLeast(pulled);
+    const dry = await plan.simulate(ownerAddr, pulled);
+    if (dry !== true && holdsAlready) {
       throw new Error(`${plan.label} would fail, so nothing was taken from the delegated wallet: ${dry}`);
     }
 
-    const pulled = await spendFromSession(id, agentAccount.address as Hex, amount, noteOf(p.memo));
-    hashes.push(pulled as Hex);
-    sessionsInvalidate();
-
-    const human = `${fmtUnits(amount, s.decimals)} ${s.symbol}`;
-    try {
-      const done = await plan.settle(ownerAddr, amount);
-      hashes.push(done as Hex);
-      return {
-        ok: true,
-        detail: `${plan.label} ${human} for ${ownerAddr.slice(0, 8)}… from their own wallet`,
-        txHash: done,
-      };
-    } catch (e) {
-      const why = friendlyError(e);
-      try {
-        const back = await agentSigner.write(s.asset as Hex, erc20Abi, "transfer", [ownerAddr, amount]);
-        hashes.push(back as Hex);
-        return {
-          ok: false,
-          detail: `${plan.label} failed (${why}) — the ${human} taken from the delegated wallet was returned to ${ownerAddr.slice(0, 8)}…`,
-          txHash: back,
-        };
-      } catch (backErr) {
-        // The one case an operator has to see. Loud, named, and with the amount.
-        const stranded =
-          `${plan.label} failed (${why}) AND the ${human} could not be returned ` +
-          `(${friendlyError(backErr)}). It is held by the app wallet ${agentAccount.address} ` +
-          `and is owed to ${ownerAddr}.`;
-        console.error(`[tasks] STRANDED FUNDS — ${stranded}`);
+    /** Give back whatever has already been pulled, and say how that went. */
+    const giveBack = async (done: Pulled[]): Promise<string> => {
+      const back: string[] = [];
+      const stuck: string[] = [];
+      for (const x of done) {
         try {
-          txlog.record({
-            actor: agentAccount.address as string, category: "defi", action: "session-funded-stranded",
-            status: "failed", txHash: pulled, detail: stranded,
-          });
-        } catch { /* the ledger is not the point */ }
-        return { ok: false, detail: stranded, txHash: pulled };
+          const h = await agentSigner.write(x.asset, erc20Abi, "transfer", [ownerAddr, x.amount]);
+          hashes.push(h as Hex);
+          back.push(`${fmtUnits(x.amount, x.decimals)} ${x.symbol}`);
+        } catch (e) {
+          stuck.push(`${fmtUnits(x.amount, x.decimals)} ${x.symbol} (${friendlyError(e)})`);
+        }
+      }
+      if (stuck.length) {
+        throw new Stranded(stuck.join(", "), ownerAddr,
+          `${stuck.join(", ")} could not be returned and is held by the app wallet`);
+      }
+      return back.join(" + ");
+    };
+
+    // Pull, one session at a time. A failure part-way returns what did move.
+    const got: Pulled[] = [];
+    for (const x of pulled) {
+      try {
+        const h = await spendFromSession(x.sessionId, agentAccount.address as Hex, x.amount, noteOf(p.memo));
+        hashes.push(h as Hex);
+        got.push(x);
+      } catch (e) {
+        sessionsInvalidate();
+        const why = friendlyError(e);
+        if (!got.length) throw new Error(`could not take ${x.symbol} from the delegated wallet: ${why}`);
+        return await settleFailure(`taking ${x.symbol} failed (${why})`, got, giveBack, ownerAddr, plan.label, hashes);
       }
     }
+    sessionsInvalidate();
+
+    try {
+      // Now that the funds are here, the question can actually be answered.
+      if (dry !== true) {
+        const second = await plan.simulate(ownerAddr, pulled);
+        if (second !== true) {
+          return await settleFailure(
+            `${plan.label} would fail (${second})`, got, giveBack, ownerAddr, plan.label, hashes,
+          );
+        }
+      }
+      const done = await plan.settle(ownerAddr, pulled);
+      hashes.push(done.txHash);
+      return {
+        ok: true,
+        detail: `${plan.label} ${human} for ${ownerAddr.slice(0, 8)}… from their own wallet${done.note ? ` — ${done.note}` : ""}`,
+        txHash: done.txHash,
+      };
+    } catch (e) {
+      if (e instanceof Stranded) return strandedResult(e, plan.label, hashes);
+      return await settleFailure(`${plan.label} failed (${friendlyError(e)})`, got, giveBack, ownerAddr, plan.label, hashes);
+    }
+  }
+
+  /**
+   * Does the app wallet already hold everything a settling call will pull?
+   *
+   * The question that makes a pre-flight simulation meaningful: only when the
+   * answer is yes can a failed simulation be read as a real refusal rather than
+   * as "the money has not arrived yet".
+   */
+  async function holdsAtLeast(pulled: Pulled[]): Promise<boolean> {
+    try {
+      for (const x of pulled) {
+        const bal = (await client.public.readContract({
+          address: x.asset, abi: erc20Abi, functionName: "balanceOf", args: [agentAccount.address as Hex],
+        })) as bigint;
+        if (bal < x.amount) return false;
+      }
+      return true;
+    } catch {
+      // Unreadable means unknown, and unknown must not be read as "yes" — that
+      // would turn a transient RPC blip into a refusal to run at all.
+      return false;
+    }
+  }
+
+  /** Report a refund, or escalate to stranded if the refund itself failed. */
+  async function settleFailure(
+    why: string,
+    got: Pulled[],
+    giveBack: (done: Pulled[]) => Promise<string>,
+    ownerAddr: Hex,
+    label: string,
+    hashes: Hex[],
+  ): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
+    try {
+      const returned = await giveBack(got);
+      return {
+        ok: false,
+        detail: `${why} — the ${returned} taken from the delegated wallet was returned to ${ownerAddr.slice(0, 8)}…`,
+        txHash: hashes[hashes.length - 1] ?? null,
+      };
+    } catch (e) {
+      if (e instanceof Stranded) return strandedResult(e, label, hashes);
+      throw e;
+    }
+  }
+
+  /** The loud path: money the app is holding and could not give back. */
+  function strandedResult(e: Stranded, label: string, hashes: Hex[]) {
+    const stranded =
+      `${label} failed AND ${e.held} could not be returned. It is held by the app wallet ` +
+      `${agentAccount.address} and is owed to ${e.owed}.`;
+    console.error(`[tasks] STRANDED FUNDS — ${stranded}`);
+    try {
+      txlog.record({
+        actor: agentAccount.address as string, category: "defi", action: "session-funded-stranded",
+        status: "failed", txHash: hashes[hashes.length - 1], detail: stranded,
+      });
+    } catch { /* the ledger is not the point */ }
+    return { ok: false, detail: stranded, txHash: hashes[hashes.length - 1] ?? null };
   }
 
   async function runTask(
@@ -7760,9 +7991,16 @@ async function main() {
           const fn = t.action === "sessionSupply" ? "supplyFor" : "repayFor";
           return runSessionFunded(t, hashes, {
             label: t.action === "sessionSupply" ? "supply" : "repay",
-            simulate: (who, value) => poolClient.wouldSucceed(fn, [a, who, value]),
-            settle: (who, value) =>
-              t.action === "sessionSupply" ? poolClient.supplyFor(a, who, value) : poolClient.repayFor(a, who, value),
+            sessions: [{ sessionId: String(p.sessionId ?? ""), amount: amt }],
+            simulate: (who, pulled) => poolClient.wouldSucceed(fn, [pulled[0].asset, who, pulled[0].amount]),
+            settle: async (who, pulled) => {
+              const txHash = t.action === "sessionSupply"
+                ? await poolClient.supplyFor(pulled[0].asset, who, pulled[0].amount)
+                : await poolClient.repayFor(pulled[0].asset, who, pulled[0].amount);
+              void settleNow(who, pulled[0].asset);
+              emissionsInvalidate();
+              return { txHash };
+            },
           });
         }
         const txHash =
@@ -7782,8 +8020,9 @@ async function main() {
         if (t.action === "sessionDeposit") {
           return runSessionFunded(t, hashes, {
             label: "deposit",
-            simulate: (who, value) => vaultClient.wouldSucceed("depositFor", [who, value]),
-            settle: (who, value) => vaultClient.depositFor(who, value),
+            sessions: [{ sessionId: String(p.sessionId ?? ""), amount: amount() }],
+            simulate: (who, pulled) => vaultClient.wouldSucceed("depositFor", [who, pulled[0].amount]),
+            settle: async (who, pulled) => ({ txHash: await vaultClient.depositFor(who, pulled[0].amount) }),
           });
         }
         const txHash = t.action === "deposit"
@@ -7795,6 +8034,36 @@ async function main() {
       }
       case "swap": {
         if (!routerClient) throw new Error("the router is not deployed");
+        if (t.action === "sessionSwap") {
+          return runSessionFunded(t, hashes, {
+            label: "swap",
+            sessions: [{ sessionId: String(p.sessionId ?? ""), amount: amount() }],
+            simulate: async (_who, pulled) => {
+              const out = await quoteRouter(pulled[0].asset, p.tokenOut as Hex, pulled[0].amount);
+              return out > 0n ? true : "the router has no route for that pair right now";
+            },
+            settle: async (who, pulled) => {
+              const inAsset = pulled[0].asset;
+              const outAsset = p.tokenOut as Hex;
+              /*
+               * Priced at the moment it runs, not at the moment it was written.
+               *
+               * A scheduled swap carrying a fixed `minOut` is wrong within a
+               * day: either it blocks every run once the price moves, or it is
+               * so loose it is not protection at all. The floor is a share of a
+               * fresh quote, so it means the same thing on every run.
+               */
+              const expected = await quoteRouter(inAsset, outAsset, pulled[0].amount);
+              const minOut = (expected * BigInt(10_000 - slippageBps(p))) / 10_000n;
+              // Read before, so what is forwarded is what the swap added and
+              // never what this wallet already held.
+              const before = await heldNow(outAsset);
+              const txHash = await routerClient.execute(inAsset, outAsset, pulled[0].amount, minOut);
+              hashes.push(txHash as Hex);
+              return deliverOutput(who, outAsset, txHash, hashes, "swap", before);
+            },
+          });
+        }
         const txHash = await routerClient.execute(
           asset(), p.tokenOut as Hex, amount(), BigInt(String(p.minOut ?? "0")),
         );
@@ -7809,6 +8078,60 @@ async function main() {
         const pool = snap.pools.find((x) => x.id === poolId);
         if (!pool) throw new Error(`no AMM pool ${poolId}`);
         const assets = pool.assets.map((x) => x.address);
+        if (t.action === "sessionAdd") {
+          /*
+           * One delegation per asset, because the pool insists.
+           *
+           * `_addLiquidity` requires every amount to be above zero — a
+           * single-sided deposit is not a thing it will mint shares for — and a
+           * session moves exactly one token. So a two-asset pool needs two
+           * sessions, and the form says so rather than failing at 3am.
+           */
+          const ids = Array.isArray(p.sessionIds) ? p.sessionIds.map((v) => String(v)) : [];
+          const amounts = (Array.isArray(p.amounts) ? p.amounts : []).map((v) => BigInt(String(v)));
+          if (ids.length !== assets.length || amounts.length !== assets.length) {
+            throw new Error(`${pool.name} has ${assets.length} assets, so it needs a session and an amount for each`);
+          }
+          return runSessionFunded(t, hashes, {
+            label: "add liquidity",
+            sessions: ids.map((sessionId, i) => ({ sessionId, amount: amounts[i] })),
+            simulate: async (who, pulled) => {
+              // The sessions must line up with the pool's assets in order, or
+              // the amounts would be paid against the wrong reserves.
+              for (const [i, a2] of assets.entries()) {
+                if (String(pulled[i].asset).toLowerCase() !== String(a2).toLowerCase()) {
+                  return `session ${i + 1} pays in ${pulled[i].symbol}, but this pool wants ${pool.assets[i].symbol} there`;
+                }
+              }
+              return ammClient.wouldSucceed("addLiquidityFor", [BigInt(poolId), who, amounts, 0n]);
+            },
+            settle: async (who) => {
+              const txHash = await ammClient.addLiquidityFor(poolId, who, assets, amounts, 0n);
+              void settleNowLp(who, poolId);
+              emissionsInvalidate();
+              return { txHash, note: `shares minted to ${who.slice(0, 8)}… in ${pool.name}` };
+            },
+          });
+        }
+        if (t.action === "sessionSwap") {
+          return runSessionFunded(t, hashes, {
+            label: "swap",
+            sessions: [{ sessionId: String(p.sessionId ?? ""), amount: BigInt(String(p.amountIn ?? "0")) }],
+            simulate: async (_who, pulled) => {
+              const out = await ammClient.quote(poolId, pulled[0].asset, p.tokenOut as Hex, pulled[0].amount);
+              return out[0] > 0n ? true : "that pool would pay out nothing for this trade";
+            },
+            settle: async (who, pulled) => {
+              const outAsset = p.tokenOut as Hex;
+              const q = await ammClient.quote(poolId, pulled[0].asset, outAsset, pulled[0].amount);
+              const minOut = (q[0] * BigInt(10_000 - slippageBps(p))) / 10_000n;
+              const before = await heldNow(outAsset);
+              const txHash = await ammClient.swap(poolId, pulled[0].asset, outAsset, pulled[0].amount, minOut);
+              hashes.push(txHash as Hex);
+              return deliverOutput(who, outAsset, txHash, hashes, `swap in ${pool.name}`, before);
+            },
+          });
+        }
         if (t.action === "add") {
           const amounts = (Array.isArray(p.amounts) ? p.amounts : []).map((v) => BigInt(String(v)));
           if (amounts.length !== assets.length) throw new Error("provide an amount for every asset in the pool");
@@ -8131,15 +8454,18 @@ async function main() {
    * can spend the app's wallet, which is the whole reason the list is explicit
    * rather than "anything except…".
    *
-   * What is deliberately absent: withdraw, borrow, swap, and removing
-   * liquidity. Those pay *out*, and the contracts credit `msg.sender` with no
-   * third-party variant, so there is no way for this server to do one on a
-   * visitor's behalf. Their own wallet signs those, from the DeFi tab.
+   * What is deliberately absent: withdraw, borrow, and removing liquidity.
+   * Each pays out of a position the visitor holds, and the contracts credit
+   * `msg.sender` with no third-party variant, so there is no way for this
+   * server to do one on their behalf. Their own wallet signs those, from the
+   * DeFi tab.
    */
   const SESSION_ACTIONS: Record<string, string[]> = {
     wallet: ["sessionSend", "sessionBulk"],
     lending: ["sessionSupply", "sessionRepay"],
     vault: ["sessionDeposit"],
+    amm: ["sessionAdd", "sessionSwap"],
+    swap: ["sessionSwap"],
   };
 
   /**
@@ -8207,10 +8533,12 @@ async function main() {
       note: scope.operator
         ? undefined
         : "These are your own standing instructions, funded by a session key you delegated and bounded by its " +
-          "cap. As well as paying an address, they can supply to the pool, repay a loan or deposit to the vault — " +
-          "the position is created in your name, not the app's, and your tokens stay in your wallet until each " +
-          "run. Withdrawing, borrowing and swapping are not on the list because those pay out to whoever signs " +
-          "them, which has to be you: do those from the DeFi tab. Revoking the session stops all of it.",
+          "cap. As well as paying an address they can supply to the pool, repay a loan, deposit to the vault, " +
+          "swap, and add liquidity — the position is created in your name, not the app's, and your tokens stay " +
+          "in your wallet until each run. Adding liquidity needs one session per asset in the pool, because it " +
+          "mints nothing for a one-sided deposit. Withdrawing, borrowing and removing liquidity are not on the " +
+          "list: those pay out of a position you hold, so only your own wallet can sign them — do those from " +
+          "the DeFi tab. Revoking a session stops everything it funds.",
     });
   });
 
@@ -8301,6 +8629,23 @@ async function main() {
     }
   }
 
+  /**
+   * A restricted session has to permit paying the app wallet.
+   *
+   * Every session-funded DeFi action reaches its venue through this server's
+   * wallet, so an allow-list that omits it would make the very first leg revert
+   * on every run. Said at the form rather than discovered by a schedule.
+   */
+  async function requireAppWalletAllowed(id: Hex, s0: NonNullable<SessionRow>): Promise<void> {
+    if (!s0.restricted) return;
+    if (await sessionAllows(id, agentAccount.address as Hex)) return;
+    throw new Error(
+      "that session only pays an allow-list, and the app wallet is not on it. Supplying, repaying, " +
+      `depositing, swapping and adding liquidity all reach the venue through ${agentAccount.address}, ` +
+      "so it has to be allowed — or open a session without an allow-list for this.",
+    );
+  }
+
   async function checkTaskParams(
     body: { venue?: string; action?: string; params?: Record<string, unknown> },
     known?: SessionRow,
@@ -8313,6 +8658,43 @@ async function main() {
      * a key this server still holds, not revoked, and paying in the asset the
      * task names. Then the venue's own parameters on top.
      */
+    /*
+     * Adding liquidity needs one delegation per asset in the pool.
+     *
+     * `TesseraAMM._addLiquidity` requires every amount to be above zero — it
+     * will not mint shares for a single-sided deposit — and a session moves
+     * exactly one token, so a pool of two assets wants two of them. Checked
+     * here so the form says it, rather than the schedule discovering it.
+     */
+    if (action === "sessionAdd") {
+      const ids = Array.isArray(body.params?.sessionIds) ? body.params.sessionIds.map((v) => String(v)) : [];
+      const amounts = Array.isArray(body.params?.amounts) ? body.params.amounts : [];
+      if (!ids.length) throw new Error("choose a session for each asset in the pool");
+      if (ids.length !== amounts.length) throw new Error("every asset needs a session and an amount");
+      let ownerSoFar = "";
+      for (const [i, raw] of ids.entries()) {
+        if (!/^0x[0-9a-fA-F]{64}$/.test(raw)) throw new Error(`session ${i + 1} is not a session id`);
+        const sN = await readSession(raw as Hex);
+        if (!sN) throw new Error(`session ${i + 1} no longer exists`);
+        if (!sN.ours) throw new Error(`session ${i + 1} delegates to a key this app no longer holds`);
+        if (sN.revoked) throw new Error(`session ${i + 1} has been revoked`);
+        // One wallet per task. Two people's money in one position is not a
+        // thing anybody asked for, and unpicking it afterwards is impossible.
+        ownerSoFar ||= String(sN.owner).toLowerCase();
+        if (String(sN.owner).toLowerCase() !== ownerSoFar) {
+          throw new Error("those sessions belong to different wallets — one task spends one wallet");
+        }
+        let v: bigint;
+        try {
+          v = BigInt(String(amounts[i] ?? "0"));
+        } catch {
+          throw new Error(`amount ${i + 1} is not an amount`);
+        }
+        if (v <= 0n) throw new Error(`amount ${i + 1} must be above zero — this pool mints nothing for a one-sided deposit`);
+        await requireAppWalletAllowed(raw as Hex, sN);
+      }
+      return;
+    }
     if (action.startsWith("session")) {
       const id = String(body.params?.sessionId ?? "");
       if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error("choose a session to spend from");
@@ -8337,7 +8719,7 @@ async function main() {
         return;
       }
       /*
-       * A DeFi verb funded by a session: supply, repay, deposit.
+       * A DeFi verb funded by a session: supply, repay, deposit, swap, add.
        *
        * The money reaches the venue through the app wallet, which is why the
        * asset has to be the session's own — spending one token and crediting a
@@ -8345,23 +8727,25 @@ async function main() {
        * a restricted session has to actually permit paying the app wallet, or
        * every run would revert at the first leg; better to say so now.
        */
+      const amountKey = action === "sessionSwap" && body.venue === "amm" ? "amountIn" : "amount";
       let value: bigint;
       try {
-        value = BigInt(String(body.params?.amount ?? "0"));
+        value = BigInt(String(body.params?.[amountKey] ?? "0"));
       } catch {
-        throw new Error(`"${String(body.params?.amount)}" is not an amount`);
+        throw new Error(`"${String(body.params?.[amountKey])}" is not an amount`);
       }
       if (value <= 0n) throw new Error("the amount must be above zero");
       const named = String(body.params?.asset ?? s0.asset).toLowerCase();
       if (named !== String(s0.asset).toLowerCase()) {
         throw new Error(`that session pays in ${s0.symbol} — pick a session for the asset this task uses`);
       }
-      if (s0.restricted && !(await sessionAllows(id as Hex, agentAccount.address as Hex))) {
-        throw new Error(
-          "that session only pays an allow-list, and the app wallet is not on it. A supply, repay or " +
-          `deposit reaches the pool through ${agentAccount.address}, so it has to be allowed — ` +
-          "or open a session without an allow-list for this.",
-        );
+      await requireAppWalletAllowed(id as Hex, s0);
+      if (action === "sessionSwap") {
+        const out = String(body.params?.tokenOut ?? "");
+        if (!isAddress(out)) throw new Error("choose what to swap into");
+        if (out.toLowerCase() === String(s0.asset).toLowerCase()) {
+          throw new Error(`that would swap ${s0.symbol} for ${s0.symbol}`);
+        }
       }
       return;
     }
@@ -8435,16 +8819,32 @@ async function main() {
           "Everything else either spends the app's wallet, or pays out to whoever signs it — " +
           "which has to be you, from the DeFi tab.");
       }
-      const sid = String(what.params?.sessionId ?? "");
-      try {
-        mine = /^0x[0-9a-fA-F]{64}$/.test(sid)
-          ? await withDeadline(readSession(sid as Hex), FORM_DEADLINE, "reading that session")
-          : null;
-      } catch (e) {
-        throw new Gate(504, `${at}${why(e)}`);
-      }
-      if (!mine || String(mine.owner).toLowerCase() !== scope.owner) {
-        throw new Gate(403, `${at}that session was not opened by this wallet`);
+      /*
+       * Every session named, not just the first.
+       *
+       * Adding liquidity names one per asset in the pool, and the ownership
+       * check has to cover all of them: checking only `sessionId` would let a
+       * task pass on a session the caller owns while spending others they do
+       * not. One missed id here is somebody else's money.
+       */
+      const named = [
+        ...(Array.isArray(what.params?.sessionIds) ? what.params.sessionIds.map((v) => String(v)) : []),
+        ...(what.params?.sessionId !== undefined ? [String(what.params.sessionId)] : []),
+      ].filter((v) => /^0x[0-9a-fA-F]{64}$/.test(v));
+      if (!named.length) throw new Gate(403, `${at}choose a session of your own to spend from`);
+      for (const sid of named) {
+        let row: SessionRow;
+        try {
+          row = await withDeadline(readSession(sid as Hex), FORM_DEADLINE, "reading that session");
+        } catch (e) {
+          throw new Gate(504, `${at}${why(e)}`);
+        }
+        if (!row || String(row.owner).toLowerCase() !== scope.owner) {
+          throw new Gate(403, `${at}that session was not opened by this wallet`);
+        }
+        // Handed on so `checkTaskParams` need not read it again; only
+        // meaningful for the single-session verbs, which is where it is used.
+        mine ??= row;
       }
     }
     try {

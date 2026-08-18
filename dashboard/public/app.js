@@ -3820,15 +3820,16 @@ const $ = (id) => document.getElementById(id);
        * receipt names — so it leads, with the expiry and the per-payment
        * ceiling after it.
        */
+      function sessionLabel(x) {
+        const until = isForever(x.expiry)
+          ? "no expiry"
+          : new Date(x.expiry * 1000).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
+        return `${x.id.slice(0, 10)}… · ${x.spendable} ${x.symbol} left` +
+          `${Number(x.perTxMaxRaw) > 0 ? ` · max ${x.perTxMax}` : ""} · until ${until}`;
+      }
       function sessionOptions() {
         if (!sessionRows.length) return `<option value="">no session this app can spend from — open one above</option>`;
-        return sessionRows.map((x) => {
-          const until = isForever(x.expiry)
-            ? "no expiry"
-            : new Date(x.expiry * 1000).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
-          return `<option value="${esc(x.id)}">${esc(x.id.slice(0, 10))}… · ${esc(x.spendable)} ${esc(x.symbol)} left` +
-            `${Number(x.perTxMaxRaw) > 0 ? ` · max ${esc(x.perTxMax)}` : ""} · until ${esc(until)}</option>`;
-        }).join("");
+        return sessionRows.map((x) => `<option value="${esc(x.id)}">${esc(sessionLabel(x))}</option>`).join("");
       }
 
       /**
@@ -4361,6 +4362,17 @@ const $ = (id) => document.getElementById(id);
         "lending:sessionSupply": ["session", "amount", "message", "memo"],
         "lending:sessionRepay": ["session", "amount", "message", "memo"],
         "vault:sessionDeposit": ["session", "amount", "message", "memo"],
+        /*
+         * A swap consumes what it is given, so it needs a floor on what comes
+         * back. `slippage` rather than a stored `minOut`: a fixed number is
+         * wrong within a day on a recurring trade — either it blocks every run
+         * once the price moves, or it is so loose it protects nothing.
+         */
+        "swap:sessionSwap": ["session", "tokenOut", "amount", "slippage", "message", "memo"],
+        "amm:sessionSwap": ["poolId", "session", "tokenOut", "amountIn", "slippage", "message", "memo"],
+        // One session per asset in the pool — the AMM mints nothing for a
+        // one-sided deposit, and a session moves exactly one token.
+        "amm:sessionAdd": ["poolId", "poolSessions", "message", "memo"],
       };
 
       /**
@@ -4418,6 +4430,16 @@ const $ = (id) => document.getElementById(id);
               `style="width:100%;font-family:var(--mono,monospace);font-size:12px"></textarea>` +
               `<span id="${prefix}RecipCount" style="font-size:11.5px;color:var(--muted)"></span>`;
           }
+          if (f === "slippage") {
+            return `<label style="font-size:11.5px;color:var(--muted);display:flex;gap:5px;align-items:center">` +
+              `accept down to <input class="field" data-tp="maxSlippageBps" inputmode="numeric" value="100" ` +
+              `style="width:74px" /> bps below the quote at run time</label>`;
+          }
+          if (f === "poolSessions") {
+            // Filled in by `renderPoolSessions` once a pool is chosen: how many
+            // rows there are is a property of the pool, not of the verb.
+            return `<div data-poolsessions="1" style="display:flex;flex-direction:column;gap:5px;width:100%"></div>`;
+          }
           if (f === "message") {
             // Optional, and honest about where it goes: this one never leaves
             // the app, so it must not look like something the recipient reads.
@@ -4438,6 +4460,63 @@ const $ = (id) => document.getElementById(id);
         // which is exactly the condition to check.
         row.querySelectorAll("[data-tp]").forEach((el) => {
           const was = kept[el.dataset.tp];
+          if (was === undefined || was === "") return;
+          if (el.tagName === "SELECT" && ![...el.options].some((o) => o.value === was)) return;
+          el.value = was;
+        });
+        // The per-asset rows depend on which pool is chosen, so they are built
+        // after the pool picker exists and rebuilt whenever it changes.
+        if (fields.includes("poolSessions")) {
+          renderPoolSessions(prefix);
+          const poolEl = row.querySelector('[data-tp="poolId"]');
+          if (poolEl && !poolEl.dataset.psBound) {
+            poolEl.dataset.psBound = "1";
+            poolEl.addEventListener("input", () => renderPoolSessions(prefix));
+            poolEl.addEventListener("change", () => renderPoolSessions(prefix));
+          }
+        }
+      }
+
+      /**
+       * One session picker and one amount per asset in the chosen pool.
+       *
+       * The AMM will not mint shares for a one-sided deposit — every amount has
+       * to be above zero — and a session key moves exactly one token, so a pool
+       * of two assets needs two delegations. Rather than explaining that in a
+       * paragraph nobody reads, the form asks for them by name.
+       */
+      function renderPoolSessions(prefix) {
+        const host = $(`${prefix}ParamRow`)?.querySelector("[data-poolsessions]");
+        if (!host) return;
+        const poolEl = $(`${prefix}ParamRow`).querySelector('[data-tp="poolId"]');
+        const poolId = String(poolEl ? poolEl.value : "").trim();
+        const pool = ((window.__amm && window.__amm.pools) || []).find((x) => String(x.id) === poolId);
+        const sig = JSON.stringify([poolId, pool ? pool.assets.map((a) => a.symbol) : null,
+          sessionRows.map((x) => [x.id, x.symbol, x.spendable])]);
+        if (host.dataset.sig === sig) return;
+        const kept = [...host.querySelectorAll("[data-ps]")].map((el) => el.value);
+        host.dataset.sig = sig;
+        if (!pool) {
+          host.innerHTML = `<span class="muted" style="font-size:11.5px">Pick a pool and its assets will be listed here.</span>`;
+          return;
+        }
+        host.innerHTML = pool.assets.map((a, i) => {
+          // Only sessions that pay in *this* asset can fund this row.
+          const usable = sessionRows.filter((x) => String(x.asset).toLowerCase() === String(a.address).toLowerCase());
+          const opts = usable.length
+            ? usable.map((x) => `<option value="${esc(x.id)}">${esc(sessionLabel(x))}</option>`).join("")
+            : `<option value="">no ${esc(a.symbol)} session — open one first</option>`;
+          return `<div class="row-actions" style="gap:6px;flex-wrap:wrap">` +
+            `<span class="muted" style="font-size:11.5px;min-width:52px">${esc(a.symbol)}</span>` +
+            `<select class="field" data-ps="session" data-ix="${i}" style="min-width:150px;flex:1">${opts}</select>` +
+            `<input class="field" data-ps="amount" data-ix="${i}" inputmode="decimal" placeholder="Amount" style="width:110px" />` +
+            `</div>`;
+        }).join("") +
+          `<span class="muted" style="font-size:11px">Every asset needs an amount above zero — the pool mints ` +
+          `nothing for a one-sided deposit — and the shares are minted to your wallet, not the app's.</span>`;
+        // Put back what was typed, where the shape still matches.
+        [...host.querySelectorAll("[data-ps]")].forEach((el, i) => {
+          const was = kept[i];
           if (was === undefined || was === "") return;
           if (el.tagName === "SELECT" && ![...el.options].some((o) => o.value === was)) return;
           el.value = was;
@@ -4483,6 +4562,34 @@ const $ = (id) => document.getElementById(id);
         }
         if (out.recipients !== undefined) out.recipients = parseRecipientList(out.recipients, dec(out.asset)).rows;
         if (venue === "amm" || action === "remove") out.poolId = Number(out.poolId || 0);
+        if (out.maxSlippageBps !== undefined) out.maxSlippageBps = Number(out.maxSlippageBps || 100);
+        /*
+         * The per-asset rows of an AMM deposit, in the pool's own order.
+         *
+         * Order is not cosmetic here: the contract pairs `amounts[i]` with
+         * `assets[i]`, so a list built in any other order would pay the right
+         * totals against the wrong reserves. Each amount is converted against
+         * *its* session's asset, which is the only decimals that can be right.
+         */
+        const rows = [...$(`${prefix}ParamRow`).querySelectorAll("[data-ps]")];
+        if (rows.length) {
+          const ids = [];
+          const amounts = [];
+          const count = rows.filter((el) => el.dataset.ps === "session").length;
+          for (let i = 0; i < count; i++) {
+            const sEl = rows.find((el) => el.dataset.ps === "session" && Number(el.dataset.ix) === i);
+            const aEl = rows.find((el) => el.dataset.ps === "amount" && Number(el.dataset.ix) === i);
+            const sess = sessionRows.find((x) => x.id === (sEl ? sEl.value : ""));
+            ids.push(sEl ? sEl.value : "");
+            amounts.push(toRaw((aEl ? aEl.value : "") || "0", sess ? sess.decimals : 6));
+          }
+          out.sessionIds = ids;
+          out.amounts = amounts;
+          // The flat pickers are not part of this shape; leaving one behind
+          // would have the server validate a session the form never asked for.
+          delete out.sessionId;
+          delete out.asset;
+        }
         return out;
       }
 

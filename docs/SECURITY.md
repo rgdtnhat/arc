@@ -376,6 +376,27 @@ deliberately, because that primitive is indistinguishable from a rug pull.
 | `lending:sessionSupply` | `spend(session → app)` then `pool.supplyFor(asset, visitor, amount)` | the visitor |
 | `lending:sessionRepay` | `spend(session → app)` then `pool.repayFor(asset, visitor, amount)` | the visitor's debt is reduced |
 | `vault:sessionDeposit` | `spend(session → app)` then `vault.depositFor(visitor, amount)` | the visitor |
+| `amm:sessionAdd` | one `spend` **per pool asset**, then `amm.addLiquidityFor(poolId, visitor, amounts, 0)` | the visitor |
+| `amm:sessionSwap` / `swap:sessionSwap` | `spend(session → app)`, the swap, then the proceeds are transferred on | the visitor |
+
+Adding liquidity needs one delegation per asset because `_addLiquidity`
+requires every amount to be above zero — it mints nothing for a one-sided
+deposit — and a session key moves exactly one token. Every session named must
+belong to the same wallet, checked in `gateScheduled` across the whole list
+rather than only the first: one unchecked id there is somebody else's money.
+
+A swap is the one case where nothing is created in the visitor's name, because
+neither the AMM nor the router takes a recipient. The proceeds land in the app
+wallet and are forwarded in a third transaction, and the amount forwarded is
+read from **that swap's own transfer logs** — with the *difference* in balance
+as the only fallback, never the balance itself. The app wallet holds hundreds of
+EURC of its own on the live deployment; forwarding a balance rather than a delta
+would hand a visitor all of it the first time a receipt could not be read.
+
+Its slippage floor is a share of a quote taken **at run time**, not a stored
+`minOut`. A fixed floor on a recurring trade is wrong within a day: either it
+blocks every run once the price moves, or it is so loose it protects nothing.
+The share is clamped to 0.1%–10%.
 
 ### The window between the two legs, and what closes it
 
@@ -398,15 +419,31 @@ the session's own (spending one token and crediting a position in another is a
 mistake nothing downstream could detect), and a restricted session whose
 allow-list omits the app wallet (every run would revert at the first leg).
 
+### The dry run, and the one thing it cannot tell you alone
+
+Every settling call pulls its tokens from the app wallet, so simulating one
+before the visitor's funds have arrived reports a failure for a reason that is
+about to stop being true. `runSessionFunded` separates the two by asking
+whether the app wallet already holds enough: if it does, a failed simulation is
+a real refusal and nothing moves; if it does not, the answer is unknown and the
+check runs again once the funds are here, refunding rather than broadcasting if
+it still fails. The settling call is never broadcast without a simulation
+agreeing to it — the difference is only whether a refusal costs a refund or
+costs nothing.
+
 ### What a visitor cannot schedule, and why
 
-Withdraw, borrow, swap, and removing liquidity. Every one of them pays *out*,
-and the contracts credit `msg.sender` with no third-party variant anywhere —
-for the same reason the `…For` functions have no counterpart that moves an
-existing holder's position. There is no way for this server to perform one on a
-visitor's behalf, so the verbs do not exist rather than existing in a weakened
-form. A visitor's own wallet signs those, from the DeFi tab, where it always
-could.
+Withdraw, borrow, and removing liquidity. Each pays out of a position the
+*visitor* holds, and the contracts credit `msg.sender` with no third-party
+variant anywhere — for the same reason the `…For` functions have no counterpart
+that moves an existing holder's position. There is no way for this server to
+perform one on a visitor's behalf, so the verbs do not exist rather than
+existing in a weakened form. A visitor's own wallet signs those, from the DeFi
+tab, where it always could.
+
+A swap is deliberately *not* on that list, and the difference is worth stating:
+it consumes what it is handed rather than drawing on anything already held, so
+there is nothing of the visitor's for it to reach into.
 
 ## Session keys: what can be changed, and by whom
 

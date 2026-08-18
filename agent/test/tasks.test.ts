@@ -339,6 +339,8 @@ test("every verb a visitor may schedule pays in; none of them pays out", () => {
     wallet: ["sessionSend", "sessionBulk"],
     lending: ["sessionSupply", "sessionRepay"],
     vault: ["sessionDeposit"],
+    amm: ["sessionAdd", "sessionSwap"],
+    swap: ["sessionSwap"],
   };
   for (const [venue, verbs] of Object.entries(visitorMay)) {
     for (const verb of verbs) {
@@ -349,16 +351,27 @@ test("every verb a visitor may schedule pays in; none of them pays out", () => {
       assert.ok(verb.startsWith("session"), `${venue}:${verb} does not name itself as session-funded`);
     }
   }
-  // The ones that pay out. None may ever appear above.
-  const paysOut = ["withdraw", "borrow", "swap", "remove", "sessionWithdraw", "sessionBorrow", "sessionSwap"];
+  /*
+   * The ones that pay out of a position the visitor already holds. None may
+   * ever appear above: the contracts burn `msg.sender`'s shares, so the app
+   * could only ever do one of these out of its *own* position.
+   *
+   * A swap is not on this list, and the difference is worth stating: it
+   * consumes what it is handed rather than drawing on anything already held,
+   * so the app can perform one with a visitor's money and forward the
+   * proceeds. There is nothing of theirs it could reach into.
+   */
+  const paysOutOfAPosition = ["withdraw", "borrow", "remove", "sessionWithdraw", "sessionBorrow", "sessionRemove"];
   const offered = Object.values(visitorMay).flat();
-  for (const verb of paysOut) {
-    assert.equal(offered.includes(verb), false, `a visitor was offered "${verb}", which pays out to whoever signs it`);
+  for (const verb of paysOutOfAPosition) {
+    assert.equal(offered.includes(verb), false, `a visitor was offered "${verb}", which draws on a position they hold`);
   }
 });
 
 test("a verb that spends the app wallet is never one of the visitor's", () => {
-  const visitorVerbs = new Set(["sessionSend", "sessionBulk", "sessionSupply", "sessionRepay", "sessionDeposit"]);
+  const visitorVerbs = new Set([
+    "sessionSend", "sessionBulk", "sessionSupply", "sessionRepay", "sessionDeposit", "sessionAdd", "sessionSwap",
+  ]);
   // Everything the executor knows how to do, minus the visitor's list, spends
   // the app's own wallet — so none of those may be named `session…` either, or
   // the gate's prefix check would let one through.

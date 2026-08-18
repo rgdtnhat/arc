@@ -94,20 +94,28 @@ const VENUES: TaskVenue[] = ["lending", "amm", "vault", "swap", "wallet"];
  * they delegated, rather than out of the app wallet: same shape, different
  * funding address, and a cap the visitor set and can revoke at any moment.
  *
- * They exist only where the venue has a `…For` entry point that credits a third
- * party — `supplyFor`, `repayFor`, `depositFor`. Those are the ones where a
- * visitor's money can go in and the position comes out in *their* name. There
- * is deliberately no `sessionWithdraw`, `sessionBorrow` or `sessionSwap`: every
- * one of those pays *out*, and the contracts credit `msg.sender` with no
- * third-party variant anywhere, because a primitive that moved an existing
- * holder's position is indistinguishable from a rug pull. A visitor's own
- * wallet has to sign for those, and does — from the DeFi tab.
+ * Most exist because the venue has a `…For` entry point that credits a third
+ * party — `supplyFor`, `repayFor`, `depositFor`, `addLiquidityFor`. Those are
+ * the ones where a visitor's money goes in and the position comes out in
+ * *their* name, with no moment at which it is the app's.
+ *
+ * `sessionSwap` is the exception: nothing in the AMM or the router takes a
+ * recipient, so the proceeds land in the app wallet and are forwarded on in a
+ * third transaction. It is included because a swap consumes what it is given
+ * rather than leaving a position behind, so forwarding is the whole of it.
+ *
+ * There is deliberately no `sessionWithdraw`, `sessionBorrow` or
+ * `sessionRemove`. Each of those pays out of a position the *visitor* holds,
+ * and the contracts credit `msg.sender` with no third-party variant anywhere —
+ * for the same reason the `…For` functions have no counterpart that moves an
+ * existing holder's position. A visitor's own wallet signs those, from the
+ * DeFi tab.
  */
 export const TASK_ACTIONS: Record<TaskVenue, string[]> = {
   lending: ["supply", "withdraw", "borrow", "repay", "sessionSupply", "sessionRepay"],
-  amm: ["add", "remove", "swap"],
+  amm: ["add", "remove", "swap", "sessionAdd", "sessionSwap"],
   vault: ["deposit", "withdraw", "sessionDeposit"],
-  swap: ["swap"],
+  swap: ["swap", "sessionSwap"],
   wallet: ["send", "bulk", "sessionSend", "sessionBulk"],
 };
 
