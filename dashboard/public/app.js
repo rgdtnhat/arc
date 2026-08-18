@@ -4373,6 +4373,16 @@ const $ = (id) => document.getElementById(id);
         // One session per asset in the pool — the AMM mints nothing for a
         // one-sided deposit, and a session moves exactly one token.
         "amm:sessionAdd": ["poolId", "poolSessions", "message", "memo"],
+        /*
+         * The exits, which name no session at all.
+         *
+         * A session key moves tokens; leaving a position starts from shares,
+         * which no session can reach. The authority is an approval on the
+         * position itself — `approveShares` on the AMM, a position operator on
+         * the vault — granted from the DeFi tab and revocable there.
+         */
+        "amm:sessionRemove": ["poolId", "shares", "message"],
+        "vault:sessionWithdraw": ["shares", "message"],
       };
 
       /**

@@ -312,18 +312,52 @@ contract TesseraVault {
         emit Deposit(user, assets, shares);
     }
 
+    /* ---- acting for a holder who asked you to --------------------------------
+     *
+     * `depositFor` lets anyone pay into somebody's position, which needs no
+     * permission because it can only help them. Taking one out is the opposite,
+     * so the holder keeps a list of who may.
+     *
+     * The assets always go to the holder — `withdrawFor` transfers to `user`,
+     * never to `msg.sender`. An operator can trigger the exit and can never
+     * receive it, which is the whole difference between "act for me" and "take
+     * from me". Off for everybody until the holder turns it on, and revocable
+     * from their own wallet in one transaction.
+     */
+    mapping(address => mapping(address => bool)) public positionOperator;
+
+    event OperatorSet(address indexed holder, address indexed operator, bool allowed);
+
+    /// @notice Let `operator` withdraw **to you** from your position here.
+    function setPositionOperator(address operator, bool allowed) external {
+        require(operator != address(0), "zero operator");
+        positionOperator[msg.sender][operator] = allowed;
+        emit OperatorSet(msg.sender, operator, allowed);
+    }
+
     function withdraw(uint256 shares) external nonReentrant returns (uint256 assets) {
-        require(shares > 0 && shares <= sharesOf[msg.sender], "shares");
+        return _withdrawFor(msg.sender, shares);
+    }
+
+    /// @notice Redeem `user`'s shares, paying **`user`**, on their authority.
+    function withdrawFor(address user, uint256 shares) external nonReentrant returns (uint256 assets) {
+        require(user == msg.sender || positionOperator[user][msg.sender], "not authorised");
+        return _withdrawFor(user, shares);
+    }
+
+    function _withdrawFor(address user, uint256 shares) internal returns (uint256 assets) {
+        require(shares > 0 && shares <= sharesOf[user], "shares");
         _accrueFee();
         assets = convertToAssets(shares);
         require(assets > 0, "zero");
-        sharesOf[msg.sender] -= shares;
+        sharesOf[user] -= shares;
         totalShares -= shares;
         _ensureLiquid(assets);
-        require(asset.transfer(msg.sender, assets), "transfer");
+        // To the holder. Never to whoever asked.
+        require(asset.transfer(user, assets), "transfer");
         _rebalance();
         lastTotalAssets = totalAssets();
-        emit Withdraw(msg.sender, assets, shares);
+        emit Withdraw(user, assets, shares);
     }
 
     // --- internal mechanics ---------------------------------------------------

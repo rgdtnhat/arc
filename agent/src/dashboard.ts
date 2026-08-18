@@ -7723,6 +7723,134 @@ async function main() {
   };
 
   /**
+   * A scheduled *exit* from a position a visitor holds.
+   *
+   * The mirror of `runSessionFunded`, and it needs a different key entirely. A
+   * session key moves tokens; an exit starts from a position, and no session
+   * can reach one. What makes it possible at all is that `TesseraAMM` gives LP
+   * shares an ERC-20-style allowance of their own — `approveShares` — so a
+   * holder can let this wallet move a bounded number of them and take that
+   * permission back from their own wallet whenever they like.
+   *
+   * The shape is: take the shares, burn them for the tokens, send the tokens
+   * on. Three legs, and two failure points, so:
+   *
+   *  1. the burn is **simulated** once the shares are actually here, and the
+   *     shares are handed straight back if it would revert;
+   *  2. what is forwarded is measured from the burn's own transfer logs, never
+   *     from this wallet's balance — the app holds hundreds of its own EURC and
+   *     forwarding a balance would hand a visitor all of it;
+   *  3. anything that cannot be given back is recorded as stranded, named and
+   *     loud, because an operator who cannot see it cannot return it.
+   *
+   * The allowance is the ceiling throughout, enforced by the contract on the
+   * first leg — this function never decides how much it may take.
+   */
+  async function runShareFunded(
+    t: Task,
+    hashes: Hex[],
+    plan: {
+      label: string;
+      poolId: number;
+      owner: Hex;
+      shares: bigint;
+      /** The tokens the exit pays out, so each can be measured and forwarded. */
+      assets: Hex[];
+    },
+  ): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
+    if (!ammClient) throw new Error("the AMM is not deployed");
+    if (plan.shares <= 0n) throw new Error("the number of shares must be above zero");
+
+    const held = await ammClient.sharesOf(plan.poolId, plan.owner);
+    if (held < plan.shares) {
+      throw new Error(
+        `that wallet holds ${held} share(s) in this pool and the task asks for ${plan.shares} — ` +
+        "nothing was touched",
+      );
+    }
+    const allowed = await ammClient.shareAllowance(plan.poolId, plan.owner);
+    if (allowed < plan.shares) {
+      throw new Error(
+        `this app may move ${allowed} of that wallet's share(s) and the task asks for ${plan.shares}. ` +
+        "Raise the share allowance from the DeFi tab — it is the holder's own approval and they can " +
+        "set it back to zero at any time.",
+      );
+    }
+
+    // Measure first, so what is forwarded is what this exit produced.
+    const before: bigint[] = [];
+    for (const a of plan.assets) before.push(await heldNow(a));
+
+    const take = await ammClient.takeShares(plan.poolId, plan.owner, plan.shares);
+    hashes.push(take as Hex);
+
+    /** Put the shares back, and escalate if even that will not go. */
+    const returnShares = async (why: string) => {
+      try {
+        const back = await ammClient.giveShares(plan.poolId, plan.owner, plan.shares);
+        hashes.push(back as Hex);
+        return {
+          ok: false,
+          detail: `${why} — the ${plan.shares} share(s) taken were returned to ${plan.owner.slice(0, 8)}…`,
+          txHash: back as string,
+        };
+      } catch (e) {
+        return strandedResult(
+          new Stranded(`${plan.shares} LP share(s) in pool ${plan.poolId}`, plan.owner,
+            `${why} and the shares could not be returned: ${friendlyError(e)}`),
+          plan.label, hashes,
+        );
+      }
+    };
+
+    const dry = await ammClient.wouldSucceed(
+      "removeLiquidity", [BigInt(plan.poolId), plan.shares, plan.assets.map(() => 0n)],
+    );
+    if (dry !== true) return await returnShares(`${plan.label} would fail (${dry})`);
+
+    let burn: Hex;
+    try {
+      burn = await ammClient.removeLiquidity(plan.poolId, plan.shares, plan.assets.map(() => 0n));
+      hashes.push(burn);
+    } catch (e) {
+      return await returnShares(`${plan.label} failed (${friendlyError(e)})`);
+    }
+
+    // The tokens are here. Forward each, and say exactly what went where.
+    const sent: string[] = [];
+    const stuck: string[] = [];
+    let last: string | null = burn;
+    for (const [i, a] of plan.assets.entries()) {
+      const meta = assetMeta(a);
+      const got = await swapProceeds(burn, a, before[i]);
+      if (got <= 0n) continue;
+      try {
+        const h = await agentSigner.write(a, erc20Abi, "transfer", [plan.owner, got]);
+        hashes.push(h as Hex);
+        last = h;
+        sent.push(`${fmtUnits(got, meta.decimals)} ${meta.symbol}`);
+      } catch (e) {
+        stuck.push(`${fmtUnits(got, meta.decimals)} ${meta.symbol} (${friendlyError(e)})`);
+      }
+    }
+    if (stuck.length) {
+      return strandedResult(
+        new Stranded(stuck.join(", "), plan.owner,
+          `${plan.label} succeeded but ${stuck.join(", ")} could not be sent on`),
+        plan.label, hashes,
+      );
+    }
+    void settleNowLp(plan.owner, plan.poolId);
+    emissionsInvalidate();
+    return {
+      ok: true,
+      detail: `${plan.label} ${plan.shares} share(s) for ${plan.owner.slice(0, 8)}… — ` +
+        `${sent.join(" + ")} sent to their wallet`,
+      txHash: last,
+    };
+  }
+
+  /**
    * Funds pulled from a visitor's delegation, and where they are.
    *
    * Carried through the whole flow so a failure at any point can say which
@@ -8017,6 +8145,40 @@ async function main() {
       case "vault": {
         if (!vaultClient) throw new Error("the vault is not deployed");
         // Same rule as lending: the shares are minted to the visitor.
+        if (t.action === "sessionWithdraw") {
+          /*
+           * An exit, so the authority is the holder's operator permission on
+           * the vault rather than a session key — a session moves tokens, and a
+           * vault position is not a token. The assets are paid to the holder by
+           * the contract itself, so nothing passes through this wallet at all:
+           * of the three exit paths this is the only one with no window.
+           */
+          if (!t.owner) throw new Error("only a connected wallet's own task can withdraw its own position");
+          if (!(await vaultClient.canActForHolders())) {
+            throw new Error(
+              "the vault on this deployment predates scheduled withdrawals — it has no way to act for a " +
+              "holder, so only your own wallet can redeem. Withdraw from the DeFi tab.",
+            );
+          }
+          const who = t.owner as Hex;
+          if (!(await vaultClient.positionOperator(who))) {
+            throw new Error(
+              "this app is not authorised on that vault position. Grant it from the DeFi tab — it is your " +
+              "own approval, the assets are always paid to you, and you can take it back at any time.",
+            );
+          }
+          const shares = BigInt(String(p.shares ?? "0"));
+          if (shares <= 0n) throw new Error("say how many shares to redeem");
+          const dry = await vaultClient.wouldSucceed("withdrawFor", [who, shares]);
+          if (dry !== true) throw new Error(`that withdrawal would fail, so nothing was touched: ${dry}`);
+          const txHash = await vaultClient.withdrawFor(who, shares);
+          hashes.push(txHash as Hex);
+          return {
+            ok: true,
+            detail: `redeemed ${shares} vault share(s) for ${who.slice(0, 8)}… — paid straight to their wallet`,
+            txHash,
+          };
+        }
         if (t.action === "sessionDeposit") {
           return runSessionFunded(t, hashes, {
             label: "deposit",
@@ -8130,6 +8292,22 @@ async function main() {
               hashes.push(txHash as Hex);
               return deliverOutput(who, outAsset, txHash, hashes, `swap in ${pool.name}`, before);
             },
+          });
+        }
+        if (t.action === "sessionRemove") {
+          /*
+           * An exit starts from a position, so it is funded by a share
+           * allowance rather than by a session key. `owner` is the wallet the
+           * task belongs to — never a parameter, because a task that could name
+           * whose position to unwind is a task that could unwind anybody's.
+           */
+          if (!t.owner) throw new Error("only a connected wallet's own task can withdraw its own position");
+          return runShareFunded(t, hashes, {
+            label: "remove liquidity from " + pool.name,
+            poolId,
+            owner: t.owner as Hex,
+            shares: BigInt(String(p.shares ?? "0")),
+            assets,
           });
         }
         if (t.action === "add") {
@@ -8460,11 +8638,21 @@ async function main() {
    * server to do one on their behalf. Their own wallet signs those, from the
    * DeFi tab.
    */
+  /**
+   * Verbs whose authority is a share allowance rather than a session key.
+   *
+   * Everything else a visitor may schedule pays *in*, funded by a session. An
+   * exit pays out of a position, so it is authorised the other way round: the
+   * holder approves this wallet to move a bounded number of their LP shares,
+   * and can set that back to zero from their own wallet at any moment.
+   */
+  const SHARE_FUNDED = new Set(["sessionRemove", "sessionWithdraw"]);
+
   const SESSION_ACTIONS: Record<string, string[]> = {
     wallet: ["sessionSend", "sessionBulk"],
     lending: ["sessionSupply", "sessionRepay"],
-    vault: ["sessionDeposit"],
-    amm: ["sessionAdd", "sessionSwap"],
+    vault: ["sessionDeposit", "sessionWithdraw"],
+    amm: ["sessionAdd", "sessionSwap", "sessionRemove"],
     swap: ["sessionSwap"],
   };
 
@@ -8538,7 +8726,10 @@ async function main() {
           "in your wallet until each run. Adding liquidity needs one session per asset in the pool, because it " +
           "mints nothing for a one-sided deposit. Withdrawing, borrowing and removing liquidity are not on the " +
           "list: those pay out of a position you hold, so only your own wallet can sign them — do those from " +
-          "the DeFi tab. Revoking a session stops everything it funds.",
+          "the DeFi tab. Leaving a pool or the vault is scheduled too, and authorised the other way round — " +
+          "you approve this app on the position itself, from the DeFi tab, and the proceeds are always paid to " +
+          "you. Lending withdraw and borrow are the exception: that contract has no way to act for a holder " +
+          "yet. Revoking a session, or an approval, stops everything it authorised.",
     });
   });
 
@@ -8651,6 +8842,27 @@ async function main() {
     known?: SessionRow,
   ) {
     const action = String(body.action ?? "");
+    if (action === "sessionWithdraw") {
+      let shares: bigint;
+      try {
+        shares = BigInt(String(body.params?.shares ?? "0"));
+      } catch {
+        throw new Error(`"${String(body.params?.shares)}" is not a number of shares`);
+      }
+      if (shares <= 0n) throw new Error("say how many shares to redeem");
+      return;
+    }
+    if (action === "sessionRemove") {
+      let shares: bigint;
+      try {
+        shares = BigInt(String(body.params?.shares ?? "0"));
+      } catch {
+        throw new Error(`"${String(body.params?.shares)}" is not a number of shares`);
+      }
+      if (shares <= 0n) throw new Error("say how many shares to withdraw");
+      if (!Number.isInteger(Number(body.params?.poolId))) throw new Error("choose a pool");
+      return;
+    }
     /*
      * Anything session-funded is checked the same way, whatever venue it is in.
      *
@@ -8831,7 +9043,19 @@ async function main() {
         ...(Array.isArray(what.params?.sessionIds) ? what.params.sessionIds.map((v) => String(v)) : []),
         ...(what.params?.sessionId !== undefined ? [String(what.params.sessionId)] : []),
       ].filter((v) => /^0x[0-9a-fA-F]{64}$/.test(v));
-      if (!named.length) throw new Gate(403, `${at}choose a session of your own to spend from`);
+      /*
+       * An exit names no session, and that is not an oversight.
+       *
+       * A session key moves tokens; leaving a pool starts from shares, which no
+       * session can reach. The authority there is the share allowance the
+       * holder granted, checked on chain by the AMM when the shares are taken,
+       * and the position unwound is always the task's own owner's — the runner
+       * reads `t.owner` rather than any parameter, so a task cannot be pointed
+       * at somebody else's position.
+       */
+      if (!named.length && !SHARE_FUNDED.has(String(what.action))) {
+        throw new Gate(403, `${at}choose a session of your own to spend from`);
+      }
       for (const sid of named) {
         let row: SessionRow;
         try {

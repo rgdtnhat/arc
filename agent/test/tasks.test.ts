@@ -338,8 +338,8 @@ test("every verb a visitor may schedule pays in; none of them pays out", () => {
   const visitorMay: Record<string, string[]> = {
     wallet: ["sessionSend", "sessionBulk"],
     lending: ["sessionSupply", "sessionRepay"],
-    vault: ["sessionDeposit"],
-    amm: ["sessionAdd", "sessionSwap"],
+    vault: ["sessionDeposit", "sessionWithdraw"],
+    amm: ["sessionAdd", "sessionSwap", "sessionRemove"],
     swap: ["sessionSwap"],
   };
   for (const [venue, verbs] of Object.entries(visitorMay)) {
@@ -361,16 +361,30 @@ test("every verb a visitor may schedule pays in; none of them pays out", () => {
    * so the app can perform one with a visitor's money and forward the
    * proceeds. There is nothing of theirs it could reach into.
    */
-  const paysOutOfAPosition = ["withdraw", "borrow", "remove", "sessionWithdraw", "sessionBorrow", "sessionRemove"];
+  /*
+   * The ones with no third-party entry point anywhere in the contracts.
+   *
+   * Withdrawing and removing liquidity became possible once the position could
+   * be reached with the holder's own approval — an LP share allowance on the
+   * AMM, a position operator on the vault. Lending's withdraw and borrow have
+   * no such hook: `TesseraPool` is at the 24KB deployment limit with 66 bytes
+   * spare, and the permission does not fit. Until it does, these must not
+   * appear above at any price, because the only way to run one is out of the
+   * app's own position.
+   */
+  const noHolderHook = ["withdraw", "borrow", "sessionBorrow", "sessionSupplyWithdraw"];
   const offered = Object.values(visitorMay).flat();
-  for (const verb of paysOutOfAPosition) {
-    assert.equal(offered.includes(verb), false, `a visitor was offered "${verb}", which draws on a position they hold`);
+  for (const verb of noHolderHook) {
+    assert.equal(offered.includes(verb), false, `a visitor was offered "${verb}", which nothing lets us do for them`);
   }
+  // Lending in particular offers only the two directions that pay *in*.
+  assert.deepEqual(visitorMay.lending, ["sessionSupply", "sessionRepay"]);
 });
 
 test("a verb that spends the app wallet is never one of the visitor's", () => {
   const visitorVerbs = new Set([
-    "sessionSend", "sessionBulk", "sessionSupply", "sessionRepay", "sessionDeposit", "sessionAdd", "sessionSwap",
+    "sessionSend", "sessionBulk", "sessionSupply", "sessionRepay", "sessionDeposit",
+    "sessionAdd", "sessionSwap", "sessionRemove", "sessionWithdraw",
   ]);
   // Everything the executor knows how to do, minus the visitor's list, spends
   // the app's own wallet — so none of those may be named `session…` either, or
@@ -383,5 +397,44 @@ test("a verb that spends the app wallet is never one of the visitor's", () => {
         `${venue}:${verb} is named like a session verb but is not one a visitor may schedule`,
       );
     }
+  }
+});
+
+/*
+ * Exits are authorised the other way round from entries.
+ *
+ * Everything a visitor may schedule that pays *in* is funded by a session key.
+ * An exit pays *out* of a position, which no session key can reach — so the
+ * authority is an approval on the position itself: `approveShares` on the AMM,
+ * `setPositionOperator` on the vault. Both are the holder's own, granted from
+ * their wallet and revocable from it.
+ *
+ * The property worth pinning: an exit takes its owner from the task's `owner`,
+ * never from a parameter. A task that could name whose position to unwind is a
+ * task that could unwind anybody's.
+ */
+test("an exit is scheduled against the task's own owner, never a named address", () => {
+  const s = store();
+  const mine = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const theirs = "0xdddddddddddddddddddddddddddddddddddddddd";
+  const r = s.create({
+    name: "unwind", venue: "amm", action: "sessionRemove", owner: mine,
+    // A hopeful attempt to point it at somebody else's position.
+    params: { poolId: 0, shares: "1000", owner: theirs, user: theirs, from: theirs },
+    schedule: { kind: "manual" },
+  });
+  assert.equal(r.ok, true);
+  const t = (r as { task: { owner: string | null; params: Record<string, unknown> } }).task;
+  // The runner reads `t.owner`. Whatever the params say is inert.
+  assert.equal(t.owner, mine);
+  assert.notEqual(t.owner, theirs);
+});
+
+test("both exit verbs are ones the executor knows, and neither names a session", () => {
+  for (const [venue, verb] of [["amm", "sessionRemove"], ["vault", "sessionWithdraw"]] as const) {
+    assert.ok(
+      TASK_ACTIONS[venue].includes(verb),
+      `${venue}:${verb} is offered but the executor has no such verb`,
+    );
   }
 });

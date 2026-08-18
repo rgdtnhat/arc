@@ -79,6 +79,53 @@ export class VaultClient {
     return this.write("depositFor", [user, assets]);
   }
 
+  /**
+   * Redeem `user`'s shares, paying **`user`**, on an authority they granted.
+   *
+   * Only on a vault deployed with `positionOperator`; `canActForHolders` says
+   * whether this one is. The assets go to the holder — this wallet triggers the
+   * exit and can never receive it.
+   */
+  async withdrawFor(user: Hex, shares: bigint): Promise<Hex> {
+    return this.write("withdrawFor", [user, shares]);
+  }
+
+  /** Has this holder named us as an operator of their position? */
+  positionOperator(holder: Hex): Promise<boolean> {
+    return this.public.readContract({
+      address: this.vault, abi: tesseraVaultAbi, functionName: "positionOperator",
+      args: [holder, this.cfg.account.address],
+    }) as Promise<boolean>;
+  }
+
+  /**
+   * Does the deployed vault understand acting for a holder at all?
+   *
+   * Asked rather than assumed: the live vault predates this, and offering a
+   * scheduled withdrawal it would revert on is worse than not offering one.
+   * Cached, because the answer is a property of the bytecode.
+   */
+  private _canAct: boolean | null = null;
+  async canActForHolders(): Promise<boolean> {
+    if (this._canAct !== null) return this._canAct;
+    try {
+      await this.public.readContract({
+        address: this.vault, abi: tesseraVaultAbi, functionName: "positionOperator",
+        args: [this.cfg.account.address, this.cfg.account.address],
+      });
+      this._canAct = true;
+    } catch {
+      this._canAct = false;
+    }
+    return this._canAct;
+  }
+
+  sharesOf(who: Hex): Promise<bigint> {
+    return this.public.readContract({
+      address: this.vault, abi: tesseraVaultAbi, functionName: "sharesOf", args: [who],
+    }) as Promise<bigint>;
+  }
+
   /** See `TesseraPoolClient.wouldSucceed` — a dry run before money moves. */
   async wouldSucceed(functionName: string, args: unknown[]): Promise<true | string> {
     try {
@@ -445,5 +492,37 @@ export class AmmClient {
 
   async removeLiquidity(poolId: number, shares: bigint, minAmounts: bigint[]): Promise<Hex> {
     return this.write("removeLiquidity", [BigInt(poolId), shares, minAmounts]);
+  }
+
+  /** How many of `owner`'s shares in `poolId` this wallet may move. */
+  shareAllowance(poolId: number, owner: Hex): Promise<bigint> {
+    return this.public.readContract({
+      address: this.amm, abi: tesseraAmmAbi, functionName: "shareAllowance",
+      args: [BigInt(poolId), owner, this.cfg.account.address],
+    }) as Promise<bigint>;
+  }
+
+  /** This wallet's own shares in a pool. */
+  sharesOf(poolId: number, who: Hex): Promise<bigint> {
+    return this.public.readContract({
+      address: this.amm, abi: tesseraAmmAbi, functionName: "sharesOf", args: [BigInt(poolId), who],
+    }) as Promise<bigint>;
+  }
+
+  /**
+   * Take shares a holder has approved this wallet to move.
+   *
+   * The AMM gives LP positions an ERC-20-style allowance of their own, which is
+   * what makes a scheduled withdrawal possible at all: a session key moves
+   * tokens, and a pool exit starts from shares. The holder approves once, and
+   * can set it back to zero from their own wallet at any time.
+   */
+  async takeShares(poolId: number, from: Hex, shares: bigint): Promise<Hex> {
+    return this.write("transferSharesFrom", [BigInt(poolId), from, this.cfg.account.address, shares]);
+  }
+
+  /** Hand shares back, for when an exit could not be completed. */
+  async giveShares(poolId: number, to: Hex, shares: bigint): Promise<Hex> {
+    return this.write("transferShares", [BigInt(poolId), to, shares]);
   }
 }

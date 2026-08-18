@@ -431,19 +431,60 @@ it still fails. The settling call is never broadcast without a simulation
 agreeing to it — the difference is only whether a refusal costs a refund or
 costs nothing.
 
-### What a visitor cannot schedule, and why
+## Scheduling an exit: the authority runs the other way
 
-Withdraw, borrow, and removing liquidity. Each pays out of a position the
-*visitor* holds, and the contracts credit `msg.sender` with no third-party
-variant anywhere — for the same reason the `…For` functions have no counterpart
-that moves an existing holder's position. There is no way for this server to
-perform one on a visitor's behalf, so the verbs do not exist rather than
-existing in a weakened form. A visitor's own wallet signs those, from the DeFi
-tab, where it always could.
+Everything above pays *in*, funded by a session key. Leaving a position pays
+*out* of something the visitor already holds, and no session key can reach a
+position — a session moves tokens. So an exit is authorised on the position
+itself, by its holder, from their own wallet:
 
-A swap is deliberately *not* on that list, and the difference is worth stating:
-it consumes what it is handed rather than drawing on anything already held, so
-there is nothing of the visitor's for it to reach into.
+| Verb | Authority | Where the proceeds go |
+|---|---|---|
+| `amm:sessionRemove` | `approveShares(poolId, app, n)` — an ERC-20-style allowance the AMM already gives LP positions | taken as shares, burned, and the tokens transferred on |
+| `vault:sessionWithdraw` | `setPositionOperator(app, true)` on the vault | **paid to the holder by the contract itself** — nothing passes through the app wallet at all |
+
+Two rules hold for the vault operator permission no matter who the operator is,
+and neither may be relaxed:
+
+1. **The assets go to the holder.** `withdrawFor` transfers to `user`, never to
+   `msg.sender`. An operator triggers the exit and can never receive it, which
+   is the whole difference between "act for me" and "take from me".
+2. **Every limit the holder's own call would face still binds**, because it is
+   the same code path with the address supplied rather than assumed.
+
+It is off for everybody until the holder turns it on, and revocable in one
+transaction from their wallet. Contract tests assert the refusal for an operator
+nobody named, that the operator's balance does not move, and that revoking stops
+it immediately.
+
+An exit takes its owner from the **task's** `owner`, never from a parameter. A
+task that could name whose position to unwind is a task that could unwind
+anybody's.
+
+The AMM exit is the one with a window: the shares are held by the app between
+being taken and being burned. The burn is simulated once they are actually here
+and the shares handed straight back if it would revert; what is forwarded is
+measured from the burn's own transfer logs, never from a balance; and anything
+that cannot be given back is recorded as stranded, named and loud.
+
+### What a visitor still cannot schedule, and why
+
+Lending's **withdraw** and **borrow**. `TesseraPool` has no third-party entry
+point for either, and cannot currently gain one: the deployed contract is
+**24,510 bytes against the 24,576-byte EIP-170 limit — 66 bytes spare**, and the
+position-operator permission needs roughly 430. Lowering the optimizer makes the
+contract *larger* under `viaIR`; merging the four wiring setters recovers 117
+bytes; only dropping `setFrozenMany` gets it under, and that selector is on the
+timelock's governance allowlist.
+
+So the honest position is that this one is a contract change and a pool
+redeploy, not a feature flag. The pool's `supplyFor`/`repayFor` mean a visitor
+can still schedule everything that pays *in*; taking a lending position out is
+signed by their own wallet from the DeFi tab.
+
+A swap is deliberately not in the "cannot" group: it consumes what it is handed
+rather than drawing on anything already held, so there is nothing of the
+visitor's for it to reach into.
 
 ## Session keys: what can be changed, and by whom
 

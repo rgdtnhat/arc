@@ -113,8 +113,8 @@ const VENUES: TaskVenue[] = ["lending", "amm", "vault", "swap", "wallet"];
  */
 export const TASK_ACTIONS: Record<TaskVenue, string[]> = {
   lending: ["supply", "withdraw", "borrow", "repay", "sessionSupply", "sessionRepay"],
-  amm: ["add", "remove", "swap", "sessionAdd", "sessionSwap"],
-  vault: ["deposit", "withdraw", "sessionDeposit"],
+  amm: ["add", "remove", "swap", "sessionAdd", "sessionSwap", "sessionRemove"],
+  vault: ["deposit", "withdraw", "sessionDeposit", "sessionWithdraw"],
   swap: ["swap", "sessionSwap"],
   wallet: ["send", "bulk", "sessionSend", "sessionBulk"],
 };
