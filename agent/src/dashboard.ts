@@ -449,6 +449,8 @@ async function main() {
     : undefined;
 
   // Vault + swap clients (present when recorded in deployments/arc.json).
+  /** The token the vault takes and pays out. USDC on every deployment so far. */
+  const vaultAssetAddr = ((liveDeployment.vaultAsset as Hex) ?? usdcAddress) as Hex;
   const vaultClient = liveDeployment.tesseraVault
     ? new VaultClient(
         { chain, rpcUrl, account: agentAccount },
@@ -8202,15 +8204,44 @@ async function main() {
               "own approval, the assets are always paid to you, and you can take it back at any time.",
             );
           }
-          const shares = BigInt(String(p.shares ?? "0"));
-          if (shares <= 0n) throw new Error("say how many shares to redeem");
+          /*
+           * Written in USDC, redeemed in shares.
+           *
+           * "Take out 5 USDC a week" is the instruction somebody means; the
+           * share count that satisfies it is a number they have no way to
+           * reason about, and it moves as the vault earns. So the task stores
+           * the amount and the conversion happens here, at the rate in force
+           * when it runs.
+           */
+          const want = BigInt(String(p.assets ?? p.amount ?? "0"));
+          if (want <= 0n) throw new Error("say how much to take out");
+          const meta = assetMeta(vaultAssetAddr);
+          let shares = await vaultClient.convertToShares(want);
+          if (shares <= 0n) throw new Error("that is too small to redeem anything");
+          /*
+           * "Everything" has to mean everything.
+           *
+           * A standing instruction for more than the position holds should
+           * empty it rather than fail — the alternative is a weekly task that
+           * works until the balance dips and then fails forever, which is the
+           * worst moment for it to stop. Rounding also means the shares for an
+           * exact balance can price one wei high, so the holding is the cap.
+           */
+          const held = await vaultClient.sharesOf(who);
+          if (held <= 0n) throw new Error("that wallet holds nothing in the vault");
+          const capped = shares > held;
+          if (capped) shares = held;
           const dry = await vaultClient.wouldSucceed("withdrawFor", [who, shares]);
           if (dry !== true) throw new Error(`that withdrawal would fail, so nothing was touched: ${dry}`);
+          const paid = await vaultClient.convertToAssets(shares);
           const txHash = await vaultClient.withdrawFor(who, shares);
           hashes.push(txHash as Hex);
           return {
             ok: true,
-            detail: `redeemed ${shares} vault share(s) for ${who.slice(0, 8)}… — paid straight to their wallet`,
+            detail:
+              `withdrew ${fmtUnits(paid, meta.decimals)} ${meta.symbol} from the vault for ${who.slice(0, 8)}… ` +
+              `— paid straight to their wallet` +
+              (capped ? ` (their whole position; ${fmtUnits(want, meta.decimals)} was asked for)` : ""),
             txHash,
           };
         }
@@ -8890,13 +8921,13 @@ async function main() {
       return;
     }
     if (action === "sessionWithdraw") {
-      let shares: bigint;
+      let want: bigint;
       try {
-        shares = BigInt(String(body.params?.shares ?? "0"));
+        want = BigInt(String(body.params?.assets ?? body.params?.amount ?? "0"));
       } catch {
-        throw new Error(`"${String(body.params?.shares)}" is not a number of shares`);
+        throw new Error(`"${String(body.params?.assets ?? body.params?.amount)}" is not an amount`);
       }
-      if (shares <= 0n) throw new Error("say how many shares to redeem");
+      if (want <= 0n) throw new Error("say how much to take out");
       return;
     }
     if (action === "sessionRemove") {

@@ -126,6 +126,26 @@ export class VaultClient {
     }) as Promise<bigint>;
   }
 
+  /**
+   * What a given amount of the underlying is worth in shares, right now.
+   *
+   * A scheduled withdrawal is written in USDC because that is the only unit
+   * anybody thinks in — "take out 5 USDC a week", never "burn 4,983,112
+   * shares". The rate moves as the vault earns, so the conversion belongs at
+   * the moment it runs, not at the moment it was written.
+   */
+  convertToShares(assets: bigint): Promise<bigint> {
+    return this.public.readContract({
+      address: this.vault, abi: tesseraVaultAbi, functionName: "convertToShares", args: [assets],
+    }) as Promise<bigint>;
+  }
+
+  convertToAssets(shares: bigint): Promise<bigint> {
+    return this.public.readContract({
+      address: this.vault, abi: tesseraVaultAbi, functionName: "convertToAssets", args: [shares],
+    }) as Promise<bigint>;
+  }
+
   /** See `TesseraPoolClient.wouldSucceed` — a dry run before money moves. */
   async wouldSucceed(functionName: string, args: unknown[]): Promise<true | string> {
     try {

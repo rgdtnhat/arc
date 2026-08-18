@@ -4368,8 +4368,17 @@ const $ = (id) => document.getElementById(id);
          * wrong within a day on a recurring trade — either it blocks every run
          * once the price moves, or it is so loose it protects nothing.
          */
-        "swap:sessionSwap": ["session", "tokenOut", "amount", "slippage", "message", "memo"],
-        "amm:sessionSwap": ["poolId", "session", "tokenOut", "amountIn", "slippage", "message", "memo"],
+        /*
+         * `pair` rather than a bare `tokenOut` dropdown.
+         *
+         * The token being *sold* is the session's — a session moves one asset
+         * and that is the one that funds the swap — so a lone dropdown reading
+         * "USDC" beside an EURC session looks like the input and is the
+         * output. The pair renders as "EURC → [into]" so both sides are on
+         * screen, and the list excludes the asset being sold.
+         */
+        "swap:sessionSwap": ["session", "pair", "amount", "slippage", "message", "memo"],
+        "amm:sessionSwap": ["poolId", "session", "pair", "amountIn", "slippage", "message", "memo"],
         // One session per asset in the pool — the AMM mints nothing for a
         // one-sided deposit, and a session moves exactly one token.
         "amm:sessionAdd": ["poolId", "poolSessions", "message", "memo"],
@@ -4384,7 +4393,9 @@ const $ = (id) => document.getElementById(id);
         "amm:sessionRemove": ["poolId", "shares", "message"],
         "lending:sessionWithdraw": ["asset", "amount", "message"],
         "lending:sessionBorrow": ["asset", "amount", "message"],
-        "vault:sessionWithdraw": ["shares", "message"],
+        // In USDC, like the deposit beside it. Shares are an implementation
+        // detail nobody schedules in; the conversion happens when it runs.
+        "vault:sessionWithdraw": ["assets", "message"],
       };
 
       /**
@@ -4447,6 +4458,12 @@ const $ = (id) => document.getElementById(id);
               `accept down to <input class="field" data-tp="maxSlippageBps" inputmode="numeric" value="100" ` +
               `style="width:74px" /> bps below the quote at run time</label>`;
           }
+          if (f === "pair") {
+            // Built by `renderSwapPair` once the session (and, for the AMM, the
+            // pool) is known: which asset is sold and what may be bought are
+            // both properties of those, not of the verb.
+            return `<span data-swappair="1" style="display:flex;gap:7px;align-items:center;flex-wrap:wrap"></span>`;
+          }
           if (f === "poolSessions") {
             // Filled in by `renderPoolSessions` once a pool is chosen: how many
             // rows there are is a property of the pool, not of the verb.
@@ -4464,7 +4481,10 @@ const $ = (id) => document.getElementById(id);
             return `<input class="field" data-tp="memo" maxlength="180" ` +
               `placeholder="On-chain memo, sent with each payment (optional)" style="min-width:200px;flex:1" />`;
           }
-          const ph = { amount: "Amount", amountIn: "Amount in", shares: "Shares", poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient" }[f] || f;
+          const ph = {
+            amount: "Amount", amountIn: "Amount in", shares: "Shares", assets: "Amount",
+            poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient",
+          }[f] || f;
           return `<input class="field" data-tp="${f}" placeholder="${esc(ph)}" style="min-width:${f === "to" ? 210 : 120}px" />`;
         }).join("");
         // Restore anything the visitor had already typed that this verb still
@@ -4487,6 +4507,64 @@ const $ = (id) => document.getElementById(id);
             poolEl.addEventListener("change", () => renderPoolSessions(prefix));
           }
         }
+        // The pair depends on the session and, on the AMM, the pool — so it is
+        // drawn after both pickers exist and redrawn whenever either changes.
+        if (fields.includes("pair")) {
+          renderSwapPair(prefix);
+          for (const sel of ['[data-tp="sessionId"]', '[data-tp="poolId"]']) {
+            const el = row.querySelector(sel);
+            if (!el || el.dataset.pairBound) continue;
+            el.dataset.pairBound = "1";
+            el.addEventListener("input", () => renderSwapPair(prefix));
+            el.addEventListener("change", () => renderSwapPair(prefix));
+          }
+        }
+      }
+
+      /**
+       * Both sides of a scheduled swap, so the pair is readable.
+       *
+       * The asset being sold is whichever the chosen session pays in — a
+       * session key moves exactly one token, and that token funds the swap. It
+       * is shown rather than offered, because it is not a choice. What *is* a
+       * choice is what to buy, and that list leaves out the asset being sold
+       * (a swap into itself is not a trade) and, on the AMM, anything the
+       * chosen pool does not hold.
+       */
+      function renderSwapPair(prefix) {
+        const row = $(`${prefix}ParamRow`);
+        const host = row && row.querySelector("[data-swappair]");
+        if (!host) return;
+        const sessEl = row.querySelector('[data-tp="sessionId"]');
+        const session = sessionRows.find((x) => x.id === (sessEl ? sessEl.value : ""));
+        const poolEl = row.querySelector('[data-tp="poolId"]');
+        const pool = poolEl
+          ? ((window.__amm && window.__amm.pools) || []).find((x) => String(x.id) === String(poolEl.value).trim())
+          : null;
+
+        // Only what this venue could actually pay out.
+        let out = walletAssets;
+        if (poolEl) out = pool ? pool.assets : [];
+        if (session) {
+          out = out.filter((a) => String(a.address).toLowerCase() !== String(session.asset).toLowerCase());
+        }
+        const sig = JSON.stringify([session ? session.asset : null, out.map((a) => a.address)]);
+        if (host.dataset.sig === sig) return;
+        const kept = (host.querySelector('[data-tp="tokenOut"]') || {}).value;
+        host.dataset.sig = sig;
+
+        const from = session
+          ? `<b>${esc(session.symbol)}</b>`
+          : `<span class="muted">pick a session</span>`;
+        const opts = out.length
+          ? out.map((a) => `<option value="${esc(a.address)}">${esc(a.symbol)}</option>`).join("")
+          : `<option value="">${esc(poolEl && !pool ? "pick a pool first" : "nothing to swap into")}</option>`;
+        host.innerHTML =
+          `<span style="font-size:12.5px">${from}</span>` +
+          `<span class="muted" style="font-size:13px">→</span>` +
+          `<select class="field" data-tp="tokenOut" style="min-width:110px">${opts}</select>`;
+        const sel = host.querySelector('[data-tp="tokenOut"]');
+        if (kept && [...sel.options].some((o) => o.value === kept)) sel.value = kept;
       }
 
       /**
@@ -4562,6 +4640,17 @@ const $ = (id) => document.getElementById(id);
         const dec = (a) => (session ? session.decimals : walDecimals(a || $("walSendAsset").value));
         if (session) out.asset = session.asset;
         if (out.amount !== undefined) out.amount = toRaw(out.amount || "0", dec(out.asset));
+        /*
+         * The vault's own token, which is what a vault withdrawal is written in.
+         *
+         * Not the send form's selected asset: this field belongs to the vault
+         * and converting it against whatever the wallet tab last had open would
+         * be wrong by a factor of a million the moment they differ.
+         */
+        if (out.assets !== undefined) {
+          const vaultTok = (window.__defiCfg && (window.__defiCfg.vaultAsset || window.__defiCfg.usdc)) || null;
+          out.assets = toRaw(out.assets || "0", vaultTok ? walDecimals(vaultTok) : 6);
+        }
         if (out.amountIn !== undefined) out.amountIn = toRaw(out.amountIn || "0", dec(out.tokenIn));
         if (out.amounts !== undefined) {
           // Each amount against its own asset's decimals. Six for everything
@@ -4845,6 +4934,8 @@ const $ = (id) => document.getElementById(id);
             if (r.note) $("tasksOwnNote").textContent = r.note;
           }
           taskActions = r.actions || {};
+          // The vault's token, for the withdrawal amount's decimals.
+          if (!window.__defiCfg) loadDefiConfig().catch(() => {});
           renderMineFilter("task", r);
           if (r.limits) taskLimits = { ...taskLimits, ...r.limits };
           if (r.appWallet) taskAppWallet = r.appWallet;
@@ -5264,6 +5355,8 @@ const $ = (id) => document.getElementById(id);
           // for a task — a visitor gets their two session verbs, an operator
           // the full list.
           if (r.actions) taskActions = r.actions;
+          // The vault's token, for the withdrawal amount's decimals.
+          if (!window.__defiCfg) loadDefiConfig().catch(() => {});
           if (r.limits) seriesLimits = { ...seriesLimits, ...r.limits };
           if (!$("serZone").options.length) {
             $("serZone").innerHTML = $("taskZone").innerHTML;
@@ -5520,6 +5613,10 @@ const $ = (id) => document.getElementById(id);
           let v = params[k];
           if (v === undefined || v === null) { el.value = ""; return; }
           if (k === "amount") v = fmtUnitsStr(String(v), dec(params.asset));
+          else if (k === "assets") {
+            const vaultTok = (window.__defiCfg && (window.__defiCfg.vaultAsset || window.__defiCfg.usdc)) || null;
+            v = fmtUnitsStr(String(v), vaultTok ? walDecimals(vaultTok) : 6);
+          }
           else if (k === "amountIn") v = fmtUnitsStr(String(v), dec(params.tokenIn));
           else if (k === "recipients" && Array.isArray(v)) {
             v = v.map((r) => `${r.to},${fmtUnitsStr(String(r.amount), dec(params.asset))}`).join("\n");
@@ -7058,6 +7155,9 @@ const $ = (id) => document.getElementById(id);
       async function loadDefiConfig() {
         if (defiCfg) return defiCfg;
         defiCfg = await (await fetch("/api/defi/config")).json();
+        // Also parked on `window` so the task form can read the vault's token
+        // without being async — it builds inputs synchronously.
+        window.__defiCfg = defiCfg;
         return defiCfg;
       }
       const pad32 = (hex) => hex.replace(/^0x/, "").toLowerCase().padStart(64, "0");

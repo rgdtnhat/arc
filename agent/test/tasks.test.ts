@@ -445,3 +445,26 @@ test("both exit verbs are ones the executor knows, and neither names a session",
     );
   }
 });
+
+/*
+ * A scheduled vault withdrawal is written in the token, not in shares.
+ *
+ * "Take out 5 USDC a week" is the instruction somebody means. The share count
+ * that satisfies it is a number they have no way to reason about, and it moves
+ * as the vault earns — so the task stores the amount and the executor converts
+ * at the rate in force when it runs. Storing shares would have quietly changed
+ * what the task withdraws every time the vault earned anything.
+ */
+test("a vault withdrawal stores an amount of the asset, and keeps it exactly", () => {
+  const s = store();
+  const r = s.create({
+    name: "weekly draw", venue: "vault", action: "sessionWithdraw",
+    owner: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    params: { assets: "5000000" },              // 5 USDC, base units
+    schedule: { kind: "every", seconds: 604800 },
+  });
+  assert.equal(r.ok, true);
+  const t = (r as { task: { params: Record<string, unknown> } }).task;
+  assert.equal(t.params.assets, "5000000");
+  assert.equal(t.params.shares, undefined, "a share count was stored instead of an amount");
+});
