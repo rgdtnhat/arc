@@ -337,7 +337,7 @@ test("every verb a visitor may schedule pays in; none of them pays out", () => {
   // thinking about the other fails a test rather than shipping.
   const visitorMay: Record<string, string[]> = {
     wallet: ["sessionSend", "sessionBulk"],
-    lending: ["sessionSupply", "sessionRepay"],
+    lending: ["sessionSupply", "sessionRepay", "sessionWithdraw", "sessionBorrow"],
     vault: ["sessionDeposit", "sessionWithdraw"],
     amm: ["sessionAdd", "sessionSwap", "sessionRemove"],
     swap: ["sessionSwap"],
@@ -372,19 +372,23 @@ test("every verb a visitor may schedule pays in; none of them pays out", () => {
    * appear above at any price, because the only way to run one is out of the
    * app's own position.
    */
-  const noHolderHook = ["withdraw", "borrow", "sessionBorrow", "sessionSupplyWithdraw"];
+  /*
+   * The app's *own* verbs. None may ever be offered to a visitor, because each
+   * one acts on the app wallet's position rather than on theirs.
+   */
+  const appsOwn = ["withdraw", "borrow", "remove", "supply", "repay", "deposit", "add", "swap"];
   const offered = Object.values(visitorMay).flat();
-  for (const verb of noHolderHook) {
-    assert.equal(offered.includes(verb), false, `a visitor was offered "${verb}", which nothing lets us do for them`);
+  for (const verb of appsOwn) {
+    assert.equal(offered.includes(verb), false, `a visitor was offered "${verb}", which acts on the app's position`);
   }
-  // Lending in particular offers only the two directions that pay *in*.
-  assert.deepEqual(visitorMay.lending, ["sessionSupply", "sessionRepay"]);
+  // Every verb a visitor gets is prefixed, which is what the gate keys on.
+  for (const verb of offered) assert.match(verb, /^session/);
 });
 
 test("a verb that spends the app wallet is never one of the visitor's", () => {
   const visitorVerbs = new Set([
     "sessionSend", "sessionBulk", "sessionSupply", "sessionRepay", "sessionDeposit",
-    "sessionAdd", "sessionSwap", "sessionRemove", "sessionWithdraw",
+    "sessionAdd", "sessionSwap", "sessionRemove", "sessionWithdraw", "sessionBorrow",
   ]);
   // Everything the executor knows how to do, minus the visitor's list, spends
   // the app's own wallet — so none of those may be named `session…` either, or
@@ -431,7 +435,10 @@ test("an exit is scheduled against the task's own owner, never a named address",
 });
 
 test("both exit verbs are ones the executor knows, and neither names a session", () => {
-  for (const [venue, verb] of [["amm", "sessionRemove"], ["vault", "sessionWithdraw"]] as const) {
+  for (const [venue, verb] of [
+    ["amm", "sessionRemove"], ["vault", "sessionWithdraw"],
+    ["lending", "sessionWithdraw"], ["lending", "sessionBorrow"],
+  ] as const) {
     assert.ok(
       TASK_ACTIONS[venue].includes(verb),
       `${venue}:${verb} is offered but the executor has no such verb`,

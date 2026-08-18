@@ -188,6 +188,48 @@ export class TesseraPoolClient {
     await this.ensureApproval(asset, amount);
     return this.write("repay", [asset, amount]);
   }
+  /**
+   * Withdraw or borrow for `user`, paid **to `user`**, on their authority.
+   *
+   * The mirror of `supplyFor`: that one needs no permission because paying into
+   * a position can only help; this one needs the holder to have named this
+   * wallet an operator, and pays them rather than us. Nothing passes through
+   * this wallet at all — of the exit paths, this is the one with no window.
+   */
+  async actFor(asset: Hex, user: Hex, amount: bigint, borrowing: boolean): Promise<Hex> {
+    return this.write("actFor", [asset, user, amount, borrowing]);
+  }
+
+  /** Has this holder named us as an operator of their position? */
+  positionOperator(holder: Hex): Promise<boolean> {
+    return this.public.readContract({
+      address: this.pool, abi: tesseraPoolAbi, functionName: "positionOperator",
+      args: [holder, this.account.address],
+    }) as Promise<boolean>;
+  }
+
+  /**
+   * Does the deployed pool understand acting for a holder at all?
+   *
+   * Asked rather than assumed: a pool deployed before this has no such
+   * function, and offering a scheduled withdrawal it would revert on is worse
+   * than not offering one. Cached — it is a property of the bytecode.
+   */
+  private _canAct: boolean | null = null;
+  async canActForHolders(): Promise<boolean> {
+    if (this._canAct !== null) return this._canAct;
+    try {
+      await this.public.readContract({
+        address: this.pool, abi: tesseraPoolAbi, functionName: "positionOperator",
+        args: [this.account.address, this.account.address],
+      });
+      this._canAct = true;
+    } catch {
+      this._canAct = false;
+    }
+    return this._canAct;
+  }
+
   /** Repay **`user`'s** debt out of this wallet. See `supplyFor`. */
   async repayFor(asset: Hex, user: Hex, amount: bigint): Promise<Hex> {
     await this.ensureApproval(asset, amount);

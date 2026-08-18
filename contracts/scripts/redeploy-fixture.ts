@@ -28,7 +28,7 @@ async function main() {
   const amm = await hre.viem.deployContract("MockAmmPool");
   const guard = await hre.viem.deployContract("TesseraPriceGuard", [amm.address, pool.address]);
 
-  await pool.write.setPriceGuard([guard.address]);
+  await pool.write.setWiring([0, guard.address]);
 
   /*
    * Two reserves with parameters nobody would pick by accident. USDC is
@@ -61,9 +61,9 @@ async function main() {
    */
   const limiter = await hre.viem.deployContract("TesseraRateLimiter", [pool.address]);
   await limiter.write.setLimit([usdc.address, U(1_000_000), 3600n]);
-  await pool.write.setRateLimiter([limiter.address]);
+  await pool.write.setWiring([2, limiter.address]);
 
-  await pool.write.setEmodeCategory([1, 9000, 9300, 9950, "stables"]);
+  await pool.write.setEmodeCategory([1, 9000, 9300, 9950, true, "stables"]);
   await pool.write.setEmodeAsset([usdc.address, 1]);
 
   // Positions for the handoff to migrate: a plain supplier, and one who borrows.

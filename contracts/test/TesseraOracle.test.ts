@@ -58,7 +58,7 @@ async function deployFixture() {
   }
 
   const as = (who: any) => hre.viem.getContractAt("TesseraPool", pool.address, { client: { wallet: who } });
-  const arm = () => pool.write.setRiskOracle([oracle.address]);
+  const arm = () => pool.write.setWiring([1, oracle.address]);
 
   // Liquidity to borrow against.
   await (await as(lp)).write.supply([usdc.address, USDC(500_000)]);
@@ -358,7 +358,7 @@ describe("TesseraPool without an oracle keeps working", () => {
     await btcFeed.write.set([P(5_000), BigInt(await time.latest())]);
     await expect((await as(attacker)).write.borrow([usdc.address, USDC(100)])).to.be.rejected;
 
-    await pool.write.setRiskOracle(["0x0000000000000000000000000000000000000000"]);
+    await pool.write.setWiring([1, "0x0000000000000000000000000000000000000000"]);
     await (await as(attacker)).write.borrow([usdc.address, USDC(100)]);
   });
 });

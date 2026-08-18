@@ -467,24 +467,43 @@ and the shares handed straight back if it would revert; what is forwarded is
 measured from the burn's own transfer logs, never from a balance; and anything
 that cannot be given back is recorded as stranded, named and loud.
 
-### What a visitor still cannot schedule, and why
+Lending has the same permission, reached through `actFor(asset, user, amount,
+borrowing)` — one entry point rather than two named ones because the contract
+had room for one. `lending:sessionWithdraw` and `lending:sessionBorrow` use it,
+and like the vault they have no window: the pool pays the holder directly.
 
-Lending's **withdraw** and **borrow**. `TesseraPool` has no third-party entry
-point for either, and cannot currently gain one: the deployed contract is
-**24,510 bytes against the 24,576-byte EIP-170 limit — 66 bytes spare**, and the
-position-operator permission needs roughly 430. Lowering the optimizer makes the
-contract *larger* under `viaIR`; merging the four wiring setters recovers 117
-bytes; only dropping `setFrozenMany` gets it under, and that selector is on the
-timelock's governance allowlist.
+**Borrowing on somebody's behalf deserves saying out loud.** It creates debt for
+the holder, which is a real authority and not a symmetrical one with
+withdrawing. It is bounded the same way their own borrow is — collateral,
+health factor, caps, liquidity, freezes, all checked against *their* account —
+and the proceeds go to them. But an operator can still take a holder closer to
+liquidation than they might have chosen. That is what the permission means, it
+is theirs to grant, and it is one transaction to take back.
 
-So the honest position is that this one is a contract change and a pool
-redeploy, not a feature flag. The pool's `supplyFor`/`repayFor` mean a visitor
-can still schedule everything that pays *in*; taking a lending position out is
-signed by their own wallet from the DeFi tab.
+### Making it fit: what came out of TesseraPool
 
-A swap is deliberately not in the "cannot" group: it consumes what it is handed
-rather than drawing on anything already held, so there is nothing of the
-visitor's for it to reach into.
+The permission needed about 430 bytes and the deployed pool had 66 spare against
+the 24,576-byte EIP-170 limit. Lowering the optimizer makes it *larger* under
+`viaIR` (24,760 at runs:1), so the space came from merging entry points that
+were separate for readability rather than necessity:
+
+| Was | Is now |
+|---|---|
+| `setPriceGuard` · `setRiskOracle` · `setRateLimiter` · `setTreasury` | `setWiring(slot, address)` |
+| `setBorrowable` · `setReserveHidden` | `setReserveFlag(asset, flag, on)` |
+| `setFrozen(address,uint8)` · `setFrozenMany(address[],uint8)` | `setFrozenMany` only — the plural survived, because the emergency case is "stop everything now" and that has to stay one transaction |
+| `setEmodeEnabled(uint8,bool)` | an `enabled` argument on `setEmodeCategory` |
+
+No control was lost. Every merged function keeps its behaviour, its events and
+its `onlyOwner` gate; a single reserve is a one-element array; and the
+timelock's instant-execution allowlist keeps the freeze brake, now naming the
+plural selector. The result is 24,368 bytes with 208 spare.
+
+**This is a redeploy, not a flag.** The pool on a running deployment has no
+`actFor`, so the app asks it — `canActForHolders()` — and refuses the verb with
+an explanation rather than reverting. `npm run redeploy:pool` migrates the
+positions; the rehearsal in `npm run verify` runs that migration end to end
+against a real chain on every commit.
 
 ## Session keys: what can be changed, and by whom
 

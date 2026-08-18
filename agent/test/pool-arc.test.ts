@@ -227,7 +227,16 @@ async function startNode(opts: NodeOptions = {}): Promise<FakeNode> {
             return reply(hash);
           }
           const fn = tx.data ? whichFunction(tx.data) : null;
-          const name = fn?.name ?? "unknown";
+          /*
+           * `setWiring(slot, address)` replaced four named setters, so the
+           * function name alone no longer says which wiring was touched — and
+           * "did the deploy arm the limiter?" is exactly what these tests ask.
+           * The slot is appended, so `setWiring:2` reads as the limiter.
+           */
+          const base = fn?.name ?? "unknown";
+          const name = base === "setWiring" && Array.isArray(fn?.args)
+            ? `setWiring:${String((fn.args as unknown[])[0])}`
+            : base;
           // A write that would revert must revert here too — viem simulates
           // first, so in practice this is belt and braces.
           if (revert.has(name)) return fail(`execution reverted: ${name} not permitted`);
@@ -478,7 +487,7 @@ test("the guard, caps, and the two new payment shapes all land in one run", asyn
 
   // The guard is only useful if the pool is actually pointed at it, and the
   // caps are only useful if they were set.
-  assert.ok(node.sent.includes("setPriceGuard"), "pool armed with the guard");
+  assert.ok(node.sent.includes("setWiring:0"), "pool armed with the guard");
   assert.ok(node.sent.includes("setCaps"), "exposure caps set");
 });
 
@@ -559,7 +568,7 @@ test("deploys the risk oracle and configures every reserve, but does not arm it"
   const record = JSON.parse(readFileSync(path.join(dir, "deployments/arc.json"), "utf8"));
   assert.match(record.tesseraOracle, /^0x[0-9a-fA-F]{40}$/);
   assert.ok(node.sent.includes("configureAsset"), "reserves configured in the oracle");
-  assert.ok(!node.sent.includes("setRiskOracle"), "pool left unarmed");
+  assert.ok(!node.sent.includes("setWiring:1"), "pool left unarmed");
 });
 
 test("arms the risk oracle when --arm-oracle is passed", async (t) => {
@@ -569,7 +578,7 @@ test("arms the risk oracle when --arm-oracle is passed", async (t) => {
 
   const { stdout } = await runScript(node, dir, ["--deploy-missing", "--arm-oracle"]);
   assert.doesNotMatch(stdout, /skip arming the risk oracle/);
-  assert.ok(node.sent.includes("setRiskOracle"), "pool pointed at the oracle");
+  assert.ok(node.sent.includes("setWiring:1"), "pool pointed at the oracle");
 });
 
 test("points the spend policy at the escrow, so it is not deployed unreachable", async (t) => {
@@ -605,7 +614,7 @@ test("arms the outflow limiter without being asked", async (t) => {
   t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
 
   await runScript(node, dir, ["--deploy-missing"]);
-  assert.ok(node.sent.includes("setRateLimiter"), "pool metered by default");
+  assert.ok(node.sent.includes("setWiring:2"), "pool metered by default");
 });
 
 test("lets an operator decline the limiter, loudly", async (t) => {
@@ -614,7 +623,7 @@ test("lets an operator decline the limiter, loudly", async (t) => {
   t.after(async () => { await node.close(); rmSync(dir, { recursive: true, force: true }); });
 
   const { stdout } = await runScript(node, dir, ["--deploy-missing", "--no-arm-limiter"]);
-  assert.ok(!node.sent.includes("setRateLimiter"), "not armed when declined");
+  assert.ok(!node.sent.includes("setWiring:2"), "not armed when declined");
   // Declining must appear in the skipped block, not vanish into the scroll.
   assert.match(stdout, /--no-arm-limiter was passed/);
 });

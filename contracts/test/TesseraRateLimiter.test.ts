@@ -40,7 +40,7 @@ async function deployFixture() {
 describe("TesseraRateLimiter (bounding the speed, not just the size)", () => {
   it("is inert until an asset is actually configured", async () => {
     const f = await loadFixture(deployFixture);
-    await f.pool.write.setRateLimiter([f.limiter.address]);
+    await f.pool.write.setWiring([2, f.limiter.address]);
 
     // Wired but unconfigured: metering an asset nobody tuned must not throttle it.
     const pw = await f.poolAs(f.whale);
@@ -51,7 +51,7 @@ describe("TesseraRateLimiter (bounding the speed, not just the size)", () => {
   it("lets a full bucket through and stops the next block cold", async () => {
     const f = await loadFixture(deployFixture);
     await f.limiter.write.setLimit([f.usdc.address, USDC(10_000), BigInt(HOUR)]);
-    await f.pool.write.setRateLimiter([f.limiter.address]);
+    await f.pool.write.setWiring([2, f.limiter.address]);
 
     const pw = await f.poolAs(f.whale);
     await pw.write.withdraw([f.usdc.address, USDC(10_000)]);
@@ -61,7 +61,7 @@ describe("TesseraRateLimiter (bounding the speed, not just the size)", () => {
   it("refills continuously, so a block is a delay and not a lockout", async () => {
     const f = await loadFixture(deployFixture);
     await f.limiter.write.setLimit([f.usdc.address, USDC(10_000), BigInt(HOUR)]);
-    await f.pool.write.setRateLimiter([f.limiter.address]);
+    await f.pool.write.setWiring([2, f.limiter.address]);
 
     const pw = await f.poolAs(f.whale);
     await pw.write.withdraw([f.usdc.address, USDC(10_000)]);
@@ -76,7 +76,7 @@ describe("TesseraRateLimiter (bounding the speed, not just the size)", () => {
   it("does not hand out two periods at a boundary — the hole a resetting window has", async () => {
     const f = await loadFixture(deployFixture);
     await f.limiter.write.setLimit([f.usdc.address, USDC(10_000), BigInt(HOUR)]);
-    await f.pool.write.setRateLimiter([f.limiter.address]);
+    await f.pool.write.setWiring([2, f.limiter.address]);
 
     const pw = await f.poolAs(f.whale);
     // Drain the bucket right at the end of a notional window...
@@ -97,7 +97,7 @@ describe("TesseraRateLimiter (bounding the speed, not just the size)", () => {
   it("meters borrowing as well as withdrawing — both take cash out", async () => {
     const f = await loadFixture(deployFixture);
     await f.limiter.write.setLimit([f.usdc.address, USDC(5_000), BigInt(HOUR)]);
-    await f.pool.write.setRateLimiter([f.limiter.address]);
+    await f.pool.write.setWiring([2, f.limiter.address]);
 
     const ut = await f.usdcAs(f.thief);
     await ut.write.approve([f.pool.address, USDC(100_000)]);
@@ -114,7 +114,7 @@ describe("TesseraRateLimiter (bounding the speed, not just the size)", () => {
   it("does not meter money coming back in", async () => {
     const f = await loadFixture(deployFixture);
     await f.limiter.write.setLimit([f.usdc.address, USDC(5_000), BigInt(HOUR)]);
-    await f.pool.write.setRateLimiter([f.limiter.address]);
+    await f.pool.write.setWiring([2, f.limiter.address]);
 
     const ut = await f.usdcAs(f.thief);
     await ut.write.approve([f.pool.address, USDC(100_000)]);
@@ -127,14 +127,14 @@ describe("TesseraRateLimiter (bounding the speed, not just the size)", () => {
   it("can be unhooked in one transaction when the limit is the problem", async () => {
     const f = await loadFixture(deployFixture);
     await f.limiter.write.setLimit([f.usdc.address, USDC(1), BigInt(HOUR)]);
-    await f.pool.write.setRateLimiter([f.limiter.address]);
+    await f.pool.write.setWiring([2, f.limiter.address]);
 
     const pw = await f.poolAs(f.whale);
     await expect(pw.write.withdraw([f.usdc.address, USDC(1_000)])).to.be.rejectedWith("RateLimited");
 
     // The escape hatch. A guard that could not be removed would be a way to
     // freeze the pool permanently by configuring one asset badly.
-    await f.pool.write.setRateLimiter([ZERO]);
+    await f.pool.write.setWiring([2, ZERO]);
     await pw.write.withdraw([f.usdc.address, USDC(1_000)]);
   });
 
@@ -160,7 +160,7 @@ describe("TesseraRateLimiter (bounding the speed, not just the size)", () => {
   it("does not charge budget for a transaction that was going to revert anyway", async () => {
     const f = await loadFixture(deployFixture);
     await f.limiter.write.setLimit([f.usdc.address, USDC(10_000), BigInt(HOUR)]);
-    await f.pool.write.setRateLimiter([f.limiter.address]);
+    await f.pool.write.setWiring([2, f.limiter.address]);
 
     const pt = await f.poolAs(f.thief);
     // No position, so this fails on balance long before it reaches the meter.

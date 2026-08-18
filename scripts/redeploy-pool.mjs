@@ -401,13 +401,14 @@ async function main() {
    * window is all a bad price needs.
    */
   if (guard && guard !== "0x0000000000000000000000000000000000000000") {
-    await send("attach the price guard", NEW, tesseraPoolAbi, "setPriceGuard", [guard]);
+    await send("attach the price guard", NEW, tesseraPoolAbi, "setWiring", [0, guard]);
   }
   for (const c of categories) {
     const e = config.global[`emode${c}`];
     await send(`e-mode category ${c} (${e.label})`, NEW, tesseraPoolAbi, "setEmodeCategory",
-      [c, e.cFactor, e.liqFactor, e.lFactor, e.label]);
-    if (!e.enabled) await send(`disable e-mode category ${c}`, NEW, tesseraPoolAbi, "setEmodeEnabled", [c, false]);
+      // `enabled` rides on the same call now, so a category that was off on
+      // the old pool comes across off rather than silently switched on.
+      [c, e.cFactor, e.liqFactor, e.lFactor, e.enabled !== false, e.label]);
   }
 
   for (const a of config.assets) {
@@ -431,10 +432,10 @@ async function main() {
 
   const zero = "0x0000000000000000000000000000000000000000";
   if (config.global.riskOracle !== zero) {
-    await send("attach the risk oracle", NEW, tesseraPoolAbi, "setRiskOracle", [config.global.riskOracle]);
+    await send("attach the risk oracle", NEW, tesseraPoolAbi, "setWiring", [1, config.global.riskOracle]);
   }
   if (config.global.rateLimiter !== zero) {
-    await send("attach the outflow limiter", NEW, tesseraPoolAbi, "setRateLimiter", [config.global.rateLimiter]);
+    await send("attach the outflow limiter", NEW, tesseraPoolAbi, "setWiring", [2, config.global.rateLimiter]);
     /*
      * And tell the limiter, which is the half that was missing.
      *
@@ -475,7 +476,7 @@ async function main() {
      * new borrowing the only outflow left is people leaving, and that is the
      * one flow that must not be slowed. `_meter` no-ops on a zero address.
      */
-    await send("detach the limiter from the retired pool", OLD, tesseraPoolAbi, "setRateLimiter", [zero]);
+    await send("detach the limiter from the retired pool", OLD, tesseraPoolAbi, "setWiring", [2, zero]);
     await send(
       "point the outflow limiter back at the new pool",
       config.global.rateLimiter, tesseraRateLimiterAbi, "setConsumer", [NEW],

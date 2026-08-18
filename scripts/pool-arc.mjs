@@ -395,7 +395,7 @@ async function main() {
     // flow to it. Each is best-effort: on a reused deployment these may already
     // be set, and a revert here must not abort the whole run.
     for (const [label, fn] of [
-      ["pointing the pool's treasury at the fee collector", () => dSend(pool, tesseraPoolAbi, "setTreasury", [feeCollector])],
+      ["pointing the pool's treasury at the fee collector", () => dSend(pool, tesseraPoolAbi, "setWiring", [3, feeCollector])],
       ["pointing the vault's treasury at the fee collector", () => dSend(vault, tesseraVaultAbi, "setTreasury", [feeCollector])],
     ]) {
       await optional(label, fn);
@@ -560,7 +560,7 @@ async function main() {
   // deployment the TWAP has no history to agree with yet.
   if (process.argv.includes("--arm-oracle")) {
     await optional("arming the pool's risk oracle", () =>
-      dSend(pool, tesseraPoolAbi, "setRiskOracle", [riskOracle]),
+      dSend(pool, tesseraPoolAbi, "setWiring", [1, riskOracle]),
     );
   } else {
     console.log("   (skip arming the risk oracle — pass --arm-oracle once the TWAP has history)");
@@ -588,7 +588,7 @@ async function main() {
     }
   }
   await optional("arming the pool's price guard", () =>
-    dSend(pool, tesseraPoolAbi, "setPriceGuard", [priceGuard]),
+    dSend(pool, tesseraPoolAbi, "setWiring", [0, priceGuard]),
   );
 
   // 6f) Exposure caps. Every other control in the pool is a ratio; none of them
@@ -795,7 +795,7 @@ async function main() {
     });
   } else {
     await optional("arming the pool's outflow limiter", () =>
-      dSend(pool, tesseraPoolAbi, "setRateLimiter", [rateLimiter]),
+      dSend(pool, tesseraPoolAbi, "setWiring", [2, rateLimiter]),
     );
   }
 
@@ -862,7 +862,6 @@ async function main() {
   // Freezing is the only power that skips the delay — see TesseraTimelock for
   // why. Derived from the signatures rather than pasted as hex so a change to
   // either function cannot leave a stale selector silently unlisted.
-  const FREEZE_SEL = toFunctionSelector("function setFrozen(address,uint8)");
   const FREEZE_MANY_SEL = toFunctionSelector("function setFrozenMany(address[],uint8)");
   const timelockRes = await adopt("TesseraTimelock", existing.tesseraTimelock, FRESH, async () => {
     console.log("→ deploying TesseraTimelock (24h on risk changes, instant freeze)…");
@@ -872,7 +871,7 @@ async function main() {
       // The guardian starts as the deployer: a veto is only useful if somebody
       // holds it, and appointing a separate one is a governance decision that
       // now has to go through the queue anyway.
-      args: [deployer.address, deployer.address, 86400n, [FREEZE_SEL, FREEZE_MANY_SEL]],
+      args: [deployer.address, deployer.address, 86400n, [FREEZE_MANY_SEL]],
       account: deployer,
       chain: arcTestnet,
     });

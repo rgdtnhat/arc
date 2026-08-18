@@ -222,7 +222,7 @@ describe("TesseraAMM (multi-asset liquidity pools)", () => {
   it("freezes swaps and deposits but never traps liquidity", async () => {
     const { deployer, alice, bob, usdc, eurc, amm, asAmm, mint } = await loadFixture(deployFixture);
     const asOwner = await hre.viem.getContractAt("TesseraAMM", amm.address, { client: { wallet: deployer } });
-    await asOwner.write.setFrozen([0n, true]);
+    await asOwner.write.setFrozen([[0n], true]);
 
     await mint(usdc, bob, U("100"));
     await expect((await asAmm(bob)).write.swap([0n, usdc.address, eurc.address, U("100"), 0n])).to.be.rejected;
@@ -234,7 +234,7 @@ describe("TesseraAMM (multi-asset liquidity pools)", () => {
     await (await asAmm(alice)).write.removeLiquidity([0n, shares, [0n, 0n]]);
     expect((await usdc.read.balanceOf([alice.account.address])) > before).to.equal(true);
 
-    await asOwner.write.setFrozen([0n, false]);
+    await asOwner.write.setFrozen([[0n], false]);
     await (await asAmm(bob)).write.swap([0n, usdc.address, eurc.address, U("100"), 0n]);
   });
 
@@ -270,7 +270,7 @@ describe("TesseraAMM (multi-asset liquidity pools)", () => {
     await expect(a.write.createPool([[usdc.address, eurc.address], SWAP_FEE, LP_SHARE, "nope"])).to.be.rejected;
     await expect(a.write.configurePool([0n, 10, 9000])).to.be.rejected;
     await expect(a.write.configurePools([[0n], 10, 9000])).to.be.rejected;
-    await expect(a.write.setFrozen([0n, true])).to.be.rejected;
+    await expect(a.write.setFrozen([[0n], true])).to.be.rejected;
     await expect(a.write.renamePool([0n, "hijacked"])).to.be.rejected;
     await expect(a.write.setMaxAssetsPerPool([8])).to.be.rejected;
     await expect(a.write.setAppFeeCollector([alice.account.address])).to.be.rejected;
@@ -540,7 +540,7 @@ describe("TesseraAMM — Aquarius rules", () => {
   it("estimates zero for a frozen pool", async () => {
     const { deployer, usdc, eurc, amm } = await loadFixture(deployFixture);
     const asOwner = await hre.viem.getContractAt("TesseraAMM", amm.address, { client: { wallet: deployer } });
-    await asOwner.write.setFrozen([0n, true]);
+    await asOwner.write.setFrozen([[0n], true]);
     expect((await amm.read.estimateSwap([0n, usdc.address, eurc.address, U("100")]))[0]).to.equal(0n);
   });
 });

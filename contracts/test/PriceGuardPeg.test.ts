@@ -27,7 +27,7 @@ async function deployFixture() {
   await pool.write.addReserve([usdc.address, 9000, 9500, 9500, 1000, true, 6, P(1)]);
   await pool.write.addReserve([other.address, 7000, 8000, 8000, 1000, false, 6, P(10)]);
   await amm.write.createPool([[usdc.address, other.address], 30, 5000, "USDC / OTH"]);
-  await pool.write.setPriceGuard([guard.address]);
+  await pool.write.setWiring([0, guard.address]);
   return { deployer, usdc, other, pool, amm, guard };
 }
 
@@ -111,10 +111,10 @@ describe("TesseraPriceGuard — pegged references", () => {
      * conditional on the guard actually refusing something for that asset.
      */
     const f = await loadFixture(deployFixture);
-    await expect(f.pool.write.setBorrowable([f.other.address, true])).to.be.rejected;
+    await expect(f.pool.write.setReserveFlag([f.other.address, 0, true])).to.be.rejected;
 
     await f.guard.write.setPeg([f.other.address, P(10), 500]);
-    await f.pool.write.setBorrowable([f.other.address, true]);
+    await f.pool.write.setReserveFlag([f.other.address, 0, true]);
     const r = await f.pool.read.reserves([f.other.address]);
     expect(r[1]).to.equal(true);
   });
@@ -123,7 +123,7 @@ describe("TesseraPriceGuard — pegged references", () => {
     // Same reasoning as the freeze exemption: reducing what the pool will do
     // cannot be the dangerous direction.
     const f = await loadFixture(deployFixture);
-    await f.pool.write.setBorrowable([f.usdc.address, false]);
+    await f.pool.write.setReserveFlag([f.usdc.address, 0, false]);
     const r = await f.pool.read.reserves([f.usdc.address]);
     expect(r[1]).to.equal(false);
   });
@@ -131,7 +131,7 @@ describe("TesseraPriceGuard — pegged references", () => {
   it("refuses to touch a reserve that was never listed", async () => {
     const f = await loadFixture(deployFixture);
     const [, stranger] = await hre.viem.getWalletClients();
-    await expect(f.pool.write.setBorrowable([stranger.account.address, false])).to.be.rejected;
+    await expect(f.pool.write.setReserveFlag([stranger.account.address, 0, false])).to.be.rejected;
   });
 
   it("only the owner sets a peg or flips the requirement", async () => {

@@ -184,7 +184,7 @@ describe("TesseraFeeCollector (a failed leg leaves nothing behind)", () => {
     // Freeze supply on the pool's reserve so the lending leg reverts inside its
     // `try`. The vault leg fails with it: its deposit supplies the same pool.
     const FREEZE_SUPPLY = 1;
-    await pool.write.setFrozen([usdc.address, FREEZE_SUPPLY]);
+    await pool.write.setFrozenMany([[usdc.address], FREEZE_SUPPLY]);
 
     await time.increase(7 * 24 * 60 * 60 + 1);
     await collector.write.allocateNow();

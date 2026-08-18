@@ -196,7 +196,7 @@ describe("TesseraRouter (swaps backed by AMM liquidity)", () => {
     const { usdc, eurc, amm, router } = await loadFixture(deployFixture);
     const before = await router.read.estimate([usdc.address, eurc.address, U("100")]);
     expect(before[0] > 0n).to.equal(true);
-    await amm.write.setFrozen([0n, true]);
+    await amm.write.setFrozen([[0n], true]);
     // A frozen pool cannot fill, so offering its price would be a quote for a
     // trade that reverts.
     const after = await router.read.estimate([usdc.address, eurc.address, U("100")]);

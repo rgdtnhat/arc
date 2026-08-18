@@ -21,14 +21,13 @@ async function deployFixture() {
   await pool.write.addReserve([usdc.address, 9000, 9500, 9500, 1000, true, 6, PRICE]);
 
   // Freezing is the emergency brake, so it is the one thing that skips the wait.
-  const FREEZE = toFunctionSelector("function setFrozen(address,uint8)");
   const FREEZE_MANY = toFunctionSelector("function setFrozenMany(address[],uint8)");
 
   const timelock = await hre.viem.deployContract("TesseraTimelock", [
     operator.account.address,
     guardian.account.address,
     BigInt(DAY),
-    [FREEZE, FREEZE_MANY],
+    [FREEZE_MANY],
   ]);
 
   // Hand the pool over. From here the operator can only act through the queue.
@@ -44,7 +43,7 @@ async function deployFixture() {
   const as = (who: any) =>
     hre.viem.getContractAt("TesseraTimelock", timelock.address, { client: { wallet: who } });
 
-  return { operator, alice, stranger, usdc, pool, timelock, call, selfCall, as, FREEZE, FREEZE_MANY, guardian };
+  return { operator, alice, stranger, usdc, pool, timelock, call, selfCall, as, FREEZE_MANY, guardian };
 }
 
 describe("TesseraTimelock (owner powers that announce themselves)", () => {
@@ -135,7 +134,7 @@ describe("TesseraTimelock (owner powers that announce themselves)", () => {
 
   it("freezes immediately, because a brake that waits a day is not a brake", async () => {
     const { usdc, pool, timelock, call } = await loadFixture(deployFixture);
-    await timelock.write.runInstant([pool.address, call("setFrozen", [usdc.address, 15])]);
+    await timelock.write.runInstant([pool.address, call("setFrozenMany", [[usdc.address], 15])]);
     expect(await pool.read.frozenActions([usdc.address])).to.equal(15);
   });
 
@@ -210,7 +209,7 @@ describe("TesseraTimelock (owner powers that announce themselves)", () => {
     const { usdc, pool, timelock, call, as, stranger } = await loadFixture(deployFixture);
     const s = await as(stranger);
     await expect(s.write.queue([pool.address, call("setPrice", [usdc.address, PRICE])])).to.be.rejected;
-    await expect(s.write.runInstant([pool.address, call("setFrozen", [usdc.address, 1])])).to.be.rejected;
+    await expect(s.write.runInstant([pool.address, call("setFrozenMany", [[usdc.address], 1])])).to.be.rejected;
 
     await timelock.write.queue([pool.address, call("setPrice", [usdc.address, 2n * PRICE])]);
     await time.increase(DAY + 1);
@@ -253,7 +252,7 @@ describe("TesseraTimelock (owner powers that announce themselves)", () => {
     const { usdc, pool, timelock, call, as, guardian } = await loadFixture(deployFixture);
     const g = await as(guardian);
     await expect(g.write.queue([pool.address, call("setPrice", [usdc.address, PRICE])])).to.be.rejected;
-    await expect(g.write.runInstant([pool.address, call("setFrozen", [usdc.address, 1])])).to.be.rejected;
+    await expect(g.write.runInstant([pool.address, call("setFrozenMany", [[usdc.address], 1])])).to.be.rejected;
     await expect(g.write.setGuardian([guardian.account.address])).to.be.rejected;
     void timelock;
   });

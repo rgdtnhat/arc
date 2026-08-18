@@ -260,13 +260,13 @@ describe("Pool migration — rebuilding positions in a pool that can be governed
     await f.newPool.write.setPrice([f.usdc.address, PRICE * 2n]);
     expect(await f.newPool.read.price([f.usdc.address])).to.equal(PRICE * 2n);
 
-    await f.newPool.write.setFrozen([f.usdc.address, 15]);
+    await f.newPool.write.setFrozenMany([[f.usdc.address], 15]);
     const [mask] = await f.newPool.read.reserveMeta([f.usdc.address]);
     expect(mask).to.equal(15);
-    await f.newPool.write.setFrozen([f.usdc.address, 0]);
+    await f.newPool.write.setFrozenMany([[f.usdc.address], 0]);
 
     const limiter = await hre.viem.deployContract("TesseraRateLimiter", [f.newPool.address]);
-    await f.newPool.write.setRateLimiter([limiter.address]);
+    await f.newPool.write.setWiring([2, limiter.address]);
     expect((await f.newPool.read.rateLimiter()).toLowerCase()).to.equal(limiter.address.toLowerCase());
   });
 });

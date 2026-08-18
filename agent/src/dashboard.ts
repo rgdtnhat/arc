@@ -3944,7 +3944,7 @@ async function main() {
        */
       if (treasury.toLowerCase() === collector.toLowerCase()) {
         try {
-          const txHash = await owner.write(poolAddr, tesseraPoolAbi, "setTreasury", [ownerAddr]);
+          const txHash = await owner.write(poolAddr, tesseraPoolAbi, "setWiring", [3, ownerAddr]);
           console.log(`[fees] the pool was paying its take rate into the collector, which cannot withdraw it — routed to ${ownerAddr} ${txHash}`);
           try {
             txlog.record({
@@ -4055,7 +4055,7 @@ async function main() {
         res.json({ ok: true, alreadyRouted: true, treasury: current });
         return;
       }
-      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setTreasury", [ownerAddr]);
+      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setWiring", [3, ownerAddr]);
       harvestWarned = false;
       logTx(req, {
         category: "defi", action: "fee-route", status: "success", txHash,
@@ -5039,7 +5039,7 @@ async function main() {
     if (!poolDeployment) { res.status(404).json({ ok: false, error: "pool not deployed" }); return; }
     if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
     try {
-      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setReserveHidden", [
+      const txHash = await owner.write(poolDeployment.poolAddress, tesseraPoolAbi, "setReserveFlag", [
         req.body?.asset as Hex,
         Boolean(req.body?.hidden),
       ]);
@@ -5071,7 +5071,7 @@ async function main() {
   const POOL_SELECTORS = {
     read: toFunctionSelector("function price(address)").slice(2),
     write: toFunctionSelector("function setPrice(address,uint256)").slice(2),
-    freeze: toFunctionSelector("function setFrozen(address,uint8)").slice(2),
+    freeze: toFunctionSelector("function setFrozenMany(address[],uint8)").slice(2),
     feed: toFunctionSelector("function setPriceFeed(address,address,uint32)").slice(2),
   };
   let poolPriceSupport: { read: boolean; write: boolean; freeze: boolean; feed: boolean } | null = null;
@@ -5168,7 +5168,7 @@ async function main() {
     const [write, freeze, feed] = asset && current !== null
       ? await Promise.all([
           hasLever(pool, tesseraPoolAbi, "setPrice", [asset, current], POOL_SELECTORS.write),
-          hasLever(pool, tesseraPoolAbi, "setFrozen", [asset, 0], POOL_SELECTORS.freeze),
+          hasLever(pool, tesseraPoolAbi, "setFrozenMany", [[asset], 0], POOL_SELECTORS.freeze),
           hasLever(
             pool, tesseraPoolAbi, "setPriceFeed",
             [asset, "0x0000000000000000000000000000000000000000", 3600], POOL_SELECTORS.feed,
@@ -8115,6 +8115,41 @@ async function main() {
          * is created in *their* name by the pool's `…For` entry point, so at no
          * point does the app hold it.
          */
+        if (t.action === "sessionWithdraw" || t.action === "sessionBorrow") {
+          /*
+           * An exit, so the authority is the holder's operator permission on
+           * the pool rather than a session key — a session moves tokens, and a
+           * lending position is not a token. The pool pays the holder directly,
+           * so nothing passes through this wallet.
+           */
+          if (!t.owner) throw new Error("only a connected wallet's own task can act on its own position");
+          if (!(await poolClient.canActForHolders())) {
+            throw new Error(
+              "the lending pool on this deployment predates scheduled exits — it has no way to act for a " +
+              "holder, so only your own wallet can withdraw or borrow. Do it from the DeFi tab.",
+            );
+          }
+          const who = t.owner as Hex;
+          if (!(await poolClient.positionOperator(who))) {
+            throw new Error(
+              "this app is not authorised on that lending position. Grant it from the DeFi tab — it is your " +
+              "own approval, the funds are always paid to you, and you can take it back at any time.",
+            );
+          }
+          const borrowing = t.action === "sessionBorrow";
+          const dry = await poolClient.wouldSucceed("actFor", [a, who, amt, borrowing]);
+          if (dry !== true) throw new Error(`that would fail, so nothing was touched: ${dry}`);
+          const txHash = await poolClient.actFor(a, who, amt, borrowing);
+          void settleNow(who, a);
+          emissionsInvalidate();
+          hashes.push(txHash as Hex);
+          return {
+            ok: true,
+            detail: `${borrowing ? "borrowed" : "withdrew"} ${fmtUnits(amt, assetMeta(a).decimals)} ` +
+              `${assetMeta(a).symbol} for ${who.slice(0, 8)}… — paid straight to their wallet`,
+            txHash,
+          };
+        }
         if (t.action === "sessionSupply" || t.action === "sessionRepay") {
           const fn = t.action === "sessionSupply" ? "supplyFor" : "repayFor";
           return runSessionFunded(t, hashes, {
@@ -8646,11 +8681,11 @@ async function main() {
    * holder approves this wallet to move a bounded number of their LP shares,
    * and can set that back to zero from their own wallet at any moment.
    */
-  const SHARE_FUNDED = new Set(["sessionRemove", "sessionWithdraw"]);
+  const SHARE_FUNDED = new Set(["sessionRemove", "sessionWithdraw", "sessionBorrow"]);
 
   const SESSION_ACTIONS: Record<string, string[]> = {
     wallet: ["sessionSend", "sessionBulk"],
-    lending: ["sessionSupply", "sessionRepay"],
+    lending: ["sessionSupply", "sessionRepay", "sessionWithdraw", "sessionBorrow"],
     vault: ["sessionDeposit", "sessionWithdraw"],
     amm: ["sessionAdd", "sessionSwap", "sessionRemove"],
     swap: ["sessionSwap"],
@@ -8728,8 +8763,10 @@ async function main() {
           "list: those pay out of a position you hold, so only your own wallet can sign them — do those from " +
           "the DeFi tab. Leaving a pool or the vault is scheduled too, and authorised the other way round — " +
           "you approve this app on the position itself, from the DeFi tab, and the proceeds are always paid to " +
-          "you. Lending withdraw and borrow are the exception: that contract has no way to act for a holder " +
-          "yet. Revoking a session, or an approval, stops everything it authorised.",
+          "you — including withdrawing and borrowing from the lending pool. Borrowing is worth a second " +
+          "thought before you grant it: it creates debt in your name, bounded by your own collateral and " +
+          "health factor, and the app can take you closer to liquidation than you might have chosen. " +
+          "Revoking a session, or an approval, stops everything it authorised.",
     });
   });
 
@@ -8842,6 +8879,16 @@ async function main() {
     known?: SessionRow,
   ) {
     const action = String(body.action ?? "");
+    if (action === "sessionBorrow" || (action === "sessionWithdraw" && body.venue === "lending")) {
+      let amount: bigint;
+      try {
+        amount = BigInt(String(body.params?.amount ?? "0"));
+      } catch {
+        throw new Error(`"${String(body.params?.amount)}" is not an amount`);
+      }
+      if (amount <= 0n) throw new Error("the amount must be above zero");
+      return;
+    }
     if (action === "sessionWithdraw") {
       let shares: bigint;
       try {

@@ -189,7 +189,7 @@ describe("Migration primitives — pay for someone else, never move their funds"
 
   it("supplyFor respects a supply freeze — migration is not a way around a halt", async () => {
     const { alice, bob, usdc, pool, give, as } = await loadFixture(deployFixture);
-    await pool.write.setFrozen([usdc.address, 1]); // FREEZE_SUPPLY
+    await pool.write.setFrozenMany([[usdc.address], 1]); // FREEZE_SUPPLY
     await give(usdc, alice, U("100"), pool.address);
     await expect(
       (await as("TesseraPool", pool.address, alice)).write.supplyFor([usdc.address, bob.account.address, U("100")]),

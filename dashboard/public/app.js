@@ -4382,6 +4382,8 @@ const $ = (id) => document.getElementById(id);
          * the vault — granted from the DeFi tab and revocable there.
          */
         "amm:sessionRemove": ["poolId", "shares", "message"],
+        "lending:sessionWithdraw": ["asset", "amount", "message"],
+        "lending:sessionBorrow": ["asset", "amount", "message"],
         "vault:sessionWithdraw": ["shares", "message"],
       };
 

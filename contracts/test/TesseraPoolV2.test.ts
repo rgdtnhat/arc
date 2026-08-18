@@ -101,7 +101,7 @@ describe("TesseraPool — e-mode for correlated assets", () => {
   async function withEmode() {
     const f = await loadFixture(deployFixture);
     // USDC and EURC track each other; cirBTC does not.
-    await f.pool.write.setEmodeCategory([1, 9500, 9700, 9800, "Stablecoins"]);
+    await f.pool.write.setEmodeCategory([1, 9500, 9700, 9800, true, "Stablecoins"]);
     await f.pool.write.setEmodeAsset([f.usdc.address, 1]);
     await f.pool.write.setEmodeAsset([f.eurc.address, 1]);
 
@@ -164,7 +164,7 @@ describe("TesseraPool — e-mode for correlated assets", () => {
     await (await f.as(f.bob)).write.supply([f.eurc.address, USDC("1000")]);
     const [boosted] = await f.pool.read.accountLimits([f.bob.account.address]);
 
-    await f.pool.write.setEmodeEnabled([1, false]);
+    await f.pool.write.setEmodeCategory([1, 9500, 9700, 9800, false, "Stablecoins"]);
     expect(await f.pool.read.emodeCategoryOf([f.bob.account.address])).to.equal(0);
     const [plain] = await f.pool.read.accountLimits([f.bob.account.address]);
     expect(plain < boosted).to.equal(true);
@@ -175,9 +175,9 @@ describe("TesseraPool — e-mode for correlated assets", () => {
     // cFactor must sit strictly below liqFactor here for the same reason it
     // does per-asset: otherwise a fully-drawn e-mode borrower sits exactly on
     // the seizure line.
-    await expect(f.pool.write.setEmodeCategory([2, 9700, 9700, 9800, "bad"])).to.be.rejected;
-    await expect(f.pool.write.setEmodeCategory([2, 9800, 9700, 9800, "bad"])).to.be.rejected;
-    await expect(f.pool.write.setEmodeCategory([0, 9500, 9700, 9800, "zero id"])).to.be.rejected;
+    await expect(f.pool.write.setEmodeCategory([2, 9700, 9700, 9800, true, "bad"])).to.be.rejected;
+    await expect(f.pool.write.setEmodeCategory([2, 9800, 9700, 9800, true, "bad"])).to.be.rejected;
+    await expect(f.pool.write.setEmodeCategory([0, 9500, 9700, 9800, true, "zero id"])).to.be.rejected;
   });
 
   it("keeps the dashboard's numbers and the liquidation numbers the same", async () => {
@@ -216,7 +216,7 @@ describe("TesseraPool — TWAP sanity band on manual prices", () => {
 
     const guard = await hre.viem.deployContract("TesseraPriceGuard", [amm.address, f.pool.address]);
     await guard.write.setFeed([f.eurc.address, 0n, f.usdc.address, 500, 600, 0n]); // ±5%, 10-min window, no depth floor
-    await f.pool.write.setPriceGuard([guard.address]);
+    await f.pool.write.setWiring([0, guard.address]);
     return { ...f, amm, guard, lp };
   }
 
@@ -257,7 +257,7 @@ describe("TesseraPool — TWAP sanity band on manual prices", () => {
     await time.increase(900);
     await f.amm.write.sync([0n]);
     await expect(f.pool.write.setPrice([f.eurc.address, 1_080_000_000n])).to.be.rejected;
-    await f.pool.write.setPriceGuard(["0x0000000000000000000000000000000000000000"]);
+    await f.pool.write.setWiring([0, "0x0000000000000000000000000000000000000000"]);
     await f.pool.write.setPrice([f.eurc.address, 1_080_000_000n]);
   });
 

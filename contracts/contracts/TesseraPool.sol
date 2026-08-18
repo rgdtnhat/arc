@@ -454,6 +454,7 @@ contract TesseraPool is ReentrancyGuard {
     event BadDebtCleared(address indexed user, address indexed asset, uint256 amount, uint256 fromBackstop);
 
     error NotOwner();
+    error NotAuthorised();
     error ActionFrozen();
     error BadOracle();
     error UnknownReserve();
@@ -612,18 +613,28 @@ contract TesseraPool is ReentrancyGuard {
      *      exactly on the liquidation boundary, which is the bug this pool
      *      already fixed once for the per-asset factors.
      */
+    /**
+     * @notice Define an e-mode category, and say whether it applies.
+     *
+     * @dev `enabled` is a parameter here rather than a `setEmodeEnabled` of its
+     *      own. Turning a category off is rare and always accompanied by
+     *      knowing its factors, so one call does both — and an extra argument
+     *      on an existing function costs a fraction of what a second dispatch
+     *      entry does in a contract this close to the deployment limit.
+     */
     function setEmodeCategory(
         uint8 category,
         uint16 cFactor,
         uint16 liqFactor,
         uint16 lFactor,
+        bool enabled,
         string calldata label
     ) external onlyOwner {
         if (category == 0) revert UnknownCategory();
         _requireFactors(cFactor, liqFactor, lFactor, 0);
         if (bytes(label).length > 32) revert BadLabel();
         emodeParams[category] =
-            EmodeParams({enabled: true, cFactor: cFactor, liqFactor: liqFactor, lFactor: lFactor, label: label});
+            EmodeParams({enabled: enabled, cFactor: cFactor, liqFactor: liqFactor, lFactor: lFactor, label: label});
         emit EmodeCategorySet(category, cFactor, liqFactor, lFactor, label);
     }
 
@@ -634,14 +645,17 @@ contract TesseraPool is ReentrancyGuard {
      *      parameters always can; that is what makes them a control rather than
      *      a display. Nothing is seized by this call itself.
      */
-    function setEmodeEnabled(uint8 category, bool on) external onlyOwner {
-        EmodeParams storage e = emodeParams[category];
-        if (e.cFactor == 0) revert UnknownCategory();
-        e.enabled = on;
-        emit EmodeCategorySet(category, e.cFactor, e.liqFactor, e.lFactor, e.label);
-    }
+
 
     /// @notice Attach an asset to a category, or detach it with category 0.
+    /**
+     * @notice Put an asset in an e-mode category, or take it out with 0.
+     *
+     * @dev `setEmodeEnabled(category, bool)` used to sit beside this. Turning a
+     *      category off is now `setEmodeCategory` with the same parameters and
+     *      `enabled` false — one call instead of two, and one fewer dispatch
+     *      entry in a contract that is out of them.
+     */
     function setEmodeAsset(address asset, uint8 category) external onlyOwner {
         if (!reserves[asset].enabled) revert UnknownReserve();
         if (category != 0 && emodeParams[category].cFactor == 0) revert UnknownCategory();
@@ -716,9 +730,26 @@ contract TesseraPool is ReentrancyGuard {
      * needs no such check — reducing what the pool will do is always allowed,
      * for the same reason freezing is.
      */
-    function setBorrowable(address asset, bool on) external onlyOwner {
+    /**
+     * @notice Turn one of a reserve's two switches on or off.
+     *
+     * Merged for the same reason as `setWiring`: two `(address,bool)` setters
+     * are two dispatch entries, and dispatch entries are the scarce thing in
+     * this contract. Nothing about either switch changed.
+     *
+     * @param flag 0 borrowable · 1 hidden from the app's asset list
+     */
+    function setReserveFlag(address asset, uint8 flag, bool on) external onlyOwner {
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
+        if (flag == 1) {
+            // Presentation only: hiding does **not** freeze anything, and a
+            // hidden reserve's suppliers keep full access to withdraw and repay.
+            reserveHidden[asset] = on;
+            emit ReserveVisibility(asset, on);
+            return;
+        }
+        if (flag != 0) revert BadMask();
         if (on && priceGuard != address(0)) {
             // A guard that would accept a mark half again the current one is
             // not guarding this asset, whatever it is configured to do.
@@ -753,36 +784,29 @@ contract TesseraPool is ReentrancyGuard {
      *      way to permanently freeze an asset's price if its reference pool were
      *      ever drained — the guard causing the outage it exists to prevent.
      */
-    function setPriceGuard(address guard) external onlyOwner {
-        priceGuard = guard;
-        emit PriceGuardSet(guard);
-    }
-
     /**
-     * @notice Point risk pricing at a TesseraOracle, or clear it with address(0).
-     * @dev Clearable deliberately. An oracle that could not be removed would be
-     *      a way to freeze the pool permanently by configuring one asset badly —
-     *      the guard causing the outage it exists to prevent.
+     * @notice Point one of the pool's four wirings at an address, or clear it.
+     *
+     * These were four one-line setters. They are one because this contract sits
+     * against the 24KB deployment limit and four dispatch entries is most of the
+     * room a feature needs — merging the ones nobody calls twice a year is the
+     * cheapest space in the contract.
+     *
+     * Every one stays clearable with `address(0)`, deliberately, for the guard,
+     * the oracle and the limiter alike: a control that could not be removed
+     * would be a way to freeze the pool permanently by configuring it badly —
+     * the safeguard causing the outage it exists to prevent. The limiter matters
+     * most, being the one control here that can legitimately block an honest
+     * withdrawal, so ending a misconfigured limit stays a single transaction.
+     *
+     * @param slot 0 price guard · 1 risk oracle · 2 outflow limiter · 3 treasury
      */
-    function setRiskOracle(address o) external onlyOwner {
-        riskOracle = o;
-        emit RiskOracleSet(o);
-    }
-
-    /**
-     * @notice Point outflow metering at a TesseraRateLimiter, or clear it.
-     * @dev Same escape hatch as the oracle, and needed more: this is the one
-     *      control here that can legitimately block an honest withdrawal, so the
-     *      ability to remove it in a single transaction is what keeps a
-     *      misconfigured limit from becoming an outage nobody can end.
-     */
-    function setRateLimiter(address l) external onlyOwner {
-        rateLimiter = l;
-        emit RateLimiterSet(l);
-    }
-
-    function setTreasury(address t) external onlyOwner {
-        treasury = t;
+    function setWiring(uint8 slot, address a) external onlyOwner {
+        if (slot == 0) { priceGuard = a; emit PriceGuardSet(a); }
+        else if (slot == 1) { riskOracle = a; emit RiskOracleSet(a); }
+        else if (slot == 2) { rateLimiter = a; emit RateLimiterSet(a); }
+        else if (slot == 3) { treasury = a; }
+        else revert BadMask();
     }
 
     /**
@@ -846,22 +870,23 @@ contract TesseraPool is ReentrancyGuard {
     }
 
     /**
-     * @notice Freeze some or all actions on a reserve.
+     * @notice Freeze some or all actions on one or more reserves.
+     *
      * @param mask Bitwise OR of FREEZE_SUPPLY / FREEZE_WITHDRAW / FREEZE_BORROW /
      *        FREEZE_REPAY; 0 unfreezes everything, FREEZE_ALL stops all four.
+     *
      * @dev Liquidation is deliberately never frozen. A freeze stops new risk from
      *      being taken on, but positions keep accruing interest, and blocking
      *      liquidation during a freeze would let bad debt build with no way to
      *      clear it — which harms the very depositors the freeze protects.
+     *
+     * @dev There was a singular `setFrozen(address,uint8)` beside this. It is
+     *      gone, and the plural is what remains rather than the other way round,
+     *      because the emergency case is "stop everything now" and that has to
+     *      stay one transaction. A single reserve is a one-element array. The
+     *      dispatch entry it freed is what let the position-operator permission
+     *      below fit inside the 24KB deployment limit.
      */
-    function setFrozen(address asset, uint8 mask) external onlyOwner {
-        if (!reserves[asset].enabled) revert UnknownReserve();
-        if (mask > FREEZE_ALL) revert BadMask();
-        frozenActions[asset] = mask;
-        emit ReserveFrozen(asset, mask);
-    }
-
-    /// @notice Apply the same freeze mask to several reserves in one call.
     function setFrozenMany(address[] calldata assets, uint8 mask) external onlyOwner {
         if (mask > FREEZE_ALL) revert BadMask();
         for (uint256 i = 0; i < assets.length; i++) {
@@ -877,18 +902,6 @@ contract TesseraPool is ReentrancyGuard {
         if (bytes(name).length > 40) revert BadLabel();
         reserveName[asset] = name;
         emit ReserveRenamed(asset, name);
-    }
-
-    /**
-     * @notice Hide a reserve from the app's asset list.
-     * @dev Presentation only: hiding does **not** freeze anything, and a hidden
-     *      reserve's suppliers keep full access to withdraw and repay. Use
-     *      `setFrozen` to actually stop activity.
-     */
-    function setReserveHidden(address asset, bool hidden) external onlyOwner {
-        if (!reserves[asset].enabled) revert UnknownReserve();
-        reserveHidden[asset] = hidden;
-        emit ReserveVisibility(asset, hidden);
     }
 
     /// @notice Reserve presentation + freeze state, for the app's asset list.
@@ -1011,7 +1024,67 @@ contract TesseraPool is ReentrancyGuard {
         emit Supply(asset, user, amount, shares);
     }
 
+    /* ---- acting for a holder who asked you to --------------------------------
+     *
+     * `supplyFor` and `repayFor` let anyone pay *into* somebody's position,
+     * which needs no permission because giving somebody money can only help
+     * them. Taking a position *out* is the opposite, and needs the holder to
+     * have said so.
+     *
+     * So: an operator list the holder keeps themselves. Two properties make it
+     * safe to hand out, and neither may be relaxed.
+     *
+     *  1. **The funds always go to the holder.** `actFor` pushes to `user`,
+     *     never to `msg.sender`. An operator can trigger the action and can
+     *     never receive a wei of it, which is the whole difference between
+     *     "act for me" and "take from me".
+     *  2. **The holder's own limits still bind.** Health, liquidity, freezes,
+     *     caps and the outflow meter are the same checks their own call goes
+     *     through — this is that code path with the address supplied rather
+     *     than assumed.
+     *
+     * It is off for everybody until the holder turns it on, and revocable from
+     * their wallet in one transaction.
+     */
+    mapping(address => mapping(address => bool)) public positionOperator;
+
+    event OperatorSet(address indexed holder, address indexed operator, bool allowed);
+
+    /**
+     * @notice Let `operator` withdraw and borrow **to you** from your position.
+     *
+     * @dev No zero-address guard, and it is not an omission: naming address(0)
+     *      an operator authorises an address that can never call anything,
+     *      because `msg.sender` is never zero. The check would cost bytes this
+     *      contract does not have to prevent a no-op.
+     */
+    function setPositionOperator(address operator, bool allowed) external {
+        positionOperator[msg.sender][operator] = allowed;
+        emit OperatorSet(msg.sender, operator, allowed);
+    }
+
+    /**
+     * @notice Withdraw or borrow for `user`, paid **to `user`**.
+     *
+     * One entry point rather than two named ones, and not for elegance: this
+     * contract sits a few hundred bytes from the 24KB deployment limit and a
+     * second external function does not fit. `borrowing` chooses which, so the
+     * dispatch table grows by one instead of two.
+     *
+     * @param borrowing true to borrow against their collateral, false to
+     *        withdraw what they supplied.
+     */
+    function actFor(address asset, address user, uint256 amount, bool borrowing) external nonReentrant {
+        if (user != msg.sender && !positionOperator[user][msg.sender]) revert NotAuthorised();
+        if (borrowing) _borrowFor(asset, user, amount);
+        else _withdrawFor(asset, user, amount);
+    }
+
     function withdraw(address asset, uint256 amount) external nonReentrant {
+        _withdrawFor(asset, msg.sender, amount);
+    }
+
+    function _withdrawFor(address asset, address user, uint256 amount) internal {
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
         _requireNotFrozen(asset, FREEZE_WITHDRAW);
@@ -1020,22 +1093,27 @@ contract TesseraPool is ReentrancyGuard {
         // their exit would be trapping funds during exactly the incident that
         // makes people want them back. A borrower pulling collateral out is a
         // different matter — that raises leverage as surely as borrowing does.
-        if (_hasDebt(msg.sender)) _requireReliablePrices();
+        if (_hasDebt(user)) _requireReliablePrices();
         _accrueAll();
-        uint256 bal = supplyBalance(asset, msg.sender);
+        uint256 bal = supplyBalance(asset, user);
         if (amount == 0 || amount > bal) revert ZeroAmount();
         if (amount > _available(r)) revert InsufficientLiquidity();
         uint256 shares = (amount * r.totalSupplyShares) / r.totalSupplyAssets;
-        supplyShares[asset][msg.sender] -= shares;
+        supplyShares[asset][user] -= shares;
         r.totalSupplyShares -= shares;
         r.totalSupplyAssets -= amount;
-        if (!_healthy(msg.sender)) revert Unhealthy();
+        if (!_healthy(user)) revert Unhealthy();
         _meter(asset, amount);
-        _push(asset, msg.sender, amount);
-        emit Withdraw(asset, msg.sender, amount, shares);
+        // To the holder. Never to whoever asked.
+        _push(asset, user, amount);
+        emit Withdraw(asset, user, amount, shares);
     }
 
     function borrow(address asset, uint256 amount) external nonReentrant {
+        _borrowFor(asset, msg.sender, amount);
+    }
+
+    function _borrowFor(address asset, address user, uint256 amount) internal {
         if (amount == 0) revert ZeroAmount();
         Reserve storage r = reserves[asset];
         if (!r.enabled) revert UnknownReserve();
@@ -1049,13 +1127,14 @@ contract TesseraPool is ReentrancyGuard {
             revert BorrowCapReached(bCap, r.totalBorrowAssets + amount);
         }
         uint256 shares = r.totalBorrowShares == 0 ? amount : (amount * r.totalBorrowShares) / r.totalBorrowAssets;
-        borrowShares[asset][msg.sender] += shares;
+        borrowShares[asset][user] += shares;
         r.totalBorrowShares += shares;
         r.totalBorrowAssets += amount;
-        if (!_healthy(msg.sender)) revert Unhealthy();
+        if (!_healthy(user)) revert Unhealthy();
         _meter(asset, amount);
-        _push(asset, msg.sender, amount);
-        emit Borrow(asset, msg.sender, amount, shares);
+        // To the holder, who carries the debt. Never to whoever asked.
+        _push(asset, user, amount);
+        emit Borrow(asset, user, amount, shares);
     }
 
     function repay(address asset, uint256 amount) external nonReentrant {

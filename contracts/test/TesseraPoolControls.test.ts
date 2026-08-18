@@ -49,7 +49,7 @@ describe("TesseraPool — freeze, naming and visibility controls", () => {
   it("freezes supply and borrow while leaving withdraw and repay open", async () => {
     const { alice, bob, usdc, pool, asPool, fund } = await loadFixture(deployFixture);
     // The incident case from the spec: stop new risk, let people get out.
-    await pool.write.setFrozen([usdc.address, FREEZE_SUPPLY | FREEZE_BORROW]);
+    await pool.write.setFrozenMany([[usdc.address], FREEZE_SUPPLY | FREEZE_BORROW]);
 
     await fund(usdc, alice, U("100"));
     await expect((await asPool(alice)).write.supply([usdc.address, U("100")])).to.be.rejected;
@@ -63,7 +63,7 @@ describe("TesseraPool — freeze, naming and visibility controls", () => {
 
   it("freezes every action with FREEZE_ALL", async () => {
     const { alice, bob, usdc, pool, asPool, fund } = await loadFixture(deployFixture);
-    await pool.write.setFrozen([usdc.address, FREEZE_ALL]);
+    await pool.write.setFrozenMany([[usdc.address], FREEZE_ALL]);
     await fund(usdc, alice, U("100"));
     await expect((await asPool(alice)).write.supply([usdc.address, U("100")])).to.be.rejected;
     await expect((await asPool(alice)).write.withdraw([usdc.address, U("100")])).to.be.rejected;
@@ -77,8 +77,8 @@ describe("TesseraPool — freeze, naming and visibility controls", () => {
     // everything: bad debt must still be clearable or it compounds on the
     // depositors the freeze is meant to protect.
     await pool.write.setPrice([btc.address, 500n * PRICE]);
-    await pool.write.setFrozen([usdc.address, FREEZE_ALL]);
-    await pool.write.setFrozen([btc.address, FREEZE_ALL]);
+    await pool.write.setFrozenMany([[usdc.address], FREEZE_ALL]);
+    await pool.write.setFrozenMany([[btc.address], FREEZE_ALL]);
 
     await fund(usdc, alice, U("500"));
     // Seized collateral lands as a pool position for the liquidator, not tokens.
@@ -92,8 +92,8 @@ describe("TesseraPool — freeze, naming and visibility controls", () => {
 
   it("unfreezes by clearing the mask", async () => {
     const { alice, usdc, pool, asPool, fund } = await loadFixture(deployFixture);
-    await pool.write.setFrozen([usdc.address, FREEZE_ALL]);
-    await pool.write.setFrozen([usdc.address, 0]);
+    await pool.write.setFrozenMany([[usdc.address], FREEZE_ALL]);
+    await pool.write.setFrozenMany([[usdc.address], 0]);
     await fund(usdc, alice, U("100"));
     await (await asPool(alice)).write.supply([usdc.address, U("100")]);
     expect(await pool.read.frozenActions([usdc.address])).to.equal(0);
@@ -108,15 +108,15 @@ describe("TesseraPool — freeze, naming and visibility controls", () => {
 
   it("rejects an out-of-range mask and an unknown reserve", async () => {
     const { usdc, pool } = await loadFixture(deployFixture);
-    await expect(pool.write.setFrozen([usdc.address, 16])).to.be.rejected;
-    await expect(pool.write.setFrozen(["0x0000000000000000000000000000000000000001", FREEZE_ALL])).to.be.rejected;
+    await expect(pool.write.setFrozenMany([[usdc.address], 16])).to.be.rejected;
+    await expect(pool.write.setFrozenMany([["0x0000000000000000000000000000000000000001"], FREEZE_ALL])).to.be.rejected;
   });
 
   it("renames a reserve and hides it without touching balances", async () => {
     const { alice, usdc, pool } = await loadFixture(deployFixture);
     const supplied = await pool.read.supplyBalance([usdc.address, alice.account.address]);
     await pool.write.renameReserve([usdc.address, "USD Coin — main"]);
-    await pool.write.setReserveHidden([usdc.address, true]);
+    await pool.write.setReserveFlag([usdc.address, 1, true]);
     const [mask, hidden, name] = await pool.read.reserveMeta([usdc.address]);
     expect(name).to.equal("USD Coin — main");
     expect(hidden).to.equal(true);
@@ -126,7 +126,7 @@ describe("TesseraPool — freeze, naming and visibility controls", () => {
 
   it("hiding is presentation only — a hidden reserve still transacts", async () => {
     const { alice, usdc, pool, asPool, fund } = await loadFixture(deployFixture);
-    await pool.write.setReserveHidden([usdc.address, true]);
+    await pool.write.setReserveFlag([usdc.address, 1, true]);
     await fund(usdc, alice, U("100"));
     await (await asPool(alice)).write.supply([usdc.address, U("100")]);
     await (await asPool(alice)).write.withdraw([usdc.address, U("100")]);
@@ -141,10 +141,10 @@ describe("TesseraPool — freeze, naming and visibility controls", () => {
   it("keeps every control owner-only", async () => {
     const { alice, usdc, pool, asPool } = await loadFixture(deployFixture);
     const a = await asPool(alice);
-    await expect(a.write.setFrozen([usdc.address, FREEZE_ALL])).to.be.rejected;
+    await expect(a.write.setFrozenMany([[usdc.address], FREEZE_ALL])).to.be.rejected;
     await expect(a.write.setFrozenMany([[usdc.address], FREEZE_ALL])).to.be.rejected;
     await expect(a.write.renameReserve([usdc.address, "mine"])).to.be.rejected;
-    await expect(a.write.setReserveHidden([usdc.address, true])).to.be.rejected;
+    await expect(a.write.setReserveFlag([usdc.address, 1, true])).to.be.rejected;
     await expect(a.write.setPriceFeed([usdc.address, usdc.address, 0])).to.be.rejected;
   });
 });

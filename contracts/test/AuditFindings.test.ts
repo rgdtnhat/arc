@@ -101,7 +101,7 @@ describe("AUDIT: a lender with no debt is trapped by an oracle divergence", () =
     await oracle.write.configureAsset([
       usdc.address, P(1), "0x0000000000000000000000000000000000000000", 0, 200, 0, 500, 7 * DAY,
     ]);
-    await pool.write.setRiskOracle([oracle.address]);
+    await pool.write.setWiring([1, oracle.address]);
 
     for (const w of [lender, borrower]) {
       await usdc.write.mint([w.account.address, U(500_000)]);
@@ -172,7 +172,7 @@ describe("AUDIT: an oracle that goes silent must not brick the pool", () => {
     await oracle.write.configureAsset([
       usdc.address, P(1), "0x0000000000000000000000000000000000000000", 0, 200, 0, 500, 3600,
     ]);
-    await pool.write.setRiskOracle([oracle.address]);
+    await pool.write.setWiring([1, oracle.address]);
 
     for (const w of [deployer, borrower]) {
       await usdc.write.mint([w.account.address, U(500_000)]);
@@ -224,7 +224,7 @@ describe("AUDIT: an oracle that goes silent must not brick the pool", () => {
     await time.increase(3601);
     await expect((await as(borrower)).write.borrow([usdc.address, U(100)])).to.be.rejected;
 
-    await pool.write.setRiskOracle(["0x0000000000000000000000000000000000000000"]);
+    await pool.write.setWiring([1, "0x0000000000000000000000000000000000000000"]);
     await (await as(borrower)).write.borrow([usdc.address, U(100)]);
   });
 });
