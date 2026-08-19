@@ -496,6 +496,27 @@ export class AmmClient {
     return this.write("addLiquidityFor", [BigInt(poolId), to, amounts, minShares]);
   }
 
+  /**
+   * What a call would return, without sending it.
+   *
+   * `wouldSucceed` answers yes-or-no; this answers with the number, which is
+   * what a slippage floor has to be built from. An unattended add or exit
+   * cannot use a floor written when the task was — the pool's ratio moves —
+   * so the expectation is taken at the moment it runs and the floor is a
+   * bounded haircut off it.
+   */
+  async simulateResult<T>(functionName: string, args: unknown[]): Promise<T | null> {
+    try {
+      const { result } = await this.public.simulateContract({
+        address: this.amm, abi: tesseraAmmAbi,
+        functionName: functionName as never, args: args as never, account: this.cfg.account,
+      });
+      return result as T;
+    } catch {
+      return null;
+    }
+  }
+
   /** See `TesseraPoolClient.wouldSucceed` — a dry run before money moves. */
   async wouldSucceed(functionName: string, args: unknown[]): Promise<true | string> {
     try {

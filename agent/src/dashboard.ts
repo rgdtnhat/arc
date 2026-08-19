@@ -486,10 +486,33 @@ async function main() {
    */
   const agentSigner = OwnerClient.forAccount(chain, rpcUrl, agentAccount);
 
-  // Guardian policy: one-shot/CI runs auto-approve so they don't block on a human.
+  /*
+   * Guardian policy. `autoApprove` turns the human co-signer into a rubber
+   * stamp, so it is a local-demo affordance and nothing else.
+   *
+   * It used to be enough that neither variable appeared in `docker-compose.yml`
+   * — the compose file forwarded a hand-kept list, so the switch could not
+   * reach the container whatever `.env` said. That list was later replaced with
+   * `env_file`, because fifteen real settings were being silently dropped by
+   * it, and the side effect was that this switch became reachable in a deployed
+   * configuration for the first time.
+   *
+   * "Never reachable in a deployed configuration" is the rule, so it is the
+   * code's job now rather than the compose file's. On a live chain the switch
+   * is off no matter what the environment says, and saying so loudly beats
+   * failing quietly: somebody who set it deliberately deserves to know it did
+   * nothing.
+   */
+  const wantsAutoApprove = process.env.TESSERA_ONCE === "1" || process.env.TESSERA_AUTO_APPROVE === "1";
+  if (wantsAutoApprove && live) {
+    console.warn(
+      "⚠️  TESSERA_AUTO_APPROVE / TESSERA_ONCE is set and is being IGNORED: the guardian cannot be " +
+      "bypassed on a live chain. Every spend above the cap still waits for a human.",
+    );
+  }
   const policy = {
     ...AGENT_POLICY,
-    autoApprove: process.env.TESSERA_ONCE === "1" || process.env.TESSERA_AUTO_APPROVE === "1",
+    autoApprove: wantsAutoApprove && !live,
   };
   const memory = new TrustMemory(
     statePath(".tessera-memory.json")
@@ -666,8 +689,26 @@ async function main() {
     fileURLToPath(new URL(".", import.meta.url)),
     "../../dashboard/public"
   );
-  // Behind Caddy/TLS: trust the proxy so req.ip is the real client IP.
-  app.set("trust proxy", true);
+  /*
+   * One hop, not "trust whatever you are told".
+   *
+   * This was `true`, which makes Express take the **leftmost** entry of
+   * `X-Forwarded-For` as `req.ip` — and that entry is written by the client.
+   * Caddy appends to the header rather than replacing it, so anybody could
+   * choose their own `req.ip` by sending one.
+   *
+   * That matters because `req.ip` is the key the admin-login lockout buckets
+   * on. Probing the live deployment: six wrong passwords behind a *fixed*
+   * forged header locked out on the sixth, exactly as designed — and six behind
+   * a *varying* one never did, because each request landed in a fresh bucket.
+   * The brake worked and could be walked around.
+   *
+   * `1` is the number of proxies actually in front of this process (Caddy, per
+   * the Caddyfile). Express then takes the address Caddy itself observed, which
+   * no client can forge. Running without a proxy still works: with no header,
+   * `req.ip` is the socket address.
+   */
+  app.set("trust proxy", 1);
   app.disable("x-powered-by");
 
   // Security headers on every response (strict CSP — the dashboard script is an
@@ -7229,7 +7270,9 @@ async function main() {
     // `?fresh=1` is the reader saying they have just changed something. It has
     // to reach past both caches, or a page reloaded after opening a session
     // shows the list from before it.
-    const wantFresh = req.query.fresh === "1";
+    // Same rule as the governance reads: a cache bypass belongs to whoever
+    // just wrote, and they are signed in. See `wantsFresh`.
+    const wantFresh = req.query.fresh === "1" && isAuthed(req);
     const cached = sessionsCache.get(cacheKey);
     if (cached && Date.now() - cached.at < SESSIONS_TTL && !wantFresh) {
       res.json({ ok: true, deployed: true, key: sessionSigner ? sessionSigner.account.address : null, sessions: cached.rows });
@@ -7655,11 +7698,13 @@ async function main() {
     who: Hex, outAsset: Hex, swapHash: Hex, hashes: Hex[], label: string,
     /** This wallet's balance of the output token *before* the swap. */
     heldBefore: bigint,
+    /** What the trade was quoted at, as a ceiling if the receipt cannot be read. */
+    expected = 0n,
   ): Promise<{ txHash: Hex; note?: string }> => {
     const meta = assetMeta(outAsset);
     // Read what the swap actually paid rather than trusting the quote: the
     // amount forwarded has to be the amount that arrived.
-    const got = await swapProceeds(swapHash, outAsset, heldBefore);
+    const got = await swapProceeds(swapHash, outAsset, heldBefore, expected);
     if (got <= 0n) {
       throw new Stranded(`the proceeds of a ${label}`, who,
         `${label} landed but its output could not be measured`);
@@ -7689,7 +7734,11 @@ async function main() {
    * a delta would hand a visitor every last one of them the first time a
    * receipt could not be read.
    */
-  const swapProceeds = async (txHash: Hex, outAsset: Hex, heldBefore: bigint): Promise<bigint> => {
+  const swapProceeds = async (
+    txHash: Hex, outAsset: Hex, heldBefore: bigint,
+    /** What the quote said this trade would pay, as a ceiling on the fallback. */
+    expected = 0n,
+  ): Promise<bigint> => {
     try {
       const rec = await client.public.getTransactionReceipt({ hash: txHash });
       const me = (agentAccount.address as string).toLowerCase().slice(2).padStart(64, "0");
@@ -7707,7 +7756,18 @@ async function main() {
       const now = (await client.public.readContract({
         address: outAsset, abi: erc20Abi, functionName: "balanceOf", args: [agentAccount.address as Hex],
       })) as bigint;
-      return now > heldBefore ? now - heldBefore : 0n;
+      const delta = now > heldBefore ? now - heldBefore : 0n;
+      /*
+       * Capped by what the trade was quoted at.
+       *
+       * The delta is this wallet's balance change, and two scheduled swaps into
+       * the same token can overlap — the second would read a difference that
+       * includes the first's proceeds and forward both. The quote is the most
+       * this trade could have produced, so it is the ceiling. Reached only when
+       * a receipt cannot be read at all, which is rare: the send already waited
+       * for confirmation before this runs.
+       */
+      return expected > 0n && delta > expected ? expected : delta;
     } catch {
       return 0n;
     }
@@ -7805,14 +7865,30 @@ async function main() {
       }
     };
 
-    const dry = await ammClient.wouldSucceed(
-      "removeLiquidity", [BigInt(plan.poolId), plan.shares, plan.assets.map(() => 0n)],
-    );
+    const zeroes = plan.assets.map(() => 0n);
+    const dry = await ammClient.wouldSucceed("removeLiquidity", [BigInt(plan.poolId), plan.shares, zeroes]);
     if (dry !== true) return await returnShares(`${plan.label} would fail (${dry})`);
+
+    /*
+     * A floor on what comes back, priced when it runs.
+     *
+     * This burned with `minAmounts` all zero, which accepts whatever the pool
+     * happens to pay — and an unattended exit is exactly the case where nobody
+     * is watching the reserves. The expectation comes from a simulation a
+     * moment ago; the floor is a bounded haircut off it, so a pool that moves
+     * between the two refuses rather than pays out short.
+     */
+    const expect = await ammClient.simulateResult<readonly bigint[]>(
+      "removeLiquidity", [BigInt(plan.poolId), plan.shares, zeroes],
+    );
+    const cut = BigInt(10_000 - slippageBps(t.params ?? {}));
+    const minAmounts = expect && expect.length === plan.assets.length
+      ? expect.map((v) => (v * cut) / 10_000n)
+      : zeroes;
 
     let burn: Hex;
     try {
-      burn = await ammClient.removeLiquidity(plan.poolId, plan.shares, plan.assets.map(() => 0n));
+      burn = await ammClient.removeLiquidity(plan.poolId, plan.shares, minAmounts);
       hashes.push(burn);
     } catch (e) {
       return await returnShares(`${plan.label} failed (${friendlyError(e)})`);
@@ -7944,6 +8020,34 @@ async function main() {
     const ownerAddr = rows[0].s.owner as Hex;
     if (rows.some((r) => String(r.s.owner).toLowerCase() !== ownerAddr.toLowerCase())) {
       throw new Error("those sessions belong to different wallets — one task spends one wallet");
+    }
+    /*
+     * The session's owner and the task's owner must be the same wallet.
+     *
+     * The save-time gate already checks this for a visitor, and this is the
+     * second line rather than the first — but the first line has a gap it does
+     * not cover: an operator skips that check entirely, so an operator-created
+     * task could name *somebody else's* delegation and spend it. The funds
+     * would land in that person's own position and stay within their cap, so it
+     * is not theft; it is still their wallet moving on somebody else's
+     * instruction, which is exactly what a delegation is supposed to bound.
+     *
+     * A task funded by a session therefore belongs to that session's owner, and
+     * nobody else can write one. Operators keep every power that matters here —
+     * they can see, pause, stop and delete it — without being able to author
+     * one that spends a wallet that is not theirs.
+     */
+    if (!t.owner) {
+      throw new Error(
+        "a session-funded task has to belong to the wallet whose session it spends. Open it from that " +
+        "wallet rather than as the operator.",
+      );
+    }
+    if (t.owner.toLowerCase() !== ownerAddr.toLowerCase()) {
+      throw new Error(
+        `this task belongs to ${t.owner.slice(0, 10)}… but the session it names was opened by ` +
+        `${ownerAddr.slice(0, 10)}… — a session-funded task spends only its own wallet`,
+      );
     }
 
     const pulled: Pulled[] = rows.map((r) => ({
@@ -8288,7 +8392,7 @@ async function main() {
               const before = await heldNow(outAsset);
               const txHash = await routerClient.execute(inAsset, outAsset, pulled[0].amount, minOut);
               hashes.push(txHash as Hex);
-              return deliverOutput(who, outAsset, txHash, hashes, "swap", before);
+              return deliverOutput(who, outAsset, txHash, hashes, "swap", before, expected);
             },
           });
         }
@@ -8334,7 +8438,23 @@ async function main() {
               return ammClient.wouldSucceed("addLiquidityFor", [BigInt(poolId), who, amounts, 0n]);
             },
             settle: async (who) => {
-              const txHash = await ammClient.addLiquidityFor(poolId, who, assets, amounts, 0n);
+              /*
+               * A floor on the shares, priced when it runs.
+               *
+               * This asked for `minShares: 0`, which is no protection at all —
+               * and `_addLiquidity` credits the *smallest* asset ratio, so a
+               * deposit landing after the pool's ratio moved mints fewer shares
+               * and quietly donates the difference. Unattended, that repeats
+               * every run. The expectation comes from a simulation at this
+               * moment; the floor is the reader's own slippage setting off it.
+               */
+              const want = await ammClient.simulateResult<bigint>(
+                "addLiquidityFor", [BigInt(poolId), who, amounts, 0n],
+              );
+              const minShares = want && want > 0n
+                ? (want * BigInt(10_000 - slippageBps(p))) / 10_000n
+                : 0n;
+              const txHash = await ammClient.addLiquidityFor(poolId, who, assets, amounts, minShares);
               void settleNowLp(who, poolId);
               emissionsInvalidate();
               return { txHash, note: `shares minted to ${who.slice(0, 8)}… in ${pool.name}` };
@@ -8356,7 +8476,7 @@ async function main() {
               const before = await heldNow(outAsset);
               const txHash = await ammClient.swap(poolId, pulled[0].asset, outAsset, pulled[0].amount, minOut);
               hashes.push(txHash as Hex);
-              return deliverOutput(who, outAsset, txHash, hashes, `swap in ${pool.name}`, before);
+              return deliverOutput(who, outAsset, txHash, hashes, `swap in ${pool.name}`, before, q[0]);
             },
           });
         }
@@ -9075,7 +9195,7 @@ async function main() {
     scope: { owner: string | null; operator: boolean },
     what: { venue?: string; action?: string; params?: Record<string, unknown> },
     where = "",
-  ): Promise<void> {
+  ): Promise<{ fundedBy: string | null }> {
     const at = where ? `${where}: ` : "";
     /*
      * Nothing has been sent, so nothing here reads as a failed transaction.
@@ -9154,6 +9274,28 @@ async function main() {
     } catch (e) {
       throw new Gate(400, `${at}${why(e)}`);
     }
+    /*
+     * Whose wallet pays, when it is not the app's.
+     *
+     * An operator may schedule against a visitor's delegation — that is what
+     * the delegation is for, and the cap, the per-payment ceiling, the
+     * allow-list and the expiry all still bind. What was wrong is that such a
+     * task was stamped with no owner, so it did not appear in the visitor's own
+     * list: their wallet was being spent by something they could not see, pause
+     * or stop. Reporting the funding wallet here lets the routes stamp it as
+     * theirs, which is what it is.
+     */
+    if (scope.operator && !SHARE_FUNDED.has(String(what.action))) {
+      const sid = [
+        ...(Array.isArray(what.params?.sessionIds) ? what.params.sessionIds.map((v) => String(v)) : []),
+        ...(what.params?.sessionId !== undefined ? [String(what.params.sessionId)] : []),
+      ].find((v) => /^0x[0-9a-fA-F]{64}$/.test(v));
+      if (sid) {
+        const row = mine ?? (await readSession(sid as Hex).catch(() => null));
+        if (row) return { fundedBy: String(row.owner).toLowerCase() };
+      }
+    }
+    return { fundedBy: scope.owner };
   }
 
   /** Answer a `Gate` refusal with its own status; re-throw anything else. */
@@ -9167,13 +9309,16 @@ async function main() {
     const scope = taskScope(req);
     if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
     const body = (req.body ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
+    let fundedBy = scope.owner;
     try {
-      await gateScheduled(scope, body);
+      ({ fundedBy } = await gateScheduled(scope, body));
     } catch (e) {
       if (sendGate(res, e)) return;
       throw e;
     }
-    const r = taskStore.create({ ...(req.body ?? {}), owner: scope.owner });
+    // Stamped with the wallet that pays, not the one that typed it — see the
+    // note at the end of `gateScheduled`.
+    const r = taskStore.create({ ...(req.body ?? {}), owner: fundedBy });
     if (!r.ok) { res.status(400).json(r); return; }
     logTx(req, {
       category: "defi", action: "task-create", status: "success",
@@ -9304,12 +9449,31 @@ async function main() {
    *
    * Each step is checked separately so the refusal names the one at fault.
    */
-  async function gateSteps(scope: { owner: string | null; operator: boolean }, steps: unknown): Promise<void> {
+  async function gateSteps(
+    scope: { owner: string | null; operator: boolean }, steps: unknown,
+  ): Promise<{ fundedBy: string | null }> {
     const list = Array.isArray(steps) ? steps : [];
+    let fundedBy = scope.owner;
     for (const [i, raw] of list.entries()) {
       const step = (raw ?? {}) as { venue?: string; action?: string; params?: Record<string, unknown> };
-      await gateScheduled(scope, step, `step ${i + 1}`);
+      const r = await gateScheduled(scope, step, `step ${i + 1}`);
+      /*
+       * A series spends one wallet, so its steps must agree on which.
+       *
+       * Two steps funded by two different people's delegations would be a
+       * series only one of them could see, spending both. The runner enforces
+       * the same rule per step; this refuses it at the form, where it can be
+       * explained.
+       */
+      if (r.fundedBy && fundedBy && r.fundedBy !== fundedBy) {
+        throw new Gate(400,
+          `step ${i + 1}: this series is funded by ${fundedBy.slice(0, 10)}… and that step names a session ` +
+          `belonging to ${r.fundedBy.slice(0, 10)}… — one series spends one wallet`);
+      }
+      fundedBy ??= r.fundedBy;
+      if (r.fundedBy) fundedBy = r.fundedBy;
     }
+    return { fundedBy };
   }
 
   app.get("/api/series", requireAuth, (req, res) => {
@@ -9337,13 +9501,14 @@ async function main() {
   app.post("/api/series", requireAuth, async (req, res) => {
     const scope = taskScope(req);
     if (!scope) { res.status(403).json({ ok: false, error: "connect a wallet or sign in as operator" }); return; }
+    let fundedBy = scope.owner;
     try {
-      await gateSteps(scope, req.body?.steps);
+      ({ fundedBy } = await gateSteps(scope, req.body?.steps));
     } catch (e) {
       if (sendGate(res, e)) return;
       throw e;
     }
-    const r = seriesStore.create({ ...(req.body ?? {}), owner: scope.owner });
+    const r = seriesStore.create({ ...(req.body ?? {}), owner: fundedBy });
     if (!r.ok) { res.status(400).json(r); return; }
     logTx(req, {
       category: "defi", action: "series-create", status: "success",
@@ -9598,9 +9763,24 @@ async function main() {
    */
   const govCache = new Map<string, { at: number; body: unknown }>();
   const GOV_TTL = live ? 10_000 : 500;
-  /** True when the caller asked for `?fresh=1`. */
-  const wantsFresh = (q: unknown): boolean =>
-    String((q as Record<string, unknown> | undefined)?.fresh ?? "") !== "";
+  /**
+   * True when the caller asked for `?fresh=1` **and** is entitled to it.
+   *
+   * `fresh` exists for the page that has just made a transaction and would
+   * otherwise read its own stale answer. That page is always signed in — as the
+   * operator or with a connected wallet — so the parameter is theirs.
+   *
+   * Anonymous, it is a cache-bypass anybody can pull: each call re-derives a
+   * governance read from a dozen contract calls, and on the live deployment an
+   * uncached `/api/gauge` takes three seconds of upstream RPC against 1ms
+   * cached. Left open it is a way to spend the operator's rate limit from a
+   * shell loop, which is the cheapest denial of service in the app.
+   *
+   * The cached answer is still served — the request is not refused, it is just
+   * not allowed to skip the queue.
+   */
+  const wantsFresh = (req: express.Request): boolean =>
+    String(req.query?.fresh ?? "") !== "" && isAuthed(req);
   const govCached = (key: string, fresh?: boolean): unknown | null => {
     // A caller that just wrote asks for `?fresh=1`. Votes are signed in the
     // browser and never touch this process, so the write path cannot clear the
@@ -9622,7 +9802,7 @@ async function main() {
       return;
     }
     {
-      const hit = govCached(`gauge:${String(req.query.user ?? "")}`, wantsFresh(req.query));
+      const hit = govCached(`gauge:${String(req.query.user ?? "")}`, wantsFresh(req));
       if (hit) { res.json(hit); return; }
     }
     try {
@@ -9987,7 +10167,7 @@ async function main() {
       return;
     }
     {
-      const hit = govCached(`gov:${String(req.query.user ?? "")}`, wantsFresh(req.query));
+      const hit = govCached(`gov:${String(req.query.user ?? "")}`, wantsFresh(req));
       if (hit) { res.json(hit); return; }
     }
     try {

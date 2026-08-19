@@ -56,7 +56,16 @@ export class AdminAuth {
 
   /** Rotate the password for the current session. Requires the current one. */
   changePassword(token: string, current: string, next: string): { ok: boolean; error?: string } {
-    if (!this.sessions.has(token)) return { ok: false, error: "not authenticated" };
+    /*
+     * `session()`, not `sessions.has()`.
+     *
+     * The map keeps an entry until something prunes it, and only `session()`
+     * checks the age — so `has()` answered yes for a token that had already
+     * expired. The current password is still required, so this was the second
+     * lock rather than the only one; a session that has timed out should not
+     * open either.
+     */
+    if (!this.session(token)) return { ok: false, error: "not authenticated" };
     if (!this.matches(current)) return { ok: false, error: "current password is wrong" };
     if (!next || next.length < 8) return { ok: false, error: "new password must be at least 8 characters" };
     this.store = AdminAuth.derive(this.store.id, next);

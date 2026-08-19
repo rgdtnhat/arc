@@ -41,3 +41,31 @@ test("unknown ids are rejected without touching the queue", () => {
   assert.equal(q.list().length, 1);
   q.resolve(q.list()[0].id, false); // clean up the pending timer
 });
+
+/*
+ * The guardian cannot be switched off on a live chain.
+ *
+ * `autoApprove` turns the human co-signer into a rubber stamp. It exists for
+ * one-shot and CI runs, and the rule is that it must never be reachable in a
+ * deployed configuration. That used to hold because `docker-compose.yml`
+ * forwarded a hand-kept list of variables and this one was not on it — a
+ * property of the deployment file, not of the code. When that list was replaced
+ * with `env_file` (fifteen real settings were being dropped by it), the switch
+ * became reachable for the first time. So the rule moved into the code.
+ */
+test("a live deployment ignores the guardian bypass however it is set", () => {
+  // The expression the dashboard builds its policy from.
+  const decide = (env: Record<string, string | undefined>, live: boolean) =>
+    (env.TESSERA_ONCE === "1" || env.TESSERA_AUTO_APPROVE === "1") && !live;
+
+  for (const env of [
+    { TESSERA_AUTO_APPROVE: "1" },
+    { TESSERA_ONCE: "1" },
+    { TESSERA_ONCE: "1", TESSERA_AUTO_APPROVE: "1" },
+  ]) {
+    assert.equal(decide(env, true), false, `the guardian was bypassed live with ${JSON.stringify(env)}`);
+    assert.equal(decide(env, false), true, "the local affordance stopped working");
+  }
+  assert.equal(decide({}, false), false, "it defaulted to on");
+  assert.equal(decide({ TESSERA_AUTO_APPROVE: "yes" }, false), false, "a non-'1' value turned it on");
+});

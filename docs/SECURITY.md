@@ -54,6 +54,56 @@ used to be about the oracle desk's inventory are gone because the inventory is:
 | Router allowance left standing | Each leg approves the exact amount and clears it after the swap; a post-swap allowance of zero is asserted in tests |
 | Rebalance bricking withdrawals | `_rebalance()` is wrapped in `try/catch`, so a pool hiccup can't block a deposit/withdraw |
 
+### 4. The brute-force lockout could be walked around — MEDIUM → fixed
+
+`req.ip` is what the admin-login lockout counts against, and Express derived it
+with `app.set("trust proxy", true)`. That means the **leftmost** entry of
+`X-Forwarded-For` — which the client writes, because Caddy appends to that
+header rather than replacing it. So the attacker chose their own bucket.
+
+Probed on the live deployment: six wrong passwords behind a *fixed* forged
+header locked out on the sixth, exactly as designed; six behind a *varying* one
+never did. The brake worked and could be stepped around.
+
+**Fix:** `trust proxy` is now `1` — the number of proxies actually in front of
+the process. Express takes the address Caddy itself observed, which no client
+can forge, and a deployment with no proxy still falls back to the socket
+address.
+
+### 5. The guardian bypass became reachable in a deployment — MEDIUM → fixed
+
+`autoApprove` turns the human co-signer into a rubber stamp, and the rule is
+that it must never be reachable in a deployed configuration. That used to hold
+because `docker-compose.yml` forwarded a hand-kept list of variables and neither
+`TESSERA_AUTO_APPROVE` nor `TESSERA_ONCE` was on it — a property of the
+deployment file rather than of the code. That list was later replaced with
+`env_file` (fifteen real settings were being silently dropped by it), and the
+side effect was that the switch could reach the container for the first time.
+
+**Fix:** the rule lives in the code. On a live chain `autoApprove` is false
+whatever the environment says, and the process logs loudly that the variable was
+ignored rather than failing silently.
+
+### 6. `?fresh=1` was an anonymous cache bypass — LOW → fixed
+
+The governance and session reads cache because each is a dozen-odd contract
+calls; `?fresh=1` skips the cache so a page that has just written does not read
+its own stale answer. Anonymous, it was an amplifier: on the live deployment an
+uncached `/api/gauge` costs three seconds of upstream RPC against about one
+millisecond cached, so a shell loop could spend the operator's rate limit.
+
+**Fix:** `fresh` is honoured only for an authenticated caller — which the page
+that just made a transaction always is. Anonymous callers still get an answer;
+they just get the cached one.
+
+### 7. An expired admin session could still change the password — LOW → fixed
+
+`changePassword` asked `sessions.has(token)`. The map keeps an entry until
+something prunes it, and only `session()` checks the age, so a timed-out token
+still opened that door. The current password was required as well, making it the
+second lock rather than the only one — but a lock that opens for an expired key
+is not a lock. It now goes through `session()`.
+
 ## Two custody modes (and why they differ)
 
 The dashboard exposes the same DeFi actions through two distinct paths:
