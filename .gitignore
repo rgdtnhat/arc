@@ -33,6 +33,9 @@ deployments/arc.local.json
 .tessera-tasks.json
 # Governance drafts and comments: operator-stored, wallet-signed, per-deployment.
 .tessera-discussions.json
+# Creation block per contract, found by binary search over getCode. Derived from
+# the chain and specific to this deployment's addresses — a cache, never truth.
+.tessera-deploy-blocks.json
 deployments/arc.history.json
 # Scratch directory for local QA scripts; never part of the app.
 .tmpqa/

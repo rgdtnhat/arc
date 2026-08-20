@@ -108,3 +108,68 @@ test("windowPlan says so when the range exceeds the budget", () => {
 test("windowPlan treats an inverted range as nothing to do", () => {
   assert.deepEqual(windowPlan(500n, 400n, 9_000n, 60), { windows: 0, complete: true });
 });
+
+/*
+ * The two failures that made this search the single most expensive thing the
+ * app did, and the one that made it quietly wrong.
+ */
+
+test("a throttled probe abandons the search instead of poisoning it", async () => {
+  /*
+   * The probes used to swallow every error as "no code here", which moves the
+   * answer later — and then caches it forever. Under a rate limit that is not
+   * a rare edge: 26 probes landing at once is what trips the limit in the first
+   * place. A throttle in the middle of the search would have cached a floor
+   * halfway down the chain, and every fee and holder scan from then on would
+   * have started there, reporting a truncated history as the whole of it.
+   */
+  const addr = "0x9999999999999999999999999999999999999999";
+  let refuse = true;
+  const pub = {
+    getBlockNumber: async () => 54_000_000n,
+    getCode: async ({ blockNumber }: { blockNumber?: bigint }) => {
+      // Refuse once the search is well underway, not on the first probe.
+      if (refuse && blockNumber !== undefined) throw new Error("Request exceeds defined limit");
+      return (blockNumber ?? 54_000_000n) >= 1_234_567n ? "0xfeed" : "0x";
+    },
+  };
+
+  // Abandoned: "not known yet", and nothing remembered.
+  assert.equal(await findDeploymentBlock(pub as never, addr), null);
+
+  // Once the limiter has backed off and calls get through, the real answer —
+  // which it could not have reached had the bad one been cached.
+  refuse = false;
+  assert.equal(await findDeploymentBlock(pub as never, addr), 1_234_567n);
+});
+
+test("a block found once is not searched for again after a restart", async () => {
+  /*
+   * In memory the search was paid once per process; a container that restarts
+   * on every deploy paid it again every time, for every contract, all at once,
+   * into a rate limit. On disk it is paid once.
+   */
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const { useDeploymentBlockFile, forgetDeploymentBlocks } = await import("../src/deploy-block.js");
+
+  const file = pathMod.join(mkdtempSync(pathMod.join(tmpdir(), "tessera-db-")), "blocks.json");
+  const addr = "0x8888888888888888888888888888888888888888";
+
+  forgetDeploymentBlocks();
+  useDeploymentBlockFile(file);
+  const { pub } = chainWhereCodeAppearsAt(9_999n);
+  assert.equal(await findDeploymentBlock(pub as never, addr), 9_999n);
+
+  // A new process: same file, and a chain that would throw if it were asked.
+  forgetDeploymentBlocks();
+  useDeploymentBlockFile(file);
+  const wontAnswer = {
+    getBlockNumber: async () => { throw new Error("the chain was consulted after a restart"); },
+    getCode: async () => { throw new Error("the chain was consulted after a restart"); },
+  };
+  assert.equal(await findDeploymentBlock(wontAnswer as never, addr), 9_999n);
+
+  forgetDeploymentBlocks();
+});

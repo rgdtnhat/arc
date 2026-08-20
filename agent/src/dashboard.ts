@@ -87,6 +87,7 @@ import { TrustMemory } from "./memory.js";
 import { describePolicy } from "./policy.js";
 import { AGENT_TASK, AGENT_POLICY } from "./scenario.js";
 import { usdc } from "@tessera/shared";
+import { rpcStats } from "@tessera/shared";
 
 /** One reserve asset in the pool (label + on-chain address; the rest is read live). */
 interface PoolAsset {
@@ -107,6 +108,7 @@ import { TesseraPoolClient, PRICE_IX } from "./pool.js";
 import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader, planHarvest, type HarvestCandidate } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
+import { useDeploymentBlockFile } from "./deploy-block.js";
 import { fillPreview } from "./auction.js";
 import { priceImpact, maxInputWithin, valueCheck, IMPACT_MAX_PCT } from "./impact.js";
 import { DefiOracle } from "@tessera/shared";
@@ -129,6 +131,14 @@ const APP_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../
 const STATE_DIR = process.env.STATE_DIR ?? APP_ROOT;
 const statePath = (name: string) => path.join(STATE_DIR, name);
 try { mkdirSync(STATE_DIR, { recursive: true }); } catch { /* already there */ }
+
+/*
+ * Deployment blocks are found by binary search over `getCode` — about 26 RPC
+ * calls per contract. In memory that is paid once per process; on disk it is
+ * paid once, full stop. Wiring it here rather than at each call site means
+ * every reader that needs a log-scan floor shares the one file.
+ */
+useDeploymentBlockFile(statePath(".tessera-deploy-blocks.json"));
 
 const PROVIDERS_PORT = 8788;
 // Cloud hosts inject $PORT; default to 8787 locally. Providers stay internal.
@@ -10439,6 +10449,15 @@ async function main() {
     res.json({
       ok: true,
       ...buildStamp,
+      /*
+       * What the RPC limiter has settled on. `rate` is requests/second it is
+       * currently willing to send; it halves whenever the endpoint pushes back
+       * and creeps up while calls are clean, so a `rate` far below the start
+       * and a rising `throttled` is the app telling you the public node is
+       * refusing traffic — the one thing that makes every read slow at once,
+       * and previously the one thing an operator had no way to see.
+       */
+      rpc: rpcStats(),
       // The other half of "is this current": which contracts it came up on.
       contracts: {
         pool: poolDeployment?.poolAddress ?? null,

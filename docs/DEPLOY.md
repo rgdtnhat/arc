@@ -340,9 +340,16 @@ full viem error, which is otherwise a wall of ABI. A stop with a known fix (for
 example the fund-custody opt-in) prints the command to run and no stack at all.
 
 Two knobs for a slow or private RPC: `TESSERA_PACE_MS` (wait between sends,
-default 6000) and `ARC_RPC_MIN_INTERVAL_MS` (minimum gap between any two RPC
-calls, default 180). Lower both on a private endpoint; raise the first if the
-public node throttles you.
+default 6000) and `ARC_RPC_CONCURRENCY` (how many RPC calls may be open at once,
+default 6, adapting between 2 and 8). Raise the second on a private endpoint;
+raise the first if the public node throttles you.
+
+`ARC_RPC_MIN_INTERVAL_MS` — the old fixed gap between calls — is still read, as
+a rate of `1000/interval`, so existing `.env` files keep working. It is no
+longer the right knob: measured against Arc's public RPC, fifteen `eth_getLogs`
+sent back to back with no gap are all served and ten sent at once have four
+refused. The limit is concurrency, not spacing, so spacing calls out spends
+latency without buying anything. Unset it and let the defaults adapt.
 
 ## If `docker compose up --build` fails
 

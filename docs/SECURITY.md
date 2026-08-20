@@ -585,6 +585,57 @@ every live session on that asset still holds**, never an unlimited amount, and
 the flow now stops if that approval does not land rather than opening a session
 that cannot pay.
 
+## What `/api/version` may say about the RPC
+
+`/api/version` is public and unauthenticated, and it now reports what the RPC
+limiter is doing: how many requests it will keep open at once, the rate it has
+settled on, how many calls have been sent and refused, a per-method tally, and
+the last refusal. That is deliberate — "the site is slow" and "the public node
+is refusing a third of our calls" look identical from outside, and only the
+second one is visible from in here. An operator who cannot see it guesses.
+
+The one thing it does **not** carry is the refused request itself. viem builds
+its error message out of the URL, the node's reason, *and the full JSON request
+body*, and the body of a refused `eth_call` or `eth_getBalance` names whichever
+address the app was reading at that moment. On a public endpoint that would
+publish, one at a time, which wallets the app looks at — so only the method and
+the node's own sentence ("rate limit exceeded") are kept. `refusalReason()` in
+`shared/src/transport.ts` does that trimming, and a test asserts the payload is
+gone rather than trusting the trim to stay correct.
+
+Nothing else in the snapshot is sensitive: counts of RPC calls by method say
+what the dashboard reads, which the dashboard already shows.
+
+### A cached answer that must never be a stale one
+
+Two things are now remembered rather than re-asked, and both are immutable by
+construction, which is the only reason it is safe:
+
+- **`eth_chainId`** — a property of the chain.
+- **`eth_getCode`, and only when it returned code, and only for "as of now".**
+  Bytecode at an address is fixed once deployed. An *empty* answer is
+  deliberately never remembered: that address may be deployed to a moment later,
+  and every "is this contract there yet?" check depends on eventually seeing
+  that it is. A `getCode` at a specific historical block is not remembered
+  either — those are the deployment-block search's probes, single-use by
+  construction.
+
+Nothing whose answer moves with the chain is cached at this layer. Balances,
+`eth_call` results, receipts and logs go to the network every time, because a
+stale balance is how an app reports money that is not there.
+
+### A refused probe is not "no code here"
+
+The deployment-block search — the binary search that gives every log scan its
+floor — used to swallow every probe error as "not deployed yet". That is the
+safe direction for a node that will not serve old state, and the wrong one for a
+throttle: the answer moves later, and it was then cached forever, so every fee
+and holder scan silently started halfway and reported a truncated history as the
+whole of it. Throttles are now told apart from refusals and abandon the search
+instead of poisoning it. The search's answers are also persisted to
+`.tessera-deploy-blocks.json` in `STATE_DIR`, so a container restart no longer
+re-runs ~26 probes per contract into the rate limit it is about to trip.
+
 ## Design assumptions (not bugs, but worth stating)
 
 - **Trusted admin/deployer key.** Whoever holds the pool owner / deployer key can
