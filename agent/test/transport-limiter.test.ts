@@ -92,7 +92,14 @@ test("a burst leaves at once, and the one past the burst waits for a refill", as
     const t0 = Date.now();
     await Promise.all([0, 1, 2, 3].map((i) => call(request, i)));
     const burst = Date.now() - t0;
-    assert.ok(burst < 250, `a burst of 4 took ${burst}ms — it is being spaced out`);
+    /*
+     * The boundary is 750ms, not "fast": at 4/s a *spaced* fourth call starts
+     * three intervals in, so anything under that proves the four went together.
+     * The generous margin is deliberate — this asserts a shape, and pinning it
+     * to a tight millisecond count only means the suite fails on a loaded
+     * machine while the code is perfectly correct.
+     */
+    assert.ok(burst < 700, `a burst of 4 took ${burst}ms — it is being spaced out`);
 
     // A fifth, from an empty bucket refilling at 4/s: about 250ms.
     const t1 = Date.now();

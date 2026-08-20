@@ -1129,6 +1129,18 @@ async function main() {
       [/notsessionkey/, "This server is not the key that session was delegated to."],
       [/recipientnotallowed/, "That recipient is not on this session's allow-list."],
       [/whichever binds first/, ""],
+      /*
+       * Refusals this app made *before* sending anything.
+       *
+       * These reached the user as "That transaction didn't go through. the
+       * lending pool on this deployment predates…", which reads as a
+       * transaction that was sent and failed — and sends somebody looking at
+       * their balance and the explorer for a transaction that never existed.
+       * Nothing was submitted: the app checked, found the pool has no way to
+       * act for a holder, and stopped. The sentence is already the right one,
+       * so it is passed through whole.
+       */
+      [/predates scheduled exits|not authorised on that lending position|own task can act on its own position/, ""],
       [/allowance|transferfrom/, "Token approval failed — approve the spender first, or check the wallet holds enough of that token."],
       [/exceeds balance|insufficient balance|\bbalance\b/, "Not enough balance for that amount."],
       [/insufficient funds|gas required|out of gas/, "Not enough USDC to cover network fees. Top up the wallet at faucet.circle.com."],
@@ -1187,7 +1199,11 @@ async function main() {
     if (!perAsset.some((p) => p.ok)) {
       console.error(`[lending] pool read failed on every reserve: ${String(firstErr).slice(0, 160)}`);
     }
-    return { account: parts.find((p) => p?.account)?.account ?? null, perAsset } as PoolBulk;
+    return {
+      account: parts.find((p) => p?.account)?.account ?? null,
+      accountError: parts.find((p) => p?.accountError)?.accountError ?? firstErr,
+      perAsset,
+    } as PoolBulk;
   }
 
   /**
@@ -1610,10 +1626,53 @@ async function main() {
               limitedBy: "unknown",
               healthFactor: null,
               degraded: true,
-              why:
-                "The pool's account summary could not be read — usually one listed asset " +
-                "the risk oracle has no price for. Reserves and your per-asset positions " +
-                "below are live; the borrow limit and health factor are not.",
+              /*
+               * Name the asset. The old wording said "usually one listed asset
+               * the risk oracle has no price for", which is the right diagnosis
+               * and a useless message: it tells a reader the shape of the
+               * problem and leaves them to work out which of four assets it is,
+               * or to conclude the app is broken. `priceOk` is read per asset in
+               * the same multicall that failed, so the answer is already here.
+               *
+               * When no asset admits to a bad price, say the read failed and do
+               * not guess a cause — a summary that could not be read because the
+               * RPC refused the call is a different problem with a different
+               * fix, and dressing it up as an oracle gap sends the operator to
+               * the wrong place.
+               */
+              why: (() => {
+                /*
+                 * The revert names the asset, so say it.
+                 *
+                 * `NoUsablePrice(address)` is `0xde5a2666` followed by the
+                 * address, and it is matched out of the stringified error
+                 * rather than decoded through an ABI because viem nests the
+                 * revert data differently depending on where the call failed —
+                 * a regex over the text finds it in every shape, and finding
+                 * nothing simply falls through to the general wording.
+                 *
+                 * Deliberately not `priceOk`: that reports the *pool's* own
+                 * mark, which is present and healthy for the very asset the
+                 * risk oracle refuses to price, so it answers "true" for the
+                 * asset that is breaking this call.
+                 */
+                const hit = /0xde5a2666[0-9a-f]{24}([0-9a-f]{40})/i.exec(String(bulk.accountError ?? ""));
+                const named = hit
+                  ? assets.find(
+                      (x: (typeof assets)[number]) => x.address.toLowerCase() === `0x${hit[1].toLowerCase()}`,
+                    )
+                  : undefined;
+                const cause = named
+                  ? `${named.symbol} has no usable price from the risk oracle, and the summary ` +
+                    "walks every listed asset"
+                  : "one listed asset has no usable price from the risk oracle, and the summary " +
+                    "walks every listed asset";
+                return (
+                  `The pool's account summary could not be read: ${cause}. ` +
+                  "Reserves and your per-asset positions below are live; the borrow limit and " +
+                  "health factor are not."
+                );
+              })(),
             }
           : null);
 

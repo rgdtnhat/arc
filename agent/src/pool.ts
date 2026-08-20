@@ -444,6 +444,19 @@ export class TesseraPoolClient {
             return { supplyValue: v[0], borrowValue: v[1], borrowLimit: v[2], healthFactor: v[3] };
           })()
         : null;
+    /*
+     * Why the summary failed, kept rather than dropped.
+     *
+     * `accountData` walks every listed reserve, so one asset the *risk oracle*
+     * cannot price takes the whole call down — and the revert names that asset:
+     * `NoUsablePrice(address)`. Without this the dashboard could only say a
+     * listed asset was probably unpriced and leave the reader to guess which.
+     *
+     * `priceOk` beside it is not the same question and cannot answer this one:
+     * it reports the *pool's* own mark, which on this deployment is present and
+     * fine for the very asset the risk oracle refuses to price.
+     */
+    const accountError = account === null ? ((acctRow as unknown as { error?: unknown }).error ?? null) : null;
     const FIELDS = 7;
     const perAsset = assets.map((asset, i) => {
       const base = 1 + i * FIELDS;
@@ -475,7 +488,7 @@ export class TesseraPoolClient {
         wallet: walR.status === "success" ? (walR.result as bigint) : 0n,
       };
     });
-    return { account, perAsset };
+    return { account, accountError, perAsset };
   }
 
   /** The account's raw ERC-20 balance of an asset (its spendable wallet funds). */

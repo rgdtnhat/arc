@@ -240,7 +240,14 @@ const aggregate = new Limiter({ rate: START_RATE, burst: BURST, min: FLOOR_RATE,
 const logs = new Limiter({
   rate: Number(process.env.ARC_RPC_LOGS_RATE ?? 6),
   burst: Number(process.env.ARC_RPC_LOGS_BURST ?? 6),
-  min: Number(process.env.ARC_RPC_LOGS_RATE_MIN ?? 2),
+  /*
+   * A floor is a promise to keep sending at that rate even while being refused,
+   * and that promise is for the page — the app has to stay usable. Background
+   * scans have no such claim: a holder index that pauses catches up on its next
+   * pass, and in production this bucket sat pinned at a floor of 2/s with 56%
+   * of its calls refused, which is not a back-off at all. It can yield properly.
+   */
+  min: Number(process.env.ARC_RPC_LOGS_RATE_MIN ?? 0.25),
   max: Number(process.env.ARC_RPC_LOGS_RATE_MAX ?? 12),
 });
 const HEAVY = new Set(["eth_getLogs"]);
@@ -485,6 +492,32 @@ export function isTransient(err: unknown): boolean {
   );
 }
 
+/*
+ * Retry, and a hypothesis that did not survive being measured.
+ *
+ * The theory was retry amplification: a refusal retried eight times turns one
+ * refused request into eight, each of which can be refused in turn, and the
+ * live counters looked like exactly that — 56% of log scans refused, most of
+ * the requests behind that number being retries rather than new work. Capping
+ * retries for refusals looked obviously right.
+ *
+ * It is not. Measured against a fake node enforcing the limit Arc actually
+ * enforces (a concurrency cap plus a rolling per-second cap, so that backing
+ * off is *able* to help — a node that refuses at random scores every policy the
+ * same and is what made the first version of this experiment misleading):
+ *
+ *   260 logical calls, 8 retries everywhere → 274 HTTP, 16 refused, 2 failed
+ *   260 logical calls, 2 retries for reads  → 274 HTTP, 15 refused, 1 failed
+ *
+ * Identical, because the limiter's own backoff already bounds the retries long
+ * before the retry count does: refused calls queue rather than repeat. Sweeping
+ * burst (6–20) and concurrency (3–8) gives the same three numbers too — the
+ * adaptation converges on the node's capacity whichever end it starts from.
+ *
+ * So the retry policy stays as it was. What the experiment does say is that the
+ * remaining lever is *demand*, not pacing: 1296 log scans in forty minutes is
+ * the thing to reduce, and no amount of re-pacing them will do it.
+ */
 async function withRetry<T>(method: string, fn: () => Promise<T>, retryable: (e: unknown) => boolean): Promise<T> {
   const deadline = Date.now() + RETRY_BUDGET_MS;
   let delay = 400;
