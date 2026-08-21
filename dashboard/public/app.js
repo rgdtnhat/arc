@@ -1937,10 +1937,30 @@ const $ = (id) => document.getElementById(id);
                   `${Number(em.apr) >= 10000 ? "&gt;10,000" : esc(Number(em.apr).toFixed(2))}%</span></div>`
               : "";
             const disabled = side === "borrow" && !a.borrowable;
+            /*
+             * The collateral factor, next to the asset it belongs to.
+             *
+             * It decides how much of a deposit counts towards borrowing — 90% of
+             * a USDC deposit, 50% of a TSRA one — and without it the borrow
+             * limit is a number the app asserts and nobody can check. On the
+             * borrow side the useful figure is the liability factor instead:
+             * that is the one that decides how much a debt in this asset counts
+             * *against* you, and it is why borrowing a risky asset eats headroom
+             * faster than its face value.
+             */
+            const cF = Number(a.cFactorBps ?? 0), lF = Number(a.lFactorBps ?? 0);
+            const factor =
+              side === "supply"
+                ? cF > 0
+                  ? `<div class="muted" style="font-size:11px">${(cF / 100).toFixed(0)}% counts as collateral</div>`
+                  : `<div class="muted" style="font-size:11px">not collateral</div>`
+                : lF > 0 && lF < 10000
+                  ? `<div class="muted" style="font-size:11px">debt counts ${(10000 / lF).toFixed(2)}&times;</div>`
+                  : "";
             return (
               `<tr data-market="${esc(a.symbol)}" style="cursor:pointer${disabled ? ";opacity:.55" : ""}">` +
               `<td><b>${esc(a.symbol)}</b>${a.enabled === false ? ' <span class="tag warn" style="font-size:10px">unavailable</span>' : ""}` +
-              `<div class="muted" style="font-size:11px">$${esc(a.priceUsd)}</div></td>` +
+              `<div class="muted" style="font-size:11px">$${esc(a.priceUsd)}</div>${factor}</td>` +
               `<td class="num mono">${esc(fmtQty(suppliedTotal))}` +
               `<div class="muted" style="font-size:11px">${esc(fmtQty(borrowsRaw))} borrowed</div></td>` +
               `<td class="num"><b>${esc(rate ?? "—")}%</b>${badge}</td>` +
@@ -1951,6 +1971,10 @@ const $ = (id) => document.getElementById(id);
 
         const size = $("lnMarketSize");
         if (size) size.textContent = "$" + totalUsd.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+        // The calculator reads the same rows this table just drew, so refresh it
+        // in the same breath rather than letting the two drift.
+        if (typeof renderBorrowCalc === "function") renderBorrowCalc();
 
         body.querySelectorAll("[data-market]").forEach((tr) => {
           tr.addEventListener("click", () => {
@@ -1965,6 +1989,94 @@ const $ = (id) => document.getElementById(id);
           });
         });
       };
+
+      /**
+       * What a deposit would let you borrow.
+       *
+       * The borrow limit is one number for a whole position, which does not
+       * answer the question somebody actually has standing at the supply box:
+       * "if I put in X of this, how much more could I draw?" That depends on the
+       * asset — 90% of a USDC deposit counts, 50% of a TSRA one — and the panel
+       * had nowhere to say so.
+       *
+       * Arithmetic only. It sends nothing, and it is deliberately built from the
+       * same figures the panel is already showing, so a reader can check it
+       * against the collateral factor printed beside each asset rather than
+       * trusting a number that appeared from nowhere.
+       */
+      function renderBorrowCalc() {
+        const sel = $("lnCalcAsset"), amt = $("lnCalcAmount"), out = $("lnCalcOut");
+        if (!sel || !amt || !out) return;
+        const ln = window.__lending;
+        const rows = (ln && ln.assets) || [];
+        if (!rows.length) { out.textContent = "No reserves yet."; return; }
+
+        // Keep the picker in step with the reserve list without stamping over
+        // whatever the reader has selected.
+        const want = rows.map((a) => a.symbol).join("|");
+        if (sel.dataset.built !== want) {
+          const keep = sel.value;
+          sel.innerHTML = rows.map((a) => `<option value="${esc(a.symbol)}">${esc(a.symbol)}</option>`).join("");
+          sel.dataset.built = want;
+          if (rows.some((a) => a.symbol === keep)) sel.value = keep;
+        }
+
+        const a = rows.find((r) => r.symbol === sel.value) || rows[0];
+        if (!a) return;
+        const qty = Number(String(amt.value).replace(/,/g, ""));
+        const cF = Number(a.cFactorBps ?? 0) / 10000;
+        const px = Number(a.priceUsd);
+        if (!Number.isFinite(qty) || qty <= 0) {
+          out.textContent = cF > 0
+            ? `${a.symbol} counts ${(cF * 100).toFixed(0)}% towards borrowing. Enter an amount to see what it would add.`
+            : `${a.symbol} does not count as collateral, so supplying it adds no borrowing power.`;
+          return;
+        }
+        if (!Number.isFinite(px) || px <= 0) { out.textContent = "That asset has no usable price right now."; return; }
+
+        const value = qty * px;
+        const added = value * cF;
+        const acct = (ln && ln.account) || {};
+        const limitNow = Number(acct.borrowLimitUsd);
+        const owed = Number(acct.borrowedUsd);
+        const liquidity = Number(acct.poolLiquidityUsd);
+        const lines = [
+          `${qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${esc(a.symbol)} ` +
+          `is $${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}, and at a ` +
+          `${(cF * 100).toFixed(0)}% collateral factor it adds ` +
+          `<b>$${added.toLocaleString(undefined, { maximumFractionDigits: 2 })}</b> of borrowing power.`,
+        ];
+        if (Number.isFinite(limitNow) && Number.isFinite(owed)) {
+          const headroom = Math.max(0, limitNow + added - owed);
+          lines.push(
+            `Your limit would go from $${limitNow.toLocaleString(undefined, { maximumFractionDigits: 2 })} to ` +
+            `$${(limitNow + added).toLocaleString(undefined, { maximumFractionDigits: 2 })}, leaving ` +
+            `<b>$${headroom.toLocaleString(undefined, { maximumFractionDigits: 2 })}</b> you could still draw ` +
+            `against $${owed.toLocaleString(undefined, { maximumFractionDigits: 2 })} already borrowed.`,
+          );
+          // Headroom is not cash. Saying only the first number is how somebody
+          // plans a draw the pool has nothing to fund.
+          if (Number.isFinite(liquidity) && liquidity < headroom) {
+            lines.push(
+              `The pool only holds $${liquidity.toLocaleString(undefined, { maximumFractionDigits: 2 })} of ` +
+              `borrowable cash right now, so that is the real ceiling until more is supplied.`,
+            );
+          }
+        }
+        if (acct.estimated) {
+          lines.push(
+            `These are estimates from the pool's own marks — the risk oracle cannot price every asset at the ` +
+            `moment, and the contract prices collateral slightly more conservatively than this does.`,
+          );
+        }
+        out.innerHTML = lines.join(" ");
+      }
+      window.renderBorrowCalc = renderBorrowCalc;
+      ["lnCalcAsset", "lnCalcAmount"].forEach((id) => {
+        const el = $(id);
+        if (el) el.addEventListener("input", renderBorrowCalc);
+        if (el) el.addEventListener("change", renderBorrowCalc);
+      });
 
       /** Rewards: what is streaming, and what this wallet can take. */
       /*

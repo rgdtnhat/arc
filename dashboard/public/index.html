@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v131" />
+    <meta name="tessera-shell" content="tessera-v132" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1537,6 +1537,26 @@
                 </tr></thead>
                 <tbody id="lnMarketRows"></tbody>
               </table></div>
+            </div>
+
+            <!--
+              What a deposit would let you borrow.
+              Answers the question the borrow limit alone cannot: a limit is one
+              number for the whole position, and "if I put in X of this, how much
+              more could I draw?" needs the asset's own collateral factor. Purely
+              arithmetic — it sends nothing and changes nothing.
+            -->
+            <div style="margin-bottom:16px;padding:12px;border:1px solid var(--line-strong);border-radius:12px">
+              <div class="muted" style="font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;margin-bottom:8px">
+                Borrowing power — what a deposit would add
+              </div>
+              <div class="row-actions" style="gap:8px;flex-wrap:wrap">
+                <select id="lnCalcAsset" class="field" style="min-width:120px"></select>
+                <input id="lnCalcAmount" class="field" inputmode="decimal" placeholder="Amount to supply" style="min-width:130px;flex:1" />
+              </div>
+              <div id="lnCalcOut" class="muted" style="font-size:12px;margin-top:9px;line-height:1.55">
+                Enter an amount to see what it would add.
+              </div>
             </div>
 
             <!-- Rewards the operator funds, on top of pool interest. Hidden

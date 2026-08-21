@@ -1610,6 +1610,8 @@ async function main() {
           // pulling out the full supply drops the borrow limit below the debt
           // and the pool refuses the whole transaction.
           cFactorBps: Number(cfg.cFactorBps ?? 0),
+          /** Where seizure starts for this asset, as opposed to where borrowing stops. */
+          liqFactorBps: Number((cfg as { liqFactorBps?: number }).liqFactorBps ?? 0),
           // Liability factor: a debt counts against you as value / lFactor.
           lFactorBps: Number(cfg.lFactorBps ?? 10_000),
           reserve: {
@@ -1745,9 +1747,52 @@ async function main() {
               const px = Number(a.priceUsd);
               return Number.isFinite(qty) && Number.isFinite(px) ? t + qty * px : t;
             }, 0);
+          /*
+           * The same arithmetic the pool does, on the marks that can be read.
+           *
+           * `_liquidity` walks every reserve and totals
+           *   borrowLimit += supplied x price x cFactor
+           *   liqLimit    += supplied x price x liqFactor
+           *   liability   += borrowed x price / lFactor
+           * and health is liqLimit / liability. All of that is reproducible from
+           * the per-asset rows, which are read individually and survive the
+           * failure that takes the aggregate call down.
+           *
+           * It is an *estimate* and labelled one, for a reason that matters:
+           * the contract prices collateral at the lowest usable oracle source
+           * and debt at the highest, while this has only the pool's own mark for
+           * both. So it will read a little more generous than the contract's own
+           * view, and the contract's is the one that decides. Showing it anyway
+           * beats four "n/a"s, which tell a borrower nothing about whether they
+           * are near liquidation — the number they most need when the oracle is
+           * having a bad day.
+           */
+          const weighted = (pick: (a: (typeof assets)[number]) => string, bps: (a: (typeof assets)[number]) => number) =>
+            assets.reduce((t: number, a: (typeof assets)[number]) => {
+              const qty = Number(pick(a));
+              const px = Number(a.priceUsd);
+              const f = bps(a);
+              return Number.isFinite(qty) && Number.isFinite(px) && f > 0 ? t + (qty * px * f) / 10_000 : t;
+            }, 0);
+          const supplied = sum((a) => a.position?.supplied ?? "0");
+          const borrowed = sum((a) => a.position?.borrowed ?? "0");
+          const limit = weighted((a) => a.position?.supplied ?? "0", (a) => a.cFactorBps);
+          const liqAt = weighted((a) => a.position?.supplied ?? "0", (a) => a.liqFactorBps);
+          // Liability divides by the factor rather than multiplying: a debt in a
+          // riskier asset counts for *more* than its face value.
+          const liability = assets.reduce((t: number, a: (typeof assets)[number]) => {
+            const qty = Number(a.position?.borrowed ?? "0");
+            const px = Number(a.priceUsd);
+            const f = a.lFactorBps;
+            return Number.isFinite(qty) && Number.isFinite(px) && f > 0 ? t + (qty * px * 10_000) / f : t;
+          }, 0);
           return {
-            suppliedUsd: sum((a) => a.position?.supplied ?? "0").toFixed(2),
-            borrowedUsd: sum((a) => a.position?.borrowed ?? "0").toFixed(2),
+            suppliedUsd: supplied.toFixed(2),
+            borrowedUsd: borrowed.toFixed(2),
+            limitUsd: limit,
+            liqAtUsd: liqAt,
+            liabilityUsd: liability,
+            healthFactor: liability > 0 ? liqAt / liability : null,
           };
         })()
       : null;
@@ -1779,21 +1824,57 @@ async function main() {
           degraded: false,
           why: null as string | null,
         }
-      : lastLending?.account ??
-        (derived
+      /*
+       * Rebuilt every read, and *before* the last good snapshot rather than
+       * after it.
+       *
+       * This said `lastLending?.account ?? derived`, which froze the panel. The
+       * snapshot is written from the previous read's own output, so once the
+       * aggregate call started failing the first degraded summary was stored and
+       * then returned unchanged for ever — supplied, borrowed and the whole
+       * explanation with it. On the live site that meant repaying 10,000 TSRA
+       * and 200 USDC moved every per-asset row, correctly, while the headline
+       * kept insisting the wallet owed $2054.91. Somebody watching it reasonably
+       * concluded the repayment had not worked.
+       *
+       * `derived` is rebuilt from the per-asset reads on every pass, so it is
+       * never staler than the rows underneath it. The snapshot stays as the
+       * fallback for the case it was meant for — nothing readable at all.
+       */
+      : (derived
           ? {
               suppliedUsd: derived.suppliedUsd,
               borrowedUsd: derived.borrowedUsd,
-              // Null, not zero. These come from the oracle the aggregate call
-              // could not reach, and a zero here reads as "no headroom" while a
-              // fabricated number reads as headroom that is not there.
-              borrowLimitUsd: null,
-              liquidationLimitUsd: null,
-              headroomUsd: null,
-              borrowableNowUsd: null,
+              /*
+               * Estimated, from the pool's own marks, rather than null.
+               *
+               * These used to be null on the reasoning that a fabricated number
+               * reads as headroom that is not there. True — but four "n/a"s tell
+               * a borrower nothing about whether they are near liquidation,
+               * which is exactly what they need to know while the oracle is
+               * having a bad day. So the pool's own arithmetic is reproduced
+               * from the per-asset rows and clearly marked `estimated`: the
+               * contract prices collateral at its lowest usable source and debt
+               * at its highest, while this has one mark for both, so this reads
+               * slightly generous and the contract's view is the one that binds.
+               */
+              borrowLimitUsd: derived.limitUsd.toFixed(2),
+              liquidationLimitUsd: derived.liqAtUsd.toFixed(2),
+              headroomUsd: Math.max(0, derived.limitUsd - Number(derived.borrowedUsd)).toFixed(2),
+              borrowableNowUsd: Math.min(
+                Math.max(0, derived.limitUsd - Number(derived.borrowedUsd)),
+                borrowableLiquidityUsd,
+              ).toFixed(2),
               poolLiquidityUsd: borrowableLiquidityUsd.toFixed(2),
               limitedBy: "unknown",
-              healthFactor: null,
+              healthFactor:
+                derived.healthFactor === null
+                  ? "∞"
+                  : derived.healthFactor > 1e6
+                    ? "∞"
+                    : derived.healthFactor.toFixed(2),
+              /** Every figure above the reserves table came from pool marks, not the risk oracle. */
+              estimated: true,
               degraded: true,
               /*
                * Name the asset. The old wording said "usually one listed asset
@@ -1853,7 +1934,8 @@ async function main() {
                   0,
                 );
                 const forYou = !owes
-                  ? " This wallet owes nothing, so its own withdrawals are unaffected."
+                  ? " This wallet owes nothing, so its own withdrawals are unaffected — the freeze " +
+                    "only applies to borrowing and to wallets carrying debt."
                   : ` This wallet owes $${derived?.borrowedUsd}, and while it owes anything the pool will ` +
                     "not release its collateral — borrowing and collateral withdrawals both wait for the " +
                     "price. Repaying in full clears it, even while the price does not come back; a partial " +
@@ -1864,8 +1946,9 @@ async function main() {
                       : "");
                 return (
                   `The pool's account summary could not be read: ${cause}. ` +
-                  "Reserves and your per-asset positions below are live; the borrow limit and " +
-                  "health factor are not." + forYou
+                  "The figures above are worked out from the pool's own marks rather than the risk " +
+                  "oracle's, so treat the borrow limit and health factor as estimates — the contract " +
+                  "prices collateral a little more conservatively than this does." + forYou
                 );
               })(),
             }
