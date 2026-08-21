@@ -1560,7 +1560,23 @@ async function main() {
         const withdrawMax = outflow === undefined
           ? minB(supplied, r.cash)
           : minB(minB(supplied, r.cash), outflow);
-        const repayMax = minB(borrowed, wallet); // your debt, capped by wallet
+        /*
+         * Your debt, capped by what the wallet actually holds — and the gap
+         * between those two, which is the thing nobody could see.
+         *
+         * "Repay max" quite reasonably reads as "clear this debt". When the
+         * wallet is short it does not: it repays what it can and leaves the
+         * rest, and because `_hasDebt` tests for *any* debt rather than a
+         * meaningful amount, the leftover keeps every collateral withdrawal
+         * frozen exactly as the full debt did. So the operator repays
+         * everything the app offers, sees no change in what they are allowed to
+         * do, and reasonably concludes the repayment did not work.
+         *
+         * `repayShortRaw` is what would still be owed afterwards, so the panel
+         * can say it before the button is pressed.
+         */
+        const repayMax = minB(borrowed, wallet);
+        const repayShort = borrowed > repayMax ? borrowed - repayMax : 0n;
         // Collateral headroom, capped by the cash that is there, capped again by
         // what the limiter will release this second. All three bind a borrow;
         // quoting the first two was quoting a number the third would refuse.
@@ -1638,6 +1654,8 @@ async function main() {
             withdrawRaw: withdrawMax.toString(),
             borrowRaw: borrowMax.toString(),
             repayRaw: repayMax.toString(),
+            /** Still owed after a max repayment — 0 when the wallet can clear it. */
+            repayShortRaw: repayShort.toString(),
           },
         };
         } catch (e) {
@@ -1816,10 +1834,38 @@ async function main() {
                     "walks every listed asset"
                   : "one listed asset has no usable price from the risk oracle, and the summary " +
                     "walks every listed asset";
+                /*
+                 * And what it means for *this* wallet, which is the part an
+                 * operator can act on.
+                 *
+                 * The freeze is not blanket: `withdraw` only consults the risk
+                 * oracle when the caller is leveraged, so a wallet that owes
+                 * nothing is unaffected. Saying only "the summary could not be
+                 * read" left somebody repaying what the app offered, seeing no
+                 * change in what they were allowed to do, and concluding the
+                 * repayment had not worked — when the truth was that a partial
+                 * repayment changes nothing, because any debt at all counts.
+                 */
+                const owes = Number(derived?.borrowedUsd ?? 0) > 0;
+                const short = assets.reduce(
+                  (t: number, x: (typeof assets)[number]) =>
+                    t + (Number(x.max?.repayShortRaw ?? 0) > 0 ? 1 : 0),
+                  0,
+                );
+                const forYou = !owes
+                  ? " This wallet owes nothing, so its own withdrawals are unaffected."
+                  : ` This wallet owes $${derived?.borrowedUsd}, and while it owes anything the pool will ` +
+                    "not release its collateral — borrowing and collateral withdrawals both wait for the " +
+                    "price. Repaying in full clears it, even while the price does not come back; a partial " +
+                    "repayment changes nothing, because any debt at all counts." +
+                    (short
+                      ? " Note that a maximum repayment on at least one asset would still leave a balance —" +
+                        " the wallet does not hold enough to clear it."
+                      : "");
                 return (
                   `The pool's account summary could not be read: ${cause}. ` +
                   "Reserves and your per-asset positions below are live; the borrow limit and " +
-                  "health factor are not."
+                  "health factor are not." + forYou
                 );
               })(),
             }
