@@ -1088,6 +1088,81 @@ async function main() {
    */
   class Refusal extends Error {}
 
+  /**
+   * Everything a viem error knows about a revert, as one lowercased string.
+   *
+   * Needed because the interesting part is never in the same place twice, and
+   * both attempts at reading it so far have looked in the wrong one:
+   *
+   *  - When the ABI *has* the error, viem decodes it and the arguments arrive
+   *    in `metaMessages`, formatted across two entries — the signature on one
+   *    line and the values on the next: `PriceUnreliable(address asset,
+   *    uint256 spreadBps)` then `(0x8BB6…, 0)`. A pattern expecting the address
+   *    to follow the name directly never matches.
+   *  - When the ABI does *not* have it — `NoUsablePrice` lives on the oracle,
+   *    not the pool — viem cannot decode it, and the top-level message carries
+   *    only the bare selector. The argument survives on `cause.data`, one or
+   *    two levels down, and never reaches `String(err)` at all.
+   *
+   * So walk the causes and collect the raw hex too, then match once against the
+   * lot. Bounded depth because these chains are short and a cycle would hang.
+   */
+  function revertText(err: unknown): string {
+    const out: string[] = [];
+    let node = err as Record<string, unknown> | undefined;
+    for (let depth = 0; node && depth < 6; depth++) {
+      for (const k of ["shortMessage", "details", "reason", "message", "data", "raw", "signature"]) {
+        const v = node[k];
+        if (typeof v === "string" && v) out.push(v);
+      }
+      const meta = node.metaMessages;
+      if (Array.isArray(meta)) out.push(...meta.filter((m): m is string => typeof m === "string"));
+      node = node.cause as Record<string, unknown> | undefined;
+    }
+    return out.join(" | ").toLowerCase();
+  }
+
+  /**
+   * The asset a price revert is complaining about, or null.
+   *
+   * `NoUsablePrice(address)` and `PriceUnreliable(address, uint256)` both name
+   * the asset that stopped the pool, and naming it is the whole difference
+   * between a message somebody can act on and one that sends them to check four
+   * assets by hand. Matched by "the error is mentioned, and here is the first
+   * address after it", which holds for the decoded spelling and the raw one
+   * alike — and returns null rather than guessing when neither is present,
+   * because attaching a name to the wrong revert is worse than not naming one.
+   */
+  function unpricedAsset(err: unknown): Hex | null {
+    const text = revertText(err);
+    const at = text.search(/nousableprice|priceunreliable|0xde5a2666|0x790db110/);
+    if (at < 0) return null;
+    const rest = text.slice(at);
+    /*
+     * Raw first: the selector and its argument are one unbroken string, so the
+     * address is not preceded by its own `0x` — it follows the four-byte
+     * selector and twenty-four zero bytes of padding. Looking for `0x` then
+     * zeros finds nothing here, which is how the first version of this ended up
+     * matching the *contract* address printed further down the same error.
+     */
+    const raw = /(?:0xde5a2666|0x790db110)0{24}([0-9a-f]{40})/.exec(rest);
+    // Decoded: viem prints the arguments on their own line after the signature,
+    // and the asset is the first of them.
+    const decoded = /(?:^|[^0-9a-f])0x([0-9a-f]{40})(?![0-9a-f])/.exec(rest);
+    const found = raw?.[1] ?? decoded?.[1];
+    if (!found) return null;
+    const addr = `0x${found}` as Hex;
+    /*
+     * And it has to be a reserve. Every one of these errors names an asset, so
+     * anything else came from elsewhere in the message — the contract's own
+     * address is printed in the "Contract Call" block of the very same error,
+     * and naming that as the unpriceable asset would be confidently wrong. A
+     * vague message beats a precise falsehood.
+     */
+    const known = (poolDeployment?.assets ?? []).some((a) => a.address.toLowerCase() === addr);
+    return known ? addr : null;
+  }
+
   function friendlyError(err: unknown): string {
     // Look everywhere viem might have put the revert reason. Reading only
     // `shortMessage` was why every failed swap said "the contract rejected
@@ -1129,11 +1204,9 @@ async function main() {
      * Handled before the table because the useful part is the address inside
      * the revert, which a fixed string cannot carry.
      */
-    const frozen = /(priceunreliable|nousableprice)\w*\s*\(?\s*(?:address\s*)?(0x[0-9a-f]{40})/i.exec(s)
-      ?? /(0x790db110|0xde5a2666)[0-9a-f]{24}([0-9a-f]{40})/i.exec(s);
-    if (frozen) {
-      const addr = (frozen[2].startsWith("0x") ? frozen[2] : `0x${frozen[2]}`) as Hex;
-      const sym = assetMeta(addr).symbol || `${addr.slice(0, 8)}…`;
+    const frozenAsset = unpricedAsset(err);
+    if (frozenAsset) {
+      const sym = assetMeta(frozenAsset).symbol || `${frozenAsset.slice(0, 8)}…`;
       /*
        * Say what is actually refused, which is narrower than "withdrawals".
        *
@@ -1734,11 +1807,9 @@ async function main() {
                  * risk oracle refuses to price, so it answers "true" for the
                  * asset that is breaking this call.
                  */
-                const hit = /0xde5a2666[0-9a-f]{24}([0-9a-f]{40})/i.exec(String(bulk.accountError ?? ""));
+                const hit = unpricedAsset(bulk.accountError);
                 const named = hit
-                  ? assets.find(
-                      (x: (typeof assets)[number]) => x.address.toLowerCase() === `0x${hit[1].toLowerCase()}`,
-                    )
+                  ? assets.find((x: (typeof assets)[number]) => x.address.toLowerCase() === hit.toLowerCase())
                   : undefined;
                 const cause = named
                   ? `${named.symbol} has no usable price from the risk oracle, and the summary ` +
