@@ -40,7 +40,7 @@ export interface Observation {
     borrowRoom?: bigint | null;
     supplyCap?: bigint | null;
     borrowCap?: bigint | null;
-    oracle?: { ok: boolean; spreadBps: number; sources: number; updatedAt: number } | null;
+    oracle?: { ok: boolean; enabled: boolean; spreadBps: number; sources: number; updatedAt: number } | null;
   }[];
   /** Health factors keyed by account label, in WAD (1e18). */
   positions?: { label: string; healthWad: bigint }[];
@@ -113,6 +113,38 @@ export function evaluate(o: Observation): Alert[] {
 
   for (const r of o.reserves ?? []) {
     const oracle = r.oracle;
+    /*
+     * No usable price at all — the loudest thing this pool can be told.
+     *
+     * Every rule below it needed at least one source to say anything: the
+     * divergence rules require two to disagree, and the staleness rule reports
+     * an entry that is merely old. The state where an asset has *nothing* — no
+     * live feed and a manual entry past `maxAge` — had no rule, and it is the
+     * one that matters most, because the pool checks every reserve before
+     * letting value out. One asset in this state stops borrowing pool-wide and
+     * refuses every leveraged withdrawal, on all assets, at any amount.
+     *
+     * On this deployment it went unnoticed for ten days. The only thing said
+     * about it was a warn reading "TSRA price has not moved in a while, last
+     * update 235h ago", sitting next to identical warns for USDC at 12h and
+     * EURC at 10h — which are healthy, because a stablecoin's price not moving
+     * is what a stablecoin does. The signal was there and it was indistinguish-
+     * able from the noise around it.
+     *
+     * Critical, and phrased as the consequence rather than the reading.
+     */
+    if (oracle && oracle.enabled && oracle.sources === 0) {
+      alerts.push({
+        key: `oracle-dark:${r.symbol}`,
+        severity: "critical",
+        title: `${r.symbol} has no usable price — the pool is refusing new risk`,
+        detail:
+          "Borrowing is frozen on every asset and any withdrawal by an account that owes " +
+          "anything is refused, until this asset can be priced again. Depositors with no " +
+          "debt can still withdraw, and repaying always works.",
+        action: "Restore a source for this asset, or take it off the risk oracle.",
+      });
+    }
     if (oracle && oracle.sources > 1) {
       if (oracle.spreadBps >= SPREAD_CRITICAL_BPS) {
         alerts.push({
@@ -131,7 +163,10 @@ export function evaluate(o: Observation): Alert[] {
         });
       }
     }
-    if (oracle && oracle.updatedAt > 0 && o.now - oracle.updatedAt > ORACLE_STALE_SECONDS) {
+    // Only worth saying while the entry is still counting for something. Once
+    // it has no sources left the alert above is the true one, and repeating it
+    // here as a warn is what made the real outage look routine.
+    if (oracle && oracle.sources > 0 && oracle.updatedAt > 0 && o.now - oracle.updatedAt > ORACLE_STALE_SECONDS) {
       alerts.push({
         key: `oracle-stale:${r.symbol}`,
         severity: "warn",

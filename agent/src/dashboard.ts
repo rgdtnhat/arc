@@ -1109,10 +1109,25 @@ async function main() {
     if (frozen) {
       const addr = (frozen[2].startsWith("0x") ? frozen[2] : `0x${frozen[2]}`) as Hex;
       const sym = assetMeta(addr).symbol || `${addr.slice(0, 8)}…`;
+      /*
+       * Say what is actually refused, which is narrower than "withdrawals".
+       *
+       *   withdraw:  if (_hasDebt(user)) _requireReliablePrices();
+       *   borrow:    _requireReliablePrices();
+       *
+       * A depositor who never borrowed can always leave — the pool goes out of
+       * its way not to trap them. What is refused is *raising leverage* while a
+       * mark is in dispute, and pulling collateral out while you owe something
+       * does that as surely as borrowing does. Saying "withdrawals are frozen"
+       * would send a debt-free supplier looking for a problem they do not have,
+       * and would hide the one thing the borrower can actually do about it.
+       */
       return (
-        `The pool has frozen withdrawals and borrowing because ${sym} has no reliable price right now. ` +
-        "This is pool-wide, not about your amount or your asset — supplying and repaying still work. " +
-        "It clears when the risk oracle can price " + sym + " again."
+        `The pool is refusing new risk because ${sym} has no reliable price right now, and that ` +
+        "applies to every asset rather than to your amount or your choice of asset. Borrowing is " +
+        "frozen, and so is withdrawing collateral while this wallet still owes anything — repay " +
+        `the debt and the withdrawal goes through. Supplying and repaying are never blocked, and a ` +
+        `wallet with no debt can withdraw normally. It clears when ${sym} can be priced again.`
       );
     }
 
@@ -1172,7 +1187,7 @@ async function main() {
       // A simulation that said no, before anything was signed. Already a whole
       // sentence — and one whose whole point is that no transaction exists.
       [/nothing was sent|that would fail, so nothing was touched/, ""],
-      [/frozen withdrawals and borrowing/, ""],
+      [/refusing new risk because/, ""],
       [/allowance|transferfrom/, "Token approval failed — approve the spender first, or check the wallet holds enough of that token."],
       [/exceeds balance|insufficient balance|\bbalance\b/, "Not enough balance for that amount."],
       [/insufficient funds|gas required|out of gas/, "Not enough USDC to cover network fees. Top up the wallet at faucet.circle.com."],
@@ -2800,8 +2815,17 @@ async function main() {
               borrowRoom,
               supplyCap: supplyRoom === UNCAPPED ? null : supplyRoom + stats.cash + stats.totalBorrows,
               borrowCap: borrowRoom + stats.totalBorrows,
-              oracle: st && st[0]
-                ? { ok: st[1], spreadBps: Number(st[4]), sources: Number(st[5]), updatedAt: Number(st[7]) }
+              // `st[0]` is the oracle's `enabled`, and it was also the guard —
+              // so an asset the oracle knows about but cannot price was
+              // reported the same as one it was never told about. Only the
+              // second is harmless: the pool skips unconfigured assets and
+              // falls back to its own mark, while an enabled asset with no
+              // sources is what freezes the book.
+              oracle: st
+                ? {
+                    ok: st[1], enabled: st[0], spreadBps: Number(st[4]),
+                    sources: Number(st[5]), updatedAt: Number(st[7]),
+                  }
                 : null,
             });
 
