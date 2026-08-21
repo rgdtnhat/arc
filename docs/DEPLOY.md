@@ -351,6 +351,39 @@ sent back to back with no gap are all served and ten sent at once have four
 refused. The limit is concurrency, not spacing, so spacing calls out spends
 latency without buying anything. Unset it and let the defaults adapt.
 
+## Clearing the agent's debt, and taking an asset off collateral duty
+
+```bash
+npm run pool:clear-debt -- --dry-run   # simulate every step, send nothing
+npm run pool:clear-debt                # do it
+```
+
+Run this when the pool has frozen on an unpriceable asset and the agent's
+scheduled lending tasks are failing. It repays every borrow the agent has, then
+drops TSRA's collateral factor to zero and closes borrowing of it.
+
+**The order is the whole point.** TSRA is most of the agent's borrow limit, so
+retuning it first would leave the position far under water and open to
+liquidation. Repaying first makes the second step unremarkable: a wallet that
+owes nothing cannot be made unhealthy by any collateral factor. The script
+refuses to touch TSRA unless every borrow share reached zero.
+
+What it does **not** do is loosen anything. Borrowing stays frozen pool-wide
+while a mark is in dispute, which is correct — `withdraw` only consults the risk
+oracle when the caller is leveraged (`if (_hasDebt(user))`), so clearing the debt
+opens the withdrawal path without weakening the check.
+
+Two details worth knowing before reading its output:
+
+- **USDC takes two repayments.** `_repayFor` rounds both the amount and the
+  shares down, so a position can be left holding a single wei-share — and
+  `_hasDebt` tests shares, not value, so that one share keeps the wallet
+  "leveraged" and the withdrawal frozen. The script repays until the shares are
+  gone, and stops rather than paying again if a repayment burns none.
+- **It tops the agent up from the deployer** when the USDC owed exceeds what the
+  agent holds, leaving 60 USDC of headroom for fees. USDC is the gas token on
+  Arc, so a wallet that spends its last unit repaying cannot send anything else.
+
 ## If `docker compose up --build` fails
 
 ### `ENOSPC: no space left on device`
