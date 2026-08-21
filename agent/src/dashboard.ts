@@ -108,6 +108,7 @@ import { TesseraPoolClient, PRICE_IX } from "./pool.js";
 import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader, planHarvest, type HarvestCandidate } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
+import { ConfirmationUnknown } from "./confirm.js";
 import { useDeploymentBlockFile } from "./deploy-block.js";
 import { fillPreview } from "./auction.js";
 import { priceImpact, maxInputWithin, valueCheck, IMPACT_MAX_PCT } from "./impact.js";
@@ -1066,6 +1067,27 @@ async function main() {
    * known causes (our own contract `require` strings, RPC throttling, gas) and
    * return one plain sentence that says what to do next.
    */
+  /**
+   * A refusal this app decided on its own, before anything was sent.
+   *
+   * These already read as whole sentences, and running one through the table
+   * below replaces a precise reason with a generic one — most damagingly with
+   * "That transaction didn't go through", which describes a transaction that
+   * was broadcast and reverted. Nothing was broadcast: the app looked, found the
+   * deployment cannot do what the task asked, and stopped. A reader who takes
+   * that at face value goes looking at their balance and the explorer for
+   * something that never existed.
+   *
+   * It is a class rather than a list of phrases because the list was wrong
+   * within a day of being written. It matched the lending wording, "predates
+   * scheduled exits", and missed the vault's "predates scheduled withdrawals" —
+   * so one step of the same series printed the clean sentence and the next
+   * printed the misleading prefix. Six of these sentences exist in pairs, and a
+   * seventh will be written eventually; a marker on the throw cannot be
+   * forgotten in the way a regex can.
+   */
+  class Refusal extends Error {}
+
   function friendlyError(err: unknown): string {
     // Look everywhere viem might have put the revert reason. Reading only
     // `shortMessage` was why every failed swap said "the contract rejected
@@ -1087,6 +1109,9 @@ async function main() {
     const raw = parts[0] ?? String(err);
     // The whole haystack is searched, so a specific reason wins over the
     // generic "reverted" that always accompanies it.
+    // Decided here, not by the chain: already the sentence we want.
+    if (err instanceof Refusal) return err.message;
+
     const s = (parts.join(" | ") || String(err)).toLowerCase();
 
     /*
@@ -1183,7 +1208,13 @@ async function main() {
        * act for a holder, and stopped. The sentence is already the right one,
        * so it is passed through whole.
        */
-      [/predates scheduled exits|not authorised on that lending position|own task can act on its own position/, ""],
+      /*
+       * The same refusals, for when one has been embedded in a larger string on
+       * its way here (`settleFailure` composes a sentence around
+       * `friendlyError`) and the class no longer travels with it. Matched by the
+       * part that is common to each pair rather than by either spelling.
+       */
+      [/predates scheduled |not authorised on that \w+ position|its own position/, ""],
       // A simulation that said no, before anything was signed. Already a whole
       // sentence — and one whose whole point is that no transaction exists.
       [/nothing was sent|that would fail, so nothing was touched/, ""],
@@ -8256,6 +8287,34 @@ async function main() {
       };
     } catch (e) {
       if (e instanceof Stranded) return strandedResult(e, plan.label, hashes);
+      /*
+       * Sent, outcome unknown: do not refund.
+       *
+       * Every other failure here means the visitor's money is still sitting in
+       * this wallet, so handing it back is right. This one does not. The call
+       * was signed and broadcast and only the receipt could not be read — it
+       * may already be mined. Refunding on that would give the visitor their
+       * money back on top of the position they now hold, and the app wallet
+       * would cover the difference. It is the same rule the RPC transport
+       * follows in the other direction, where a write is never retried on a
+       * timeout because the first one may have landed.
+       *
+       * So it is reported, with the hash, and nothing is undone.
+       */
+      if (e instanceof ConfirmationUnknown) {
+        hashes.push(e.txHash);
+        const detail =
+          `${plan.label} was sent for ${ownerAddr.slice(0, 8)}… but the network stopped answering, so ` +
+          `whether it landed is unknown. Nothing was refunded, because refunding a call that did land ` +
+          `would pay twice. Check ${e.txHash} before running this again.`;
+        try {
+          txlog.record({
+            actor: ownerAddr, category: "defi", action: `${plan.label} unconfirmed`,
+            status: "pending", txHash: e.txHash, detail,
+          });
+        } catch { /* the ledger is not the point */ }
+        return { ok: false, detail, txHash: e.txHash };
+      }
       return await settleFailure(`${plan.label} failed (${friendlyError(e)})`, got, giveBack, ownerAddr, plan.label, hashes);
     }
   }
@@ -8353,16 +8412,16 @@ async function main() {
            * lending position is not a token. The pool pays the holder directly,
            * so nothing passes through this wallet.
            */
-          if (!t.owner) throw new Error("only a connected wallet's own task can act on its own position");
+          if (!t.owner) throw new Refusal("only a connected wallet's own task can act on its own position");
           if (!(await poolClient.canActForHolders())) {
-            throw new Error(
+            throw new Refusal(
               "the lending pool on this deployment predates scheduled exits — it has no way to act for a " +
               "holder, so only your own wallet can withdraw or borrow. Do it from the DeFi tab.",
             );
           }
           const who = t.owner as Hex;
           if (!(await poolClient.positionOperator(who))) {
-            throw new Error(
+            throw new Refusal(
               "this app is not authorised on that lending position. Grant it from the DeFi tab — it is your " +
               "own approval, the funds are always paid to you, and you can take it back at any time.",
             );
@@ -8413,7 +8472,7 @@ async function main() {
          */
         const dryRun = await poolClient.wouldSucceed(t.action, [a, amt]);
         if (dryRun !== true) {
-          throw new Error(`nothing was sent — ${friendlyError(new Error(dryRun))}`);
+          throw new Refusal(`nothing was sent — ${friendlyError(new Error(dryRun))}`);
         }
         const txHash =
           t.action === "supply" ? await poolClient.supply(a, amt)
@@ -8437,16 +8496,16 @@ async function main() {
            * the contract itself, so nothing passes through this wallet at all:
            * of the three exit paths this is the only one with no window.
            */
-          if (!t.owner) throw new Error("only a connected wallet's own task can withdraw its own position");
+          if (!t.owner) throw new Refusal("only a connected wallet's own task can withdraw its own position");
           if (!(await vaultClient.canActForHolders())) {
-            throw new Error(
+            throw new Refusal(
               "the vault on this deployment predates scheduled withdrawals — it has no way to act for a " +
               "holder, so only your own wallet can redeem. Withdraw from the DeFi tab.",
             );
           }
           const who = t.owner as Hex;
           if (!(await vaultClient.positionOperator(who))) {
-            throw new Error(
+            throw new Refusal(
               "this app is not authorised on that vault position. Grant it from the DeFi tab — it is your " +
               "own approval, the assets are always paid to you, and you can take it back at any time.",
             );
@@ -8630,7 +8689,7 @@ async function main() {
            * task belongs to — never a parameter, because a task that could name
            * whose position to unwind is a task that could unwind anybody's.
            */
-          if (!t.owner) throw new Error("only a connected wallet's own task can withdraw its own position");
+          if (!t.owner) throw new Refusal("only a connected wallet's own task can withdraw its own position");
           return runShareFunded(t, hashes, {
             label: "remove liquidity from " + pool.name,
             poolId,
@@ -8782,7 +8841,8 @@ async function main() {
   /**
    * Run every task in a series, in the relation its mode asks for.
    *
-   * Sequential stops at the first failure: a series of dependent steps that
+   * Sequential carries on past a failure unless the series asks it not to — see
+   * `onFailure`. It used to stop always: a series of dependent steps that
    * carries on past a step which was meant to fund the next one does something
    * nobody asked for. Parallel reports each failure and lets the rest finish,
    * because there was no dependency to break.

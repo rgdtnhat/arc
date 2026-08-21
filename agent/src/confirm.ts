@@ -32,6 +32,40 @@ export class TransactionReverted extends Error {
   }
 }
 
+/**
+ * Broadcast, and then the chain stopped answering.
+ *
+ * A different thing from a revert, and the difference decides whether money
+ * moves. A revert is a *known* outcome: the transaction landed and undid
+ * itself, so anything it was going to spend is still where it was, and a caller
+ * that pulled funds to make the call can safely hand them back. This is the
+ * unknown outcome — the transaction was signed and sent, and then the receipt
+ * could not be read. It may be mined already, it may be mined in a minute.
+ *
+ * Treating that as a failure is how a caller pays twice. The session-funded
+ * flows pull a visitor's money, make a call with it, and refund on failure; if
+ * a vault deposit lands but its receipt times out, refunding hands the visitor
+ * their money back on top of the position they now hold, and the app wallet
+ * covers the difference. It is the same rule the RPC transport already follows
+ * in the other direction — writes are never retried on a timeout, because the
+ * first one may have landed — and it has to hold on the way out too.
+ *
+ * Carries the hash, because the one useful thing to do with an unknown outcome
+ * is go and look at it.
+ */
+export class ConfirmationUnknown extends Error {
+  readonly txHash: Hex;
+  constructor(txHash: Hex, cause: unknown, what?: string) {
+    super(
+      `${what ? what + ": " : ""}the transaction was sent but the network stopped answering, so ` +
+        `whether it landed is unknown — check ${txHash} before retrying ` +
+        `(${String((cause as { shortMessage?: string; message?: string })?.shortMessage ?? (cause as Error)?.message ?? cause).slice(0, 120)})`,
+    );
+    this.name = "ConfirmationUnknown";
+    this.txHash = txHash;
+  }
+}
+
 /** Minimal shape of the receipt this module cares about. */
 export type MinimalReceipt = { status: string | number; [k: string]: unknown };
 
@@ -58,7 +92,14 @@ export async function confirm<T extends MinimalReceipt>(
   hash: Hex,
   what?: string,
 ): Promise<T> {
-  const receipt = await (pub as unknown as Waiter).waitForTransactionReceipt({ hash });
+  let receipt: MinimalReceipt;
+  try {
+    receipt = await (pub as unknown as Waiter).waitForTransactionReceipt({ hash });
+  } catch (e) {
+    // Not a failure — an unknown. See ConfirmationUnknown: the caller must not
+    // undo anything on the strength of this.
+    throw new ConfirmationUnknown(hash, e, what);
+  }
   if (!receiptOk(receipt as { status: string | number })) throw new TransactionReverted(hash, what);
   return receipt as unknown as T;
 }
