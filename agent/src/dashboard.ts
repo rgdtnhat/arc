@@ -5856,10 +5856,27 @@ async function main() {
     const address = armed && armed !== zero ? armed : (liveDeployment?.tesseraOracle as Hex | undefined);
     if (!address || address === zero) return null;
 
-    const [configs, block] = await Promise.all([
+    const [configs, reserves, block] = await Promise.all([
       client.public.multicall({
         contracts: proposals.map(
           (p) => ({ address, abi: tesseraOracleAbi, functionName: "configOf", args: [p.asset] }) as const,
+        ) as never,
+        allowFailure: true,
+      }),
+      /*
+       * The pool's own risk weights, read fresh rather than taken from the
+       * dashboard's cached view.
+       *
+       * They decide whether an asset may be held at its stored mark when no
+       * quote can be agreed — see the heartbeat in `proposeOracleWrite`. That
+       * is a decision about whether a price can size a loan, so it is made on
+       * what the contract says right now, not on a snapshot that could be a
+       * poll old. A read that fails leaves the asset looking risk-bearing,
+       * which is the direction that refuses to write.
+       */
+      client.public.multicall({
+        contracts: proposals.map(
+          (p) => ({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "reserves", args: [p.asset] }) as const,
         ) as never,
         allowFailure: true,
       }),
@@ -5883,10 +5900,15 @@ async function main() {
         } satisfies OracleWrite;
       }
       const [enabled, stored, updatedAt, , , maxMoveBps, minUpdateInterval, , maxAge] = c;
+      const rr = reserves[i] as { status: string; result?: unknown } | undefined;
+      const res = rr?.status === "success" ? (rr.result as readonly unknown[]) : null;
+      // borrowable is index 1, cFactor index 3 — see the Reserve struct.
+      const riskFree = res ? res[1] === false && Number(res[3]) === 0 : false;
       return proposeOracleWrite({
         asset: p.asset,
         symbol: p.symbol,
         agreedUsd: p.agreedUsd,
+        riskFree,
         nowS,
         entry: {
           enabled,

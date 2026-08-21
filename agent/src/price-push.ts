@@ -227,8 +227,16 @@ export interface OracleWrite {
   /** Signed, relative to `stored`. */
   moveBps: number;
   clamped: boolean;
-  /** Why this is being sent, or null when nothing is. */
-  reason: "drift" | "expiring" | null;
+  /**
+   * Why this is being sent, or null when nothing is.
+   *
+   * `heartbeat` re-sends the stored value unchanged, to stop a *risk-free*
+   * asset's entry expiring and freezing the pool. It is the only reason that
+   * never moves a price.
+   */
+  reason: "drift" | "expiring" | "heartbeat" | null;
+  /** A sentence for the operator log, when the reason alone is not enough. */
+  detail?: string;
   /** Seconds until the stored price stops counting as a source. */
   expiresInS: number;
   /** True once it already has. */
@@ -285,6 +293,14 @@ export function proposeOracleWrite(args: {
   entry: OracleEntry;
   /** The cross-checked price, or null when the sources did not agree. */
   agreedUsd: number | null;
+  /**
+   * True when this asset carries no risk weight in the pool: it backs no
+   * borrowing (`cFactor == 0`) and cannot itself be borrowed.
+   *
+   * It is the condition that makes a heartbeat safe — see the `agreedUsd ===
+   * null` branch below.
+   */
+  riskFree?: boolean;
   /** Chain time, in seconds — the clock the oracle's own guards are measured against. */
   nowS: number;
   minMoveBps?: number;
@@ -327,6 +343,41 @@ export function proposeOracleWrite(args: {
 
   const target = agreedUsd === null ? null : toPoolPrice(agreedUsd);
   if (target === null) {
+    /*
+     * No quote. Whether that is allowed to take the market down depends
+     * entirely on whether this asset's mark still decides anything.
+     *
+     * `maxAge` exists so that if every source for an asset dies, the pool stops
+     * trading rather than trading on a number nobody stands behind. That is
+     * right, and an earlier attempt to paper over it here — re-sending the
+     * stored value whenever an entry was expiring — was rightly rejected: it
+     * would have made a mark immortal, so a real price collapse would leave the
+     * pool lending against it for ever.
+     *
+     * The case below is not that one. When an asset has been taken off
+     * collateral duty — `cFactor` is zero and it cannot be borrowed — its price
+     * sizes no loan, sets no borrow limit, and gates no liquidation. There is
+     * nothing left for `maxAge` to protect, and letting the entry lapse instead
+     * *causes* an outage: the pool checks every listed reserve before releasing
+     * value, so one unpriceable asset freezes borrowing and every leveraged
+     * withdrawal across all of them. That is how a wallet with 987 USDC of
+     * collateral against 345 USDC of debt ended up unable to withdraw anything.
+     *
+     * So a risk-free asset gets a heartbeat: the value already on record,
+     * `next === stored`, zero basis points of movement. It cannot revalue
+     * anything, because it changes nothing and because there is nothing left to
+     * value. An asset that still carries weight is skipped exactly as before.
+     */
+    const runningOut = base.expired || expiresInS <= entry.maxAge * (1 - refreshAt);
+    if (runningOut && args.riskFree && entry.stored > 0n) {
+      return {
+        ...base,
+        reason: "heartbeat",
+        detail:
+          "no agreed quote, and this asset carries no risk weight — holding the stored mark so it " +
+          "cannot expire and freeze the whole pool",
+      };
+    }
     return {
       ...base,
       // Named by urgency: an entry that is about to stop pricing the pool is a

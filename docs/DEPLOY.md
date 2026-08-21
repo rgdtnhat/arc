@@ -351,6 +351,43 @@ sent back to back with no gap are all served and ten sent at once have four
 refused. The limit is concurrency, not spacing, so spacing calls out spends
 latency without buying anything. Unset it and let the defaults adapt.
 
+## When one asset's outage freezes the whole pool
+
+```bash
+npm run pool:retire-risk -- --dry-run   # simulate every step, send nothing
+npm run pool:retire-risk                # do it
+```
+
+`TesseraPool._requireReliablePrices` walks **every** listed reserve before it
+lets value out, so one asset the risk oracle cannot price freezes borrowing and
+every leveraged withdrawal across all of them. On this deployment TSRA's oracle
+entry expired and could not be replaced — its TWAP source needs 25,000 USDC of
+pool depth against the 21 the pool holds — and a wallet with 987 USDC of
+collateral against 345 USDC of debt could not withdraw a single unit.
+
+The script takes the unpriceable asset off collateral duty and then lets the
+pool trade again, in that order:
+
+1. `setRiskParams(asset, cFactor = 0)` — it backs no borrowing.
+2. `setBorrowable(asset, false)` — and cannot itself be borrowed.
+3. `setPrice(asset, <the value already stored>)` — a heartbeat that refreshes
+   the entry's clock so the pool stops refusing.
+
+**The order is the safety argument.** The first two only ever reduce what the
+pool will do, which the contract allows unconditionally. The third writes a
+price with no quote behind it, which would be indefensible on an asset that can
+size a loan — so it happens only once the first two have made sure this one
+cannot. Reversed, the pool would briefly trade with the asset at full collateral
+weight on a mark nobody is checking, which is what `maxAge` exists to prevent.
+
+The heartbeat moves nothing: it re-sends the number already on record, zero
+basis points. It refuses to run if any wallet it can see would be left unhealthy
+without that collateral — better a frozen pool than a liquidated user.
+
+After this the price refresher keeps applying the same rule on its own: it will
+hold a **risk-free** asset's mark rather than let it lapse and freeze the pool
+again, and still refuses to do that for any asset that can back a loan.
+
 ## Clearing the agent's debt, and taking an asset off collateral duty
 
 ```bash

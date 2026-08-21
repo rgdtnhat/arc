@@ -356,3 +356,107 @@ test("agreedUsd distinguishes a confirmed price from a feed that never answered"
   });
   assert.ok(agreed.agreedUsd! > 0);
 });
+
+/*
+ * The heartbeat, and the line it must not cross.
+ *
+ * An earlier version of this held *any* expiring entry at its stored value, and
+ * the test above — "will not refresh an entry on a price nothing confirms" —
+ * correctly refused it: `maxAge` exists so that if every source for an asset
+ * dies, the pool stops trading rather than trading on a number nobody stands
+ * behind. Making a mark immortal would mean a real price collapse left the pool
+ * lending against it for ever.
+ *
+ * The narrow case is different. Once an asset is off collateral duty — cFactor
+ * zero, not borrowable — its price sizes no loan, sets no borrow limit and gates
+ * no liquidation. There is nothing for `maxAge` to protect, and letting the
+ * entry lapse actively causes harm: the pool checks every listed reserve before
+ * releasing value, so one unpriceable asset freezes borrowing and every
+ * leveraged withdrawal across all of them. Live, that left a wallet holding 987
+ * USDC of collateral against 345 USDC of debt unable to withdraw anything.
+ */
+
+test("an asset that still carries risk is never held at an unconfirmed price", () => {
+  // The rule the earlier attempt broke. Nothing about the heartbeat may weaken
+  // it: an asset that can back a loan must be allowed to expire.
+  for (const nowS of [6 * DAY, 8 * DAY]) {
+    const w = oracleAt({ agreedUsd: null, nowS });
+    assert.ok(w.skip, `an asset with risk weight was written at ${nowS / DAY} days`);
+    assert.notEqual(w.reason, "heartbeat");
+  }
+});
+
+test("an asset with no risk weight is held rather than allowed to freeze the pool", () => {
+  const w = proposeOracleWrite({
+    asset: A, symbol: "TSRA", entry: entry({ stored: P(0.125), updatedAt: 0 }),
+    agreedUsd: null, nowS: 8 * DAY, riskFree: true,
+  });
+  assert.ok(!w.skip, `the entry was left to expire: ${w.skip}`);
+  assert.equal(w.reason, "heartbeat");
+  assert.equal(actionableOracleWrites([w]).length, 1, "the heartbeat would never be sent");
+});
+
+test("a heartbeat cannot move a price — that is what makes it allowed", () => {
+  /*
+   * The safety property in one assertion. Writing without a quote would be
+   * indefensible if it could change what anything is worth; it cannot, because
+   * the value sent is the value already stored. If this ever fails, the
+   * heartbeat has become a price write with no source behind it.
+   */
+  for (const stored of [P(0.125), P(1), P(95_000)]) {
+    const w = proposeOracleWrite({
+      asset: A, symbol: "X", entry: entry({ stored, updatedAt: 0 }),
+      agreedUsd: null, nowS: 8 * DAY, riskFree: true,
+    });
+    assert.equal(w.next, stored, "the heartbeat sent something other than the stored value");
+    assert.equal(w.moveBps, 0);
+    assert.equal(w.clamped, false);
+  }
+});
+
+test("a risk-free asset with plenty of life is still left alone", () => {
+  // The heartbeat is for entries running out, not a licence to write every
+  // round. A quiet asset should cost no transactions at all.
+  const w = proposeOracleWrite({
+    asset: A, symbol: "TSRA", entry: entry({ stored: P(0.125), updatedAt: 0 }),
+    agreedUsd: null, nowS: DAY, riskFree: true,
+  });
+  assert.match(w.skip ?? "", /no agreed quote/);
+  assert.equal(w.reason, null);
+});
+
+test("a heartbeat is never the first price an asset gets", () => {
+  /*
+   * With nothing stored there is no mark to hold, and sending zero is not a
+   * heartbeat — it is seeding a price from nowhere, which is the thing the skip
+   * exists to prevent. Seeding stays a deliberate act.
+   */
+  const w = proposeOracleWrite({
+    asset: A, symbol: "NEW", entry: entry({ stored: 0n, updatedAt: 0 }),
+    agreedUsd: null, nowS: 8 * DAY, riskFree: true,
+  });
+  assert.ok(w.skip, "an unseeded asset was written to");
+  assert.match(w.skip ?? "", /no price on record/);
+});
+
+test("a heartbeat still waits for the oracle's own update interval", () => {
+  // `setPrice` reverts inside `minUpdateInterval`; a keeper that ignores it
+  // burns a reverting transaction every round.
+  const w = proposeOracleWrite({
+    asset: A, symbol: "TSRA",
+    entry: entry({ stored: P(0.125), updatedAt: 8 * DAY - 60, minUpdateInterval: 1800 }),
+    agreedUsd: null, nowS: 8 * DAY, riskFree: true,
+  });
+  assert.ok(w.skip, "the heartbeat ignored minUpdateInterval");
+  assert.match(w.skip ?? "", /accepts the next write/);
+});
+
+test("a real quote is still preferred over holding the old mark", () => {
+  // The heartbeat is the fallback, not the plan. When sources agree, track them.
+  const w = proposeOracleWrite({
+    asset: A, symbol: "TSRA", entry: entry({ stored: P(0.125), updatedAt: 0 }),
+    agreedUsd: 0.13, nowS: 8 * DAY, riskFree: true,
+  });
+  assert.notEqual(w.reason, "heartbeat");
+  assert.ok(w.next > P(0.125), "it held the old mark instead of tracking the quote");
+});
