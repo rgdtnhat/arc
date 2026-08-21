@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { SeriesStore, SERIES_LIMITS } from "../src/series.js";
+import { SeriesStore, SERIES_LIMITS, walkSequentially } from "../src/series.js";
 
 /**
  * A series fires several payments at once, so most of these check that it does
@@ -236,4 +236,130 @@ test("a series written against task ids is carried onto its own steps", () => {
   const again = new SeriesStore(f);
   assert.equal(again.adoptTaskMembers((id) => tasks[id] ?? null).carried.length, 0);
   assert.equal(again.get("old-series")!.steps.length, 2);
+});
+
+/*
+ * What a sequential run does when a step fails.
+ *
+ * Stopping was the only behaviour, on the reasoning that a later step may have
+ * relied on the one that failed. Sometimes true, and not the usual case: a
+ * series is more often a list of independent errands. On the live deployment it
+ * did real damage — a pool-wide price freeze failed the *first* lending step of
+ * a nine-step series and took eight unrelated wallet sends down with it, every
+ * run, reported as "an earlier step failed".
+ */
+
+test("a series carries on past a failed step by default", () => {
+  const s = store();
+  const r = s.create({ steps: [step(), step()], schedule: { kind: "manual" } });
+  assert.equal(s.get(idOf(r))!.onFailure, "continue");
+});
+
+test("stopping at the first failure is still available, and is remembered", () => {
+  const s = store();
+  const id = idOf(s.create({ steps: [step()], onFailure: "stop", schedule: { kind: "manual" } }));
+  assert.equal(s.get(id)!.onFailure, "stop");
+  s.update(id, { onFailure: "continue" });
+  assert.equal(s.get(id)!.onFailure, "continue");
+});
+
+test("a value that is neither is refused rather than guessed at", () => {
+  // The two readings of a bad value are opposites — run the rest, or cancel
+  // them — so picking one silently is how somebody's payments go missing.
+  const s = store();
+  const r = s.create({ steps: [step()], onFailure: "maybe", schedule: { kind: "manual" } });
+  assert.equal(r.ok, false);
+  assert.match(errOf(r), /unknown onFailure/);
+  const id = idOf(s.create({ steps: [step()], schedule: { kind: "manual" } }));
+  assert.equal(s.update(id, { onFailure: "sometimes" }).ok, false);
+  assert.equal(s.get(id)!.onFailure, "continue", "a refused edit changed it anyway");
+});
+
+test("a series written before this was a choice gets the new behaviour", () => {
+  /*
+   * The old default was to stop, and that is the bug being fixed — an operator
+   * whose nine-step series has been cancelling itself at step two should not
+   * have to re-create it to get the fix.
+   */
+  const f = file();
+  writeFileSync(f, JSON.stringify([{
+    id: "old", name: "errands", steps: [{ id: "s1", ...step(), enabled: true }],
+    mode: "sequential", schedule: { kind: "manual" }, enabled: true, owner: null, createdAt: 1,
+    firstRunAt: null, lastRunAt: null, lastStatus: null, lastDetail: "", runs: 0,
+  }]));
+  assert.equal(new SeriesStore(f).get("old")!.onFailure, "continue");
+});
+
+test("a series that asked to stop keeps stopping across a restart", () => {
+  const f = file();
+  const s = new SeriesStore(f);
+  const id = idOf(s.create({ steps: [step()], onFailure: "stop", schedule: { kind: "manual" } }));
+  assert.equal(new SeriesStore(f).get(id)!.onFailure, "stop");
+});
+
+/*
+ * The walk itself: which steps get a turn.
+ *
+ * Tested apart from the runner because the runner needs a chain behind it and
+ * this rule does not. Nothing about spending is in here — `run` is supplied by
+ * the caller and is the same path that has always done the spending.
+ */
+
+const walkStep = (name: string) => ({ id: name, name, venue: "wallet", action: "send", params: {}, enabled: true }) as never;
+
+test("one failure no longer cancels the steps behind it", async () => {
+  /*
+   * The live case, exactly: a nine-step series whose first lending step failed
+   * on a pool-wide price freeze, taking eight unrelated wallet sends with it —
+   * every run, reported as "an earlier step failed".
+   */
+  const ran: string[] = [];
+  const over: string[] = [];
+  await walkSequentially(
+    [walkStep("a"), walkStep("b"), walkStep("c")],
+    async (s) => { ran.push(s.name); return s.name === "a" ? "failed" : "ok"; },
+    { onFailure: "continue", stopped: () => false, passedOver: (s) => over.push(s.name) },
+  );
+  assert.deepEqual(ran, ["a", "b", "c"]);
+  assert.deepEqual(over, [], "steps were passed over even though the series was set to continue");
+});
+
+test("a series set to stop still stops, and says what never ran", async () => {
+  const ran: string[] = [];
+  const over: [string, string][] = [];
+  await walkSequentially(
+    [walkStep("a"), walkStep("b"), walkStep("c")],
+    async (s) => { ran.push(s.name); return s.name === "a" ? "failed" : "ok"; },
+    { onFailure: "stop", stopped: () => false, passedOver: (s, why) => over.push([s.name, why]) },
+  );
+  assert.deepEqual(ran, ["a"]);
+  assert.deepEqual(over, [["b", "an earlier step failed"], ["c", "an earlier step failed"]]);
+});
+
+test("the operator's stop still takes effect mid-run, whatever the failure rule", async () => {
+  /*
+   * The one thing continuing must not weaken. Stop is a person asking for the
+   * spending to end now; it is checked before every step and it names the ones
+   * it prevented, so a half-run series is still a legible receipt.
+   */
+  const ran: string[] = [];
+  const over: [string, string][] = [];
+  let halt = false;
+  await walkSequentially(
+    [walkStep("a"), walkStep("b"), walkStep("c")],
+    async (s) => { ran.push(s.name); halt = true; return "ok"; },
+    { onFailure: "continue", stopped: () => halt, passedOver: (s, why) => over.push([s.name, why]) },
+  );
+  assert.deepEqual(ran, ["a"]);
+  assert.deepEqual(over, [["b", "stopped by the operator"], ["c", "stopped by the operator"]]);
+});
+
+test("every step still runs when nothing fails", async () => {
+  const ran: string[] = [];
+  await walkSequentially(
+    [walkStep("a"), walkStep("b")],
+    async (s) => { ran.push(s.name); return "ok"; },
+    { onFailure: "continue", stopped: () => false, passedOver: () => assert.fail("nothing should be passed over") },
+  );
+  assert.deepEqual(ran, ["a", "b"]);
 });

@@ -68,7 +68,7 @@ import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emiss
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
-import { SeriesStore, SERIES_LIMITS, type TaskSeries, type SeriesStep } from "./series.js";
+import { SeriesStore, SERIES_LIMITS, walkSequentially, type TaskSeries, type SeriesStep } from "./series.js";
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
@@ -1088,6 +1088,34 @@ async function main() {
     // The whole haystack is searched, so a specific reason wins over the
     // generic "reverted" that always accompanies it.
     const s = (parts.join(" | ") || String(err)).toLowerCase();
+
+    /*
+     * The pool-wide price freeze, said in words, with the asset named.
+     *
+     * `_requireReliablePrices` checks *every* reserve before letting value out,
+     * so one asset the risk oracle cannot price stops `withdraw` and `borrow`
+     * for all of them, at any amount. That is the pool deliberately failing
+     * closed, and it is the right behaviour — but as a message it arrived as
+     * "The contract rejected this transaction. Double-check the amount", which
+     * sends somebody to try a smaller number forever. The amount was never the
+     * problem: on this deployment TSRA's oracle entry expired and every lending
+     * task failed for ten days against that sentence.
+     *
+     * Handled before the table because the useful part is the address inside
+     * the revert, which a fixed string cannot carry.
+     */
+    const frozen = /(priceunreliable|nousableprice)\w*\s*\(?\s*(?:address\s*)?(0x[0-9a-f]{40})/i.exec(s)
+      ?? /(0x790db110|0xde5a2666)[0-9a-f]{24}([0-9a-f]{40})/i.exec(s);
+    if (frozen) {
+      const addr = (frozen[2].startsWith("0x") ? frozen[2] : `0x${frozen[2]}`) as Hex;
+      const sym = assetMeta(addr).symbol || `${addr.slice(0, 8)}…`;
+      return (
+        `The pool has frozen withdrawals and borrowing because ${sym} has no reliable price right now. ` +
+        "This is pool-wide, not about your amount or your asset — supplying and repaying still work. " +
+        "It clears when the risk oracle can price " + sym + " again."
+      );
+    }
+
     const table: [RegExp, string][] = [
       [/request limit|rate limit|too many requests|429|-32005/, "The Arc network is rate-limiting us right now. Wait a few seconds and try again."],
       [/timeout|timed out|fetch failed|socket|econnreset|network/, "Couldn't reach the Arc network. Check your connection and try again."],
@@ -1141,6 +1169,10 @@ async function main() {
        * so it is passed through whole.
        */
       [/predates scheduled exits|not authorised on that lending position|own task can act on its own position/, ""],
+      // A simulation that said no, before anything was signed. Already a whole
+      // sentence — and one whose whole point is that no transaction exists.
+      [/nothing was sent|that would fail, so nothing was touched/, ""],
+      [/frozen withdrawals and borrowing/, ""],
       [/allowance|transferfrom/, "Token approval failed — approve the spender first, or check the wallet holds enough of that token."],
       [/exceeds balance|insufficient balance|\bbalance\b/, "Not enough balance for that amount."],
       [/insufficient funds|gas required|out of gas/, "Not enough USDC to cover network fees. Top up the wallet at faucet.circle.com."],
@@ -8341,6 +8373,24 @@ async function main() {
             },
           });
         }
+        /*
+         * Ask before sending. Every other path here already does.
+         *
+         * These four went straight to the write, so a transaction that could
+         * not succeed was signed, broadcast, mined and reverted — costing gas
+         * and coming back as a decoded revert wearing a generic sentence. It is
+         * also what made a failure look intermittent: "the lending task often
+         * fails" was every withdraw failing for the same pool-wide reason, and
+         * a simulation would have said so in words the first time, for nothing.
+         *
+         * Simulating is not a guarantee — the chain can move between the two —
+         * but it turns the common case from a burnt transaction into an
+         * explanation, and it costs one read.
+         */
+        const dryRun = await poolClient.wouldSucceed(t.action, [a, amt]);
+        if (dryRun !== true) {
+          throw new Error(`nothing was sent — ${friendlyError(new Error(dryRun))}`);
+        }
         const txHash =
           t.action === "supply" ? await poolClient.supply(a, amt)
           : t.action === "withdraw" ? await poolClient.withdraw(a, amt)
@@ -8775,19 +8825,25 @@ async function main() {
       if (sr.mode === "parallel") {
         await Promise.all(sr.steps.map((step) => runOne(step).catch(() => "failed" as const)));
       } else {
-        for (const [at, step] of sr.steps.entries()) {
-          if (seriesStopped.has(sr.id)) { skipped.push("stopped by the operator"); break; }
-          const outcome = await runOne(step);
-          if (outcome === "failed") {
-            // Name the ones that never got a turn, so the receipt is the whole
-            // story rather than the point it stopped telling it.
-            for (const rest of sr.steps.slice(at + 1)) {
-              skipped.push(`${rest.name} (an earlier step failed)`);
-              seriesStore.markStep(sr.id, rest.id, "skipped", "an earlier step failed");
-            }
-            break;
-          }
-        }
+        /*
+         * Carrying on past a failure is the default — see `onFailure`. Each
+         * remaining step is still checked on its own terms when its turn comes
+         * (the policy gate, the balance, the simulation), so continuing is not
+         * continuing regardless: a step that genuinely depended on the failed
+         * one fails its own checks and says so in its own words, instead of
+         * being recorded as collateral damage from something several steps away.
+         *
+         * Name the ones that never got a turn, so the receipt is the whole story
+         * rather than the point it stopped telling it.
+         */
+        await walkSequentially(sr.steps, runOne, {
+          onFailure: sr.onFailure,
+          stopped: () => seriesStopped.has(sr.id),
+          passedOver: (rest, why) => {
+            skipped.push(`${rest.name} (${why})`);
+            seriesStore.markStep(sr.id, rest.id, "skipped", why);
+          },
+        });
       }
       const detail =
         `${done.length}/${wanted} ran` +

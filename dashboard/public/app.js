@@ -5257,6 +5257,9 @@ const $ = (id) => document.getElementById(id);
         $("serDays").style.display = kind === "weekly" ? "" : "none";
         $("serDom").style.display = kind === "monthly" || kind === "yearly" ? "" : "none";
         $("serMonth").style.display = kind === "yearly" ? "" : "none";
+        // "All at once" gives every step its turn regardless, so there is no
+        // failure for a later step to be stopped by.
+        $("serOnFailure").style.display = $("serMode").value === "sequential" ? "" : "none";
       }
 
       /** The tasks to choose from, with the order they were ticked preserved. */
@@ -5395,7 +5398,8 @@ const $ = (id) => document.getElementById(id);
                 const on = mine.filter((m) => m.enabled !== false).length;
                 return `<tr><td><b>${esc(x.name)}</b>` +
                   `<div class="muted" style="font-size:11px">` +
-                  `${x.mode === "sequential" ? "one after another" : "all at once"} · ` +
+                  `${x.mode === "sequential" ? "one after another" : "all at once"}` +
+                  `${x.mode === "sequential" && x.onFailure === "stop" ? ", stopping at the first failure" : ""} · ` +
                   `${on} step${on === 1 ? "" : "s"}` +
                   `${on === mine.length ? "" : ` (${mine.length - on} off)`}${state}</div>${steps}</td>` +
                   `<td style="font-size:12px">${esc(x.scheduleText)}<div class="muted" style="font-size:11px">next ${esc(next)}</div></td>` +
@@ -5423,6 +5427,7 @@ const $ = (id) => document.getElementById(id);
         editingSeries = id;
         $("serName").value = x.name || "";
         $("serMode").value = x.mode;
+        $("serOnFailure").value = x.onFailure === "stop" ? "stop" : "continue";
         // A copy: editing the form must not change the loaded row underneath it.
         serSteps = (x.steps || []).map((st) => ({ ...st, params: { ...st.params } }));
         if (window.__stopEditingStep) window.__stopEditingStep();
@@ -5488,7 +5493,8 @@ const $ = (id) => document.getElementById(id);
           : sc.kind === "monthly" ? `day ${sc.day} of each month at ${at()}`
           : `${sc.month}/${sc.day} each year at ${at()}`;
         $("serPreview").textContent = n
-          ? `${n} step${n === 1 ? "" : "s"}, ${$("serMode").value === "sequential" ? "one after another" : "all at once"}, ${when}`
+          ? `${n} step${n === 1 ? "" : "s"}, ${$("serMode").value === "sequential" ? "one after another" : "all at once"}` +
+            `${$("serMode").value === "sequential" && $("serOnFailure").value === "stop" ? ", stopping at the first failure" : ""}, ${when}`
           : "add the steps this series should run";
       }
 
@@ -5630,7 +5636,7 @@ const $ = (id) => document.getElementById(id);
       }
 
       if ($("serCreate")) {
-        ["serKind", "serMode"].forEach((id) => $(id).addEventListener("change", () => { syncSeriesForm(); previewSeries(); }));
+        ["serKind", "serMode", "serOnFailure"].forEach((id) => $(id).addEventListener("change", () => { syncSeriesForm(); previewSeries(); }));
         ["serEveryN", "serEveryUnit", "serHour", "serMinute", "serZone", "serDom", "serMonth"].forEach((id) =>
           $(id).addEventListener("input", previewSeries));
         $("serDays").addEventListener("change", previewSeries);
@@ -5655,7 +5661,13 @@ const $ = (id) => document.getElementById(id);
               id: String(st.id || "").startsWith("new-") ? undefined : st.id,
               name: st.name, venue: st.venue, action: st.action, params: st.params, enabled: st.enabled !== false,
             }));
-            const body = { name: $("serName").value.trim(), mode: $("serMode").value, steps, schedule: serSchedule() };
+            const body = {
+              name: $("serName").value.trim(),
+              mode: $("serMode").value,
+              onFailure: $("serOnFailure").value,
+              steps,
+              schedule: serSchedule(),
+            };
             const r = await (await postAuthed(editingSeries ? `/api/series/${editingSeries}` : "/api/series", body)).json();
             showReceipt("serMsg", Boolean(r.ok),
               r.ok ? `${editingSeries ? "saved" : "created"} — ${r.scheduleText}` : `failed: ${r.error}`);

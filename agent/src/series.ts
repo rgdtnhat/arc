@@ -78,6 +78,23 @@ export interface TaskSeries {
   /** The steps, in the order they run when the mode is sequential. */
   steps: SeriesStep[];
   mode: SeriesMode;
+  /**
+   * What a sequential run does when a step fails.
+   *
+   * `stop` was the only behaviour, on the reasoning that a later step may have
+   * been relying on the one that failed — a withdraw of what a supply had just
+   * put in. That is sometimes true and it is not the operator's usual case: a
+   * series is more often a list of independent errands, and one of them failing
+   * for its own reasons is no reason to cancel the rest. It also interacts
+   * badly with a pool-wide freeze, where the *first* lending step fails and
+   * takes eight unrelated wallet sends down with it.
+   *
+   * So it is a choice, defaulting to `continue`. Every step is still checked on
+   * its own terms when its turn comes — the policy gate, the balance, the
+   * simulation — so carrying on never means carrying on regardless: a step that
+   * depended on a failed one fails its own checks and says so.
+   */
+  onFailure: "continue" | "stop";
   schedule: Schedule;
   enabled: boolean;
   /** The wallet that owns it, lower-cased — or null for the operator's. */
@@ -94,6 +111,7 @@ export interface SeriesInput {
   name?: string;
   steps?: unknown;
   mode?: string;
+  onFailure?: string;
   schedule?: unknown;
   enabled?: boolean;
   owner?: string | null;
@@ -177,7 +195,19 @@ export class SeriesStore {
           // `owner` for the same reason as in `tasks.ts`: a record written
           // before the field existed has no key, and "no wallet behind it" is
           // one value here, not two.
-          .map((s) => ({ ...s, owner: s.owner ?? null, steps: Array.isArray(s.steps) ? s.steps : [] }));
+          .map((s) => ({
+            ...s,
+            owner: s.owner ?? null,
+            steps: Array.isArray(s.steps) ? s.steps : [],
+            /*
+             * Series written before this was a choice stop on the first
+             * failure. They get the new default rather than the old behaviour,
+             * because the old behaviour is the bug being fixed — an operator
+             * whose nine-step series has been cancelling itself at step two
+             * should not have to re-create it to get the fix.
+             */
+            onFailure: s.onFailure === "stop" ? ("stop" as const) : ("continue" as const),
+          }));
       }
     } catch {
       /* first run */
@@ -233,11 +263,16 @@ export class SeriesStore {
     if (!parsed.ok) return parsed;
     const mode = String(input.mode ?? "sequential") as SeriesMode;
     if (!MODES.includes(mode)) return { ok: false, error: `unknown mode "${input.mode}"` };
+    const onFailure = String(input.onFailure ?? "continue");
+    if (onFailure !== "continue" && onFailure !== "stop") {
+      return { ok: false, error: `unknown onFailure "${input.onFailure}"` };
+    }
     const series: TaskSeries = {
       id: randomUUID(),
       name: String(input.name ?? "task series").trim().slice(0, SERIES_LIMITS.maxName) || "task series",
       steps: parsed.steps,
       mode,
+      onFailure: onFailure as "continue" | "stop",
       schedule: parseSchedule(input.schedule),
       enabled: input.enabled !== false,
       owner: input.owner ? String(input.owner).toLowerCase() : null,
@@ -256,6 +291,11 @@ export class SeriesStore {
   update(id: string, input: SeriesInput): { ok: true; series: TaskSeries } | { ok: false; error: string } {
     const s = this.series.find((x) => x.id === id);
     if (!s) return { ok: false, error: "no such series" };
+    if (input.onFailure !== undefined) {
+      const v = String(input.onFailure);
+      if (v !== "continue" && v !== "stop") return { ok: false, error: `unknown onFailure "${input.onFailure}"` };
+      s.onFailure = v;
+    }
     if (input.mode !== undefined) {
       const mode = String(input.mode) as SeriesMode;
       if (!MODES.includes(mode)) return { ok: false, error: `unknown mode "${input.mode}"` };
@@ -379,5 +419,37 @@ export class SeriesStore {
       nextRunAt: this.nextRunAt(s, now),
       scheduleText: describeSchedule(s.schedule),
     }));
+  }
+}
+
+/**
+ * Walk a sequential series, deciding only what runs next.
+ *
+ * Extracted from the runner so the ordering rule can be tested without a chain
+ * behind it. Nothing about spending lives here: `run` is the caller's, and it
+ * is the same `executeTask` path that has always done the spending. This
+ * decides which steps get a turn, and what to record for the ones that do not.
+ */
+export async function walkSequentially(
+  steps: SeriesStep[],
+  run: (step: SeriesStep) => Promise<"ok" | "failed" | "skipped">,
+  opts: {
+    onFailure: "continue" | "stop";
+    /** Checked before each step, so an operator's Stop takes effect mid-run. */
+    stopped: () => boolean;
+    /** Called for each step that never got a turn, with the reason. */
+    passedOver: (step: SeriesStep, why: string) => void;
+  },
+): Promise<void> {
+  for (const [at, step] of steps.entries()) {
+    if (opts.stopped()) {
+      for (const rest of steps.slice(at)) opts.passedOver(rest, "stopped by the operator");
+      return;
+    }
+    const outcome = await run(step);
+    if (outcome === "failed" && opts.onFailure === "stop") {
+      for (const rest of steps.slice(at + 1)) opts.passedOver(rest, "an earlier step failed");
+      return;
+    }
   }
 }

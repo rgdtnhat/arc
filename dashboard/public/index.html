@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v125" />
+    <meta name="tessera-shell" content="tessera-v126" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -2733,6 +2733,14 @@
                 <select id="serMode" class="field">
                   <option value="sequential">One after another</option>
                   <option value="parallel">All at once</option>
+                </select>
+                <!--
+                  Only meaningful for a sequential run; hidden for "all at once",
+                  where every step has already had its turn. See syncSeriesForm.
+                -->
+                <select id="serOnFailure" class="field" title="What happens when a step fails">
+                  <option value="continue">If one fails, run the rest</option>
+                  <option value="stop">If one fails, stop there</option>
                 </select>
               </div>
               <div class="kv" style="margin-bottom:5px">Steps, in the order they run</div>
