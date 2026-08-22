@@ -376,6 +376,19 @@ decision, so it has to be typed:
 npm run pool:tune-outflow -- --share=20 --allow-tighten
 ```
 
+By default the share is of **everything supplied to the reserve**, not of the
+cash currently free. Cash is supplied minus what is on loan, so a cap sized to
+it shrinks as people borrow — the limiter tightens exactly when the market is
+busiest, for a reason unrelated to anybody draining it. Nothing is given up:
+a cap above the free cash cannot release more than exists, because the pool
+refuses that itself with `InsufficientLiquidity` before the limiter is asked.
+`--basis=cash` restores the older behaviour.
+
+Note what neither option can be: **a share of one person's deposit.**
+`TesseraRateLimiter.consume(asset, amount)` takes no account — it is one bucket
+per asset, shared by everyone withdrawing or borrowing. Per-holder metering
+would need a different limiter contract and the pool repointed at it.
+
 A share is a policy — "a fifth of the reserve an hour, so draining takes five
 hours" — and reads the same at any size. What it is *not* is self-maintaining:
 the cap it writes is an absolute number, so it drifts as the reserve moves. A

@@ -32,6 +32,7 @@
  *   npm run pool:tune-outflow -- --share=25       # more cautious
  *   npm run pool:tune-outflow -- --asset=USDC     # one reserve only
  *   npm run pool:tune-outflow -- --share=20 --allow-tighten   # deliberately lower
+ *   npm run pool:tune-outflow -- --basis=cash     # size to free liquidity instead
  */
 import { createPublicClient, createWalletClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -52,6 +53,33 @@ const ONLY = flag("asset", "");
  * arrived at.
  */
 const TIGHTEN = process.argv.includes("--allow-tighten");
+/**
+ * What the share is a share *of*.
+ *
+ *   supplied — everything deposited in the reserve, lent out or not (default)
+ *   cash     — only what is free to leave right now
+ *
+ * `supplied` is the better basis and is why it is the default. `cash` is
+ * `supplied` minus what is on loan, so a cap sized to it *shrinks as people
+ * borrow* — the limiter tightens exactly when the market is busiest, for a
+ * reason that has nothing to do with anybody draining it. Sizing to the market
+ * instead means the cap describes a policy about the reserve rather than a
+ * reading of its current liquidity.
+ *
+ * Nothing is given up by the looser base: a cap above the free cash cannot let
+ * more out than exists, because the pool refuses that on its own with
+ * `InsufficientLiquidity` before the limiter is ever consulted.
+ *
+ * Note what neither option can be: a share of one *person's* deposit.
+ * `TesseraRateLimiter.consume(asset, amount)` takes no account — it is a single
+ * bucket per asset, shared by everyone who withdraws or borrows. Metering per
+ * holder would need a different limiter contract and the pool repointed at it.
+ */
+const BASIS = flag("basis", "supplied");
+if (BASIS !== "supplied" && BASIS !== "cash") {
+  console.error("--basis must be 'supplied' (the whole reserve) or 'cash' (only what is free right now).");
+  process.exit(1);
+}
 const PERIOD = 3600n;
 
 if (!Number.isFinite(SHARE) || SHARE <= 0 || SHARE > 100) {
@@ -80,7 +108,7 @@ async function main() {
   }
   console.log(`pool     ${pool}`);
   console.log(`limiter  ${limiter}`);
-  console.log(`share    ${SHARE}% of reserve cash per hour\n`);
+  console.log(`share    ${SHARE}% of ${BASIS === "supplied" ? "everything supplied to the reserve" : "the reserve's free cash"} per hour\n`);
 
   for (const a of dep.poolAssets ?? []) {
     if (ONLY && a.symbol !== ONLY && a.address.toLowerCase() !== ONLY.toLowerCase()) continue;
@@ -94,7 +122,10 @@ async function main() {
     const reserves = await pub.readContract({ address: pool, abi: tesseraPoolAbi, functionName: "reserves", args: [a.address] });
     const dec = Number(reserves[2]);
     const cash = rd[0];
-    const want = (cash * BigInt(Math.round(SHARE))) / 100n;
+    // Index 9 is totalSupplyAssets — see the Reserve struct in TesseraPool.sol.
+    const supplied = reserves[9];
+    const base = BASIS === "supplied" ? supplied : cash;
+    const want = (base * BigInt(Math.round(SHARE))) / 100n;
 
     const perHourNow = (cap * 3600n) / (period === 0n ? 3600n : period);
     if (want === 0n) {
@@ -114,19 +145,20 @@ async function main() {
      */
     if (want < perHourNow && !TIGHTEN) {
       console.log(
-        `${a.symbol.padEnd(7)} cash ${fmt(cash, dec).padStart(14)}  ` +
+        `${a.symbol.padEnd(7)} ${BASIS} ${fmt(base, dec).padStart(14)}  ` +
         `cap ${fmt(perHourNow, dec)}/h already exceeds ${SHARE}% of it — left alone ` +
         `(pass --allow-tighten to lower it)`,
       );
       continue;
     }
     if (want === perHourNow) {
-      console.log(`${a.symbol.padEnd(7)} cash ${fmt(cash, dec).padStart(14)}  cap already ${fmt(want, dec)}/h`);
+      console.log(`${a.symbol.padEnd(7)} ${BASIS} ${fmt(base, dec).padStart(14)}  cap already ${fmt(want, dec)}/h`);
       continue;
     }
     console.log(
-      `${a.symbol.padEnd(7)} cash ${fmt(cash, dec).padStart(14)}  ` +
-      `cap ${fmt(perHourNow, dec)}/h -> ${fmt(want, dec)}/h` +
+      `${a.symbol.padEnd(7)} ${BASIS} ${fmt(base, dec).padStart(14)}` +
+      (BASIS === "supplied" && supplied !== cash ? ` (cash ${fmt(cash, dec)})` : "") +
+      `  cap ${fmt(perHourNow, dec)}/h -> ${fmt(want, dec)}/h` +
       (want < perHourNow ? "   (TIGHTER — draining takes longer)" : ""),
     );
     const req = { address: limiter, abi: tesseraRateLimiterAbi, functionName: "setLimit", args: [a.address, want, PERIOD] };
