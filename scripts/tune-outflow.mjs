@@ -31,6 +31,7 @@
  *   npm run pool:tune-outflow                     # 50% of reserve cash per hour
  *   npm run pool:tune-outflow -- --share=25       # more cautious
  *   npm run pool:tune-outflow -- --asset=USDC     # one reserve only
+ *   npm run pool:tune-outflow -- --share=20 --allow-tighten   # deliberately lower
  */
 import { createPublicClient, createWalletClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -41,6 +42,16 @@ const DRY = process.argv.includes("--dry-run");
 const flag = (n, d) => (process.argv.find((a) => a.startsWith(`--${n}=`)) ?? "").split("=")[1] ?? d;
 const SHARE = Number(flag("share", "50"));
 const ONLY = flag("asset", "");
+/**
+ * Allow the share to *lower* a cap as well as raise it.
+ *
+ * Off by default, because a share of a thin reserve is smaller than the constant
+ * it replaces and a resize run to make withdrawals less annoying must not
+ * quietly clamp every small reserve on the way past. Tightening is a decision
+ * about how fast the pool may be drained, and it should be typed rather than
+ * arrived at.
+ */
+const TIGHTEN = process.argv.includes("--allow-tighten");
 const PERIOD = 3600n;
 
 if (!Number.isFinite(SHARE) || SHARE <= 0 || SHARE > 100) {
@@ -101,16 +112,22 @@ async function main() {
      * reserve, made deliberately with `setLimit`, not a side effect of a batch
      * somebody ran to make withdrawals less annoying.
      */
-    if (want <= perHourNow) {
+    if (want < perHourNow && !TIGHTEN) {
       console.log(
         `${a.symbol.padEnd(7)} cash ${fmt(cash, dec).padStart(14)}  ` +
-        `cap ${fmt(perHourNow, dec)}/h already exceeds ${SHARE}% of it — left alone`,
+        `cap ${fmt(perHourNow, dec)}/h already exceeds ${SHARE}% of it — left alone ` +
+        `(pass --allow-tighten to lower it)`,
       );
+      continue;
+    }
+    if (want === perHourNow) {
+      console.log(`${a.symbol.padEnd(7)} cash ${fmt(cash, dec).padStart(14)}  cap already ${fmt(want, dec)}/h`);
       continue;
     }
     console.log(
       `${a.symbol.padEnd(7)} cash ${fmt(cash, dec).padStart(14)}  ` +
-      `cap ${fmt(perHourNow, dec)}/h -> ${fmt(want, dec)}/h`,
+      `cap ${fmt(perHourNow, dec)}/h -> ${fmt(want, dec)}/h` +
+      (want < perHourNow ? "   (TIGHTER — draining takes longer)" : ""),
     );
     const req = { address: limiter, abi: tesseraRateLimiterAbi, functionName: "setLimit", args: [a.address, want, PERIOD] };
     const { request } = await pub.simulateContract({ ...req, account: deployer });

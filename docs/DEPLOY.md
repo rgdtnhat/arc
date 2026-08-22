@@ -366,11 +366,21 @@ hundredfold; the cap did not move. A cap should be a fraction of what it guards,
 not a number, and this resizes each one to a share of the cash actually in its
 reserve.
 
-**It only ever raises.** A share of a *thin* reserve is smaller than the constant
-it replaces — 50% of six EURC is three an hour against a standing cap of 250 —
-so a plain resize would quietly tighten every small reserve while loosening the
-one it was run for. Tightening a limit is a deliberate risk decision about a
-specific reserve, not a side effect of making withdrawals less annoying.
+**It only ever raises, unless you say otherwise.** A share of a *thin* reserve is
+smaller than the constant it replaces — 50% of six EURC is three an hour against
+a standing cap of 250 — so a plain resize would quietly tighten every small
+reserve while loosening the one it was run for. Tightening is a deliberate risk
+decision, so it has to be typed:
+
+```bash
+npm run pool:tune-outflow -- --share=20 --allow-tighten
+```
+
+A share is a policy — "a fifth of the reserve an hour, so draining takes five
+hours" — and reads the same at any size. What it is *not* is self-maintaining:
+the cap it writes is an absolute number, so it drifts as the reserve moves. A
+50% cap set when a reserve held 713 was 100% of it once the reserve fell to 356.
+Re-run it after the pool's size changes materially.
 
 What it does not give up: the limiter exists to make draining the pool take time
 somebody can notice and react in, not to make it impossible. At 50% an hour,
