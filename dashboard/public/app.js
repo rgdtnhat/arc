@@ -4484,6 +4484,15 @@ const $ = (id) => document.getElementById(id);
 
       /** The parameters each verb needs, so the form asks for those and no others. */
       const TASK_FIELDS = {
+        /*
+         * No fields, and that is the whole entry.
+         *
+         * A faucet decides its own amount and the address is the task's owner,
+         * so there is nothing to fill in. An empty list is a real answer here —
+         * `taskParamRow` renders nothing and the form is just a name and a
+         * schedule.
+         */
+        "faucet:topUp": [],
         "lending:supply": ["asset", "amount"], "lending:withdraw": ["asset", "amount"],
         "lending:borrow": ["asset", "amount"], "lending:repay": ["asset", "amount"],
         "vault:deposit": ["amount"], "vault:withdraw": ["shares"],

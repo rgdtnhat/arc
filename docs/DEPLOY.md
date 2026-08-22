@@ -351,6 +351,31 @@ sent back to back with no gap are all served and ten sent at once have four
 refused. The limit is concurrency, not spacing, so spacing calls out spends
 latency without buying anything. Unset it and let the defaults adapt.
 
+## Keeping a wallet funded on its own
+
+Tasks and series have a `faucet` venue with one verb, `topUp`. It is the only
+one that brings money *in*: it asks the testnet faucet to drip to the task's
+owner — the connected wallet for a visitor's task, the app wallet for an
+operator's.
+
+It sits outside the guardian cap and the session machinery deliberately. Those
+exist to bound an outflow, and none of them has anything to say about a deposit
+somebody else makes into your wallet; running a top-up past them would be checks
+that pass vacuously, which reads like a spend that was waved through.
+
+**It needs an API key to run unattended.** Without `CIRCLE_API_KEY` the faucet
+can only tell you where to top up by hand, so a scheduled `topUp` refuses and
+says which variable would enable it — rather than reporting a drip that never
+happened, which would leave a wallet believed funded and empty.
+
+```bash
+CIRCLE_API_KEY=…
+CIRCLE_FAUCET_BLOCKCHAIN=ARC-SEPOLIA   # the network id Circle knows Arc by
+```
+
+Faucets rate limit per address on their own side, so a top-up scheduled more
+often than the faucet allows simply fails that run and tries again on the next.
+
 ## When the withdrawal limit feels absurd
 
 ```bash

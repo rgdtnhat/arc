@@ -8977,6 +8977,48 @@ async function main() {
 
         return { ok: true, detail: `swapped in ${pool.name}`, txHash };
       }
+      case "faucet": {
+        /*
+         * Ask the testnet faucet for funds. The only task that brings money in.
+         *
+         * Whose wallet: the task's owner, or the app wallet for an operator's.
+         * A faucet drip is a deposit, so a visitor scheduling one is asking for
+         * their *own* address to be topped up — there is nothing here that
+         * could spend somebody else's money, which is why this venue sits
+         * outside the guardian cap and the session machinery rather than
+         * pretending to pass checks that have nothing to say about it.
+         *
+         * The address does leave the machine, so it is worth being plain that
+         * this hands a wallet address to Circle. That is what a faucet is.
+         */
+        const who = (t.owner ?? agentAccount.address) as Hex;
+        const result = await faucet.request(who);
+        if (result.ok) {
+          // A drip lands as a plain transfer, so nothing here has a receipt to
+          // wait on — the balance simply appears. Nudge the caches that would
+          // otherwise show yesterday's number for another poll.
+          if (chainCache) chainCache.at = 0;
+          invalidateAll();
+          return {
+            ok: true,
+            detail: `faucet asked to top up ${who.slice(0, 8)}…${result.amountUsdc ? ` — ${result.amountUsdc} USDC` : ""}`,
+            txHash: (result.txHash as string) ?? null,
+          };
+        }
+        /*
+         * A manual faucet is not a failure the scheduler can retry its way out
+         * of, and reporting it as a generic error would have somebody rerunning
+         * the task nightly for ever. Say what is missing and what would fix it.
+         */
+        if (result.manual) {
+          throw new Refusal(
+            `this deployment has no programmatic faucet, so a scheduled top-up cannot run: set ` +
+            `CIRCLE_API_KEY (and CIRCLE_FAUCET_BLOCKCHAIN for the right network) to enable it. ` +
+            `Until then, top up ${who} by hand at ${result.url ?? "https://faucet.circle.com/"}.`,
+          );
+        }
+        throw new Error(result.message);
+      }
       case "wallet": {
         const a = asset();
         /*
@@ -9297,12 +9339,32 @@ async function main() {
    */
   const SHARE_FUNDED = new Set(["sessionRemove", "sessionWithdraw", "sessionBorrow"]);
 
+  /**
+   * Verbs that name no funding source because they move nothing out.
+   *
+   * A faucet drip pays *into* the task owner's wallet. There is no session to
+   * name, no allowance to check and no cap to apply — every one of those exists
+   * to bound an outflow, and asking for them here would be theatre: checks that
+   * pass vacuously read, to anyone auditing the list, like a spend that was
+   * waved through. The authority that matters is simply whose address the funds
+   * land at, and the runner takes that from `t.owner` rather than any parameter,
+   * so a task cannot be pointed at somebody else's wallet.
+   *
+   * What a visitor can do with one is spend the *deployment's* faucet quota,
+   * which is a real cost and not a transfer of anybody's money. Faucets rate
+   * limit per address on their own side, and a scheduled top-up that is refused
+   * simply fails.
+   */
+  const INBOUND = new Set(["topUp"]);
+
   const SESSION_ACTIONS: Record<string, string[]> = {
     wallet: ["sessionSend", "sessionBulk"],
     lending: ["sessionSupply", "sessionRepay", "sessionWithdraw", "sessionBorrow"],
     vault: ["sessionDeposit", "sessionWithdraw"],
     amm: ["sessionAdd", "sessionSwap", "sessionRemove"],
     swap: ["sessionSwap"],
+    // Pays in, to the scheduler's own wallet. See INBOUND.
+    faucet: ["topUp"],
   };
 
   /**
@@ -9493,6 +9555,10 @@ async function main() {
     known?: SessionRow,
   ) {
     const action = String(body.action ?? "");
+    // A faucet top-up takes no parameters: the amount is the faucet's to decide
+    // and the address is the task's owner. There is nothing here to validate,
+    // and inventing a field to check would only be something to get wrong.
+    if (body.venue === "faucet") return;
     if (action === "sessionBorrow" || (action === "sessionWithdraw" && body.venue === "lending")) {
       let amount: bigint;
       try {
@@ -9714,7 +9780,7 @@ async function main() {
        * reads `t.owner` rather than any parameter, so a task cannot be pointed
        * at somebody else's position.
        */
-      if (!named.length && !SHARE_FUNDED.has(String(what.action))) {
+      if (!named.length && !SHARE_FUNDED.has(String(what.action)) && !INBOUND.has(String(what.action))) {
         throw new Gate(403, `${at}choose a session of your own to spend from`);
       }
       for (const sid of named) {
@@ -9748,7 +9814,7 @@ async function main() {
      * or stop. Reporting the funding wallet here lets the routes stamp it as
      * theirs, which is what it is.
      */
-    if (scope.operator && !SHARE_FUNDED.has(String(what.action))) {
+    if (scope.operator && !SHARE_FUNDED.has(String(what.action)) && !INBOUND.has(String(what.action))) {
       const sid = [
         ...(Array.isArray(what.params?.sessionIds) ? what.params.sessionIds.map((v) => String(v)) : []),
         ...(what.params?.sessionId !== undefined ? [String(what.params.sessionId)] : []),

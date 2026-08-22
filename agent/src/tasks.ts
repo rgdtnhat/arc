@@ -23,7 +23,7 @@ import { nextRun, parseSchedule, describeSchedule, type Schedule } from "./sched
  * overnight wakes up and does today's work, not last night's twelve times.
  */
 
-export type TaskVenue = "lending" | "amm" | "vault" | "swap" | "wallet";
+export type TaskVenue = "lending" | "amm" | "vault" | "swap" | "wallet" | "faucet";
 
 export interface Task {
   id: string;
@@ -84,7 +84,7 @@ export const TASK_LIMITS = {
   maxMessage: 200,
 };
 
-const VENUES: TaskVenue[] = ["lending", "amm", "vault", "swap", "wallet"];
+const VENUES: TaskVenue[] = ["lending", "amm", "vault", "swap", "wallet", "faucet"];
 
 /** What each venue will actually carry out. Anything else is refused at creation. */
 /*
@@ -117,6 +117,18 @@ export const TASK_ACTIONS: Record<TaskVenue, string[]> = {
   vault: ["deposit", "withdraw", "sessionDeposit", "sessionWithdraw"],
   swap: ["swap", "sessionSwap"],
   wallet: ["send", "bulk", "sessionSend", "sessionBulk"],
+  /*
+   * The one venue that brings money *in* rather than moving it out.
+   *
+   * Worth its own venue rather than a wallet verb, because everything the
+   * scheduler does to a spend — the guardian cap, the session's allowance, the
+   * blocklist — is about limiting an outflow, and none of it has anything to
+   * say about a deposit somebody else is making into your wallet. Filing it
+   * under `wallet` would put it behind checks that would all pass vacuously and
+   * would read, to anyone auditing the list, as a spend that had been waved
+   * through.
+   */
+  faucet: ["topUp"],
 };
 
 export class TaskStore {
