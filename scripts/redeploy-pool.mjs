@@ -68,6 +68,7 @@ import {
   pacedHttp,
   tesseraPoolAbi,
   tesseraPriceGuardAbi,
+  tesseraOracleAbi,
   tesseraEmissionsAbi,
   tesseraEmitterAbi,
   tesseraGaugeAbi,
@@ -310,6 +311,58 @@ async function main() {
   }
   if (categories.length) console.log(`  e-mode  ${categories.length} categor${categories.length === 1 ? "y" : "ies"} in use`);
 
+  /*
+   * Would the new pool be born frozen?
+   *
+   * The new pool is wired to the *same* risk oracle, and `_requireReliablePrices`
+   * walks every listed reserve before letting value out. So an asset the oracle
+   * cannot price does not stay behind with the retired pool — it freezes the new
+   * one from its first block, and twenty-seven transactions later the operator
+   * is exactly where they started, having also moved every position across.
+   *
+   * That is worth stopping for. `npm run pool:retire-risk` is three
+   * transactions and clears it; this is not the tool for that job, and running
+   * it first changes nothing about what this one does afterwards.
+   */
+  console.log(`\n[1b] can the risk oracle price every listed asset?\n`);
+  const dark = [];
+  const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+  if (config.global.riskOracle && config.global.riskOracle !== ZERO_ADDR) {
+    for (const a of config.assets) {
+      let st;
+      try {
+        st = await pub.readContract({
+          address: config.global.riskOracle, abi: tesseraOracleAbi, functionName: "status", args: [a.address],
+        });
+      } catch {
+        // Unknown is not a yes, but it is also not proof of a freeze — say so
+        // and let the operator decide, rather than blocking on a throttled read.
+        console.log(`  ?  ${a.symbol.padEnd(7)} could not ask the oracle`);
+        continue;
+      }
+      const [enabled, , , , , sources] = st;
+      if (enabled && Number(sources) === 0) {
+        dark.push(a.symbol);
+        console.log(`  ✗ ${a.symbol.padEnd(7)} no usable price — this alone freezes the whole pool`);
+      } else {
+        console.log(`  ✓ ${a.symbol.padEnd(7)} ${Number(sources)} source(s)`);
+      }
+    }
+  }
+  if (dark.length) {
+    const warning =
+      `${dark.join(", ")} ${dark.length === 1 ? "has" : "have"} no usable price on the risk oracle.\n\n` +
+      "  The new pool is wired to that same oracle and checks every reserve before it\n" +
+      "  releases value, so it would be frozen from its first block exactly as this one\n" +
+      "  is: no borrowing, and no withdrawal by any wallet carrying debt.\n\n" +
+      "  Fix that first — it is three transactions, not twenty-seven:\n\n" +
+      "      npm run pool:retire-risk -- --dry-run\n" +
+      "      npm run pool:retire-risk\n\n" +
+      "  Then come back to this. Nothing about the redeploy changes in the meantime.";
+    if (EXECUTE) throw new Error(`Refusing to redeploy into a freeze.\n\n  ${warning}`);
+    console.log(`\n  !! ${warning}\n`);
+  }
+
   // --- 2. the security check the redeploy is for ----------------------------
   /*
    * The point of the exercise is that the new pool can list TSRA borrowable —
@@ -363,13 +416,23 @@ async function main() {
      * Whether *this* run may promote an asset to borrowable. An asset that was
      * already borrowable stays as it was — the old pool's judgement is carried,
      * not re-litigated. A promotion needs the guard.
+     *
+     * And it needs the asset to still carry collateral weight. A reserve sitting
+     * at `cFactor = 0` is not merely unlisted for borrowing, it has been taken
+     * off risk duty on purpose — that is how `pool:retire-risk` rescues a pool
+     * frozen by an asset the oracle cannot price. Promoting it here because a
+     * guard bands its mark would quietly re-litigate that decision on the new
+     * pool, and the mark in question is precisely the one being *held* rather
+     * than quoted. A guard that bands a stale number still bands a stale number.
      */
-    a.promote = !a.borrowable && guarded.includes(a.symbol);
+    a.promote = !a.borrowable && a.cFactor > 0 && guarded.includes(a.symbol);
     if (!a.borrowable && !a.promote) {
       console.log(
-        unreadable.includes(a.symbol)
-          ? `  note   ${a.symbol} stays supply-only — the guard could not be asked, and an unread verdict is not a yes`
-          : `  note   ${a.symbol} stays supply-only — band it on the guard (setPeg) to list it borrowable`,
+        a.cFactor === 0
+          ? `  note   ${a.symbol} stays supply-only — it carries no collateral weight, so it was retired on purpose`
+          : unreadable.includes(a.symbol)
+            ? `  note   ${a.symbol} stays supply-only — the guard could not be asked, and an unread verdict is not a yes`
+            : `  note   ${a.symbol} stays supply-only — band it on the guard (setPeg) to list it borrowable`,
       );
     }
     if (a.promote) console.log(`  note   ${a.symbol} will be listed borrowable, because the guard bands it`);
