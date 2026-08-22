@@ -2604,8 +2604,33 @@ const $ = (id) => document.getElementById(id);
          */
         const bound = a.limitedBy && a.limitedBy[action];
         if (bound === "outflow" && a.outflowBudget != null) {
-          why = ` — capped by the outflow limiter, which will release ${a.outflowBudget} ${a.symbol} ` +
-            `this hour and refills steadily`;
+          /*
+           * A wait, not a wall.
+           *
+           * This used to say the limiter "will release N this hour", which
+           * reads as a ceiling for the next sixty minutes. It is not: N is the
+           * bucket's level right now, and it refills continuously. On the live
+           * pool that meant "8.747 this hour" when the true answer was 250 an
+           * hour and a two-minute wait for the rest — the app's own scheduled
+           * tasks had drained the bucket moments earlier.
+           *
+           * Saying the rate turns an arbitrary-looking number into something a
+           * reader can plan around, which is the whole difference between a
+           * limit that protects the pool and one that just annoys people.
+           */
+          const now = Number(String(a.outflowBudget).replace(/,/g, ""));
+          const rate = a.outflowRefill && Number(String(a.outflowRefill.perHour).replace(/,/g, ""));
+          why = ` — capped by the outflow limiter: ${a.outflowBudget} ${a.symbol} available right now`;
+          if (rate > 0) {
+            why += `, refilling at ${a.outflowRefill.perHour} ${a.symbol}/hour`;
+            // How long until the amount they are actually reaching for is free.
+            const want = Number(String($("lnAmount") ? $("lnAmount").value : "").replace(/,/g, ""));
+            const target = Number.isFinite(want) && want > now ? want : null;
+            if (target !== null) {
+              const mins = Math.ceil(((target - now) / rate) * 60);
+              why += ` — ${target} in about ${mins < 60 ? `${mins} minute${mins === 1 ? "" : "s"}` : `${(mins / 60).toFixed(1)} hours`}`;
+            }
+          }
         } else if (bound === "liquidity" && action === "borrow") {
           why = " — capped by the cash in the reserve, not by your collateral";
         }
@@ -2734,7 +2759,13 @@ const $ = (id) => document.getElementById(id);
       $("lnAsset").addEventListener("change", () => { renderLendingAsset(); refreshMyPositions().catch(() => {}); });
       $("lnAction").addEventListener("change", renderLendingAsset);
       // Manual edits invalidate the remembered exact-MAX raw value.
-      $("lnAmount").addEventListener("input", () => { delete $("lnAmount").dataset.raw; });
+      $("lnAmount").addEventListener("input", () => {
+        delete $("lnAmount").dataset.raw;
+        // Re-draw the cap hint: when the outflow limiter is what binds, the hint
+        // says how long until *this* amount is available, so it has to follow
+        // what is typed rather than freeze at whatever was there on load.
+        if (typeof renderLendingAsset === "function") renderLendingAsset();
+      });
       $("lnMax").addEventListener("click", fillMax);
       $("lnExecute").addEventListener("click", async () => {
         const a = selectedLendingAsset();

@@ -1437,9 +1437,28 @@ async function main() {
       .readContract({ address: poolDeployment.poolAddress, abi: tesseraPoolAbi, functionName: "rateLimiter" })
       .catch(() => null)) as Hex | null;
     const outflowBudget = new Map<string, bigint>();
+    /*
+     * The refill rate, not just the level.
+     *
+     * Only `available` was read, so the panel could say "max withdraw 8.747"
+     * and nothing about what that meant. It read as a hard ceiling for the
+     * hour — and the honest answer was closer to "wait two minutes", because
+     * the bucket refills at 250 an hour and had simply been drained by the
+     * app's own scheduled tasks a moment earlier. A limit somebody can wait out
+     * is a very different thing from one they cannot, and the difference was
+     * invisible.
+     */
+    const outflowRate = new Map<string, { cap: bigint; period: number }>();
     if (limiterAddr && limiterAddr !== "0x0000000000000000000000000000000000000000") {
       await Promise.all(
         poolDeployment.assets.map(async (a) => {
+          const cfg = (await pool.public
+            .readContract({ address: limiterAddr, abi: tesseraRateLimiterAbi, functionName: "limitOf", args: [a.address as Hex] })
+            .catch(() => null)) as readonly [bigint, bigint, bigint, bigint] | null;
+          // cap 0 is the limiter's way of saying "unmetered" — no rate to show.
+          if (cfg && cfg[0] > 0n && cfg[1] > 0n) {
+            outflowRate.set(a.address.toLowerCase(), { cap: cfg[0], period: Number(cfg[1]) });
+          }
           const v = await pool.public
             .readContract({ address: limiterAddr, abi: tesseraRateLimiterAbi, functionName: "available", args: [a.address as Hex] })
             .catch(() => null);
@@ -1647,6 +1666,19 @@ async function main() {
           },
           /** What the limiter will release this second, or null when unmetered. */
           outflowBudget: outflow === undefined ? null : fmtUnits(outflow, dec),
+          /*
+           * What the budget refills at, so a cap can be read as a wait rather
+           * than a wall. Absent when the asset is unmetered.
+           */
+          outflowRefill: (() => {
+            const rate = outflowRate.get(a.address.toLowerCase());
+            if (!rate) return null;
+            return {
+              perHour: fmtUnits((rate.cap * 3600n) / BigInt(Math.max(1, rate.period)), dec),
+              capRaw: rate.cap.toString(),
+              periodSeconds: rate.period,
+            };
+          })(),
           max: {
             supply: fmtUnits(supplyMax, dec),
             withdraw: fmtUnits(withdrawMax, dec),

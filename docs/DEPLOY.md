@@ -351,6 +351,34 @@ sent back to back with no gap are all served and ten sent at once have four
 refused. The limit is concurrency, not spacing, so spacing calls out spends
 latency without buying anything. Unset it and let the defaults adapt.
 
+## When the withdrawal limit feels absurd
+
+```bash
+npm run pool:tune-outflow -- --dry-run   # show the plan
+npm run pool:tune-outflow                # 50% of each reserve's cash per hour
+npm run pool:tune-outflow -- --share=25  # more cautious
+```
+
+The outflow limiter meters every withdraw and borrow against a per-asset budget
+that refills over an hour. The caps were set once, at deployment, as constants —
+250 USDC an hour, chosen when the reserve held five. The reserve grew a
+hundredfold; the cap did not move. A cap should be a fraction of what it guards,
+not a number, and this resizes each one to a share of the cash actually in its
+reserve.
+
+**It only ever raises.** A share of a *thin* reserve is smaller than the constant
+it replaces — 50% of six EURC is three an hour against a standing cap of 250 —
+so a plain resize would quietly tighten every small reserve while loosening the
+one it was run for. Tightening a limit is a deliberate risk decision about a
+specific reserve, not a side effect of making withdrawals less annoying.
+
+What it does not give up: the limiter exists to make draining the pool take time
+somebody can notice and react in, not to make it impossible. At 50% an hour,
+emptying a reserve still takes two hours of sustained outflow. The gap between
+50% and 32% is not what stands between this pool and an attacker; the gap
+between either and no limiter at all is. `--share=0` is refused — unmetering an
+asset is `clearLimit` on the contract, a separate and deliberate act.
+
 ## When one asset's outage freezes the whole pool
 
 ```bash
