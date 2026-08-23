@@ -49,7 +49,7 @@ import {
   tesseraAmmBytecode,
 } from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
-import { faucetFromEnv } from "./circle/faucet.js";
+import { faucetFromEnv, FAUCET_ASSETS, type FaucetAsset } from "./circle/faucet.js";
 import { createProviderApp, type ProviderEvent } from "@tessera/providers";
 import { CATALOG } from "@tessera/providers/catalog";
 import { TesseraClient } from "./client.js";
@@ -8991,8 +8991,36 @@ async function main() {
          * The address does leave the machine, so it is worth being plain that
          * this hands a wallet address to Circle. That is what a faucet is.
          */
-        const who = (t.owner ?? agentAccount.address) as Hex;
-        const result = await faucet.request(who);
+        /*
+         * Where it lands, and who may say so.
+         *
+         * An operator may name any address — they are spending their own faucet
+         * quota and topping up whoever they meant to. A visitor may not: their
+         * task funds the wallet they connected with, full stop. Letting them
+         * name a destination would turn the operator's quota into a drip
+         * anybody could aim anywhere, which is not theft but is not theirs to
+         * direct either.
+         *
+         * Unowned tasks are the operator's, so `t.owner` being null *is* the
+         * permission — the same test every other verb here uses.
+         */
+        const asked = String(p.to ?? "").trim();
+        if (asked && !/^0x[0-9a-fA-F]{40}$/.test(asked)) {
+          throw new Refusal(`"${asked}" is not an address`);
+        }
+        if (asked && t.owner && asked.toLowerCase() !== t.owner.toLowerCase()) {
+          throw new Refusal(
+            "a top-up scheduled from your own wallet funds that wallet. Leave the address blank, " +
+            "or ask the operator to schedule one for somewhere else.",
+          );
+        }
+        const who = (asked || t.owner || agentAccount.address) as Hex;
+
+        const wanted = String(p.asset ?? "usdc").toLowerCase();
+        if (!(FAUCET_ASSETS as readonly string[]).includes(wanted)) {
+          throw new Refusal(`the faucet drips ${FAUCET_ASSETS.join(", ")} — not "${String(p.asset)}"`);
+        }
+        const result = await faucet.request(who, wanted as FaucetAsset);
         if (result.ok) {
           // A drip lands as a plain transfer, so nothing here has a receipt to
           // wait on — the balance simply appears. Nudge the caches that would
@@ -9001,7 +9029,9 @@ async function main() {
           invalidateAll();
           return {
             ok: true,
-            detail: `faucet asked to top up ${who.slice(0, 8)}…${result.amountUsdc ? ` — ${result.amountUsdc} USDC` : ""}`,
+            detail:
+              `faucet asked to top up ${who.slice(0, 8)}… with ${wanted.toUpperCase()}` +
+              (result.amountUsdc ? ` — ${result.amountUsdc}` : ""),
             txHash: (result.txHash as string) ?? null,
           };
         }
@@ -9612,7 +9642,17 @@ async function main() {
     // A faucet top-up takes no parameters: the amount is the faucet's to decide
     // and the address is the task's owner. There is nothing here to validate,
     // and inventing a field to check would only be something to get wrong.
-    if (body.venue === "faucet") return;
+    if (body.venue === "faucet") {
+      // Both fields are optional — the default is USDC to the task's own owner —
+      // so this only rejects values that could not work.
+      const a = String(body.params?.asset ?? "usdc").toLowerCase();
+      if (!(FAUCET_ASSETS as readonly string[]).includes(a)) {
+        throw new Error(`the faucet drips ${FAUCET_ASSETS.join(", ")} — not "${String(body.params?.asset)}"`);
+      }
+      const to = String(body.params?.to ?? "").trim();
+      if (to && !/^0x[0-9a-fA-F]{40}$/.test(to)) throw new Error(`"${to}" is not an address`);
+      return;
+    }
     if (action === "fundFromOwner") {
       // Only the amount is required: the destination defaults to the app wallet,
       // which is the wallet this exists to keep funded.

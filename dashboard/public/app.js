@@ -4492,7 +4492,7 @@ const $ = (id) => document.getElementById(id);
          * `taskParamRow` renders nothing and the form is just a name and a
          * schedule.
          */
-        "faucet:topUp": [],
+        "faucet:topUp": ["faucetAsset", "to"],
         "lending:supply": ["asset", "amount"], "lending:withdraw": ["asset", "amount"],
         "lending:borrow": ["asset", "amount"], "lending:repay": ["asset", "amount"],
         "vault:deposit": ["amount"], "vault:withdraw": ["shares"],
@@ -4588,6 +4588,19 @@ const $ = (id) => document.getElementById(id);
         row.querySelectorAll("[data-tp]").forEach((el) => { kept[el.dataset.tp] = el.value; });
         row.dataset.sig = sig;
         row.innerHTML = fields.map((f) => {
+          /*
+           * The faucet's asset list is the faucet's, not the pool's.
+           *
+           * `assetOptions` is built from the wallet's tokens and carries
+           * addresses; Circle's drip takes a token *name* and knows a different
+           * set. Reusing the pool picker here would offer TSRA, which no faucet
+           * has, and send an address where a name is expected.
+           */
+          if (f === "faucetAsset") {
+            return `<select class="field" data-tp="asset">` +
+              ["usdc", "eurc", "cirbtc"].map((a) => `<option value="${a}">${a.toUpperCase()}</option>`).join("") +
+              `</select>`;
+          }
           if (f === "asset" || f === "tokenIn" || f === "tokenOut") {
             return `<select class="field" data-tp="${f}">${assetOptions}</select>`;
           }
@@ -4640,10 +4653,14 @@ const $ = (id) => document.getElementById(id);
             return `<input class="field" data-tp="memo" maxlength="180" ` +
               `placeholder="On-chain memo, sent with each payment (optional)" style="min-width:200px;flex:1" />`;
           }
-          const ph = {
-            amount: "Amount", amountIn: "Amount in", shares: "Shares", assets: "Amount",
-            poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient",
-          }[f] || f;
+          const ph = (venue === "faucet" && f === "to"
+            ? "0x… address (blank = your own wallet)"
+            : venue === "wallet" && action === "fundFromOwner" && f === "to"
+              ? "0x… address (blank = the app wallet)"
+              : {
+                  amount: "Amount", amountIn: "Amount in", shares: "Shares", assets: "Amount",
+                  poolId: "Pool id", amounts: "Amounts, comma separated", to: "0x… recipient",
+                }[f]) || f;
           return `<input class="field" data-tp="${f}" placeholder="${esc(ph)}" style="min-width:${f === "to" ? 210 : 120}px" />`;
         }).join("");
         // Restore anything the visitor had already typed that this verb still

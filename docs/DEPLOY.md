@@ -358,6 +358,19 @@ one that brings money *in*: it asks the testnet faucet to drip to the task's
 owner — the connected wallet for a visitor's task, the app wallet for an
 operator's.
 
+Two optional parameters:
+
+- **asset** — `usdc` (default), `eurc` or `cirbtc`. Circle's drip takes a
+  boolean per token rather than a name, so the choice *is* the field sent, and
+  one at a time: two flags in a request make a partial failure unreadable, since
+  either token being unsupported rejects the whole drip. `usdc` and `eurc` are
+  the two Circle documents; `cirbtc` is offered because Arc carries it, and if
+  the endpoint does not know it the reply says so in as many words.
+- **to** — an address. Blank means the task's own owner. An **operator** may name
+  any address; a **visitor** may not, because their task funds the wallet they
+  connected with. Letting them name a destination would turn the operator's
+  quota into a drip anybody could aim anywhere.
+
 It sits outside the guardian cap and the session machinery deliberately. Those
 exist to bound an outflow, and none of them has anything to say about a deposit
 somebody else makes into your wallet; running a top-up past them would be checks

@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { TaskStore, TASK_ACTIONS } from "../src/tasks.js";
-import { CircleFaucet } from "../src/circle/faucet.js";
+import { CircleFaucet, FAUCET_ASSETS } from "../src/circle/faucet.js";
 
 /**
  * Scheduling a testnet top-up.
@@ -272,4 +272,72 @@ test("a schedule is kept, so a wallet can keep itself topped up", () => {
     schedule: { kind: "every", seconds: 86_400 },
   }));
   assert.equal(s.due(Date.now() + 90_000_000).length, 1);
+});
+
+/*
+ * Choosing what to ask for, and where it lands.
+ */
+
+test("the asset asked for is the flag that gets sent", async () => {
+  /*
+   * Circle's drip takes a boolean per token rather than a token name, so the
+   * asset choice *is* the field name. Getting this wrong would not error — it
+   * would quietly request nothing, or the wrong thing.
+   */
+  for (const asset of ["usdc", "eurc", "cirbtc"] as const) {
+    let sent = "";
+    await new CircleFaucet({
+      apiKey: "k",
+      blockchain: "ARC-TESTNET",
+      fetchImpl: (async (_u: string, init: { body: string }) => {
+        sent = init.body;
+        return { ok: true, status: 200, text: async () => "", json: async () => ({}) };
+      }) as unknown as typeof fetch,
+    }).request(("0x" + "3".repeat(40)) as `0x${string}`, asset);
+    const body = JSON.parse(sent) as Record<string, unknown>;
+    assert.equal(body[asset], true, `${asset} was not requested`);
+    // And only that one: two flags in a request make a partial failure
+    // unreadable, since either token being unsupported rejects the whole drip.
+    for (const other of ["usdc", "eurc", "cirbtc"].filter((x) => x !== asset)) {
+      assert.equal(other in body, false, `${asset} request also asked for ${other}`);
+    }
+  }
+});
+
+test("USDC is what you get if you do not choose", async () => {
+  let sent = "";
+  await new CircleFaucet({
+    apiKey: "k",
+    fetchImpl: (async (_u: string, init: { body: string }) => {
+      sent = init.body;
+      return { ok: true, status: 200, text: async () => "", json: async () => ({}) };
+    }) as unknown as typeof fetch,
+  }).request(("0x" + "4".repeat(40)) as `0x${string}`);
+  assert.equal((JSON.parse(sent) as Record<string, unknown>).usdc, true);
+});
+
+test("the asset comes back on the result, whatever happened", async () => {
+  // A receipt that does not say which token was asked for cannot be checked
+  // against the balance that did or did not move.
+  const okRes = await new CircleFaucet({
+    apiKey: "k",
+    fetchImpl: (async () => ({ ok: true, status: 200, text: async () => "", json: async () => ({}) })) as unknown as typeof fetch,
+  }).request(("0x" + "5".repeat(40)) as `0x${string}`, "eurc");
+  assert.equal(okRes.asset, "eurc");
+  assert.match(okRes.message, /EURC/);
+
+  const manual = await new CircleFaucet({}).request(("0x" + "6".repeat(40)) as `0x${string}`, "cirbtc");
+  assert.equal(manual.asset, "cirbtc");
+  assert.match(manual.message, /CIRBTC/, "the manual instructions must name the token to pick");
+});
+
+test("an unsupported token is Circle's answer to give, not ours to guess", () => {
+  /*
+   * `usdc` and `eurc` are the two Circle documents; `cirbtc` is offered because
+   * Arc carries it. If the endpoint does not know a token it says so in as many
+   * words — "The 'cirbtc' token is not supported by 'ARC-TESTNET' blockchain" —
+   * and that reply reaches the operator verbatim. Hiding the option to avoid a
+   * possible error would be deciding on Circle's behalf.
+   */
+  assert.deepEqual([...FAUCET_ASSETS], ["usdc", "eurc", "cirbtc"]);
 });

@@ -18,6 +18,8 @@ export const CIRCLE_FAUCET_API = "https://api.circle.com/v1/faucet/drips";
 
 export interface FaucetResult {
   ok: boolean;
+  /** Which asset was asked for. */
+  asset?: FaucetAsset;
   /** True when no programmatic drip is available — a human must use the web faucet. */
   manual?: boolean;
   /**
@@ -34,9 +36,22 @@ export interface FaucetResult {
   message: string;
 }
 
+/**
+ * Which asset to ask for.
+ *
+ * Circle's drip endpoint takes a boolean per token rather than a token name, so
+ * these are the field names it expects — `usdc` and `eurc` are the two it
+ * documents. `cirbtc` is offered because Arc carries it, and if the endpoint
+ * does not know it the reply says so in as many words ("The 'cirbtc' token is
+ * not supported by 'ARC-TESTNET' blockchain"), which is a better answer than
+ * pretending the choice does not exist.
+ */
+export const FAUCET_ASSETS = ["usdc", "eurc", "cirbtc"] as const;
+export type FaucetAsset = (typeof FAUCET_ASSETS)[number];
+
 export interface Faucet {
   readonly kind: string;
-  request(address: Hex): Promise<FaucetResult>;
+  request(address: Hex, asset?: FaucetAsset): Promise<FaucetResult>;
 }
 
 export interface CircleFaucetConfig {
@@ -69,15 +84,16 @@ export class CircleFaucet implements Faucet {
   readonly kind = "circle";
   constructor(private readonly cfg: CircleFaucetConfig = {}) {}
 
-  async request(address: Hex): Promise<FaucetResult> {
+  async request(address: Hex, asset: FaucetAsset = "usdc"): Promise<FaucetResult> {
     const apiUrl = this.cfg.apiUrl ?? (this.cfg.apiKey ? CIRCLE_FAUCET_API : undefined);
     if (!apiUrl) {
       return {
         ok: false,
         manual: true,
         address,
+        asset,
         url: CIRCLE_FAUCET_URL,
-        message: `Open ${CIRCLE_FAUCET_URL}, pick Arc Testnet + USDC, and paste ${address}`,
+        message: `Open ${CIRCLE_FAUCET_URL}, pick Arc Testnet + ${asset.toUpperCase()}, and paste ${address}`,
       };
     }
     const doFetch = this.cfg.fetchImpl ?? fetch;
@@ -93,7 +109,11 @@ export class CircleFaucet implements Faucet {
           blockchain: this.cfg.blockchain ?? "ARC-SEPOLIA",
           // See `native` above: on Arc this must not be asked for at all.
           ...(this.cfg.native ? { native: true } : {}),
-          usdc: true,
+          // One flag, named for the asset. Asking for two in a request means a
+          // partial failure has no sensible reading — either token being
+          // unsupported rejects the whole drip, so the caller would not know
+          // which one it got.
+          [asset]: true,
         }),
       });
       if (!res.ok) {
@@ -134,6 +154,7 @@ export class CircleFaucet implements Faucet {
         return {
           ok: false,
           address,
+          asset,
           // A rate limit is worth telling apart upstream too: it is the one
           // failure where trying the same thing later is exactly right.
           throttled: res.status === 429,
@@ -145,8 +166,9 @@ export class CircleFaucet implements Faucet {
       return {
         ok: true,
         address,
+        asset,
         txHash: json.txHash ?? json.data?.txHash,
-        message: "Requested testnet USDC from the Circle faucet API",
+        message: `Requested testnet ${asset.toUpperCase()} from the Circle faucet API`,
       };
     } catch (err) {
       return {
