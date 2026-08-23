@@ -173,3 +173,51 @@ test("the address is the one asked for, not one the client chose", async () => {
   const body = await bodyOf({ blockchain: "ARC-TESTNET" });
   assert.equal(body.address, "0x" + "1".repeat(40));
 });
+
+/*
+ * Advice that matches the status.
+ *
+ * The generic version told the reader to check their key and network id
+ * whatever went wrong — and the first thing that went wrong once both were
+ * correct was a 429, so the app confidently pointed at two settings that were
+ * fine. A rate limit is not a misconfiguration; it is the faucet working.
+ */
+
+const failing = (status: number, body: string) =>
+  new CircleFaucet({
+    apiKey: "k",
+    blockchain: "ARC-TESTNET",
+    fetchImpl: (async () => ({ ok: false, status, text: async () => body, json: async () => ({}) })) as unknown as typeof fetch,
+  }).request(("0x" + "2".repeat(40)) as `0x${string}`);
+
+test("a rate limit says to wait, not to check settings that are already right", async () => {
+  const r = await failing(429, '{"code":5,"message":"API rate limit error"}');
+  assert.equal(r.ok, false);
+  assert.equal(r.throttled, true, "a scheduler needs to tell this from a broken request");
+  assert.match(r.message, /rate limiting/);
+  assert.match(r.message, /key and the network are right/);
+  assert.doesNotMatch(r.message, /Check CIRCLE_FAUCET_BLOCKCHAIN/, "it sent the reader after a setting that was fine");
+});
+
+test("a rejected key says so, and does not blame the network id", async () => {
+  const r = await failing(401, '{"message":"unauthorized"}');
+  assert.match(r.message, /authentication failure/);
+  assert.match(r.message, /CIRCLE_API_KEY/);
+  assert.notEqual(r.throttled, true);
+});
+
+test("anything else still points at both settings, because either could be it", async () => {
+  const r = await failing(400, '{"message":"bad blockchain"}');
+  assert.match(r.message, /CIRCLE_FAUCET_BLOCKCHAIN/);
+  assert.match(r.message, /ARC-TESTNET/, "naming the value actually sent is what makes it fixable");
+  assert.notEqual(r.throttled, true);
+});
+
+test("whatever the status, the faucet's own words survive", async () => {
+  // The sentence Circle wrote is the most useful thing in the message and must
+  // not be replaced by our interpretation of it.
+  for (const [status, body] of [[429, "API rate limit error"], [401, "unauthorized"], [400, "bad blockchain"]] as const) {
+    const r = await failing(status, body);
+    assert.match(r.message, new RegExp(body), `HTTP ${status} lost the reason`);
+  }
+});

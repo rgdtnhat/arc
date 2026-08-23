@@ -20,6 +20,12 @@ export interface FaucetResult {
   ok: boolean;
   /** True when no programmatic drip is available — a human must use the web faucet. */
   manual?: boolean;
+  /**
+   * True when the faucet refused for rate limiting rather than for anything
+   * wrong with the request. The distinction matters to a scheduler: this is the
+   * one failure where running the identical task later is the correct response.
+   */
+  throttled?: boolean;
   address: Hex;
   /** Web faucet URL to open when manual. */
   url?: string;
@@ -106,15 +112,33 @@ export class CircleFaucet implements Faucet {
         // into an unhandled one.
         const body = typeof res.text === "function" ? await res.text().catch(() => "") : "";
         const said = body.trim().slice(0, 200);
+        /*
+         * Advice that matches the status, not one paragraph for every failure.
+         *
+         * The generic version told the reader to check their key and network id
+         * whatever went wrong — and the first thing that went wrong after they
+         * were both correct was a 429, so the app confidently pointed at two
+         * settings that were fine. A rate limit is not a misconfiguration; it is
+         * the faucet working, and the only action is to wait.
+         */
+        const advice =
+          res.status === 429
+            ? "The faucet is rate limiting, which means the key and the network are right — it " +
+              "allows a drip per address only every so often. Wait and run it again; a scheduled " +
+              `top-up will simply succeed on a later run. ${CIRCLE_FAUCET_URL} keeps its own ` +
+              "separate allowance if you need funds now."
+            : res.status === 401 || res.status === 403
+              ? "That is an authentication failure: check CIRCLE_API_KEY."
+              : `Check CIRCLE_FAUCET_BLOCKCHAIN (currently "${this.cfg.blockchain ?? "ARC-SEPOLIA"}") ` +
+                `and CIRCLE_API_KEY, or use ${CIRCLE_FAUCET_URL}`;
         return {
           ok: false,
           address,
+          // A rate limit is worth telling apart upstream too: it is the one
+          // failure where trying the same thing later is exactly right.
+          throttled: res.status === 429,
           url: CIRCLE_FAUCET_URL,
-          message:
-            `Circle faucet API returned HTTP ${res.status}` +
-            (said ? ` — ${said}` : "") +
-            `. Check CIRCLE_API_KEY and CIRCLE_FAUCET_BLOCKCHAIN (currently ` +
-            `"${this.cfg.blockchain ?? "ARC-SEPOLIA"}"), or use ${CIRCLE_FAUCET_URL}`,
+          message: `Circle faucet API returned HTTP ${res.status}` + (said ? ` — ${said}` : "") + `. ${advice}`,
         };
       }
       const json = (await res.json().catch(() => ({}))) as { txHash?: string; data?: { txHash?: string } };
