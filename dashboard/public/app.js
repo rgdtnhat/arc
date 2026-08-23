@@ -4574,6 +4574,33 @@ const $ = (id) => document.getElementById(id);
        *   same parameters for a given verb — one builder, so a field added for
        *   one can never quietly be missing from the other.
        */
+      /**
+       * Verbs whose `to` may be left blank, and what blank means for each.
+       *
+       * `wallet:send` needs a recipient — there is nowhere sensible for a
+       * payment with no destination to go. These two have a default that is
+       * more useful than anything a reader would type: the faucet drips to your
+       * own wallet, and a top-up from the deployer lands in the app wallet it
+       * exists to keep funded. Both placeholders say so.
+       */
+      const OPTIONAL_TO = new Set(["faucet:topUp", "wallet:fundFromOwner"]);
+
+      /**
+       * The address complaint, or null when there is nothing to complain about.
+       *
+       * Shared by the task form and the series-step form because they had the
+       * same check written out twice, and a rule duplicated is a rule that gets
+       * fixed once. Both said "that is not an address" for an empty box the
+       * placeholder had just described as optional.
+       */
+      function addressProblem(prefix, venue, action) {
+        const el = $(`${prefix}ParamRow`).querySelector('[data-tp="to"]');
+        if (!el) return null;
+        const value = el.value.trim();
+        if (!value) return OPTIONAL_TO.has(`${venue}:${action}`) ? null : "that is not an address";
+        return /^0x[0-9a-fA-F]{40}$/.test(value) ? null : "that is not an address";
+      }
+
       function taskParamRow(prefix = "task") {
         const venue = $(`${prefix}Venue`).value, action = $(`${prefix}Action`).value;
         const fields = TASK_FIELDS[`${venue}:${action}`] || [];
@@ -5322,10 +5349,8 @@ const $ = (id) => document.getElementById(id);
             if (bad.length) return showReceipt("taskMsg", false, `line ${bad.join(", ")} is not "address,amount"`);
             if (!rows.length) return showReceipt("taskMsg", false, "add at least one recipient");
           }
-          const toEl = $("taskParamRow").querySelector('[data-tp="to"]');
-          if (toEl && !/^0x[0-9a-fA-F]{40}$/.test(toEl.value.trim())) {
-            return showReceipt("taskMsg", false, "that is not an address");
-          }
+          const toProblem = addressProblem("task", $("taskVenue").value, $("taskAction").value);
+          if (toProblem) return showReceipt("taskMsg", false, toProblem);
           btn.disabled = true;
           showBusy("taskMsg", editingTask ? "saving your changes…" : "saving the task…");
           try {
@@ -5716,11 +5741,8 @@ const $ = (id) => document.getElementById(id);
             if (bad.length) { $("stepHint").textContent = `line ${bad.join(", ")} is not "address,amount"`; return; }
             if (!rows.length) { $("stepHint").textContent = "add at least one recipient"; return; }
           }
-          const toEl = $("stepParamRow").querySelector('[data-tp="to"]');
-          if (toEl && !/^0x[0-9a-fA-F]{40}$/.test(toEl.value.trim())) {
-            $("stepHint").textContent = "that is not an address";
-            return;
-          }
+          const toProblem = addressProblem("step", venue, action);
+          if (toProblem) { $("stepHint").textContent = toProblem; return; }
           if (serSteps.length >= (seriesLimits.maxMembers || 25) && !editingStep) {
             $("stepHint").textContent = `that is the ${seriesLimits.maxMembers}-step limit for one series`;
             return;
