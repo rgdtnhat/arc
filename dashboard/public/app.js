@@ -5181,6 +5181,19 @@ const $ = (id) => document.getElementById(id);
                  */
                 const paidTo = t.venue === "wallet" && t.params && t.params.to ? String(t.params.to) : "";
                 /*
+                 * Where a faucet drip lands, resolved rather than left implied.
+                 *
+                 * The address is optional and blank means "the task's own
+                 * wallet", which is exactly the case where a reader most wants
+                 * it spelled out — a row that says only "faucet · topUp" gives
+                 * them no way to check it is pointed where they meant before it
+                 * starts running on a timer.
+                 */
+                const dripTo = t.venue === "faucet"
+                  ? String((t.params && t.params.to) || t.owner || taskAppWallet || "")
+                  : "";
+                const dripDefaulted = t.venue === "faucet" && !(t.params && t.params.to);
+                /*
                  * What it pays, and out of whose wallet.
                  *
                  * A row that says "wallet · send" and names a recipient still
@@ -5194,7 +5207,12 @@ const $ = (id) => document.getElementById(id);
                 const sym = sess ? sess.symbol
                   : (walletAssets.find((a) => String(a.address).toLowerCase() === String(p.asset || "").toLowerCase()) || {}).symbol || "";
                 const amountText =
-                  p.amount !== undefined && p.amount !== null && p.amount !== ""
+                  // A faucet gives what it gives; the choice on the task is the
+                  // token, so that is the thing worth showing where an amount
+                  // would otherwise be.
+                  t.venue === "faucet"
+                    ? String(p.asset || "usdc").toUpperCase()
+                  : p.amount !== undefined && p.amount !== null && p.amount !== ""
                     ? `${fmtUnitsStr(String(p.amount), dec)} ${sym}`.trim()
                     : Array.isArray(p.recipients) && p.recipients.length
                       ? `${fmtUnitsStr(String(p.recipients.reduce((sum, r) => sum + BigInt(r.amount || 0), 0n)), dec)} ${sym}`.trim() +
@@ -5203,7 +5221,18 @@ const $ = (id) => document.getElementById(id);
                 // Null owner is the app wallet — an operator's task. Anything
                 // else is a visitor's, paid out of their own delegation.
                 const owner = t.owner || "";
-                const ownerLine = owner
+                /*
+                 * "from the app wallet" is wrong for a drip.
+                 *
+                 * Nothing is spent to run one — the funds come from Circle, not
+                 * from the wallet this line names. Printing a funding source for
+                 * an inbound task states the opposite of what happens.
+                 */
+                const ownerLine = t.venue === "faucet"
+                  ? `<div class="muted mono" style="font-size:10.5px;word-break:break-all">into ${esc(dripTo)}` +
+                    `${dripDefaulted ? " (this task's own wallet)" : ""} ` +
+                    `<button class="btn" data-tcopy="${esc(dripTo)}" style="padding:0 5px;font-size:10px">copy</button></div>`
+                  : owner
                   ? `<div class="muted mono" style="font-size:10.5px;word-break:break-all">from ${esc(owner)} ` +
                     `<button class="btn" data-tcopy="${esc(owner)}" style="padding:0 5px;font-size:10px">copy</button></div>`
                   : `<div class="muted mono" style="font-size:10.5px;word-break:break-all">from the app wallet ${esc(taskAppWallet)} ` +
@@ -5530,6 +5559,20 @@ const $ = (id) => document.getElementById(id);
       function stepSummary(st) {
         const p = st.params || {};
         const bits = [];
+        /*
+         * A faucet step has no amount and no session, so the generic path
+         * described it as "faucet · topUp" and stopped — which leaves out both
+         * things somebody actually needs to check before letting it run on a
+         * timer: which token it asks for, and whose wallet it lands in.
+         *
+         * The asset is a token name here rather than an address, so it is not
+         * looked up in the wallet's list.
+         */
+        if (st.venue === "faucet") {
+          bits.push(String(p.asset || "usdc").toUpperCase());
+          bits.push(p.to ? `to ${String(p.to).slice(0, 10)}…` : "to this series' own wallet");
+          return ` · ${esc(bits.join(" · "))}`;
+        }
         const session = sessionRows.find((x) => x.id === p.sessionId);
         const dec = session ? session.decimals : 6;
         const sym = session ? session.symbol : walSymbol(p.asset);
