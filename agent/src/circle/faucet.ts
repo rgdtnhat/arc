@@ -74,11 +74,30 @@ export class CircleFaucet implements Faucet {
         }),
       });
       if (!res.ok) {
+        /*
+         * Carry the body, not just the status.
+         *
+         * The two things most likely to be wrong here are the API key and the
+         * network identifier, and both come back as a 4xx with a sentence
+         * saying which. Reporting only "HTTP 400" turns a one-line fix into
+         * guesswork about a value the operator cannot look up from inside this
+         * app — Circle names its chains its own way, and `ARC-TESTNET` and
+         * `ARC-SEPOLIA` are not distinguishable by reasoning.
+         */
+        // Guarded: a `fetch` implementation is only obliged to give us what we
+        // use, and reading the body must never turn a reportable HTTP error
+        // into an unhandled one.
+        const body = typeof res.text === "function" ? await res.text().catch(() => "") : "";
+        const said = body.trim().slice(0, 200);
         return {
           ok: false,
           address,
           url: CIRCLE_FAUCET_URL,
-          message: `Circle faucet API returned HTTP ${res.status} — fall back to ${CIRCLE_FAUCET_URL}`,
+          message:
+            `Circle faucet API returned HTTP ${res.status}` +
+            (said ? ` — ${said}` : "") +
+            `. Check CIRCLE_API_KEY and CIRCLE_FAUCET_BLOCKCHAIN (currently ` +
+            `"${this.cfg.blockchain ?? "ARC-SEPOLIA"}"), or use ${CIRCLE_FAUCET_URL}`,
         };
       }
       const json = (await res.json().catch(() => ({}))) as { txHash?: string; data?: { txHash?: string } };

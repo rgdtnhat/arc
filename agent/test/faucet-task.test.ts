@@ -76,6 +76,8 @@ test("an API error is a failure, not a manual fallback", async () => {
   // "the faucet said no". Only the first is worth printing instructions for.
   const r = await new CircleFaucet({
     apiKey: "k",
+    // No `text` on purpose: a fetch implementation owes us only what we use,
+    // and reading the body must not turn a reportable error into a crash.
     fetchImpl: (async () => ({ ok: false, status: 429, json: async () => ({}) })) as unknown as typeof fetch,
   }).request("0x" + "b".repeat(40) as `0x${string}`);
   assert.equal(r.ok, false);
@@ -101,4 +103,26 @@ test("a network failure does not throw out of the task runner", async () => {
   }).request("0x" + "d".repeat(40) as `0x${string}`);
   assert.equal(r.ok, false);
   assert.match(r.message, /fetch failed/);
+});
+
+test("a rejected drip repeats what the faucet actually said", async () => {
+  /*
+   * The two things most likely to be wrong are the API key and the network
+   * identifier, and both come back as a 4xx with a sentence naming which.
+   * Reporting only the status code turns a one-line fix into guesswork about a
+   * value that cannot be looked up from inside the app.
+   */
+  const r = await new CircleFaucet({
+    apiKey: "k",
+    blockchain: "ARC-WRONG",
+    fetchImpl: (async () => ({
+      ok: false,
+      status: 400,
+      text: async () => '{"message":"unsupported blockchain"}',
+      json: async () => ({}),
+    })) as unknown as typeof fetch,
+  }).request(("0x" + "e".repeat(40)) as `0x${string}`);
+  assert.equal(r.ok, false);
+  assert.match(r.message, /unsupported blockchain/, "the faucet's own reason was dropped");
+  assert.match(r.message, /ARC-WRONG/, "the value actually sent should be named back");
 });
