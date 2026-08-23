@@ -6780,7 +6780,12 @@ async function main() {
       // approval in this codebase is exact.
       await owner.write(token, erc20Abi, "approve", [emissionsAddr, amount]);
       const txHash = await owner.write(emissionsAddr, tesseraEmissionsAbi, "fund", [amount]);
-      logTx(req, { category: "defi", action: "emissions-fund", status: "success", txHash, detail: String(amount) });
+      // `String(amount)` printed the raw integer and named no token, so a
+      // reward top-up read as "200000000000000000000" in the history.
+      logTx(req, {
+        category: "defi", action: "emissions-fund", status: "success", txHash,
+        assetAddress: token, raw: amount,
+      });
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
@@ -7168,7 +7173,12 @@ async function main() {
       })) as Hex;
       await owner.write(token, erc20Abi, "approve", [lpEmissionsAddr, amount]);
       const txHash = await owner.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "fund", [amount]);
-      logTx(req, { category: "defi", action: "lp-emissions-fund", status: "success", txHash, detail: String(amount) });
+      // `String(amount)` printed the raw integer and named no token, so a
+      // reward top-up read as "200000000000000000000" in the history.
+      logTx(req, {
+        category: "defi", action: "lp-emissions-fund", status: "success", txHash,
+        assetAddress: token, raw: amount,
+      });
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
@@ -7849,11 +7859,16 @@ async function main() {
       if (!isAddress(to)) { res.status(400).json({ ok: false, error: "bad recipient" }); return; }
       const amount = BigInt(String(req.body?.amount ?? "0"));
       if (amount <= 0n) { res.status(400).json({ ok: false, error: "amount must be above zero" }); return; }
+      // Which token this session spends, read before the spend invalidates the
+      // cache — `${amount}` alone printed the raw integer, so "1500000" stood
+      // for 1.5 USDC in the history, with nothing to say which token it was.
+      const spendAsset = (await readSession(id))?.asset;
       const txHash = await spendFromSession(id, to, amount, noteOf(req.body?.memo));
       sessionsInvalidate();
       logTx(req, {
         category: "defi", action: "session-spend", status: "success", txHash,
-        detail: `${amount} from session ${id.slice(0, 10)}… to ${to}`,
+        assetAddress: spendAsset, raw: amount,
+        detail: `from session ${id.slice(0, 10)}… to ${to}`,
       });
       res.json({ ok: true, txHash });
     } catch (e) {
@@ -7887,8 +7902,16 @@ async function main() {
     /** Written into each transaction, where the recipient can read it. */
     memo = "",
   ): Promise<{
-    sent: { to: string; amount: string; txHash: string; memoOnChain?: boolean }[];
+    /**
+     * `amount` is for reading and `raw` is for adding up. A caller that totals
+     * a list must not do it by parsing the display strings back into numbers,
+     * and a receipt must report what actually moved rather than what was
+     * planned — so both travel together, per row that really was sent.
+     */
+    sent: { to: string; amount: string; raw: string; txHash: string; memoOnChain?: boolean }[];
     failed: { to: string; error: string }[];
+    symbol: string;
+    decimals: number;
   }> {
     const meta = assetMeta(asset);
     const who = agentAccount.address as Hex;
@@ -7899,7 +7922,7 @@ async function main() {
     if (total > held) {
       throw new Error(`that totals ${fmtUnits(total, meta.decimals)} ${meta.symbol} and the wallet holds ${fmtUnits(held, meta.decimals)}`);
     }
-    const sent: { to: string; amount: string; txHash: string; memoOnChain?: boolean }[] = [];
+    const sent: { to: string; amount: string; raw: string; txHash: string; memoOnChain?: boolean }[] = [];
     const failed: { to: string; error: string }[] = [];
     for (const row of list) {
       if (abort()) {
@@ -7909,14 +7932,14 @@ async function main() {
       try {
         const r = await transferWithMemo(asset, row.to, row.amount, memo);
         sent.push({
-          to: row.to, amount: fmtUnits(row.amount, meta.decimals),
+          to: row.to, amount: fmtUnits(row.amount, meta.decimals), raw: row.amount.toString(),
           txHash: r.txHash, memoOnChain: r.memoOnChain,
         });
       } catch (e) {
         failed.push({ to: row.to, error: friendlyError(e) });
       }
     }
-    return { sent, failed };
+    return { sent, failed, symbol: meta.symbol, decimals: meta.decimals };
   }
 
   /**
@@ -8016,7 +8039,12 @@ async function main() {
       const r = await sendTransfers(asset, list, () => false, memo);
       logTx(req, {
         category: "defi", action: "wallet-send-bulk", status: r.failed.length ? "failed" : "success",
-        assetAddress: asset, txHash: r.sent[0]?.txHash,
+        assetAddress: asset,
+        // The sum of the rows that were actually sent, not of the list that was
+        // asked for — a run that fails half way must not report the whole plan
+        // as money that moved.
+        raw: r.sent.reduce((t, x) => t + BigInt(x.raw), 0n),
+        txHash: r.sent[0]?.txHash,
         detail: `${r.sent.length} sent, ${r.failed.length} failed` + (note ? ` — "${note}"` : ""),
       });
       res.json({ ok: r.sent.length > 0, ...r, message: note || undefined });
@@ -8813,12 +8841,25 @@ async function main() {
             settle: async (who, pulled) => ({ txHash: await vaultClient.depositFor(who, pulled[0].amount) }),
           });
         }
+        const vaultMeta = assetMeta(vaultAssetAddr);
+        const shares = BigInt(String(p.shares ?? "0"));
         const txHash = t.action === "deposit"
           ? await vaultClient.deposit(amount())
-          : await vaultClient.withdrawShares(BigInt(String(p.shares ?? "0")));
+          : await vaultClient.withdrawShares(shares);
         hashes.push(txHash as Hex);
-
-        return { ok: true, detail: `vault ${t.action}`, txHash };
+        /*
+         * "vault deposit" was the whole receipt — the same sentence whatever
+         * moved. A deposit is denominated in the vault's asset; a withdrawal by
+         * shares is denominated in shares, whose value in that asset moves, so
+         * naming the asset there would name a unit that was not used.
+         */
+        return {
+          ok: true,
+          detail: t.action === "deposit"
+            ? `vault deposit ${fmtUnits(amount(), vaultMeta.decimals)} ${vaultMeta.symbol}`
+            : `vault withdraw ${shares} share${shares === 1n ? "" : "s"}`,
+          txHash,
+        };
       }
       case "swap": {
         if (!routerClient) throw new Error("the router is not deployed");
@@ -8857,7 +8898,17 @@ async function main() {
         );
         hashes.push(txHash as Hex);
 
-        return { ok: true, detail: `swap ${assetMeta(asset()).symbol} → ${assetMeta(p.tokenOut as Hex).symbol}`, txHash };
+        /*
+         * How much, not just which pair. The input is exact — it is what left
+         * the wallet. The output is not known here (the router returns a hash,
+         * not a fill), so this names the pair rather than inventing a figure.
+         */
+        const swapIn = assetMeta(asset());
+        return {
+          ok: true,
+          detail: `swap ${fmtUnits(amount(), swapIn.decimals)} ${swapIn.symbol} → ${assetMeta(p.tokenOut as Hex).symbol}`,
+          txHash,
+        };
       }
       case "amm": {
         if (!ammClient) throw new Error("the AMM is not deployed");
@@ -8960,22 +9011,38 @@ async function main() {
           emissionsInvalidate();
           hashes.push(txHash as Hex);
 
-          return { ok: true, detail: `added liquidity to ${pool.name}`, txHash };
+          // Every figure names its token: a two-sided deposit reported as
+          // "added liquidity to USDC/EURC" said nothing about either side.
+          const put = amounts
+            .map((v, i) => `${fmtUnits(v, assetMeta(assets[i]).decimals)} ${assetMeta(assets[i]).symbol}`)
+            .join(" + ");
+          return { ok: true, detail: `added ${put} to ${pool.name}`, txHash };
         }
         if (t.action === "remove") {
-          const txHash = await ammClient.removeLiquidity(poolId, BigInt(String(p.shares ?? "0")), assets.map(() => 0n));
+          const shares = BigInt(String(p.shares ?? "0"));
+          const txHash = await ammClient.removeLiquidity(poolId, shares, assets.map(() => 0n));
           void settleNowLp(agentAccount.address as Hex, poolId);
           emissionsInvalidate();
           hashes.push(txHash as Hex);
-
-          return { ok: true, detail: `removed liquidity from ${pool.name}`, txHash };
+          // Shares, not tokens: what comes back depends on the pool's balances
+          // at execution, and this call accepts any amount (`0n` minimums).
+          return { ok: true, detail: `removed ${shares} share${shares === 1n ? "" : "s"} from ${pool.name}`, txHash };
         }
+        const ammIn = BigInt(String(p.amountIn ?? "0"));
         const txHash = await ammClient.swap(
-          poolId, p.tokenIn as Hex, p.tokenOut as Hex, BigInt(String(p.amountIn ?? "0")), BigInt(String(p.minOut ?? "0")),
+          poolId, p.tokenIn as Hex, p.tokenOut as Hex, ammIn, BigInt(String(p.minOut ?? "0")),
         );
         hashes.push(txHash as Hex);
-
-        return { ok: true, detail: `swapped in ${pool.name}`, txHash };
+        // The input is exact. The output is whatever the pool filled at, which
+        // this call does not read back, so it is named rather than guessed.
+        const ammMeta = assetMeta(p.tokenIn as Hex);
+        return {
+          ok: true,
+          detail:
+            `swapped ${fmtUnits(ammIn, ammMeta.decimals)} ${ammMeta.symbol} → ` +
+            `${assetMeta(p.tokenOut as Hex).symbol} in ${pool.name}`,
+          txHash,
+        };
       }
       case "faucet": {
         /*
@@ -9128,7 +9195,7 @@ async function main() {
               const txHash = await spendFromSession(id, row.to, row.amount, noteOf(p.memo));
               hashes.push(txHash as Hex);
               first ??= txHash;
-              sent.push(`${fmtUnits(row.amount, assetMeta(a).decimals)}→${row.to.slice(0, 8)}…`);
+              sent.push(`${fmtUnits(row.amount, assetMeta(a).decimals)} ${assetMeta(a).symbol}→${row.to.slice(0, 8)}…`);
             } catch (e) {
               failed.push(`${row.to.slice(0, 8)}… ${friendlyError(e)}`);
             }
@@ -9155,7 +9222,9 @@ async function main() {
          * a table cell holds one.
          */
         hashes.push(...r.sent.map((x) => x.txHash));
-        const paid = r.sent.map((x) => `${x.amount}→${x.to.slice(0, 8)}…`).join(" ");
+        // Amounts name their token. "0.003→0x4D3163…" was the whole record of a
+        // scheduled payment, and this wallet holds four of them.
+        const paid = r.sent.map((x) => `${x.amount} ${r.symbol}→${x.to.slice(0, 8)}…`).join(" ");
         const note = noteOf(p.message);
         const detail =
           `${r.sent.length} sent${r.failed.length ? `, ${r.failed.length} failed` : ""}` +

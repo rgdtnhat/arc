@@ -3288,11 +3288,27 @@ const $ = (id) => document.getElementById(id);
         }
         // 1% slippage floor.
         const minOut = (BigInt(q.out) * 99n / 100n).toString();
+        /*
+         * The sizes, not just the pair.
+         *
+         * "swap USDC → EURC" is the same sentence for five dollars and five
+         * thousand, which makes it useless as a receipt.
+         *
+         * The input is exact — that is the amount leaving the wallet. The
+         * output is not: the router fills at execution price, and the response
+         * carries only a hash, so the quoted figure is what was expected rather
+         * than what arrived. `minOut` is the one output number the chain
+         * guarantees, because the transaction reverts below it — so that is the
+         * one this says.
+         */
+        const swapWhat =
+          `swap ${fmtUnitsStr(String(q.amountIn), Number(q.decIn ?? 6))} ${q.symIn}` +
+          ` → at least ${fmtUnitsStr(minOut, Number(q.decOut ?? 6))} ${q.symOut}`;
         const btn = $("swExecute");
         // Self-custody: swap the user's own tokens through their wallet.
         if (selfMode()) {
           btn.disabled = true;
-          await selfCustody("swapMsg", `swap ${q.symIn} → ${q.symOut}`, async (from, cfg) => {
+          await selfCustody("swapMsg", swapWhat, async (from, cfg) => {
             await ensureAllowance(from, q.tokenIn, cfg.router, q.amountIn);
             // Five minutes. The router rejects anything mined after this, which
             // is what stops a transaction that sat in the mempool from being
@@ -3311,11 +3327,11 @@ const $ = (id) => document.getElementById(id);
           return;
         }
         btn.disabled = true;
-        showBusy("swapMsg", `swapping ${q.symIn} → ${q.symOut}…`);
+        showBusy("swapMsg", `${swapWhat} — sending…`);
         try {
           const r = await (await postAuthed(`/api/swap?tokenIn=${q.tokenIn}&tokenOut=${q.tokenOut}&amountIn=${q.amountIn}&minOut=${minOut}`)).json();
           msg.style.display = "block";
-          if (r.ok) msg.innerHTML = `swapped ${esc(q.symIn)} → ${esc(q.symOut)} ✓ — view on Arcscan: ${txLink(r.txHash)}`;
+          if (r.ok) msg.innerHTML = `${esc(swapWhat)} ✓ — view on Arcscan: ${txLink(r.txHash)}`;
           else msg.textContent = `failed: ${r.error}`;
           msg.style.color = r.ok ? "var(--good)" : "var(--warn)";
         } catch {
@@ -3683,6 +3699,27 @@ const $ = (id) => document.getElementById(id);
         return a ? a.symbol : "";
       };
 
+      /**
+       * An amount with its token — the only form a receipt may state one in.
+       *
+       * "send 1 to 0xA005fE97… confirmed" was the whole record of a payment
+       * that could equally have been 1 USDC or 1 cirBTC. Every figure a receipt
+       * prints goes through here so that cannot happen a line at a time.
+       */
+      function amountLabel(raw, asset) {
+        return `${fmtUnitsStr(String(raw), walDecimals(asset))} ${walSymbol(asset)}`.trim();
+      }
+      /**
+       * Total a list of raw amounts.
+       *
+       * Raw, never the display strings: a receipt that adds up "1.5" and "2"
+       * by parsing them back is one rounding rule away from reporting a figure
+       * nobody sent.
+       */
+      function sumRaw(values) {
+        return (values || []).reduce((t, v) => t + BigInt(v || 0), 0n);
+      }
+
       if ($("walletCopy")) {
         $("walletCopy").addEventListener("click", async () => {
           try {
@@ -3698,6 +3735,14 @@ const $ = (id) => document.getElementById(id);
           if (!(parseFloat(human) > 0)) return showReceipt("walMsg", false, "enter an amount above zero");
           const btn = $("walSend");
           const raw = toRaw(human, walDecimals(asset));
+          /*
+           * Every figure on a receipt names its token.
+           *
+           * "send 1 to 0xA005fE97… confirmed" is the whole record of a payment
+           * that could equally have been 1 USDC or 1 cirBTC, and the wallet
+           * offers several. An amount without its unit is not a receipt.
+           */
+          const paid = amountLabel(raw, asset);
           const note = ($("walSendMsg") ? $("walSendMsg").value : "").trim().slice(0, 200);
           const memo = ($("walSendMemo") ? $("walSendMemo").value : "").trim().slice(0, 180);
           // Self-custody sends the visitor's own tokens with their own
@@ -3709,7 +3754,7 @@ const $ = (id) => document.getElementById(id);
             // The memo is appended to the call's own data. Solidity ignores
             // calldata past the arguments it decodes, so the transfer executes
             // exactly as encoded and the memo lands in the transaction input.
-            await selfCustody("walMsg", `send ${human} to ${to.slice(0, 10)}…`, async (from, c) =>
+            await selfCustody("walMsg", `send ${paid} to ${to.slice(0, 10)}…`, async (from, c) =>
               sendTx(from, asset, callData(c.selectors.erc20Transfer, encAddr(to), encUint(raw)) + memoHex(memo)));
             btn.disabled = false;
             $("walSendAmount").value = "";
@@ -3724,7 +3769,7 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           btn.disabled = true;
-          showBusy("walMsg", `sending ${human} to ${to.slice(0, 10)}…`);
+          showBusy("walMsg", `sending ${paid} to ${to.slice(0, 10)}…`);
           try {
             const r = await (await postAuthed("/api/wallet/send", { asset, to, amount: raw, message: note, memo })).json();
             const first = r.sent && r.sent[0];
@@ -3734,7 +3779,7 @@ const $ = (id) => document.getElementById(id);
                 // Say when the memo did not make it. The payment went through
                 // either way, and claiming a memo that is not on chain is the
                 // one thing this must not do.
-                ? `sent ${human}${memo ? (first && first.memoOnChain ? " with memo" : " — the memo could not be attached, so it was not sent") : ""}`
+                ? `sent ${paid} to ${to.slice(0, 10)}…${memo ? (first && first.memoOnChain ? " with memo" : " — the memo could not be attached, so it was not sent") : ""}`
                 : `failed: ${r.error}`,
               first && first.txHash,
             );
@@ -3772,7 +3817,9 @@ const $ = (id) => document.getElementById(id);
             for (let i = 0; i < rows.length; i++) {
               const row = rows[i];
               const ok = await selfCustody(
-                "walMsg", `send ${i + 1} of ${rows.length} to ${row.to.slice(0, 10)}…`,
+                "walMsg",
+                `send ${amountLabel(row.amount, asset)} to ${row.to.slice(0, 10)}…` +
+                  ` (${i + 1} of ${rows.length})`,
                 async (from, c) => sendTx(from, asset,
                   callData(c.selectors.erc20Transfer, encAddr(row.to), encUint(row.amount)) + memoHex(memo)),
               );
@@ -3783,7 +3830,11 @@ const $ = (id) => document.getElementById(id);
             return;
           }
           btn.disabled = true;
-          showBusy("walMsg", `sending to ${rows.length} address${rows.length === 1 ? "" : "es"}…`);
+          // The total, named — a list of rows is the one place where nobody
+          // has added it up for themselves.
+          const bulkAsset = $("walSendAsset").value;
+          const bulkTotal = amountLabel(sumRaw(rows.map((x) => x.amount)), bulkAsset);
+          showBusy("walMsg", `sending ${bulkTotal} to ${rows.length} address${rows.length === 1 ? "" : "es"}…`);
           try {
             const r = await (await postAuthed("/api/wallet/send-bulk", {
               asset: $("walSendAsset").value, recipients: rows,
@@ -3791,8 +3842,17 @@ const $ = (id) => document.getElementById(id);
               memo: ($("walSendMemo") ? $("walSendMemo").value : "").trim().slice(0, 180),
             })).json();
             const sent = (r.sent || []).length, failed = (r.failed || []).length;
+            /*
+             * What moved, not what was asked for.
+             *
+             * `bulkTotal` is the plan; a run that fails half way through moved
+             * less than that, and a receipt that reports the plan as the sum
+             * paid is the one number an operator would never catch. The server
+             * returns each sent row's raw amount for exactly this.
+             */
+            const moved = amountLabel(sumRaw((r.sent || []).map((x) => x.raw)), bulkAsset);
             showReceipt("walMsg", Boolean(r.ok) && !failed,
-              r.ok ? `${sent} sent${failed ? `, ${failed} failed` : ""}` : `failed: ${r.error}`,
+              r.ok ? `${sent} sent — ${moved}${failed ? `, ${failed} failed` : ""}` : `failed: ${r.error}`,
               (r.sent || [])[0] && r.sent[0].txHash);
             if (sent) { loadWallet(); $("walBulk").value = ""; $("walBulkCount").textContent = ""; }
           } catch { showReceipt("walMsg", false, "request failed"); }
@@ -6713,9 +6773,17 @@ const $ = (id) => document.getElementById(id);
             const parsed = parseAmount(human, sharesNotAssets ? 0 : a.decimals);
             if (parsed.error) return bsShow(parsed.error, "var(--warn)");
             const raw = parsed.raw;
+            /*
+             * Say the size, in its own unit.
+             *
+             * "cover deposited" said nothing about how much, and a queued exit
+             * is counted in *shares* — labelling that with the asset's symbol
+             * would name a token that was never the unit being moved.
+             */
+            const said = `${label} — ${human} ${sharesNotAssets ? "share" + (human === "1" ? "" : "s") : a.symbol}`;
             // Self-custody signs its own; the pool asks no permission for this.
             if (selfMode()) {
-              return selfCustody("backstopMsg", label, async (from, cfg) => {
+              return selfCustody("backstopMsg", said, async (from, cfg) => {
                 const sel2 = cfg.selectors;
                 if (action === "deposit") {
                   await ensureAllowance(from, a.address, cfg.pool, raw);
@@ -6724,7 +6792,7 @@ const $ = (id) => document.getElementById(id);
                 return sendTx(from, cfg.pool, callData(sel2.backstopQueue, encAddr(a.address), encUint(raw)));
               }).then(() => loadBackstop());
             }
-            post(`/api/lending/backstop/${action}`, `asset=${a.address}&amount=${raw}`, label);
+            post(`/api/lending/backstop/${action}`, `asset=${a.address}&amount=${raw}`, said);
           });
         };
         amountAction("bsDeposit", "deposit", "cover deposited", false);
@@ -9838,7 +9906,10 @@ const $ = (id) => document.getElementById(id);
           const dec = Number(opt.dataset.dec || 6);
           const parsed = parseAmount($("gaBribeAmount").value, dec);
           if (!parsed.raw) { govMsg("gaBribeMsg", parsed.error || "Enter an amount.", "var(--warn)"); return; }
-          await selfCustody("gaBribeMsg", `attach ${$("gaBribeAmount").value} to a market`, async (from, cfg) => {
+          // The picker's label is the symbol; the asset list is the same answer
+          // from the deployment, and one of the two is always there.
+          const bribeSym = walSymbol(token) || (opt.textContent || "").trim();
+          await selfCustody("gaBribeMsg", `attach ${$("gaBribeAmount").value} ${bribeSym}`.trim() + " to a market", async (from, cfg) => {
             // Exactly what is being attached, and no more — the same rule every
             // other approval in this app follows.
             await ensureAllowance(from, token, cfg.gauge, BigInt(parsed.raw));
