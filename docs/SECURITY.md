@@ -104,6 +104,35 @@ still opened that door. The current password was required as well, making it the
 second lock rather than the only one — but a lock that opens for an expired key
 is not a lock. It now goes through `session()`.
 
+### 8. The guardian cap sat in the callers, and one checked the wrong number — HIGH → fixed
+
+The rule is that the cap is enforced inside the one function that escrows
+funds, "not repeated in each caller — a cap that callers must remember to check
+is not a cap". It was repeated in each caller. Both of them checked something;
+the invoice path checked the wrong thing.
+
+`payInvoices` compared the **invoice's** amount against `autoApproveMax` and
+then called `purchase`, which escrows the **quote's** price — bounded by
+`quoteMatchesOffer` against the catalog entry, and not by the bill at all. The
+two numbers are independent. A provider that invoiced a penny for a service
+listed at a pound was escalated for the penny, approved for the penny, and paid
+the pound: an unattended spend of the whole catalog price with no guardian ever
+asked about it. Neither the cap nor the invoice budget bound the amount that
+actually moved, because the budget was decremented by the invoice too.
+
+Reproduced against a stub escrow: a service listed at 1 USDC, a cap of 0.005,
+no guardian answering — 1 USDC reached `open()`.
+
+**Fix:** one gate, inside `purchase`, immediately after the quote is validated
+and immediately before anything moves — so the number it reads is the number
+that will be escrowed. Both callers now do no checking of their own; a declined
+spend comes back as a skipped ledger entry. The guardian is also asked to
+approve the quoted price rather than the listed one, and the invoice budget is
+decremented by what was escrowed rather than by what was billed.
+
+The cost is one 402 quote request for a spend that is then declined. A quote
+moves nothing; the alternative was moving money nobody approved.
+
 ## Two custody modes (and why they differ)
 
 The dashboard exposes the same DeFi actions through two distinct paths:

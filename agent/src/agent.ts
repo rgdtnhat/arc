@@ -247,33 +247,8 @@ export class TesseraAgent {
           continue;
         }
 
-        // Safety sandbox: above the policy cap, a guardian must co-sign.
-        if (this.cfg.policy && svc.price > this.cfg.policy.autoApproveMax) {
-          const approved = await this.escalate(svc, decision);
-          if (!approved) {
-            this.emit({
-              level: "guardian",
-              resource: svc.resource,
-              message: `Guardian declined ${svc.name} (${formatUsdc(svc.price)} USDC) — not buying`,
-            });
-            this.ledger.push({
-              resource: svc.resource,
-              name: svc.name,
-              provider: svc.provider,
-              price: svc.price,
-              status: "skipped",
-              reason: "guardian declined (over policy cap)",
-              txs: {},
-            });
-            continue;
-          }
-          this.emit({
-            level: "guardian",
-            resource: svc.resource,
-            message: `Guardian approved ${svc.name} (${formatUsdc(svc.price)} USDC)`,
-          });
-        }
-
+        // The guardian cap is enforced inside `purchase`, against the amount it
+        // is about to escrow. A declined spend comes back as a skipped entry.
         let entry: LedgerEntry;
         try {
           entry = await this.purchase(svc, decision, this.resolveQuery(need.query));
@@ -344,12 +319,15 @@ export class TesseraAgent {
   }
 
   /** Ask the guardian to co-sign an over-cap spend. */
-  private async escalate(svc: OfferedService, decision: Decision): Promise<boolean> {
+  private async escalate(svc: OfferedService, decision: Decision, price = svc.price): Promise<boolean> {
     const policy = this.cfg.policy!;
+    // The price asked of the guardian is the price about to be escrowed, not
+    // the listed one — approving a figure other than the one that moves is the
+    // same defect as capping one.
     this.emit({
       level: "guardian",
       resource: svc.resource,
-      message: `ESCALATED: ${svc.name} costs ${formatUsdc(svc.price)} USDC (> ${formatUsdc(policy.autoApproveMax)} cap) — awaiting guardian`,
+      message: `ESCALATED: ${svc.name} costs ${formatUsdc(price)} USDC (> ${formatUsdc(policy.autoApproveMax)} cap) — awaiting guardian`,
     });
     if (policy.autoApprove) {
       await new Promise((r) => setTimeout(r, 400)); // brief, visible pause
@@ -360,7 +338,7 @@ export class TesseraAgent {
         resource: svc.resource,
         name: svc.name,
         provider: svc.provider,
-        priceUsdc: formatUsdc(svc.price),
+        priceUsdc: formatUsdc(price),
         reason: decision.reason,
       },
       policy.approvalTimeoutMs ?? 60_000
@@ -417,6 +395,41 @@ export class TesseraAgent {
     }
     // Record what will actually move, which may be below the vetted price.
     entry.price = quote.price;
+
+    /*
+     * 1c) The guardian cap, at the choke point — and measured against the
+     *     amount that is about to be escrowed.
+     *
+     * This used to sit in the callers. Both of them checked something, but the
+     * invoice path checked the *invoice's* amount and then escrowed the
+     * *quote's* price, which is bounded by the catalog entry and not by the
+     * bill: a provider that invoiced a penny for a service listed at a pound
+     * was escalated for the penny and paid the pound, with no guardian asked
+     * about the difference. That is the failure the money invariants describe —
+     * a cap each caller must remember is not a cap.
+     *
+     * Here there is one gate, and the number it reads is the number that moves.
+     * The cost is one quote request for a spend that is then declined; a quote
+     * moves nothing, and the alternative was moving money nobody approved.
+     */
+    if (this.cfg.policy && quote.price > this.cfg.policy.autoApproveMax) {
+      const approved = await this.escalate(svc, decision, quote.price);
+      if (!approved) {
+        entry.status = "skipped";
+        entry.reason = "guardian declined (over policy cap)";
+        this.emit({
+          level: "guardian",
+          resource: svc.resource,
+          message: `Guardian declined ${svc.name} (${formatUsdc(quote.price)} USDC) — not buying`,
+        });
+        return entry;
+      }
+      this.emit({
+        level: "guardian",
+        resource: svc.resource,
+        message: `Guardian approved ${svc.name} (${formatUsdc(quote.price)} USDC)`,
+      });
+    }
 
     // 2) Escrow the payment on Arc. Chain time and wall time can skew either
     //    way (fast-mined blocks run ahead; idle local chains fall behind), so
@@ -757,14 +770,6 @@ export class TesseraAgent {
         decline(`amount ${inv.amountUsdc} exceeds invoice budget`);
         continue;
       }
-      if (this.cfg.policy && amount > this.cfg.policy.autoApproveMax) {
-        const approved = await this.escalate(svc, { buy: true, reason: `invoice: ${inv.memo}`, trust });
-        if (!approved) {
-          decline("guardian declined (over policy cap)");
-          continue;
-        }
-      }
-
       this.emit({ level: "decide", resource: inv.resource, message: `PAY invoice "${inv.memo}" (${inv.amountUsdc} USDC) — trust ${trust.toFixed(2)}` });
       const entry = await this.purchase(svc, { buy: true, reason: `invoice: ${inv.memo}`, trust });
       this.ledger.push(entry);
@@ -772,7 +777,11 @@ export class TesseraAgent {
         this.cfg.memory?.record(svc.provider, svc.name, entry.status);
       }
       if (entry.status === "settled") {
-        remaining -= amount;
+        // What was escrowed, not what was billed. `purchase` writes the quoted
+        // price onto the entry, and the two need not agree — a budget spent
+        // against the invoice while a different sum left the wallet is a budget
+        // that does not bind.
+        remaining -= entry.price;
         this.invoiceVerdicts.push({ invoiceId: inv.invoiceId, verdict: "paid", reason: inv.memo });
       } else {
         this.invoiceVerdicts.push({ invoiceId: inv.invoiceId, verdict: "declined", reason: entry.reason });

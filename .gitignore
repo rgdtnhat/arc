@@ -31,6 +31,7 @@ deployments/arc.local.json
 .tessera-emissions-guard.json
 # Standing instructions: what this deployment does on its own, and when.
 .tessera-tasks.json
+.tessera-series.json
 # Governance drafts and comments: operator-stored, wallet-signed, per-deployment.
 .tessera-discussions.json
 # Creation block per contract, found by binary search over getCode. Derived from
