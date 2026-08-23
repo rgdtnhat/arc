@@ -5169,9 +5169,7 @@ const $ = (id) => document.getElementById(id);
           }
           $("taskRows").innerHTML = (r.tasks || []).length
             ? r.tasks.map((t) => {
-                const when = (ms) => new Date(ms).toLocaleString(undefined, {
-                  year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
-                });
+                const when = stamp;
                 const next = t.nextRunAt ? when(t.nextRunAt) : "—";
                 /*
                  * "✓ 1 sent: 0.001 → 0x4D3163…" was the whole history, and it
@@ -5537,14 +5535,35 @@ const $ = (id) => document.getElementById(id);
         host.innerHTML = serSteps.length
           ? serSteps.map((st, i) => {
               const off = st.enabled === false;
+              /*
+               * A step is a task, so it is described like one.
+               *
+               * This showed a name, a verb and "last: ok" — while the scheduled
+               * task beside it answered how much, out of whose wallet, into
+               * whose, when it last ran and with which transaction. A step
+               * spends exactly as a task does, and reviewing a series meant
+               * opening each step's editor to see what it would actually do.
+               *
+               * Everything below comes from what a step already stores; nothing
+               * new is asked of the server.
+               */
+              const badge = stepAmount(st);
               const last = st.lastStatus
-                ? `<div class="muted" style="font-size:10.5px">last: ${esc(st.lastStatus)}${st.lastDetail ? ` — ${esc(st.lastDetail)}` : ""}</div>`
-                : "";
+                ? `<div class="muted" style="font-size:10.5px;margin-top:2px">` +
+                    `<b style="color:var(--${st.lastStatus === "ok" ? "good" : "warn"})">` +
+                    `${st.lastStatus === "ok" ? "✓" : st.lastStatus === "skipped" ? "–" : "✗"}</b> ` +
+                    `${st.lastRunAt ? esc(stamp(st.lastRunAt)) : esc(st.lastStatus)}` +
+                    `${st.lastDetail ? ` — ${esc(st.lastDetail)}` : ""}</div>` +
+                  (st.lastTxHash ? `<div style="font-size:10.5px;margin-top:1px">${txLink(st.lastTxHash)}</div>` : "")
+                : `<div class="muted" style="font-size:10.5px;margin-top:2px">never run</div>`;
               return `<div class="row-actions" style="align-items:flex-start;gap:6px;flex-wrap:wrap">` +
                 `<span class="muted" style="font-size:12px;min-width:18px">${i + 1}.</span>` +
                 `<span style="flex:1;min-width:150px;font-size:12.5px${off ? ";opacity:.55" : ""}">` +
-                `<b>${esc(st.name)}</b>${off ? ' <span style="color:var(--warn);font-size:10.5px">off</span>' : ""}` +
-                `<div class="muted" style="font-size:11px">${esc(st.venue)} · ${esc(st.action)}${stepSummary(st)}</div>${last}</span>` +
+                `<b>${esc(st.name)}</b>` +
+                `${badge ? ` <span style="font-size:12px;color:var(--good)">${esc(badge)}</span>` : ""}` +
+                `${off ? ' <span style="color:var(--warn);font-size:10.5px">off</span>' : ""}` +
+                `<div class="muted" style="font-size:11px">${esc(st.venue)} · ${esc(st.action)}${stepSummary(st)}</div>` +
+                stepWallets(st) + last + `</span>` +
                 `<button class="btn" data-stepup="${i}" ${i === 0 ? "disabled" : ""} style="padding:1px 7px;font-size:11px">↑</button>` +
                 `<button class="btn" data-stepdown="${i}" ${i === serSteps.length - 1 ? "disabled" : ""} style="padding:1px 7px;font-size:11px">↓</button>` +
                 `<button class="btn" data-stepedit="${i}" style="padding:1px 8px;font-size:11px">Edit</button>` +
@@ -5555,31 +5574,113 @@ const $ = (id) => document.getElementById(id);
           : `<span class="muted" style="font-size:12px">No steps yet — add the first one below.</span>`;
       }
 
-      /** The part of a step worth reading at a glance: who, and how much. */
+      /**
+       * A timestamp as every row here prints one.
+       *
+       * The task list and the series list each carried their own copy of this
+       * inside a map callback, which is why a step row could not say when it
+       * last ran: the formatter was not in scope where the steps are drawn.
+       */
+      function stamp(ms) {
+        return new Date(ms).toLocaleString(undefined, {
+          year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+        });
+      }
+
+      /**
+       * What a step moves, as the task row prints it — the figure in green.
+       *
+       * A faucet gives what it gives, so the token is the whole answer there;
+       * everywhere else it is the amount, in the units of the session or asset
+       * the step actually names.
+       */
+      function stepAmount(st) {
+        const p = st.params || {};
+        if (st.venue === "faucet") return String(p.asset || "usdc").toUpperCase();
+        const session = sessionAll.find((x) => x.id === p.sessionId) || sessionRows.find((x) => x.id === p.sessionId);
+        const dec = session ? session.decimals : walDecimals(p.asset);
+        const sym = session ? session.symbol : walSymbol(p.asset);
+        if (p.amount !== undefined && p.amount !== null && p.amount !== "") {
+          return `${fmtUnitsStr(String(p.amount), dec)} ${sym || ""}`.trim();
+        }
+        if (Array.isArray(p.recipients) && p.recipients.length) {
+          const total = p.recipients.reduce((sum, r) => sum + BigInt(r.amount || 0), 0n);
+          return `${fmtUnitsStr(String(total), dec)} ${sym || ""}`.trim() +
+            ` to ${p.recipients.length} address${p.recipients.length === 1 ? "" : "es"}`;
+        }
+        return "";
+      }
+
+      /**
+       * Whose wallet a step would run as.
+       *
+       * A step carries no owner of its own — the series owns it. An existing
+       * series says so directly; one still being composed belongs to whoever
+       * is composing it, which is the connected wallet, or the app wallet when
+       * an operator is working without one. Resolving it here is what lets a
+       * step print the same two addresses a task row prints.
+       */
+      function stepOwner() {
+        const row = editingSeries ? seriesRowsById.get(editingSeries) : null;
+        if (row) return String(row.owner || taskAppWallet || "");
+        return String(window.__myAddress || taskAppWallet || "");
+      }
+
+      /**
+       * Whose wallet a step spends, and whose it pays — in full, and copyable.
+       *
+       * The summary line truncates an address to ten characters, which is fine
+       * for recognising one you already know and useless for checking one you
+       * do not. The task row prints both ends in full for exactly that reason,
+       * and a step is no less worth checking before it runs on a timer.
+       */
+      function stepWallets(st) {
+        const p = st.params || {};
+        const line = (label, addr, note) =>
+          `<div class="muted mono" style="font-size:10.5px;word-break:break-all">${label} ${esc(addr)}` +
+          `${note ? ` ${note}` : ""} ` +
+          `<button class="btn" data-stepcopy="${esc(addr)}" style="padding:0 5px;font-size:10px">copy</button></div>`;
+        if (st.venue === "faucet") {
+          /*
+           * Nothing is spent to run a drip — the funds come from Circle — so
+           * naming a funding source here would state the opposite of what
+           * happens. Only the destination is real, and a blank one is exactly
+           * the case worth spelling out rather than leaving implied.
+           */
+          const to = String(p.to || "") || stepOwner();
+          return to
+            ? line("into", to, p.to ? "" : "(this series' own wallet)")
+            : `<div class="muted" style="font-size:10.5px">into this series' own wallet</div>`;
+        }
+        const out = [];
+        /*
+         * A session-funded step spends the delegation, not the series owner's
+         * balance, so the session's owner is the truthful funding side when
+         * there is one.
+         */
+        const session = sessionAll.find((x) => x.id === p.sessionId) || sessionRows.find((x) => x.id === p.sessionId);
+        const from = (session && session.owner) || stepOwner();
+        if (from) out.push(line("from", String(from), ""));
+        if (p.to) out.push(line("to", String(p.to), ""));
+        return out.join("");
+      }
+
+      /**
+       * What is left to say once the row has said the rest.
+       *
+       * This line used to carry the amount and a ten-character stub of the
+       * destination, because it was the only line there was. Both are now shown
+       * properly — the amount as the figure in green, the addresses in full and
+       * copyable — so repeating them here would just be the same facts twice,
+       * once in a form too short to check. What no other line answers is which
+       * delegation a session-funded step spends.
+       */
       function stepSummary(st) {
         const p = st.params || {};
-        const bits = [];
-        /*
-         * A faucet step has no amount and no session, so the generic path
-         * described it as "faucet · topUp" and stopped — which leaves out both
-         * things somebody actually needs to check before letting it run on a
-         * timer: which token it asks for, and whose wallet it lands in.
-         *
-         * The asset is a token name here rather than an address, so it is not
-         * looked up in the wallet's list.
-         */
-        if (st.venue === "faucet") {
-          bits.push(String(p.asset || "usdc").toUpperCase());
-          bits.push(p.to ? `to ${String(p.to).slice(0, 10)}…` : "to this series' own wallet");
-          return ` · ${esc(bits.join(" · "))}`;
-        }
-        const session = sessionRows.find((x) => x.id === p.sessionId);
-        const dec = session ? session.decimals : 6;
-        const sym = session ? session.symbol : walSymbol(p.asset);
-        if (p.amount) bits.push(`${fmtUnitsStr(String(p.amount), dec)}${sym ? ` ${sym}` : ""}`);
-        if (Array.isArray(p.recipients)) bits.push(`${p.recipients.length} recipient${p.recipients.length === 1 ? "" : "s"}`);
-        if (p.to) bits.push(`to ${String(p.to).slice(0, 10)}…`);
-        return bits.length ? ` · ${esc(bits.join(" · "))}` : "";
+        if (!p.sessionId) return "";
+        const session = sessionAll.find((x) => x.id === p.sessionId) || sessionRows.find((x) => x.id === p.sessionId);
+        const label = session && session.symbol ? `${session.symbol} session` : "session";
+        return ` · ${esc(label)} ${esc(String(p.sessionId).slice(0, 10))}…`;
       }
 
       async function loadSeries() {
@@ -5613,9 +5714,7 @@ const $ = (id) => document.getElementById(id);
           }
           syncStepForm();
           renderSteps();
-          const when = (ms) => new Date(ms).toLocaleString(undefined, {
-            year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
-          });
+          const when = stamp;
           $("serRows").innerHTML = (r.series || []).length
             ? r.series.map((x) => {
                 const next = x.nextRunAt ? when(x.nextRunAt) : "—";
@@ -5810,6 +5909,14 @@ const $ = (id) => document.getElementById(id);
           const btn = e.target.closest("button");
           if (!btn) return;
           const d = btn.dataset;
+          // Copy carries an address rather than an index, so it is answered
+          // before the index lookup below rejects it.
+          if (d.stepcopy) {
+            navigator.clipboard.writeText(d.stepcopy)
+              .then(() => showReceipt("serMsg", true, "address copied"))
+              .catch(() => showReceipt("serMsg", false, "could not copy — select the address and copy it by hand"));
+            return;
+          }
           const at = Number(d.stepup ?? d.stepdown ?? d.stepedit ?? d.steptoggle ?? d.stepdel);
           if (!Number.isInteger(at) || !serSteps[at]) return;
           if (d.stepup !== undefined) {
