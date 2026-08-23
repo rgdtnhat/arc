@@ -568,7 +568,21 @@ const $ = (id) => document.getElementById(id);
       // Tolerates a short value (e.g. "operator") rather than mangling it.
       const short = (a) => (!a ? "—" : a.length > 14 ? a.slice(0, 6) + "…" + a.slice(-4) : a);
       const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
-      const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+      /*
+       * Escape for HTML — including the quotes.
+       *
+       * This escaped `& < >` only, which is enough for text between tags and
+       * not enough for an attribute: `title="${esc(x)}"` with a quote in `x`
+       * closes the attribute and everything after it is markup. Nothing in the
+       * page puts free text in an attribute today, so this is closing the door
+       * rather than a live hole — but "safe as long as nobody adds a title
+       * attribute" is not a property anybody can maintain.
+       *
+       * `esc` is never assigned to `textContent` anywhere, so escaping quotes
+       * cannot leave a literal `&quot;` on screen.
+       */
+      const esc = (s) => String(s == null ? "" : s)
+        .replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
       /**
        * Post-transaction refresh: re-read the chain now, then once more shortly
@@ -814,8 +828,8 @@ const $ = (id) => document.getElementById(id);
               <b>${esc(a.name)}</b> wants <b style="color:var(--warn)">${a.priceUsdc} USDC</b>
               <div style="color:var(--muted);font-size:12px">${esc(a.reason)} · provider ${short(a.provider)}</div>
             </div>
-            <button class="btn" style="border-color:#14532d;background:#0c2c1e;color:var(--good)" onclick="verdict(${a.id},'approve')">Approve ✓</button>
-            <button class="btn" style="border-color:#531414;background:#2c0c0c;color:var(--bad)" onclick="verdict(${a.id},'reject')">Reject ✗</button>
+            <button class="btn" style="border-color:#14532d;background:#0c2c1e;color:var(--good)" data-verdict="approve" data-approval="${esc(a.id)}">Approve ✓</button>
+            <button class="btn" style="border-color:#531414;background:#2c0c0c;color:var(--bad)" data-verdict="reject" data-approval="${esc(a.id)}">Reject ✗</button>
           </div>`
           )
           .join("");
@@ -1114,10 +1128,30 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
-      window.verdict = async (id, v) => {
-        await postAuthed(`/api/approvals/${id}/${v}`).catch(() => {});
+      /*
+       * The guardian's answer, on a listener rather than an `onclick`.
+       *
+       * These two buttons were the only inline handlers in the app, and the
+       * app's own Content-Security-Policy is `script-src 'self'` with no
+       * `unsafe-inline` — so the browser refused to run them and the human
+       * co-signer could not answer an escalation at all. It failed closed, and
+       * therefore silently: an unanswered escalation is simply never bought.
+       *
+       * Delegated from the card, the same way every other button here works, so
+       * it survives the list being re-rendered on each poll.
+       */
+      const verdict = async (id, v) => {
+        await postAuthed(`/api/approvals/${encodeURIComponent(id)}/${v}`).catch(() => {});
         tick();
       };
+      if ($("approvals")) {
+        $("approvals").addEventListener("click", async (e) => {
+          const btn = e.target.closest("button[data-verdict]");
+          if (!btn) return;
+          btn.disabled = true;
+          await verdict(btn.dataset.approval, btn.dataset.verdict);
+        });
+      }
 
       $("runBtn").addEventListener("click", async () => {
         $("runBtn").disabled = true;

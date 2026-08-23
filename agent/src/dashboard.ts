@@ -54,6 +54,7 @@ import { createProviderApp, type ProviderEvent } from "@tessera/providers";
 import { CATALOG } from "@tessera/providers/catalog";
 import { TesseraClient } from "./client.js";
 import { TesseraAgent, type AgentEvent, type LedgerEntry } from "./agent.js";
+import { quoteMatchesOffer } from "./decide.js";
 import {
   planDeleverage,
   planLiquidation,
@@ -4739,6 +4740,30 @@ async function main() {
       if (!provider || !price) {
         throw new Error("the 402 challenge was missing quote headers");
       }
+
+      /*
+       * The quote is the provider's, and the provider is not the authority.
+       *
+       * Everything in a 402 is attacker-controlled — the price this escrows and
+       * the address it pays. What was vetted is the catalog entry: its price is
+       * what the operator agreed to, and `providerAddrs` is the key this
+       * deployment expects to sign for that resource. Taking either from the
+       * response was escrowing an unbounded amount to an address of the
+       * provider's choosing, which is the failure the money invariants
+       * describe — and the check the agent's own buying loop already runs
+       * before it opens escrow.
+       *
+       * Same helper as that loop, so the two paths cannot come to different
+       * answers about the same quote. Nothing has moved at this point: a quote
+       * costs a request, and the alternative was moving money nobody vetted.
+       */
+      const vetted = providerAddrs[svc.resource] as Hex | undefined;
+      if (!vetted) throw new Error(`no vetted provider address for ${svc.resource}`);
+      const match = quoteMatchesOffer(
+        { provider, price: BigInt(price) },
+        { provider: vetted, price: svc.price },
+      );
+      if (!match.ok) throw new Error(`refusing this quote — ${match.reason}`);
 
       // A tab-billed service (the liquidation feed) advertises different terms:
       // no per-call quote, because the whole point is that calls don't touch the
