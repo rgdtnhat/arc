@@ -10131,6 +10131,11 @@ async function main() {
       ownOnly,
       operator: scope.operator,
       actions: scope.operator ? TASK_ACTIONS : SESSION_ACTIONS,
+      // The same wallet the task list names, for the same reason: a step in an
+      // operator's series spends from it, and a row that says "the app wallet"
+      // leaves nothing to check or copy. The series card is reachable without
+      // ever opening the task card, so it cannot borrow the answer from there.
+      appWallet: agentAccount.address,
       limits: SERIES_LIMITS,
     });
   });

@@ -63,13 +63,17 @@ ${grab("stamp")}
 ${grab("stepAmount")}
 ${grab("stepOwner")}
 ${grab("stepWallets")}
-    return { stamp, stepAmount, stepOwner, stepWallets };
+${grab("stepSummary")}
+${grab("stepFacts")}
+    const txLink = (h) => '<a href="#">' + String(h).slice(0, 10) + '</a>';
+    return { stamp, stepAmount, stepOwner, stepWallets, stepFacts };
   `;
   return new Function("CTX", body)(ctx) as {
     stamp: (ms: number) => string;
     stepAmount: (st: Record<string, unknown>) => string;
     stepOwner: () => string;
-    stepWallets: (st: Record<string, unknown>) => string;
+    stepWallets: (st: Record<string, unknown>, series?: Record<string, unknown>) => string;
+    stepFacts: (st: Record<string, unknown>, series?: Record<string, unknown>) => { badge: string; verb: string; detail: string };
   };
 }
 
@@ -171,12 +175,64 @@ test("the copy button is wired where the steps are drawn", () => {
   );
 });
 
+test("a row in the table describes a step against the series that owns it", () => {
+  /*
+   * The table draws steps for every series at once, so the owner cannot come
+   * from whatever is open in the editor — it has to be passed in.
+   */
+  const ui = load({ myAddress: OWNER });
+  const theirs = ui.stepWallets({ venue: "wallet", action: "send", params: { to: ADDR } }, { id: "s9", owner: APP_WALLET });
+  assert.match(theirs, new RegExp(`from ${APP_WALLET}`));
+  assert.equal(theirs.includes(OWNER), false, "a table row borrowed the reader's own address");
+});
+
+test("stepFacts answers the three questions a task row answers", () => {
+  const ui = load({ myAddress: OWNER });
+  const f = ui.stepFacts(
+    { venue: "wallet", action: "send", params: { asset: USDC, to: ADDR, amount: "2500000" },
+      lastStatus: "ok", lastRunAt: 1755900000000, lastDetail: "1 sent", lastTxHash: "0x" + "a".repeat(64) },
+    { id: "s1", owner: OWNER },
+  );
+  assert.match(f.badge, /2\.5 USDC/, "how much");
+  assert.match(f.verb, /wallet · send/, "what it does");
+  assert.match(f.detail, new RegExp(`from ${OWNER}`), "whose wallet");
+  assert.match(f.detail, new RegExp(`to ${ADDR}`), "into whose");
+  assert.match(f.detail, /1 sent/, "what happened");
+  assert.match(f.detail, /0xaaaaaaaa/, "where the receipt is");
+});
+
+test("a step that has not run says so rather than nothing", () => {
+  const ui = load();
+  const f = ui.stepFacts({ venue: "lending", action: "supply", params: { asset: USDC, amount: "10000000" } });
+  assert.match(f.detail, /never run/);
+});
+
+test("the table and the editor describe a step with the same function", () => {
+  /*
+   * They drifted once already: the editor gained the amount, the addresses and
+   * the receipt while the table still said "1. faucet topUp" and a sentence.
+   */
+  const table = app.slice(app.indexOf("const steps = mine.map("), app.indexOf("const on = mine.filter("));
+  assert.match(table, /stepFacts\(m, x\)/, "the table builds its own description again");
+  const rsAt = app.indexOf("function renderSteps()");
+  const editor = app.slice(rsAt, app.indexOf("\n      }\n", rsAt));
+  assert.match(editor, /stepFacts\(st\)/, "the editor builds its own description again");
+});
+
+test("the copy button works in the table too, not just the editor", () => {
+  // `data-tcopy` is bound to the task table alone, so each list that prints an
+  // address needs its own handler or the button is decoration.
+  const handler = app.slice(app.indexOf('$("serRows").addEventListener("click"'));
+  assert.match(handler.slice(0, 1200), /dataset\.stepcopy/, "#serRows does not handle its copy button");
+});
+
 test("the step row shows the run and its receipt", () => {
-  const rows = app.slice(app.indexOf("function renderSteps()"), app.indexOf("function stamp("));
-  assert.match(rows, /stepAmount\(st\)/, "a step does not say how much it moves");
-  assert.match(rows, /stepWallets\(st\)/, "a step does not say whose wallet it touches");
-  assert.match(rows, /txLink\(st\.lastTxHash\)/, "a step's last run has no link to its transaction");
-  assert.match(rows, /stamp\(st\.lastRunAt\)/, "a step does not say when it last ran");
+  const fAt = app.indexOf("function stepFacts(");
+  const facts = app.slice(fAt, app.indexOf("\n      }\n", fAt));
+  assert.match(facts, /stepAmount\(st\)/, "a step does not say how much it moves");
+  assert.match(facts, /stepWallets\(st, series\)/, "a step does not say whose wallet it touches");
+  assert.match(facts, /txLink\(st\.lastTxHash\)/, "a step's last run has no link to its transaction");
+  assert.match(facts, /stamp\(st\.lastRunAt\)/, "a step does not say when it last ran");
 });
 
 test("the timestamp formatter is shared, not trapped in a row renderer", () => {

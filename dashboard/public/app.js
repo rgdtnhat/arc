@@ -3660,8 +3660,20 @@ const $ = (id) => document.getElementById(id);
         }
       }
 
-      const walAsset = (addr) =>
-        walletAssets.find((x) => String(x.address).toLowerCase() === String(addr).toLowerCase()) || null;
+      /**
+       * A token's symbol and decimals, from whichever list has loaded.
+       *
+       * `walletAssets` is filled by the Send & receive card, so anything that
+       * asked before that card ran got no symbol and, worse, the default of six
+       * decimals — which prints a cirBTC amount a hundred times too large. The
+       * deployment's own asset list carries the same three fields and does not
+       * depend on which card the reader opened first.
+       */
+      const walAsset = (addr) => {
+        const key = String(addr).toLowerCase();
+        const match = (list) => (list || []).find((x) => String(x.address).toLowerCase() === key) || null;
+        return match(walletAssets) || match(window.__defiCfg && window.__defiCfg.assets);
+      };
       const walDecimals = (addr) => {
         const a = walAsset(addr);
         return a ? a.decimals : 6;
@@ -4482,6 +4494,65 @@ const $ = (id) => document.getElementById(id);
       let editingTask = null;
       const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
+      /**
+       * The schedule pickers, built once and without asking the server.
+       *
+       * The offsets used to be built inside `loadTasks`, and the series form
+       * copied that select's markup — so the offset dropdown was blank in two
+       * situations that happen constantly. `loadTasks` returns early when the
+       * server says "sign in", which is every poll while signed out, so nothing
+       * was ever built; and a session that goes straight to the Task series tab
+       * never runs `loadTasks` at all, leaving the series form copying an empty
+       * select. Editing anything then showed no zone: the value being assigned
+       * matched no option, and a select with no matching option shows blank.
+       *
+       * A list of UTC offsets does not depend on who is signed in or on any
+       * response, so it is built from nothing, at load, for both forms.
+       */
+      function zoneOptionsHtml() {
+        // Whole and half-hour offsets, which covers every zone in use.
+        return Array.from({ length: 57 }, (_, i) => (i - 28) * 30)
+          .map((m) => `<option value="${m}"${m === 0 ? " selected" : ""}>${zoneLabel(m)}</option>`)
+          .join("");
+      }
+      function zoneLabel(m) {
+        const sign = m < 0 ? "-" : "+", a = Math.abs(m);
+        return `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
+      }
+      function ensureScheduleControls() {
+        let built = false;
+        for (const [zoneId, daysId] of [["taskZone", "taskDays"], ["serZone", "serDays"]]) {
+          const zone = $(zoneId);
+          if (zone && !zone.options.length) { zone.innerHTML = zoneOptionsHtml(); built = true; }
+          const days = $(daysId);
+          if (days && !days.children.length) {
+            days.innerHTML = DAY_NAMES.map((d, i) =>
+              `<label style="font-size:12px;margin-right:7px"><input type="checkbox" value="${i}" /> ${d}</label>`).join("");
+            built = true;
+          }
+        }
+        return built;
+      }
+      ensureScheduleControls();
+
+      /**
+       * Show a stored offset, including one this list does not carry.
+       *
+       * A handful of zones are on a 15- or 45-minute offset, and assigning a
+       * value no option holds leaves the select blank rather than raising
+       * anything — the same silent failure as the empty list above. An offset
+       * that exists is worth showing even when it is unusual.
+       */
+      function setZone(el, minutes) {
+        if (!el) return;
+        const m = Number(minutes ?? 0) || 0;
+        el.value = String(m);
+        if (el.value !== String(m)) {
+          el.insertAdjacentHTML("beforeend", `<option value="${m}">${zoneLabel(m)}</option>`);
+          el.value = String(m);
+        }
+      }
+
       /** The parameters each verb needs, so the form asks for those and no others. */
       const TASK_FIELDS = {
         /*
@@ -4962,7 +5033,7 @@ const $ = (id) => document.getElementById(id);
         } else if (s.kind !== "manual") {
           $("taskHour").value = String(s.hour ?? 0);
           $("taskMinute").value = String(s.minute ?? 0);
-          $("taskZone").value = String(s.offsetMinutes ?? 0);
+          setZone($("taskZone"), s.offsetMinutes);
           if (s.kind === "weekly") {
             $("taskDays").querySelectorAll("input").forEach((i) => { i.checked = (s.days || []).includes(Number(i.value)); });
           }
@@ -5155,18 +5226,7 @@ const $ = (id) => document.getElementById(id);
             $("taskAction").dataset.venue = "";
             syncTaskForm();
           }
-          if (!$("taskZone").options.length) {
-            // Whole and half-hour offsets, which covers every zone in use.
-            $("taskZone").innerHTML = Array.from({ length: 57 }, (_, i) => (i - 28) * 30)
-              .map((m) => {
-                const sign = m < 0 ? "-" : "+", a = Math.abs(m);
-                const label = `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
-                return `<option value="${m}"${m === 0 ? " selected" : ""}>${label}</option>`;
-              }).join("");
-            $("taskDays").innerHTML = DAY_NAMES.map((d, i) =>
-              `<label style="font-size:12px;margin-right:7px"><input type="checkbox" value="${i}" /> ${d}</label>`).join("");
-            syncTaskForm();
-          }
+          if (ensureScheduleControls()) syncTaskForm();
           $("taskRows").innerHTML = (r.tasks || []).length
             ? r.tasks.map((t) => {
                 const when = stamp;
@@ -5202,8 +5262,7 @@ const $ = (id) => document.getElementById(id);
                 const p = t.params || {};
                 const sess = sessionAll.find((x) => x.id === p.sessionId);
                 const dec = sess ? sess.decimals : walDecimals(p.asset);
-                const sym = sess ? sess.symbol
-                  : (walletAssets.find((a) => String(a.address).toLowerCase() === String(p.asset || "").toLowerCase()) || {}).symbol || "";
+                const sym = sess ? sess.symbol : walSymbol(p.asset);
                 const amountText =
                   // A faucet gives what it gives; the choice on the task is the
                   // token, so that is the thing worth showing where an amount
@@ -5328,10 +5387,7 @@ const $ = (id) => document.getElementById(id);
         /** Say the schedule back in words before it is saved, not after. */
         function previewTask() {
           const s = taskSchedule();
-          const zone = (o) => {
-            const sign = o < 0 ? "-" : "+", a = Math.abs(o);
-            return `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
-          };
+          const zone = zoneLabel;
           const at = () => `${String(s.hour).padStart(2, "0")}:${String(s.minute).padStart(2, "0")} ${zone(s.offsetMinutes)}`;
           // The typed figure, before the floor — so a raise can be named rather
           // than just silently appearing in the sentence.
@@ -5529,6 +5585,36 @@ const $ = (id) => document.getElementById(id);
       }
 
       /** One line per step: what it does, and the controls to move or drop it. */
+      /**
+       * Everything a step does, in the form both places that draw one need.
+       *
+       * The editor's list and the series table were describing the same step
+       * two different ways — the editor gained the amount, the addresses and
+       * the receipt; the table still said "1. faucet topUp" and a sentence.
+       * They read from one function now, so a step cannot say one thing in the
+       * list and another in the table.
+       *
+       * `series` is the row a step belongs to, which is what its wallet lines
+       * are resolved against. The editor passes nothing and gets the series
+       * being edited.
+       */
+      function stepFacts(st, series) {
+        const badge = stepAmount(st);
+        const last = st.lastStatus
+          ? `<div class="muted" style="font-size:10.5px;margin-top:2px">` +
+              `<b style="color:var(--${st.lastStatus === "ok" ? "good" : "warn"})">` +
+              `${st.lastStatus === "ok" ? "✓" : st.lastStatus === "skipped" ? "–" : "✗"}</b> ` +
+              `${st.lastRunAt ? esc(stamp(st.lastRunAt)) : esc(st.lastStatus)}` +
+              `${st.lastDetail ? ` — ${esc(st.lastDetail)}` : ""}</div>` +
+            (st.lastTxHash ? `<div style="font-size:10.5px;margin-top:1px">${txLink(st.lastTxHash)}</div>` : "")
+          : `<div class="muted" style="font-size:10.5px;margin-top:2px">never run</div>`;
+        return {
+          badge: badge ? ` <span style="font-size:12px;color:var(--good)">${esc(badge)}</span>` : "",
+          verb: `<div class="muted" style="font-size:11px">${esc(st.venue)} · ${esc(st.action)}${stepSummary(st)}</div>`,
+          detail: stepWallets(st, series) + last,
+        };
+      }
+
       function renderSteps() {
         const host = $("serSteps");
         if (!host) return;
@@ -5536,34 +5622,17 @@ const $ = (id) => document.getElementById(id);
           ? serSteps.map((st, i) => {
               const off = st.enabled === false;
               /*
-               * A step is a task, so it is described like one.
-               *
-               * This showed a name, a verb and "last: ok" — while the scheduled
-               * task beside it answered how much, out of whose wallet, into
-               * whose, when it last ran and with which transaction. A step
-               * spends exactly as a task does, and reviewing a series meant
-               * opening each step's editor to see what it would actually do.
-               *
-               * Everything below comes from what a step already stores; nothing
-               * new is asked of the server.
+               * A step is a task, so it is described like one — the same way in
+               * the list here and in the series table, from one function.
                */
-              const badge = stepAmount(st);
-              const last = st.lastStatus
-                ? `<div class="muted" style="font-size:10.5px;margin-top:2px">` +
-                    `<b style="color:var(--${st.lastStatus === "ok" ? "good" : "warn"})">` +
-                    `${st.lastStatus === "ok" ? "✓" : st.lastStatus === "skipped" ? "–" : "✗"}</b> ` +
-                    `${st.lastRunAt ? esc(stamp(st.lastRunAt)) : esc(st.lastStatus)}` +
-                    `${st.lastDetail ? ` — ${esc(st.lastDetail)}` : ""}</div>` +
-                  (st.lastTxHash ? `<div style="font-size:10.5px;margin-top:1px">${txLink(st.lastTxHash)}</div>` : "")
-                : `<div class="muted" style="font-size:10.5px;margin-top:2px">never run</div>`;
+              const f = stepFacts(st);
               return `<div class="row-actions" style="align-items:flex-start;gap:6px;flex-wrap:wrap">` +
                 `<span class="muted" style="font-size:12px;min-width:18px">${i + 1}.</span>` +
                 `<span style="flex:1;min-width:150px;font-size:12.5px${off ? ";opacity:.55" : ""}">` +
                 `<b>${esc(st.name)}</b>` +
-                `${badge ? ` <span style="font-size:12px;color:var(--good)">${esc(badge)}</span>` : ""}` +
+                `${f.badge}` +
                 `${off ? ' <span style="color:var(--warn);font-size:10.5px">off</span>' : ""}` +
-                `<div class="muted" style="font-size:11px">${esc(st.venue)} · ${esc(st.action)}${stepSummary(st)}</div>` +
-                stepWallets(st) + last + `</span>` +
+                f.verb + f.detail + `</span>` +
                 `<button class="btn" data-stepup="${i}" ${i === 0 ? "disabled" : ""} style="padding:1px 7px;font-size:11px">↑</button>` +
                 `<button class="btn" data-stepdown="${i}" ${i === serSteps.length - 1 ? "disabled" : ""} style="padding:1px 7px;font-size:11px">↓</button>` +
                 `<button class="btn" data-stepedit="${i}" style="padding:1px 8px;font-size:11px">Edit</button>` +
@@ -5614,14 +5683,15 @@ const $ = (id) => document.getElementById(id);
       /**
        * Whose wallet a step would run as.
        *
-       * A step carries no owner of its own — the series owns it. An existing
-       * series says so directly; one still being composed belongs to whoever
-       * is composing it, which is the connected wallet, or the app wallet when
-       * an operator is working without one. Resolving it here is what lets a
-       * step print the same two addresses a task row prints.
+       * A step carries no owner of its own — the series owns it. A series that
+       * exists says so directly, whether it is the one being edited or a row in
+       * the list; one still being composed belongs to whoever is composing it,
+       * which is the connected wallet, or the app wallet when an operator is
+       * working without one. Resolving it here is what lets a step print the
+       * same two addresses a task row prints.
        */
-      function stepOwner() {
-        const row = editingSeries ? seriesRowsById.get(editingSeries) : null;
+      function stepOwner(series) {
+        const row = series || (editingSeries ? seriesRowsById.get(editingSeries) : null);
         if (row) return String(row.owner || taskAppWallet || "");
         return String(window.__myAddress || taskAppWallet || "");
       }
@@ -5634,7 +5704,7 @@ const $ = (id) => document.getElementById(id);
        * do not. The task row prints both ends in full for exactly that reason,
        * and a step is no less worth checking before it runs on a timer.
        */
-      function stepWallets(st) {
+      function stepWallets(st, series) {
         const p = st.params || {};
         const line = (label, addr, note) =>
           `<div class="muted mono" style="font-size:10.5px;word-break:break-all">${label} ${esc(addr)}` +
@@ -5647,7 +5717,7 @@ const $ = (id) => document.getElementById(id);
            * happens. Only the destination is real, and a blank one is exactly
            * the case worth spelling out rather than leaving implied.
            */
-          const to = String(p.to || "") || stepOwner();
+          const to = String(p.to || "") || stepOwner(series);
           return to
             ? line("into", to, p.to ? "" : "(this series' own wallet)")
             : `<div class="muted" style="font-size:10.5px">into this series' own wallet</div>`;
@@ -5659,7 +5729,7 @@ const $ = (id) => document.getElementById(id);
          * there is one.
          */
         const session = sessionAll.find((x) => x.id === p.sessionId) || sessionRows.find((x) => x.id === p.sessionId);
-        const from = (session && session.owner) || stepOwner();
+        const from = (session && session.owner) || stepOwner(series);
         if (from) out.push(line("from", String(from), ""));
         if (p.to) out.push(line("to", String(p.to), ""));
         return out.join("");
@@ -5697,6 +5767,9 @@ const $ = (id) => document.getElementById(id);
           }
           if ($("seriesNotReady")) $("seriesNotReady").style.display = "none";
           if ($("seriesBody")) $("seriesBody").style.display = "";
+          // The wallet an operator's steps spend from. Set here as well as in
+          // the task list because this card loads on its own.
+          if (r.appWallet) taskAppWallet = r.appWallet;
           seriesRowsById = new Map((r.series || []).map((x) => [x.id, x]));
           renderMineFilter("series", r);
           // What a series may be told to do is the server's call, the same as
@@ -5706,12 +5779,7 @@ const $ = (id) => document.getElementById(id);
           // The vault's token, for the withdrawal amount's decimals.
           if (!window.__defiCfg) loadDefiConfig().catch(() => {});
           if (r.limits) seriesLimits = { ...seriesLimits, ...r.limits };
-          if (!$("serZone").options.length) {
-            $("serZone").innerHTML = $("taskZone").innerHTML;
-            $("serDays").innerHTML = DAY_NAMES.map((d, i) =>
-              `<label style="font-size:12px;margin-right:7px"><input type="checkbox" value="${i}" /> ${d}</label>`).join("");
-            syncSeriesForm();
-          }
+          if (ensureScheduleControls()) syncSeriesForm();
           syncStepForm();
           renderSteps();
           const when = stamp;
@@ -5729,14 +5797,21 @@ const $ = (id) => document.getElementById(id);
                     `<div style="font-size:11px;margin-top:2px">${esc(x.lastDetail || "")}</div>`
                   : `<span class="muted">never run</span>`;
                 const mine = x.steps || [];
+                /*
+                 * The steps, described as the scheduled-task table describes a
+                 * task — because that is what each one is.
+                 *
+                 * This row used to be the only place a series was reviewed
+                 * without opening it, and it said "1. faucet topUp" and a
+                 * sentence of detail: not which token, not whose wallet, not
+                 * where the receipt is. All of it was already on the step.
+                 */
                 const steps = mine.map((m, i) => {
-                  const tick = m.lastStatus === "ok" ? ' <span style="color:var(--good)">✓</span>'
-                    : m.lastStatus === "failed" ? ' <span style="color:var(--warn)">✗</span>'
-                    : m.lastStatus === "skipped" ? ' <span class="muted">–</span>' : "";
-                  return `<div class="muted" style="font-size:11px${m.enabled === false ? ";opacity:.55" : ""}">` +
-                    `${x.mode === "sequential" ? `${i + 1}. ` : "· "}${esc(m.name)}${tick}` +
-                    `${m.enabled === false ? ' <span style="color:var(--warn)">off</span>' : ""}` +
-                    `${m.lastDetail ? ` <span class="muted">— ${esc(m.lastDetail)}</span>` : ""}</div>`;
+                  const f = stepFacts(m, x);
+                  return `<div style="font-size:11.5px;margin-top:5px${m.enabled === false ? ";opacity:.55" : ""}">` +
+                    `<span class="muted">${x.mode === "sequential" ? `${i + 1}. ` : "· "}</span>${esc(m.name)}${f.badge}` +
+                    `${m.enabled === false ? ' <span style="color:var(--warn);font-size:10.5px">off</span>' : ""}` +
+                    f.verb + f.detail + `</div>`;
                 }).join("");
                 const on = mine.filter((m) => m.enabled !== false).length;
                 return `<tr><td><b>${esc(x.name)}</b>` +
@@ -5787,7 +5862,7 @@ const $ = (id) => document.getElementById(id);
         } else if (sc.kind !== "manual") {
           $("serHour").value = String(sc.hour ?? 0);
           $("serMinute").value = String(sc.minute ?? 0);
-          $("serZone").value = String(sc.offsetMinutes ?? 0);
+          setZone($("serZone"), sc.offsetMinutes);
           if (sc.kind === "weekly") {
             $("serDays").querySelectorAll("input").forEach((i) => { i.checked = (sc.days || []).includes(Number(i.value)); });
           }
@@ -5817,10 +5892,7 @@ const $ = (id) => document.getElementById(id);
       function previewSeries() {
         const sc = serSchedule();
         const n = serSteps.filter((x) => x.enabled !== false).length;
-        const zone = (o) => {
-          const sign = o < 0 ? "-" : "+", a = Math.abs(o);
-          return `GMT${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
-        };
+        const zone = zoneLabel;
         const at = () => `${String(sc.hour).padStart(2, "0")}:${String(sc.minute).padStart(2, "0")} ${zone(sc.offsetMinutes)}`;
         const every = (x) => {
           const u = x % 604800 === 0 ? [x / 604800, "week"]
@@ -6030,6 +6102,20 @@ const $ = (id) => document.getElementById(id);
           const run = btn.dataset.srun, del = btn.dataset.sdel, tog = btn.dataset.stog;
           const edit = btn.dataset.sedit, stop = btn.dataset.sstop;
           if (edit) { startEditingSeries(edit); return; }
+          /*
+           * The steps in this table print their addresses in full with a copy
+           * button, and `data-tcopy` is bound to the scheduled-task table only
+           * — so without this the button would look right and do nothing. It is
+           * answered before the disable-and-post path below, which is for the
+           * verbs that talk to the server.
+           */
+          if (btn.dataset.stepcopy) {
+            try {
+              await navigator.clipboard.writeText(btn.dataset.stepcopy);
+              showReceipt("serMsg", true, "address copied");
+            } catch { showReceipt("serMsg", false, "could not copy — select the address and copy it by hand"); }
+            return;
+          }
           btn.disabled = true;
           try {
             if (run) {
