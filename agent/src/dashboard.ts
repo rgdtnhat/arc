@@ -9017,7 +9017,13 @@ async function main() {
             `Until then, top up ${who} by hand at ${result.url ?? "https://faucet.circle.com/"}.`,
           );
         }
-        throw new Error(result.message);
+        /*
+         * Also a refusal, not a failed transaction. A faucet request is an HTTP
+         * call to Circle; nothing is ever signed or broadcast, so the generic
+         * "That transaction didn't go through" prefix would send somebody to
+         * the explorer looking for a hash that does not exist.
+         */
+        throw new Refusal(result.message);
       }
       case "wallet": {
         const a = asset();

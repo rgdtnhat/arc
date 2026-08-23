@@ -126,3 +126,50 @@ test("a rejected drip repeats what the faucet actually said", async () => {
   assert.match(r.message, /unsupported blockchain/, "the faucet's own reason was dropped");
   assert.match(r.message, /ARC-WRONG/, "the value actually sent should be named back");
 });
+
+/*
+ * What the request actually asks for.
+ *
+ * On Arc, USDC *is* the native gas token, so asking for a separate native drip
+ * is not merely redundant — Circle rejects the whole request:
+ *
+ *     HTTP 400 {"code":2,"message":"The 'native token' token is not supported
+ *     by 'ARC-TESTNET' blockchain"}
+ *
+ * The blockchain id was right all along; the body was asking for an asset the
+ * chain cannot have.
+ */
+
+/** Capture the JSON body a drip would send. */
+async function bodyOf(cfg: Record<string, unknown>) {
+  let sent = "";
+  await new CircleFaucet({
+    apiKey: "k",
+    ...cfg,
+    fetchImpl: (async (_u: string, init: { body: string }) => {
+      sent = init.body;
+      return { ok: true, status: 200, text: async () => "", json: async () => ({}) };
+    }) as unknown as typeof fetch,
+  }).request(("0x" + "1".repeat(40)) as `0x${string}`);
+  return JSON.parse(sent) as Record<string, unknown>;
+}
+
+test("no native token is requested by default, because Arc has none to give", async () => {
+  const body = await bodyOf({ blockchain: "ARC-TESTNET" });
+  assert.equal("native" in body, false, "asking for a native drip is what made Arc refuse the request");
+  assert.equal(body.usdc, true, "USDC is the whole point");
+  assert.equal(body.blockchain, "ARC-TESTNET");
+});
+
+test("a chain with a separate gas token can still ask for it", async () => {
+  // The flag is not deleted, only defaulted off — this client is not Arc-only.
+  const body = await bodyOf({ blockchain: "ETH-SEPOLIA", native: true });
+  assert.equal(body.native, true);
+  assert.equal(body.usdc, true);
+});
+
+test("the address is the one asked for, not one the client chose", async () => {
+  // Worth pinning: this is the only field that decides where money lands.
+  const body = await bodyOf({ blockchain: "ARC-TESTNET" });
+  assert.equal(body.address, "0x" + "1".repeat(40));
+});

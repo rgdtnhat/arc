@@ -37,8 +37,24 @@ export interface CircleFaucetConfig {
   /** Drip endpoint; defaults to Circle's when an API key is present. */
   apiUrl?: string;
   apiKey?: string;
-  /** Circle blockchain id, e.g. "ARC-SEPOLIA". */
+  /** Circle blockchain id, e.g. "ARC-TESTNET". */
   blockchain?: string;
+  /**
+   * Ask for the chain's *native* token as well as USDC. Off by default.
+   *
+   * It used to be sent unconditionally, and on Arc that is a contradiction:
+   * USDC **is** the native gas token there, so there is no separate native
+   * asset to drip and the whole request is rejected — the drip does not
+   * degrade to "USDC only", it fails outright:
+   *
+   *     HTTP 400 {"code":2,"message":"The 'native token' token is not
+   *     supported by 'ARC-TESTNET' blockchain"}
+   *
+   * Which is a good error and cost an evening anyway, because the request was
+   * asking for something the chain cannot have. Chains that do have a separate
+   * gas token can turn it back on with `CIRCLE_FAUCET_NATIVE=true`.
+   */
+  native?: boolean;
   fetchImpl?: typeof fetch;
 }
 
@@ -69,7 +85,8 @@ export class CircleFaucet implements Faucet {
         body: JSON.stringify({
           address,
           blockchain: this.cfg.blockchain ?? "ARC-SEPOLIA",
-          native: true,
+          // See `native` above: on Arc this must not be asked for at all.
+          ...(this.cfg.native ? { native: true } : {}),
           usdc: true,
         }),
       });
@@ -125,5 +142,7 @@ export function faucetFromEnv(): CircleFaucet {
     apiUrl: process.env.CIRCLE_FAUCET_API_URL,
     apiKey,
     blockchain: process.env.CIRCLE_FAUCET_BLOCKCHAIN ?? "ARC-SEPOLIA",
+    // Opt-in, because the chain this app is built for does not have one.
+    native: process.env.CIRCLE_FAUCET_NATIVE === "true",
   });
 }
