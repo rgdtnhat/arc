@@ -9026,6 +9026,54 @@ async function main() {
         throw new Refusal(result.message);
       }
       case "wallet": {
+        if (t.action === "fundFromOwner") {
+          /*
+           * Top a wallet up from the deployer's own balance.
+           *
+           * The keyless answer to keeping the agent funded. Circle's drip API
+           * refuses unauthenticated calls (`401 Missing API key`) and its web
+           * faucet is a captcha-protected page that exists to stay one, so the
+           * only honest way to fund a wallet without a third party is to move
+           * money the operator already has.
+           *
+           * Which makes this a *spend*, not a top-up, whatever it is called
+           * from the outside — so it is operator-only, and a visitor is refused
+           * by the same rule that refuses them `send` rather than by anything
+           * written here. The deployer key is the pool's owner; handing a
+           * visitor a way to schedule transfers out of it would be handing them
+           * the treasury.
+           */
+          if (!owner) throw new Refusal(OWNER_HINT);
+          if (t.owner) {
+            throw new Refusal(
+              "this tops up a wallet from the deployer's balance, which is the operator's to spend. " +
+              "Schedule it as the operator, or use a session-funded task to spend your own wallet.",
+            );
+          }
+          const amt = BigInt(String(p.amount ?? "0"));
+          if (amt <= 0n) throw new Refusal("say how much to send");
+          const to = (String(p.to ?? "") || agentAccount.address) as Hex;
+          if (!/^0x[0-9a-fA-F]{40}$/.test(to)) throw new Refusal(`"${String(p.to)}" is not an address`);
+
+          const held = await client.public.getBalance({ address: owner.account.address as Hex });
+          // The gas token's 18-decimal view of a 6-decimal balance.
+          const heldUsdc = held / 10n ** 12n;
+          const KEEP = 5_000_000n; // 5 USDC, so the deployer can still sign
+          if (heldUsdc < amt + KEEP) {
+            throw new Refusal(
+              `the deployer holds ${fmtUnits(heldUsdc, 6)} USDC and this would leave it unable to pay ` +
+              `its own fees — send at most ${fmtUnits(heldUsdc > KEEP ? heldUsdc - KEEP : 0n, 6)}.`,
+            );
+          }
+          const txHash = await owner.write(usdcAddress, erc20Abi, "transfer", [to, amt]);
+          hashes.push(txHash as Hex);
+          invalidateAll();
+          return {
+            ok: true,
+            detail: `sent ${fmtUnits(amt, 6)} USDC from the deployer to ${to.slice(0, 8)}…`,
+            txHash,
+          };
+        }
         const a = asset();
         /*
          * Two funding addresses, one shape.
@@ -9565,6 +9613,20 @@ async function main() {
     // and the address is the task's owner. There is nothing here to validate,
     // and inventing a field to check would only be something to get wrong.
     if (body.venue === "faucet") return;
+    if (action === "fundFromOwner") {
+      // Only the amount is required: the destination defaults to the app wallet,
+      // which is the wallet this exists to keep funded.
+      let amount: bigint;
+      try {
+        amount = BigInt(String(body.params?.amount ?? "0"));
+      } catch {
+        throw new Error(`"${String(body.params?.amount)}" is not an amount`);
+      }
+      if (amount <= 0n) throw new Error("say how much to send");
+      const to = String(body.params?.to ?? "");
+      if (to && !/^0x[0-9a-fA-F]{40}$/.test(to)) throw new Error(`"${to}" is not an address`);
+      return;
+    }
     if (action === "sessionBorrow" || (action === "sessionWithdraw" && body.venue === "lending")) {
       let amount: bigint;
       try {

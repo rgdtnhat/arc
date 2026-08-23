@@ -4500,6 +4500,13 @@ const $ = (id) => document.getElementById(id);
         "amm:add": ["poolId", "amounts"], "amm:remove": ["poolId", "shares"],
         "amm:swap": ["poolId", "tokenIn", "tokenOut", "amountIn"],
         "wallet:send": ["asset", "to", "amount", "message", "memo"],
+        /*
+         * From the deployer's balance rather than the app wallet's. No asset
+         * picker: the deployer's balance is the gas token, which on Arc is USDC.
+         * `to` is optional and defaults to the app wallet, which is the wallet
+         * this exists to keep funded.
+         */
+        "wallet:fundFromOwner": ["to", "amount"],
         "wallet:bulk": ["asset", "recipients", "message", "memo"],
         // Funded by a visitor's delegation rather than the app wallet.
         "wallet:sessionSend": ["session", "to", "amount", "message", "memo"],

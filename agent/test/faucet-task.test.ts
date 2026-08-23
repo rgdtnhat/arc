@@ -221,3 +221,55 @@ test("whatever the status, the faucet's own words survive", async () => {
     assert.match(r.message, new RegExp(body), `HTTP ${status} lost the reason`);
   }
 });
+
+/*
+ * Funding a wallet with no faucet key at all.
+ *
+ * Circle's drip API refuses unauthenticated calls outright — `401 malformed
+ * authorization. Missing API key` — and its web faucet is a captcha-protected
+ * page that exists to stay one. So the only honest way to keep a wallet funded
+ * without a third party is to move money the operator already has, and that is
+ * a *spend*, whatever it is called from the outside.
+ *
+ * Which is why it lives with the spending verbs rather than beside
+ * `faucet.topUp`. That venue is exempt from the funding checks because a drip
+ * moves nobody's money; this moves the deployer's — the key that owns the pool,
+ * the oracle and the limiter — so it has to be operator-only, and it is refused
+ * for a visitor by the same rule that refuses them `send`.
+ */
+
+test("funding from the owner is a wallet verb, not a faucet one", () => {
+  assert.ok(TASK_ACTIONS.wallet.includes("fundFromOwner"));
+  assert.equal(TASK_ACTIONS.faucet.includes("fundFromOwner"), false,
+    "a transfer out of the deployer must not sit in the venue exempt from funding checks");
+});
+
+test("it needs an amount, because it spends", () => {
+  /*
+   * The opposite of `faucet.topUp`, which takes no parameters at all. A drip is
+   * whatever the faucet decides to give; this is whatever the operator decides
+   * to send, and an unstated amount would have to be guessed.
+   */
+  const s = store();
+  const ok = s.create({ venue: "wallet", action: "fundFromOwner", params: { amount: "2000000" }, schedule: { kind: "manual" } });
+  assert.equal(ok.ok, true, errOf(ok));
+  assert.equal(s.get(idOf(ok))!.params.amount, "2000000");
+});
+
+test("the destination is optional, and defaults to the wallet this exists to fund", () => {
+  // Topping up the app wallet is the whole point; naming it every time would be
+  // a field to get wrong for no gain.
+  const s = store();
+  const r = s.create({ venue: "wallet", action: "fundFromOwner", params: { amount: "1000000" }, schedule: { kind: "manual" } });
+  assert.equal(r.ok, true);
+  assert.equal(s.get(idOf(r))!.params.to, undefined);
+});
+
+test("a schedule is kept, so a wallet can keep itself topped up", () => {
+  const s = store();
+  const id = idOf(s.create({
+    venue: "wallet", action: "fundFromOwner", params: { amount: "5000000" },
+    schedule: { kind: "every", seconds: 86_400 },
+  }));
+  assert.equal(s.due(Date.now() + 90_000_000).length, 1);
+});

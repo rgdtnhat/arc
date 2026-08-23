@@ -116,7 +116,19 @@ export const TASK_ACTIONS: Record<TaskVenue, string[]> = {
   amm: ["add", "remove", "swap", "sessionAdd", "sessionSwap", "sessionRemove"],
   vault: ["deposit", "withdraw", "sessionDeposit", "sessionWithdraw"],
   swap: ["swap", "sessionSwap"],
-  wallet: ["send", "bulk", "sessionSend", "sessionBulk"],
+  /*
+   * `fundFromOwner` tops a wallet up from the *deployer's* balance rather than
+   * the app wallet's — the answer to "keep the agent funded" when there is no
+   * faucet key, since Circle's drip API refuses unauthenticated calls outright
+   * and its web faucet is a captcha-protected page that must stay one.
+   *
+   * Filed with the spends, deliberately, and not beside `faucet.topUp`. That
+   * venue is exempt from the funding checks because a drip moves nobody's
+   * money; this moves the operator's, so it belongs where every other outflow
+   * is — operator-only, and refused for a visitor by the same rule that refuses
+   * them `send`.
+   */
+  wallet: ["send", "bulk", "fundFromOwner", "sessionSend", "sessionBulk"],
   /*
    * The one venue that brings money *in* rather than moving it out.
    *

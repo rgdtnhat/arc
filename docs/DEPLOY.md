@@ -375,6 +375,25 @@ CIRCLE_FAUCET_BLOCKCHAIN=ARC-SEPOLIA   # the network id Circle knows Arc by
 
 Faucets rate limit per address on their own side, so a top-up scheduled more
 often than the faucet allows simply fails that run and tries again on the next.
+Daily matches how these usually work.
+
+### Without a faucet key at all
+
+There is no keyless drip. Circle's API refuses unauthenticated calls —
+`401 malformed authorization. Missing API key` — and the web faucet is a
+captcha-protected page, which it is entitled to be; automating it would be
+circumventing the control rather than using it.
+
+What works instead is moving money the operator already has:
+
+    wallet / fundFromOwner    params: amount, and optionally to
+
+It sends USDC from the **deployer's** balance to the app wallet (or a named
+address). Filed with the spending verbs rather than beside `faucet.topUp`, and
+the distinction is the point: a drip moves nobody's money, this moves the key
+that owns the pool, the oracle and the limiter. So it is operator-only, refused
+for a visitor by the same rule that refuses them `send`, and it leaves 5 USDC
+behind so the deployer can still pay its own fees.
 
 ## When the withdrawal limit feels absurd
 
