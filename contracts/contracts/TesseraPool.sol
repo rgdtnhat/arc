@@ -1099,6 +1099,21 @@ contract TesseraPool is ReentrancyGuard {
         if (amount == 0 || amount > bal) revert ZeroAmount();
         if (amount > _available(r)) revert InsufficientLiquidity();
         uint256 shares = (amount * r.totalSupplyShares) / r.totalSupplyAssets;
+        /*
+         * No assets leave without shares being burned.
+         *
+         * Interest makes a share worth more than a unit of the asset, so this
+         * division floors: a withdrawal small enough rounds to zero shares and
+         * pays out anyway, leaving the balance it was drawn against untouched
+         * and repeatable. `supply` already refuses a deposit that mints nothing;
+         * the exit side is the one that matters, because the mint side only
+         * costs the depositor.
+         *
+         * The amount at stake per call is under one unit of the asset, so this
+         * was never worth anybody's gas — but "you cannot take assets without
+         * burning shares" has to be true, not merely unprofitable to break.
+         */
+        if (shares == 0) revert ZeroAmount();
         supplyShares[asset][user] -= shares;
         r.totalSupplyShares -= shares;
         r.totalSupplyAssets -= amount;
@@ -1127,6 +1142,10 @@ contract TesseraPool is ReentrancyGuard {
             revert BorrowCapReached(bCap, r.totalBorrowAssets + amount);
         }
         uint256 shares = r.totalBorrowShares == 0 ? amount : (amount * r.totalBorrowShares) / r.totalBorrowAssets;
+        // Debt that rounds to nothing is a loan that never has to be repaid.
+        // Same flooring as the exit above, and the same rule: no assets out
+        // without the accounting that follows them.
+        if (shares == 0) revert ZeroAmount();
         borrowShares[asset][user] += shares;
         r.totalBorrowShares += shares;
         r.totalBorrowAssets += amount;
@@ -1155,6 +1174,14 @@ contract TesseraPool is ReentrancyGuard {
         uint256 pay = amount > debt ? debt : amount;
         if (pay == 0) revert ZeroAmount();
         uint256 shares = (pay * r.totalBorrowShares) / r.totalBorrowAssets;
+        /*
+         * A repayment that clears no debt is worse than wasted: it takes the
+         * payer's money, leaves their debt where it was, and drops
+         * `totalBorrowAssets` without dropping the shares against it — which
+         * quietly writes down what every other borrower owes. Refuse it and
+         * tell them to pay enough to matter.
+         */
+        if (shares == 0) revert ZeroAmount();
         borrowShares[asset][user] -= shares;
         r.totalBorrowShares -= shares;
         r.totalBorrowAssets -= pay;

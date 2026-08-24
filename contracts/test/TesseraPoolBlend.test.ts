@@ -65,12 +65,23 @@ async function withBorrower(
 /**
  * Force an accrual without moving anything that matters.
  *
- * A 1-wei withdrawal by the supplier calls `_accrueAll` and needs no allowance,
- * which a repayment would — the borrower is holding borrowed tokens, not an
- * approval to hand them back.
+ * A withdrawal by the supplier calls `_accrueAll` and needs no allowance, which
+ * a repayment would — the borrower is holding borrowed tokens, not an approval
+ * to hand them back.
+ *
+ * It used to withdraw a single unit. That worked only because a unit divided to
+ * *zero* shares once interest had accrued: it paid out against a balance it
+ * never reduced, which is the defect `TesseraPoolRounding.test.ts` now pins.
+ *
+ * The amount cannot be computed from the reserve either, because the call being
+ * made is the one that books the interest — `reserves()` still reads the totals
+ * from before this poke's own accrual, so any "exactly one share" figure taken
+ * from it is stale by the time the division happens. A thousandth of a USDC is
+ * comfortably above one share at any index these tests reach, and is 5e-8 of
+ * the smallest pool here: far below anything the rate assertions can see.
  */
 async function poke(f: Awaited<ReturnType<typeof deployFixture>>) {
-  await (await f.as(f.alice)).write.withdraw([f.usdc.address, 1n]);
+  await (await f.as(f.alice)).write.withdraw([f.usdc.address, USDC("0.001")]);
 }
 
 describe("TesseraPool — Blend interest-rate model", () => {
