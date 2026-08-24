@@ -41,6 +41,13 @@ export interface Observation {
     supplyCap?: bigint | null;
     borrowCap?: bigint | null;
     oracle?: { ok: boolean; enabled: boolean; spreadBps: number; sources: number; updatedAt: number } | null;
+    /** Collateral factor in bps. Above zero, this asset backs loans. */
+    collateralFactorBps?: number | null;
+    /**
+     * Whether a price guard is enabled for this asset — the band that catches a
+     * price nobody should have been able to set.
+     */
+    guarded?: boolean | null;
   }[];
   /** Health factors keyed by account label, in WAD (1e18). */
   positions?: { label: string; healthWad: bigint }[];
@@ -143,6 +150,34 @@ export function evaluate(o: Observation): Alert[] {
           "anything is refused, until this asset can be priced again. Depositors with no " +
           "debt can still withdraw, and repaying always works.",
         action: "Restore a source for this asset, or take it off the risk oracle.",
+      });
+    }
+    /*
+     * Collateral priced with nothing checking the price.
+     *
+     * `TesseraPriceGuard.check` returns "fine" for any price of an asset whose
+     * feed is disabled — that is the documented default, and it is the right
+     * one for an asset nobody borrows against. It is the wrong one the moment
+     * that asset carries a collateral factor: the price then mints borrowing
+     * power directly, and a fat finger, a stale upstream or a compromised
+     * price-setter key writes it with no band to catch it.
+     *
+     * Deliberately not a function of how much is supplied today. A reserve with
+     * eighty dollars in it and a 70% factor is one deposit away from mattering,
+     * and the configuration is what is wrong, not the balance.
+     */
+    if (r.guarded === false && (r.collateralFactorBps ?? 0) > 0) {
+      alerts.push({
+        key: `unguarded-collateral:${r.symbol}`,
+        severity: "critical",
+        title: `${r.symbol} backs loans at ${((r.collateralFactorBps ?? 0) / 100).toFixed(0)}% with no price guard`,
+        detail:
+          "Its price feed is disabled on the price guard, so any price at all passes the deviation " +
+          "check — and at this collateral factor the price is what decides how much can be borrowed " +
+          "against it. Nothing here is wrong yet; nothing would catch it if it were.",
+        action:
+          "Configure a guard for this asset (a peg for a stable, a pool average with a band for anything " +
+          "else), or drop its collateral factor to zero so it stops backing loans.",
       });
     }
     if (oracle && oracle.sources > 1) {

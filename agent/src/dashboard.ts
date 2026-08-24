@@ -3106,10 +3106,12 @@ async function main() {
 
         obs.reserves = [];
         obs.outflow = [];
+        // The guard, for the "collateral priced with nothing checking it" rule.
+        const guardWatchAddr = (liveDeployment.tesseraPriceGuard as Hex) ?? null;
         await Promise.all(
           assets.map(async (a) => {
             const addr = a.address as Hex;
-            const [stats, capacity, oracleStatus, budget] = await Promise.all([
+            const [stats, capacity, oracleStatus, budget, guardFeed] = await Promise.all([
               poolClient!.reserveData(addr).catch(() => null),
               poolClient!.public
                 .readContract({ address: poolClient!.pool, abi: tesseraPoolAbi, functionName: "capacityOf", args: [addr] })
@@ -3124,6 +3126,14 @@ async function main() {
                     .readContract({ address: limiterAddr, abi: tesseraRateLimiterAbi, functionName: "limitOf", args: [addr] })
                     .catch(() => null)
                 : Promise.resolve(null),
+              // Whether a deviation band exists for this asset at all. A feed
+              // that is off is not a neutral setting for something that backs
+              // loans — see the rule in `watchtower.ts`.
+              guardWatchAddr
+                ? poolClient!.public
+                    .readContract({ address: guardWatchAddr, abi: tesseraPriceGuardAbi, functionName: "feeds", args: [addr] })
+                    .catch(() => null)
+                : Promise.resolve(null),
             ]);
             if (!stats) return;
 
@@ -3131,9 +3141,15 @@ async function main() {
             const [supplyRoom, borrowRoom] = capacity as readonly [bigint, bigint];
             const UNCAPPED = (1n << 256n) - 1n;
 
+            const cfg = await poolClient!.reserveConfig(addr).catch(() => null);
             obs.reserves!.push({
               symbol: a.symbol,
               utilisationPct: Number(stats.utilizationWad) / 1e16,
+              collateralFactorBps: cfg ? cfg.cFactorBps : null,
+              // `feeds[0]` is the feed's own `enabled`. Null when there is no
+              // guard contract at all, which is a different thing from a guard
+              // that is deployed and switched off for this asset.
+              guarded: guardFeed ? Boolean((guardFeed as readonly unknown[])[0]) : null,
               supplyRoom: supplyRoom === UNCAPPED ? null : supplyRoom,
               borrowRoom,
               supplyCap: supplyRoom === UNCAPPED ? null : supplyRoom + stats.cash + stats.totalBorrows,

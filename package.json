@@ -38,7 +38,8 @@
     "session:key": "node scripts/session-key.mjs",
     "pool:tune-outflow": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/tune-outflow.mjs",
     "pool:retire-risk": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/retire-asset-risk.mjs",
-    "pool:clear-debt": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/clear-agent-debt.mjs"
+    "pool:clear-debt": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/clear-agent-debt.mjs",
+    "pool:guard-collateral": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/guard-collateral.mjs"
   },
   "overrides": {
     "adm-zip": "^0.6.0",

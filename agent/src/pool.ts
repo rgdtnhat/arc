@@ -396,9 +396,23 @@ export class TesseraPoolClient {
    * `addReserve` — worth surfacing, because an unregistered reserve otherwise
    * looks identical to a read failure.
    */
-  async reserveConfig(
-    asset: Hex,
-  ): Promise<{ enabled: boolean; decimals: number; priceE8: bigint; borrowable: boolean }> {
+  /**
+   * The declared shape used to be narrower than the value.
+   *
+   * It returned the three risk factors and promised four fields, so every
+   * caller that wanted a collateral factor had to re-read the tuple and index
+   * it by hand — which is exactly the mistake the `ReserveTuple` comment above
+   * exists to stop somebody making.
+   */
+  async reserveConfig(asset: Hex): Promise<{
+    enabled: boolean;
+    decimals: number;
+    priceE8: bigint;
+    borrowable: boolean;
+    cFactorBps: number;
+    liqFactorBps: number;
+    lFactorBps: number;
+  }> {
     const r = (await this.public.readContract({
       address: this.pool,
       abi: tesseraPoolAbi,
