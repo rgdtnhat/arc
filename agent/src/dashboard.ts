@@ -9772,7 +9772,18 @@ async function main() {
     const t = myTask(req, res);
     if (!t) return;
     const wasRunning = runningTasks.has(t.id);
-    stopRequested.add(t.id);
+    /*
+     * The flag interrupts the run in flight. With no run in flight there is
+     * nothing to interrupt, and setting it anyway is what broke Resume.
+     *
+     * It is cleared in `executeTask`'s `finally` — which cannot happen while
+     * the task is disabled, and Stop disables it. So a task stopped while idle
+     * kept the flag for ever, and the first run after Resume walked into it:
+     * the venue handlers ask `stopped(t.id)` before each transfer, refused
+     * every one, reported "stopped by the operator", and only then cleared it.
+     * A daily schedule lost a day to a stop nobody was still asking for.
+     */
+    if (wasRunning) stopRequested.add(t.id);
     taskStore.update(t.id, { enabled: false });
     logTx(req, {
       category: "defi", action: "task-stop", status: "success",
@@ -10283,6 +10294,16 @@ async function main() {
       }
     }
     const r = taskStore.update(req.params.id, body);
+    /*
+     * Resume means start again, so it drops any stop still being asked for.
+     *
+     * The other half of the fix in `/stop`: that one stops a stale flag being
+     * created, this one stops a live flag outliving the decision to resume. A
+     * stop that lands while a run is in flight is legitimately set, and if the
+     * operator resumes before that run's `finally` fires, the flag would still
+     * be waiting for the next one.
+     */
+    if (r.ok && r.task.enabled) stopRequested.delete(r.task.id);
     if (r.ok) {
       logTx(req, {
         category: "defi", action: "task-edit", status: "success",
@@ -10414,6 +10435,13 @@ async function main() {
     }
     const r = seriesStore.update(req.params.id, req.body ?? {});
     if (!r.ok) { res.status(400).json(r); return; }
+    // Resume drops every stop still being asked for — the series' own, and one
+    // per step, because a series stopped mid-list leaves a flag on each step
+    // that never got to clear its own.
+    if (r.series.enabled) {
+      seriesStopped.delete(r.series.id);
+      for (const step of r.series.steps) stopRequested.delete(`${r.series.id}:${step.id}`);
+    }
     logTx(req, {
       category: "defi", action: "series-edit", status: "success",
       detail: `${r.series.name}: ${describeSchedule(r.series.schedule)}${r.series.enabled ? "" : " (paused)"}`,
@@ -10444,11 +10472,17 @@ async function main() {
     const sr = mySeries(req, res);
     if (!sr) return;
     const wasRunning = seriesRunning.has(sr.id);
-    seriesStopped.add(sr.id);
+    // Same rule as a single task, and it bit harder here: a series stopped mid
+    // list left a flag on every step that had not run, and each step's flag is
+    // only cleared by that step running. The first pass after Resume refused
+    // the lot.
+    if (wasRunning) {
+      seriesStopped.add(sr.id);
+      // Stop the step that is running too, so one already sending stops mid-list.
+      // The id is the one `executeSeries` runs each step under.
+      for (const step of sr.steps) stopRequested.add(`${sr.id}:${step.id}`);
+    }
     seriesStore.update(sr.id, { enabled: false });
-    // Stop the step that is running too, so one already sending stops mid-list.
-    // The id is the one `executeSeries` runs each step under.
-    for (const step of sr.steps) stopRequested.add(`${sr.id}:${step.id}`);
     logTx(req, {
       category: "defi", action: "series-stop", status: "success",
       detail: `${sr.name}: ${wasRunning ? "stopped mid-run" : "stopped"}`,
