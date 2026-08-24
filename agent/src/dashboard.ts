@@ -8016,6 +8016,21 @@ async function main() {
   }
 
   /** Parse `[{to, amount}]` where amount is already in base units. */
+  /**
+   * An amount, as base units and nothing else.
+   *
+   * `BigInt(String(x))` was the whole check, and it is looser than the error
+   * beside it claims: it rejects "1.5" and "1e30" but happily reads "0x10" as
+   * 16, along with `0b`/`0o` literals and padded whitespace. Somebody typing a
+   * hex string gets a number they did not mean rather than the refusal every
+   * other malformed amount receives.
+   */
+  function baseUnits(v: unknown): bigint {
+    const raw = String(v ?? "0").trim();
+    if (!/^\d+$/.test(raw)) throw new Error("not base units");
+    return BigInt(raw);
+  }
+
   function parseRecipients(input: unknown, cap = TASK_LIMITS.maxRecipients): { to: Hex; amount: bigint }[] {
     const rows = Array.isArray(input) ? input : [];
     if (rows.length > cap) throw new Error(`that is more than ${cap} recipients in one go`);
@@ -8024,7 +8039,7 @@ async function main() {
       if (!isAddress(o.to)) throw new Error(`row ${i + 1}: "${String(o.to)}" is not an address`);
       let amount: bigint;
       try {
-        amount = BigInt(String(o.amount ?? "0"));
+        amount = baseUnits(o.amount);
       } catch {
         throw new Error(`row ${i + 1}: "${String(o.amount)}" is not an amount`);
       }
@@ -9282,6 +9297,24 @@ async function main() {
 
   /** Run it, record what happened, and never let one task's failure stop another. */
   async function executeTask(t: Task, source: "schedule" | "manual"): Promise<{ ok: boolean; detail: string; txHash: string | null }> {
+    /*
+     * One run of a task at a time.
+     *
+     * `runningTasks` already existed, and was read only to put "running now" on
+     * a row — nothing consulted it before starting. The scheduler guards itself
+     * with `tasksBusy`, so the sweep could not overlap the sweep; "Run now"
+     * went straight to this function with no guard at all. Two taps on a slow
+     * response, or one tap while the sweep is part way through the same task,
+     * sent the payment twice.
+     *
+     * The check and the add have no `await` between them, so on one thread this
+     * is a mutex. The refusal must not touch `markRun`: the run already in
+     * flight owns that row, and overwriting it would report the refusal as the
+     * outcome of the payment actually being made.
+     */
+    if (runningTasks.has(t.id)) {
+      return { ok: false, detail: "that task is already running — this run was not started", txHash: null };
+    }
     // A stop applies to the run it was pressed during, not to every run after
     // it. Clearing here — not when the flag is set — is what keeps a task that
     // was stopped once from being permanently, invisibly dead.
@@ -9332,6 +9365,11 @@ async function main() {
    * the one that already exists.
    */
   async function executeSeries(sr: TaskSeries, source: "schedule" | "manual") {
+    // Same rule as a single task, and it matters more here: a series is several
+    // spends, so an overlapping run repeats all of them.
+    if (seriesRunning.has(sr.id)) {
+      return { ok: false, detail: "that series is already running — this run was not started" };
+    }
     seriesRunning.add(sr.id);
     const done: string[] = [];
     const failed: string[] = [];
@@ -9752,7 +9790,7 @@ async function main() {
       // which is the wallet this exists to keep funded.
       let amount: bigint;
       try {
-        amount = BigInt(String(body.params?.amount ?? "0"));
+        amount = baseUnits(body.params?.amount);
       } catch {
         throw new Error(`"${String(body.params?.amount)}" is not an amount`);
       }
@@ -9764,7 +9802,7 @@ async function main() {
     if (action === "sessionBorrow" || (action === "sessionWithdraw" && body.venue === "lending")) {
       let amount: bigint;
       try {
-        amount = BigInt(String(body.params?.amount ?? "0"));
+        amount = baseUnits(body.params?.amount);
       } catch {
         throw new Error(`"${String(body.params?.amount)}" is not an amount`);
       }
@@ -9942,15 +9980,29 @@ async function main() {
     // "wallet cannot abscond" is a better answer than a complaint about the
     // parameters that verb would have needed.
     const venue = String(what.venue ?? "");
-    const verbs = (TASK_ACTIONS as Record<string, string[]>)[venue];
-    if (!verbs) throw new Gate(400, `${at}unknown venue "${what.venue}"`);
+    /*
+     * `Object.hasOwn`, because this object is being used as a lookup table for
+     * a string the caller chose.
+     *
+     * `TASK_ACTIONS["constructor"]` is not undefined — it is the inherited
+     * `Object.prototype.constructor`, a function, which sails past a falsy
+     * check and then throws on `.includes`. In an async handler that throw
+     * became an unhandled rejection and the request was never answered at all:
+     * any caller with a wallet connected could hang a socket, permanently, by
+     * naming a venue after anything on `Object.prototype`. Same for
+     * `toString`, `valueOf`, `__proto__` and the rest.
+     */
+    const verbs = Object.hasOwn(TASK_ACTIONS, venue)
+      ? (TASK_ACTIONS as Record<string, string[]>)[venue]
+      : undefined;
+    if (!Array.isArray(verbs)) throw new Gate(400, `${at}unknown venue "${what.venue}"`);
     if (!verbs.includes(String(what.action))) {
       throw new Gate(400, `${at}${venue} cannot "${what.action}" — try ${verbs.join(", ")}`);
     }
 
     let mine: SessionRow | undefined;
     if (!scope.operator) {
-      const allowed = SESSION_ACTIONS[venue] ?? [];
+      const allowed = Object.hasOwn(SESSION_ACTIONS, venue) ? SESSION_ACTIONS[venue] ?? [] : [];
       if (!allowed.includes(String(what.action))) {
         const offer = Object.entries(SESSION_ACTIONS)
           .map(([v, list]) => `${v}: ${list.join(", ")}`)
@@ -10029,10 +10081,27 @@ async function main() {
     return { fundedBy: scope.owner };
   }
 
-  /** Answer a `Gate` refusal with its own status; re-throw anything else. */
+  /**
+   * Answer a refusal — and answer everything else too.
+   *
+   * This used to return false for anything that was not a `Gate`, and every
+   * caller then re-threw. Inside an async Express handler a throw is an
+   * unhandled rejection: Express never sees it, no response is written, and the
+   * caller waits for ever. A hung request is worse than a 500 — it holds a
+   * socket, tells the reader nothing, and looks like a slow chain rather than a
+   * bug.
+   *
+   * So this always answers. A `Gate` keeps its own status and wording; anything
+   * else is a fault on our side and says so, with the detail on the server log
+   * rather than in the body.
+   */
   function sendGate(res: express.Response, e: unknown): boolean {
-    if (!(e instanceof Gate)) return false;
-    res.status(e.status).json({ ok: false, error: e.message });
+    if (e instanceof Gate) {
+      res.status(e.status).json({ ok: false, error: e.message });
+      return true;
+    }
+    console.error(`[dashboard] unhandled in a scheduled-write route: ${String(e).slice(0, 300)}`);
+    if (!res.headersSent) res.status(500).json({ ok: false, error: friendlyError(e) });
     return true;
   }
 
@@ -10044,8 +10113,8 @@ async function main() {
     try {
       ({ fundedBy } = await gateScheduled(scope, body));
     } catch (e) {
-      if (sendGate(res, e)) return;
-      throw e;
+      sendGate(res, e);
+      return;
     }
     // Stamped with the wallet that pays, not the one that typed it — see the
     // note at the end of `gateScheduled`.
@@ -10134,8 +10203,8 @@ async function main() {
           params: body.params ?? existing.params,
         });
       } catch (e) {
-        if (sendGate(res, e)) return;
-        throw e;
+        sendGate(res, e);
+        return;
       }
     }
     const r = taskStore.update(req.params.id, body);
@@ -10241,8 +10310,8 @@ async function main() {
     try {
       ({ fundedBy } = await gateSteps(scope, req.body?.steps));
     } catch (e) {
-      if (sendGate(res, e)) return;
-      throw e;
+      sendGate(res, e);
+      return;
     }
     const r = seriesStore.create({ ...(req.body ?? {}), owner: fundedBy });
     if (!r.ok) { res.status(400).json(r); return; }
@@ -10264,8 +10333,8 @@ async function main() {
       try {
         await gateSteps(scope, req.body.steps);
       } catch (e) {
-        if (sendGate(res, e)) return;
-        throw e;
+        sendGate(res, e);
+        return;
       }
     }
     const r = seriesStore.update(req.params.id, req.body ?? {});
