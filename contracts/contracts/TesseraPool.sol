@@ -1198,6 +1198,25 @@ contract TesseraPool is ReentrancyGuard {
         uint256 repayAmount
     ) external nonReentrant {
         _accrueAll();
+        /*
+         * The same divergence check the auction path makes, for the same
+         * reason — and it was missing here.
+         *
+         * `startAuction` says it plainly: "mark a price down, declare somebody
+         * liquidatable, buy their collateral at the discount". That is the
+         * whole attack, and it was written on the slower of the two seizure
+         * paths while this one — the direct call, one transaction, no auction
+         * to wait out — took whatever price the oracle last held, believed or
+         * not. A borrower who is solvent at the true price could be liquidated
+         * at a stale one, and the collateral seized is priced by the same
+         * unbelieved number.
+         *
+         * Refusing to seize during an outage can let bad debt accrue. That
+         * trade was already made for the auction, and a pool that will not
+         * price a withdrawal it does not believe must not price a seizure it
+         * does not believe either.
+         */
+        _requireReliablePrices();
         // Not `!_healthy`: exceeding the borrow limit is not grounds for
         // seizure, only for refusing new debt.
         if (!_liquidatable(user)) revert Healthy();

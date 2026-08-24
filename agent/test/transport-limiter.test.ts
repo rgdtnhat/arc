@@ -40,8 +40,11 @@ function node() {
   let seen = 0;
   let peak = 0;
   let open = 0;
+  /** When each request reached the server, so a burst can be told from a queue. */
+  const arrivals: number[] = [];
   const server = http.createServer((req, res) => {
     open += 1;
+    arrivals.push(Date.now());
     peak = Math.max(peak, open);
     let body = "";
     req.on("data", (c) => (body += c));
@@ -65,6 +68,16 @@ function node() {
     says: (fn: typeof reply) => (reply = fn),
     get count() { return seen; },
     get peak() { return peak; },
+    /**
+     * The spread of arrivals, which is what "burst" means.
+     *
+     * Deliberately relative rather than absolute: a loaded machine delays every
+     * request in the group by about the same amount, so the spread holds while
+     * total elapsed time does not. Asserting on elapsed time is what made this
+     * file fail under the full parallel suite while the limiter was correct.
+     */
+    get spread() { return arrivals.length < 2 ? 0 : arrivals[arrivals.length - 1] - arrivals[0]; },
+    get arrivals() { return [...arrivals]; },
   };
 }
 
@@ -89,23 +102,28 @@ test("a burst leaves at once, and the one past the burst waits for a refill", as
    */
   const { n, request } = await connect();
   try {
-    const t0 = Date.now();
     await Promise.all([0, 1, 2, 3].map((i) => call(request, i)));
-    const burst = Date.now() - t0;
     /*
-     * The boundary is 750ms, not "fast": at 4/s a *spaced* fourth call starts
-     * three intervals in, so anything under that proves the four went together.
-     * The generous margin is deliberate — this asserts a shape, and pinning it
-     * to a tight millisecond count only means the suite fails on a loaded
-     * machine while the code is perfectly correct.
+     * Measured at the server, as a spread rather than a duration.
+     *
+     * At 4/s a *spaced* fourth request arrives three intervals — 750ms — after
+     * the first. A burst arrives together. The distinction is the gap between
+     * first and last arrival, and that is the same number whether the machine
+     * is idle or fighting the rest of the suite for CPU: load delays all four
+     * alike. The elapsed-time version of this assertion failed under the full
+     * parallel run while the limiter was doing exactly the right thing.
      */
-    assert.ok(burst < 700, `a burst of 4 took ${burst}ms — it is being spaced out`);
+    assert.ok(
+      n.spread < 500,
+      `four requests arrived ${n.spread}ms apart (${n.arrivals.map((t) => t - n.arrivals[0]).join(", ")}) — they are being spaced out`,
+    );
 
-    // A fifth, from an empty bucket refilling at 4/s: about 250ms.
-    const t1 = Date.now();
+    // A fifth, from an empty bucket refilling at 4/s: it must land a clear
+    // interval after the burst, which is the rate limit still being there.
+    const last = n.arrivals[n.arrivals.length - 1];
     await call(request, 4);
-    const next = Date.now() - t1;
-    assert.ok(next > 150, `the 5th call took only ${next}ms — the rate is not bounded`);
+    const gap = n.arrivals[n.arrivals.length - 1] - last;
+    assert.ok(gap > 150, `the 5th request came ${gap}ms after the 4th — the rate is not bounded`);
     assert.equal(n.count, 5);
   } finally {
     await n.stop();
