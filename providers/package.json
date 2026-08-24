@@ -10,7 +10,8 @@
     "./pricing": "./src/pricing.ts"
   },
   "scripts": {
-    "start": "NODE_USE_ENV_PROXY=1 tsx src/server.ts"
+    "start": "NODE_USE_ENV_PROXY=1 tsx src/server.ts",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@tessera/shared": "*",

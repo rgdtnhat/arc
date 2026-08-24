@@ -96,11 +96,11 @@ test("removeLiquidity calldata matches (array is the last argument)", () => {
 });
 
 test("sharesOf read calldata matches", () => {
-  const mine = callData(SEL.ammShares, encUint(4), encAddr("0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4"));
+  const mine = callData(SEL.ammShares, encUint(4), encAddr("0x1111111111111111111111111111111111111111"));
   const theirs = encodeFunctionData({
     abi: tesseraAmmAbi,
     functionName: "sharesOf",
-    args: [4n, "0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4"],
+    args: [4n, "0x1111111111111111111111111111111111111111"],
   });
   assert.equal(mine, theirs);
 });

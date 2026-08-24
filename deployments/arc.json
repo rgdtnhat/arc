@@ -4,7 +4,6 @@
   "usdc": "0x3600000000000000000000000000000000000000",
   "tesseraEscrow": "0x9776498c2a0661a2d3bbb10c5094d16f835a9a7d",
   "tesseraTab": "0x5d482c70ac56cdc44414a93446709fee17d78c6d",
-  "agent": "0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4",
   "provider": "0xa5b42b3Ebe7FDB187c956D310f868960015d2988",
   "deployedAt": "2026-07-17T06:22:37.721Z",
   "tesseraPool": "0x6b11ef0b1daed7af08106bc9015cd83bdd963bfc",

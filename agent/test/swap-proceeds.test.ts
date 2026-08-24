@@ -32,7 +32,9 @@ function fromLogs(logs: { address: string; topics: string[]; data: string }[], t
 /** The fallback: what the swap *added*, never what is there. */
 const fromBalances = (before: bigint, after: bigint) => (after > before ? after - before : 0n);
 
-const APP = "0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4";
+/* A sample wallet, distinct from `other` below — the point of that case is
+ * that the two differ. */
+const APP = "0x2222222222222222222222222222222222222222";
 const EURC = "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a";
 const topic = (addr: string) => "0x" + addr.toLowerCase().slice(2).padStart(64, "0");
 

@@ -64,21 +64,25 @@ ENV NODE_ENV=production
 ENV PORT=8787
 EXPOSE 8787
 
-# ## Why this still runs as root
+# ## Not root
 #
-# `USER node` is the obvious hardening and it is deliberately not here yet.
-# `docker-compose.yml` bind-mounts `./deployments` from the host, and a bind
-# mount keeps the host's ownership whatever the image does — so an image-side
-# `chown` does not reach it. Deploying a contract from the dashboard writes
-# `deployments/arc.local.json`, which is how a freshly deployed address
-# outranks the committed record; as `node` that write fails with EACCES, is
-# caught, and the override is silently not persisted. Every later deploy would
-# then need a hand-patch, which is the exact failure that file exists to stop.
+# `node:22-bookworm-slim` runs as root by default and nothing here needs it: the
+# app binds 8787, not a privileged port, and its state lives on a volume.
 #
-# To adopt it: `chown -R 1000:1000 deployments` on the host first (1000 is
-# `node` in this image), then add `RUN mkdir -p /app/state && chown -R
-# node:node /app` and `USER node` here. Worth doing on a host where that step
-# can be verified; not worth doing blind, because the failure is quiet.
+# This was held back once because `docker-compose.yml` bind-mounts
+# `./deployments` from the host, a bind mount keeps the host's ownership
+# whatever the image does, and deploying a contract writes
+# `deployments/arc.local.json` there — which as `node` failed with EACCES, was
+# caught, and left the override silently unpersisted. That is fixed at the
+# source rather than papered over with a chown the operator has to remember:
+# the write falls back to STATE_DIR, which the process owns, and the loader
+# reads both and prefers the copy this process could have kept current. So the
+# hardening no longer depends on anything being done to the host first.
+#
+# A `chown -R 1000:1000 deployments` on the host is still tidier — the record
+# then sits where a reader expects it — but nothing breaks without it.
+RUN mkdir -p /app/state && chown -R node:node /app
+USER node
 
 # Providers + agent + dashboard, live against Arc.
 CMD ["npm", "start"]

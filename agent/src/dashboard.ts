@@ -54,6 +54,7 @@ import { createProviderApp, type ProviderEvent } from "@tessera/providers";
 import { CATALOG } from "@tessera/providers/catalog";
 import { TesseraClient } from "./client.js";
 import { TesseraAgent, type AgentEvent, type LedgerEntry } from "./agent.js";
+import { writeJsonAtomic } from "./state-file.js";
 import { quoteMatchesOffer } from "./decide.js";
 import {
   planDeleverage,
@@ -196,21 +197,37 @@ const brain = (process.env.AGENT_BRAIN as "rules" | "llm") ?? "rules";
  */
 const liveDeployment = (() => {
   const dir = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../deployments");
-  const read = (name: string): Record<string, unknown> | null => {
+  const readFrom = (file: string): Record<string, unknown> | null => {
     try {
-      const d = JSON.parse(readFileSync(path.join(dir, name), "utf8"));
+      const d = JSON.parse(readFileSync(file, "utf8"));
       return d && typeof d === "object" ? d : null;
     } catch {
       return null;
     }
   };
+  const read = (name: string) => readFrom(path.join(dir, name));
   const withExplorer = (d: Record<string, unknown>) => ({
     ...d,
     explorer: explorerFrom(process.env.ARC_EXPLORER_URL),
   });
 
   const base = read("arc.json");
-  const local = read("arc.local.json");
+  /*
+   * The local record may not live beside the committed one.
+   *
+   * `deployments/` is a bind mount from the host, so its ownership is the
+   * host's whatever the image says. Where the process cannot write there it
+   * writes into STATE_DIR instead — its own volume, which it always can — and
+   * this is the other half of that: read both, and let the copy this process
+   * could actually have written win. Preferring the state-dir file is right
+   * because it is the only one a locked-down container can keep current.
+   */
+  const localBeside = read("arc.local.json");
+  const localState = STATE_DIR === dir ? null : readFrom(path.join(STATE_DIR, "arc.local.json"));
+  if (localState && localBeside) {
+    console.log("[deployment] arc.local.json exists in both deployments/ and STATE_DIR — using the STATE_DIR copy");
+  }
+  const local = localState ?? localBeside;
   const { merged, applied, ignored } = mergeDeployment(base, local);
   // A mistyped capital in one asset address used to throw inside every loop
   // that touched the list, taking whole panels down with a 500.
@@ -5478,6 +5495,17 @@ async function main() {
       let wrote = false;
       try {
         const dir = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../deployments");
+        /*
+         * Where the record can actually be kept.
+         *
+         * `deployments/` is a bind mount, so on a host that owns it as root a
+         * hardened container cannot write there — and this write is how a
+         * freshly deployed address outranks the committed one. Failing meant
+         * every later deploy needed a hand-patch, and it failed *quietly*.
+         *
+         * So: try the conventional place, and fall back to STATE_DIR, which is
+         * the process's own volume and always writable. The loader reads both.
+         */
         const file = path.join(dir, "arc.local.json");
         // Claim the key. Only what this host deployed itself outranks the
         // committed file — everything else it merely remembers goes stale, and
@@ -5489,10 +5517,20 @@ async function main() {
         claimed.add(key);
         const next = { ...liveDeployment, [key]: address, overrides: [...claimed] };
         delete (next as Record<string, unknown>).explorer;
-        writeFileSync(file, JSON.stringify(next, null, 2) + "\n");
+        try {
+          writeJsonAtomic(file, next);
+        } catch (e) {
+          const fallback = statePath("arc.local.json");
+          console.warn(
+            `[deploy] ${file} is not writable (${String((e as { code?: string }).code ?? e).slice(0, 40)}) — ` +
+            `keeping the record at ${fallback} instead, which this process owns. ` +
+            `Both are read at startup and this one wins, so nothing is lost.`,
+          );
+          writeJsonAtomic(fallback, next);
+        }
         wrote = true;
       } catch (e) {
-        console.error(`[deploy] could not write arc.local.json: ${String(e).slice(0, 140)}`);
+        console.error(`[deploy] could not write arc.local.json anywhere: ${String(e).slice(0, 140)}`);
       }
 
       res.json({
@@ -13336,7 +13374,17 @@ async function main() {
        * So the operator is told which address they are acting as. It is the
        * same one the server signs with, so the page and the chain agree.
        */
-      actingAs: id.kind === "admin" ? ((liveDeployment.agent as Hex) ?? client.account.address) : (id.address ?? null),
+      /*
+       * Read from the key, not from a committed record.
+       *
+       * This used to prefer `liveDeployment.agent`, which meant the app wallet's
+       * address sat in `deployments/arc.json` — a file that is public in the
+       * repository — purely to be echoed back to the operator who is already
+       * signing with it. The address the server actually signs with is both
+       * more authoritative and impossible to let drift, so it is the only
+       * source now.
+       */
+      actingAs: id.kind === "admin" ? client.account.address : (id.address ?? null),
     });
   });
 
