@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeJsonAtomic, readJson, sayCorrupt } from "./state-file.js";
 import { nextRun, parseSchedule, describeSchedule, type Schedule } from "./schedule.js";
 
 /**
@@ -147,8 +147,9 @@ export class TaskStore {
   private tasks: Task[] = [];
 
   constructor(private readonly file: string) {
-    try {
-      const raw = JSON.parse(readFileSync(file, "utf8"));
+    {
+      const { value: raw, outcome } = readJson<unknown>(file, null);
+      if (outcome === "corrupt") sayCorrupt("tasks", file);
       /*
        * Normalise `owner` on the way in.
        *
@@ -166,14 +167,12 @@ export class TaskStore {
           .filter((t) => t && typeof t.id === "string")
           .map((t) => ({ ...t, owner: t.owner ?? null }));
       }
-    } catch {
-      /* first run */
     }
   }
 
   private persist() {
     try {
-      writeFileSync(this.file, JSON.stringify(this.tasks, null, 0));
+      writeJsonAtomic(this.file, this.tasks, { pretty: false });
     } catch (e) {
       // A task list that cannot be written still works for this process; losing
       // it on restart is better than refusing to schedule anything.

@@ -47,6 +47,24 @@ export interface ActionKitOptions {
   treasury?: TesseraTreasury;
   /** Lending pool client — enables pool_supply / pool_borrow / etc. */
   pool?: TesseraPoolClient;
+  /**
+   * The guardian cap, applied to every action here that can move USDC.
+   *
+   * This surface exists for a model brain to drive, which is exactly the caller
+   * least able to be trusted with an unbounded `escrow_payment(provider,
+   * amount)`. The deterministic loop routes every spend through
+   * `Agent.purchase`, where the cap lives; the kit reached `client.open()`
+   * directly, with no cap, no blocklist and no vetted price to check against.
+   *
+   * Nothing exposes `invoke()` over HTTP today, so this was a door rather than
+   * a hole — but "unreachable" is a property of the current routes, not of this
+   * file, and the rule is that a new spend path uses the same lock as the old
+   * ones rather than adding a second door.
+   *
+   * Left undefined, the payment actions refuse outright. A caller that means to
+   * spend has to say what it may spend.
+   */
+  spendCap?: bigint;
 }
 
 /** A dispatchable registry of Tessera agent actions. */
@@ -91,6 +109,26 @@ export function createTesseraActions(
   opts: ActionKitOptions = {}
 ): TesseraActionKit {
   const doFetch = opts.fetchImpl ?? fetch;
+  /**
+   * The gate every USDC-moving action here passes, and the only one.
+   *
+   * Refusing when no cap is configured is deliberate: a kit built without one
+   * is a kit nobody has decided a limit for, and defaulting to "unlimited" is
+   * the decision that should never be made by omission.
+   */
+  const withinCap = (amount: bigint, what: string) => {
+    if (opts.spendCap === undefined) {
+      throw new Error(
+        `${what} moves USDC and this action kit has no spend cap configured — ` +
+        `pass \`spendCap\` to createTesseraActions to enable it`,
+      );
+    }
+    if (amount > opts.spendCap) {
+      throw new Error(
+        `${what} would move ${formatUsdc(amount)} USDC, over this kit's ${formatUsdc(opts.spendCap)} USDC cap`,
+      );
+    }
+  };
   const marketplace = () => {
     if (!opts.providersBaseUrl) {
       throw new Error("providersBaseUrl is required for marketplace actions");
@@ -166,12 +204,19 @@ export function createTesseraActions(
       },
       handler: async (input: { provider: Hex; amount: string; deadline: string; quoteHash: Hex }) => {
         const amount = BigInt(input.amount);
+        withinCap(amount, "escrow_payment");
         await client.ensureApproval(amount);
         const { paymentId, txHash } = await client.open(input.provider, amount, BigInt(input.deadline), input.quoteHash);
         return { paymentId: paymentId.toString(), txHash };
       },
     },
     {
+      /*
+       * Settle and refund are deliberately uncapped: neither is a new spend.
+       * The money is already escrowed — capped when `escrow_payment` opened it
+       * — and these two decide which side of the contract receives it. A cap
+       * here would only ever strand funds already committed.
+       */
       name: "settle_payment",
       description: "Release an escrowed payment to the provider after delivery is verified against the SLA.",
       kind: "payment",
@@ -207,7 +252,9 @@ export function createTesseraActions(
         required: ["provider", "deposit", "durationSeconds"],
       },
       handler: async (input: { provider: Hex; deposit: string; durationSeconds: number }) => {
-        const { tabId, txHash } = await client.openTab(input.provider, BigInt(input.deposit), input.durationSeconds);
+        const deposit = BigInt(input.deposit);
+        withinCap(deposit, "open_tab");
+        const { tabId, txHash } = await client.openTab(input.provider, deposit, input.durationSeconds);
         return { tabId: tabId.toString(), txHash };
       },
     },
@@ -281,7 +328,11 @@ export function createTesseraActions(
         description: "Supply an asset to the lending pool to earn yield (also usable as collateral).",
         kind: "payment",
         inputSchema: { type: "object", properties: amtProp, required: ["asset", "amount"] },
-        handler: async (i: { asset: Hex; amount: string }) => ({ txHash: await pool.supply(i.asset, BigInt(i.amount)) }),
+        handler: async (i: { asset: Hex; amount: string }) => {
+          const amount = BigInt(i.amount);
+          withinCap(amount, "pool_supply");
+          return { txHash: await pool.supply(i.asset, amount) };
+        },
       },
       {
         name: "pool_withdraw",
@@ -295,14 +346,24 @@ export function createTesseraActions(
         description: "Borrow a borrowable asset against your supplied collateral (health-checked).",
         kind: "payment",
         inputSchema: { type: "object", properties: amtProp, required: ["asset", "amount"] },
-        handler: async (i: { asset: Hex; amount: string }) => ({ txHash: await pool.borrow(i.asset, BigInt(i.amount)) }),
+        handler: async (i: { asset: Hex; amount: string }) => {
+          const amount = BigInt(i.amount);
+          // A borrow takes on debt against the agent's collateral, so the cap
+          // bounds the risk rather than a payment — same number, same reason.
+          withinCap(amount, "pool_borrow");
+          return { txHash: await pool.borrow(i.asset, amount) };
+        },
       },
       {
         name: "pool_repay",
         description: "Repay borrowed assets to the lending pool.",
         kind: "payment",
         inputSchema: { type: "object", properties: amtProp, required: ["asset", "amount"] },
-        handler: async (i: { asset: Hex; amount: string }) => ({ txHash: await pool.repay(i.asset, BigInt(i.amount)) }),
+        handler: async (i: { asset: Hex; amount: string }) => {
+          const amount = BigInt(i.amount);
+          withinCap(amount, "pool_repay");
+          return { txHash: await pool.repay(i.asset, amount) };
+        },
       },
       {
         name: "pool_account",

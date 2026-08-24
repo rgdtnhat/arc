@@ -743,6 +743,65 @@ async function main() {
   app.use(express.static(dashboardDir));
   app.use(express.json({ limit: "64kb" }));
 
+  /*
+   * A ceiling on how fast one address may ask.
+   *
+   * The only brake here was the admin-login lockout, which covers exactly one
+   * route. Everything else was unbounded: the read endpoints are cheap because
+   * they serve a 20-second cache, but "cheap" times "as fast as a socket will
+   * carry it" is still a way to spend the process's CPU, and the write routes
+   * each cost a chain read or worse.
+   *
+   * The numbers are deliberately far above real use rather than near it. The
+   * dashboard polls on 12s/20s/30s/60s timers — call it a dozen requests a
+   * minute per open tab, plus a burst of a few dozen when somebody switches
+   * tabs — and several people behind one office NAT share an address. A limit
+   * that a busy floor of real users can reach is a limit that will be
+   * remembered as an outage, so these sit an order of magnitude clear of that
+   * and still refuse a flood.
+   *
+   * Writes get the tighter budget: they are the ones that touch the chain, and
+   * nobody legitimately posts twice a second.
+   *
+   * `req.ip` is trustworthy here only because `trust proxy` is 1 — see the note
+   * above. With `true`, the client picks its own bucket and this stops being a
+   * limit at all.
+   */
+  const RATE_WINDOW_MS = 60_000;
+  const READ_BUDGET = Number(process.env.TESSERA_RATE_READS ?? 600);
+  const WRITE_BUDGET = Number(process.env.TESSERA_RATE_WRITES ?? 120);
+  const buckets = new Map<string, { reads: number; writes: number; until: number }>();
+  app.use("/api", (req, res, next) => {
+    if (READ_BUDGET <= 0 && WRITE_BUDGET <= 0) return next();
+    const now = Date.now();
+    const key = req.ip ?? "unknown";
+    let b = buckets.get(key);
+    if (!b || b.until <= now) {
+      b = { reads: 0, writes: 0, until: now + RATE_WINDOW_MS };
+      buckets.set(key, b);
+      /*
+       * Sweep expired buckets while we are here, so the map is bounded by the
+       * addresses seen in one window rather than by every address ever seen.
+       * A forged `X-Forwarded-For` cannot grow it: `req.ip` is what Caddy saw.
+       */
+      if (buckets.size > 4096) for (const [k, v] of buckets) if (v.until <= now) buckets.delete(k);
+    }
+    const write = req.method !== "GET" && req.method !== "HEAD";
+    const used = write ? (b.writes += 1) : (b.reads += 1);
+    const budget = write ? WRITE_BUDGET : READ_BUDGET;
+    if (budget > 0 && used > budget) {
+      const retry = Math.max(1, Math.ceil((b.until - now) / 1000));
+      res.setHeader("Retry-After", String(retry));
+      res.status(429).json({
+        ok: false,
+        error: `too many requests — wait ${retry}s. If this is not a mistake, the limit is ` +
+          `${budget} ${write ? "writes" : "reads"} a minute from one address.`,
+      });
+      return;
+    }
+    next();
+  });
+
   /* --------------------------------------------------------------------------
    * Public x402 gateway.
    *

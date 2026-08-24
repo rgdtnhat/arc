@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeJsonAtomic, readJson, sayCorrupt } from "./state-file.js";
 import { randomUUID } from "node:crypto";
 
 /**
@@ -69,17 +69,14 @@ export class TxLog {
   private rows: TxRecord[] = [];
 
   constructor(private readonly file: string) {
-    try {
-      const raw = JSON.parse(readFileSync(file, "utf8"));
-      if (Array.isArray(raw)) this.rows = raw.filter((r) => r && typeof r.id === "string");
-    } catch {
-      /* first run */
-    }
+    const { value: raw, outcome } = readJson<unknown>(file, null);
+    if (outcome === "corrupt") sayCorrupt("txlog", file);
+    if (Array.isArray(raw)) this.rows = raw.filter((r) => r && typeof r.id === "string");
   }
 
   private persist() {
     try {
-      writeFileSync(this.file, JSON.stringify(this.rows, null, 2) + "\n");
+      writeJsonAtomic(this.file, this.rows);
     } catch (e) {
       console.error(`[txlog] could not persist: ${String(e).slice(0, 120)}`);
     }

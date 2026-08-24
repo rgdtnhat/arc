@@ -136,6 +136,19 @@ export class TesseraAgent {
       faucet: this.cfg.faucet,
       treasury: this.cfg.treasury,
       pool: this.cfg.pool,
+      /*
+       * The same ceiling the deterministic loop escalates at.
+       *
+       * A model brain driving this surface is the caller least able to be
+       * trusted with an unbounded `escrow_payment`, and there is no guardian on
+       * the other end of a tool call to ask. So the kit stops at the cap rather
+       * than escalating past it: over that, the buying loop is the way in,
+       * because that is where a human can be asked.
+       *
+       * With no policy configured the kit gets no cap and refuses to move
+       * anything, which is the right answer to "nobody has decided a limit".
+       */
+      spendCap: this.cfg.policy?.autoApproveMax,
     });
   }
 

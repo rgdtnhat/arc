@@ -1,5 +1,6 @@
 import { randomUUID, scryptSync, timingSafeEqual, randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { writeJsonAtomic } from "./state-file.js";
 
 /**
  * Admin authentication for the dashboard.
@@ -37,7 +38,14 @@ export class AdminAuth {
   }
 
   private persist() {
-    writeFileSync(this.file, JSON.stringify(this.store), { mode: 0o600 });
+    /*
+     * Atomic, because this is the one file that cannot be re-derived.
+     *
+     * A truncated admin store does not reseed — `JSON.parse` throws out of the
+     * constructor and the dashboard will not start at all. A crash during a
+     * password change was enough to do it.
+     */
+    writeJsonAtomic(this.file, this.store, { mode: 0o600, pretty: false });
   }
 
   private matches(password: string): boolean {

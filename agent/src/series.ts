@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeJsonAtomic, readJson, sayCorrupt } from "./state-file.js";
 import { nextRun, parseSchedule, describeSchedule, type Schedule } from "./schedule.js";
 import { TASK_ACTIONS, type TaskVenue } from "./tasks.js";
 
@@ -184,8 +184,9 @@ export class SeriesStore {
   private series: TaskSeries[] = [];
 
   constructor(private readonly file: string) {
-    try {
-      const raw = JSON.parse(readFileSync(file, "utf8"));
+    {
+      const { value: raw, outcome } = readJson<unknown>(file, null);
+      if (outcome === "corrupt") sayCorrupt("series", file);
       if (Array.isArray(raw)) {
         // Normalise on the way in: a record written before series owned their
         // steps has no `steps` at all, and every reader below would rather have
@@ -209,14 +210,12 @@ export class SeriesStore {
             onFailure: s.onFailure === "stop" ? ("stop" as const) : ("continue" as const),
           }));
       }
-    } catch {
-      /* first run */
     }
   }
 
   private persist() {
     try {
-      writeFileSync(this.file, JSON.stringify(this.series, null, 0));
+      writeJsonAtomic(this.file, this.series, { pretty: false });
     } catch (e) {
       console.error(`[series] could not persist: ${String(e).slice(0, 120)}`);
     }

@@ -3,6 +3,16 @@ import assert from "node:assert/strict";
 import { createTesseraActions } from "../src/agentkit.ts";
 import type { TesseraClient } from "../src/client.ts";
 
+/*
+ * A cap, because the kit refuses to move USDC without one.
+ *
+ * These tests are about dispatch — that an action exists, parses its input and
+ * reaches the client. The cap they pass is deliberately far above the amounts
+ * below, so it never decides the outcome; `kit-cap.test.ts` is where the cap
+ * itself is exercised.
+ */
+const SPEND_CAP = 10n ** 12n;
+
 /** A duck-typed TesseraClient that records calls, so the kit is testable offline. */
 function fakeClient() {
   const calls: Record<string, unknown[]> = {};
@@ -28,7 +38,7 @@ function fakeClient() {
 
 test("manifest exposes wallet, payment and on-chain actions with schemas", () => {
   const { client } = fakeClient();
-  const kit = createTesseraActions(client);
+  const kit = createTesseraActions(client, { spendCap: SPEND_CAP });
   const names = kit.manifest().map((a) => a.name);
   for (const expected of [
     "usdc_balance",
@@ -55,7 +65,7 @@ test("manifest exposes wallet, payment and on-chain actions with schemas", () =>
 
 test("usdc_balance reads the wallet and formats USDC", async () => {
   const { client, calls } = fakeClient();
-  const kit = createTesseraActions(client);
+  const kit = createTesseraActions(client, { spendCap: SPEND_CAP });
   const out = await kit.invoke<{ raw: string; usdc: string }>("usdc_balance");
   assert.equal(out.raw, "1500000");
   assert.equal(out.usdc, "1.5");
@@ -64,7 +74,7 @@ test("usdc_balance reads the wallet and formats USDC", async () => {
 
 test("escrow_payment approves then opens escrow with parsed bigints", async () => {
   const { client, calls } = fakeClient();
-  const kit = createTesseraActions(client);
+  const kit = createTesseraActions(client, { spendCap: SPEND_CAP });
   const out = await kit.invoke<{ paymentId: string; txHash: string }>("escrow_payment", {
     provider: "0x00000000000000000000000000000000000000aa",
     amount: "4000",
@@ -84,7 +94,7 @@ test("escrow_payment approves then opens escrow with parsed bigints", async () =
 
 test("refund_payment routes to the slashing refund path", async () => {
   const { client, calls } = fakeClient();
-  const kit = createTesseraActions(client);
+  const kit = createTesseraActions(client, { spendCap: SPEND_CAP });
   const out = await kit.invoke<{ txHash: string }>("refund_payment", { paymentId: "9" });
   assert.equal(out.txHash, "0xrefund");
   assert.deepEqual(calls.refund[0], [9n]);
@@ -94,6 +104,7 @@ test("discover_services uses the injected fetch against the providers URL", asyn
   const { client } = fakeClient();
   let hitUrl = "";
   const kit = createTesseraActions(client, {
+    spendCap: SPEND_CAP,
     providersBaseUrl: "http://providers.test",
     fetchImpl: (async (url: string) => {
       hitUrl = String(url);
@@ -107,13 +118,13 @@ test("discover_services uses the injected fetch against the providers URL", asyn
 
 test("marketplace actions fail clearly without a providers URL", async () => {
   const { client } = fakeClient();
-  const kit = createTesseraActions(client);
+  const kit = createTesseraActions(client, { spendCap: SPEND_CAP });
   await assert.rejects(() => kit.invoke("discover_services"), /providersBaseUrl is required/);
 });
 
 test("invoking an unknown action throws", async () => {
   const { client } = fakeClient();
-  const kit = createTesseraActions(client);
+  const kit = createTesseraActions(client, { spendCap: SPEND_CAP });
   await assert.rejects(() => kit.invoke("nope"), /unknown action: nope/);
 });
 
@@ -129,7 +140,7 @@ test("lending actions appear and dispatch when a pool is provided", async () => 
     accountData: async () => ({ supplyValue: 1500n, borrowValue: 500n, borrowLimit: 1000n, healthFactor: 2n * 10n ** 18n }),
     reserveData: async () => ({ cash: 100n, totalBorrows: 50n, utilizationWad: 5n * 10n ** 17n, borrowAprWad: 35n * 10n ** 15n, supplyAprWad: 15n * 10n ** 15n }),
   } as any;
-  const kit = createTesseraActions(client, { pool });
+  const kit = createTesseraActions(client, { pool, spendCap: SPEND_CAP });
   const names = kit.manifest().map((a) => a.name);
   for (const n of ["pool_supply", "pool_withdraw", "pool_borrow", "pool_repay", "pool_account", "pool_reserve"]) {
     assert.ok(names.includes(n), `missing ${n}`);

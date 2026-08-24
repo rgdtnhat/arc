@@ -64,5 +64,21 @@ ENV NODE_ENV=production
 ENV PORT=8787
 EXPOSE 8787
 
+# ## Why this still runs as root
+#
+# `USER node` is the obvious hardening and it is deliberately not here yet.
+# `docker-compose.yml` bind-mounts `./deployments` from the host, and a bind
+# mount keeps the host's ownership whatever the image does — so an image-side
+# `chown` does not reach it. Deploying a contract from the dashboard writes
+# `deployments/arc.local.json`, which is how a freshly deployed address
+# outranks the committed record; as `node` that write fails with EACCES, is
+# caught, and the override is silently not persisted. Every later deploy would
+# then need a hand-patch, which is the exact failure that file exists to stop.
+#
+# To adopt it: `chown -R 1000:1000 deployments` on the host first (1000 is
+# `node` in this image), then add `RUN mkdir -p /app/state && chown -R
+# node:node /app` and `USER node` here. Worth doing on a host where that step
+# can be verified; not worth doing blind, because the failure is quiet.
+
 # Providers + agent + dashboard, live against Arc.
 CMD ["npm", "start"]
