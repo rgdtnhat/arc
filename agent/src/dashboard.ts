@@ -1,6 +1,6 @@
 import express from "express";
 import path from "node:path";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { mergeDeployment, explorerFrom, normaliseAssets } from "./deployment.js";
 import { fileURLToPath } from "node:url";
@@ -134,6 +134,42 @@ const APP_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../
 const STATE_DIR = process.env.STATE_DIR ?? APP_ROOT;
 const statePath = (name: string) => path.join(STATE_DIR, name);
 try { mkdirSync(STATE_DIR, { recursive: true }); } catch { /* already there */ }
+/*
+ * Prove STATE_DIR is writable before anything depends on it.
+ *
+ * Everything this process must not lose lives here: the admin store, the task
+ * and series schedules, the transaction log. When the directory is not
+ * writable the first store to save throws from its constructor, the process
+ * exits before the HTTP server binds, and the container looks healthy while
+ * answering nothing. Diagnosing that from the outside is an evening; the
+ * process knew in the first millisecond.
+ *
+ * A named volume is the way this happens. Docker seeds a volume's ownership
+ * from the image only when the volume is new, so one carried over from an
+ * earlier deployment keeps whatever it had — and a container that later drops
+ * to an unprivileged user cannot write its own state directory.
+ *
+ * Fail here, loudly, naming the path and the fix.
+ */
+{
+  const probe = path.join(STATE_DIR, ".write-probe");
+  try {
+    writeFileSync(probe, String(process.pid));
+    unlinkSync(probe);
+  } catch (e) {
+    const who = typeof process.getuid === "function" ? `uid ${process.getuid()}` : "this process";
+    console.error(
+      `\n✗ STATE_DIR is not writable: ${STATE_DIR}\n` +
+      `  ${who} cannot write there (${String((e as { code?: string }).code ?? e)}), and everything this app\n` +
+      `  must not lose is kept in it — the admin store, your scheduled tasks and series, the\n` +
+      `  transaction log. Starting anyway would mean losing all of it at the next write.\n\n` +
+      `  If STATE_DIR is a Docker volume, its ownership comes from whenever it was created, not\n` +
+      `  from the image: chown it to the user this container runs as, or run as the user that\n` +
+      `  already owns it.\n`,
+    );
+    process.exit(1);
+  }
+}
 
 /*
  * Deployment blocks are found by binary search over `getCode` — about 26 RPC

@@ -64,39 +64,37 @@ ENV NODE_ENV=production
 ENV PORT=8787
 EXPOSE 8787
 
-# ## Not root
+# ## Why this runs as root, after two attempts at not doing
 #
-# `node:22-bookworm-slim` runs as root by default and nothing here needs it: the
-# app binds 8787, not a privileged port, and its state lives on a volume.
+# `USER node` is the obvious hardening and it is deliberately not here. Twice
+# now it has broken a live deployment for a marginal gain, and the second
+# failure is the one that settles it:
 #
-# This was held back once because `docker-compose.yml` bind-mounts
-# `./deployments` from the host, a bind mount keeps the host's ownership
-# whatever the image does, and deploying a contract writes
-# `deployments/arc.local.json` there — which as `node` failed with EACCES, was
-# caught, and left the override silently unpersisted. That is fixed at the
-# source rather than papered over with a chown the operator has to remember:
-# the write falls back to STATE_DIR, which the process owns, and the loader
-# reads both and prefers the copy this process could have kept current. So the
-# hardening no longer depends on anything being done to the host first.
+#  1. `chown -R node:node /app` filled a small VPS's disk. A recursive chown
+#     rewrites every file's metadata, and in an overlay build that copies all
+#     ~95 production packages into a new layer. Narrowing it to `/app/state`
+#     fixed that.
+#  2. `/app/state` is a **named volume that already exists**. Docker seeds a
+#     volume's ownership from the image only when the volume is new, and this
+#     one has carried the admin store, config and history since the first
+#     deploy — so it stays root-owned, the app cannot write it, and the process
+#     dies at boot before the HTTP server is up. The container starts, reports
+#     healthy to compose, and answers nothing.
 #
-# A `chown -R 1000:1000 deployments` on the host is still tidier — the record
-# then sits where a reader expects it — but nothing breaks without it.
+# Making it work needs `chown -R 1000:1000` on the volume *and* on the
+# bind-mounted `deployments/`, on every host, remembered forever. That is a
+# manual step whose absence is a silent outage, traded against an unprivileged
+# process in a single-tenant container on a testnet. It is not worth it here.
 #
-# ## One directory, not the tree
+# What did survive from those attempts, and is worth keeping: the deploy record
+# falls back to STATE_DIR when `deployments/` is not writable, and the app now
+# refuses to start with a named reason when STATE_DIR cannot be written —
+# rather than exiting silently, which is what made this cost an evening.
 #
-# This used to be `chown -R node:node /app`, and that filled a small VPS's disk
-# and failed the build with thousands of "No space left on device". A recursive
-# chown rewrites the metadata of every file it touches, and in an overlay build
-# a metadata change is a copy: all ~95 production packages get copied up into a
-# new layer, roughly doubling what the image costs to build.
-#
-# It was also unnecessary. `node` needs to *read* /app, and it already can —
-# the files are world-readable. The only thing it needs to *write* is
-# STATE_DIR, so that is the only thing that changes hands. The named volume
-# compose mounts there inherits this ownership from the image, so it lands
-# writable without anything being done to the host.
-RUN mkdir -p /app/state && chown node:node /app/state
-USER node
+# To adopt it later: `docker compose down`, `chown -R 1000:1000` both the
+# volume's mountpoint and `deployments/`, then add `USER node` back. Verify
+# with `docker compose exec tessera id` before trusting it.
+RUN mkdir -p /app/state
 
 # Providers + agent + dashboard, live against Arc.
 CMD ["npm", "start"]

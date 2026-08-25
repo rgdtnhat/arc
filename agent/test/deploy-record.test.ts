@@ -125,10 +125,29 @@ test("the source wires both halves", () => {
   assert.match(src, /const local = localState \?\? localBeside;/, "the fallback does not win");
 });
 
-test("the container no longer runs as root", () => {
+test("the image does not drop privileges without the volume being prepared for it", () => {
+  /*
+   * `USER node` was tried twice and reverted twice. The second failure settles
+   * it: `/app/state` is a named volume that already exists, Docker seeds a
+   * volume's ownership from the image only when the volume is *new*, so one
+   * carried over from an earlier deployment stays root-owned. The app then
+   * cannot write its own state, dies before the HTTP server binds, and the
+   * container reports healthy while answering nothing.
+   *
+   * If it comes back, it has to come back with the volume handled — so this
+   * fails on a bare `USER node`, and passes once the Dockerfile also chowns
+   * the state directory the volume mounts over.
+   */
   const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
-  assert.match(dockerfile, /^USER node$/m, "the image still runs as root");
-  assert.match(dockerfile, /chown node:node \/app\/state/, "STATE_DIR is not writable by the user that runs it");
+  const drops = /^USER (?!root)/m.test(dockerfile);
+  if (drops) {
+    assert.match(
+      dockerfile, /chown[^\n]*\/app\/state/,
+      "USER is dropped without giving that user its state directory — see the note in the Dockerfile",
+    );
+  }
+  // Either way the directory must exist, because STATE_DIR points at it.
+  assert.match(dockerfile, /mkdir -p \/app\/state/);
 });
 
 test("nothing chowns the whole app tree", () => {
@@ -152,4 +171,27 @@ test("nothing chowns the whole app tree", () => {
       `a recursive chown of the whole tree is back: ${line.trim()}`,
     );
   }
+});
+
+test("an unwritable state directory stops the boot with a reason", () => {
+  /*
+   * The failure this replaces: the process exited before the HTTP server bound,
+   * compose reported the container healthy, and the app answered nothing. From
+   * outside that is an evening of guessing; the process knew in the first
+   * millisecond.
+   *
+   * Proven by running the app with STATE_DIR pointing under a file, which no
+   * user can write:
+   *
+   *   ✗ STATE_DIR is not writable: /etc/hostname/state
+   *     uid 0 cannot write there (ENOTDIR), and everything this app must not lose…
+   */
+  const src = readFileSync(new URL("../src/dashboard.ts", import.meta.url), "utf8");
+  const probe = src.slice(src.indexOf("Prove STATE_DIR is writable"), src.indexOf("Prove STATE_DIR is writable") + 2200);
+  assert.match(probe, /writeFileSync\(probe/, "nothing actually tries to write");
+  assert.match(probe, /unlinkSync\(probe\)/, "the probe file is left behind");
+  assert.match(probe, /process\.exit\(1\)/, "it warns and carries on, which loses the state anyway");
+  // The message has to name the path and the cause, or it is just another crash.
+  assert.match(probe, /STATE_DIR is not writable: \$\{STATE_DIR\}/);
+  assert.match(probe, /ownership comes from whenever it was created/);
 });
