@@ -45,9 +45,11 @@
 import { readFileSync } from "node:fs";
 import { createPublicClient, createWalletClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { arcTestnet, erc20Abi, tesseraPoolAbi, pacedHttp, formatUsdc } from "@tessera/shared";
+import { arcTestnet, erc20Abi, tesseraPoolAbi, tesseraRateLimiterAbi, pacedHttp, formatUsdc } from "@tessera/shared";
 import { planMigration, affordability, verifyMigration } from "../agent/src/migrate.ts";
 import { ArchiveScanner } from "../agent/src/archive-chain.ts";
+
+const ZERO = "0x0000000000000000000000000000000000000000";
 import { mergeDeployment } from "../agent/src/deployment.ts";
 
 const RPC = process.env.ARC_RPC_URL ?? "https://rpc.testnet.arc.network";
@@ -336,9 +338,78 @@ async function main() {
   if (!newPool) throw new Error("--execute needs --to 0x… (the destination pool)");
 
   if (!VERIFY_ONLY) {
+    /*
+     * Can the destination actually pay these people out?
+     *
+     * This script's whole job is moving somebody else's position into a pool
+     * they did not choose, and until now it never asked whether that pool
+     * works. A redeploy that fails part way leaves one that looks finished —
+     * reserves listed, prices set, guard attached — and still cannot serve a
+     * withdrawal, because `TesseraRateLimiter` trusts exactly one consumer and
+     * it is still the pool being retired. `_meter` then reverts inside every
+     * withdraw and every borrow.
+     *
+     * Migrating into that is the worst outcome this script can produce: funds
+     * moved, by somebody else, into somewhere the owner cannot leave. It is
+     * also entirely detectable beforehand, which is why it is checked here and
+     * not in a runbook.
+     */
+    const limiter = await pub.readContract({
+      address: newPool, abi: tesseraPoolAbi, functionName: "rateLimiter",
+    }).catch(() => ZERO);
+    if (limiter && limiter !== ZERO) {
+      const consumer = await pub.readContract({
+        address: limiter, abi: tesseraRateLimiterAbi, functionName: "consumer",
+      }).catch(() => null);
+      if (!consumer || consumer.toLowerCase() !== newPool.toLowerCase()) {
+        throw new Error(
+          `The destination pool has outflow limiter ${limiter} attached, but that limiter's\n` +
+          `  consumer is ${consumer ?? "unreadable"} — not ${newPool}. Every withdraw and borrow on the\n` +
+          `  destination will revert with NotConsumer(), so this would move positions somewhere\n` +
+          `  nobody can exit.\n\n` +
+          `  Finish the redeploy first — it repoints the limiter:\n` +
+          `    npm run redeploy:pool -- --emitter=keep --reuse=${newPool} --execute`,
+        );
+      }
+    }
+
+    /*
+     * And the same question for the assets themselves. A reserve that is not
+     * enabled on the destination cannot receive a `supplyFor` at all, and
+     * finding that out per-position, part way through, is how a set ends up
+     * half moved.
+     */
+    for (const a of assets) {
+      const r = await pub.readContract({
+        address: newPool, abi: tesseraPoolAbi, functionName: "reserves", args: [a.address],
+      }).catch(() => null);
+      if (!r || !r[0]) {
+        throw new Error(
+          `${a.symbol} is not an enabled reserve on ${newPool}, so the positions held in it\n` +
+          `  cannot be moved there. Finish the redeploy before migrating.`,
+        );
+      }
+    }
+
+    /*
+     * An incomplete scan is a warning in a survey and a refusal here.
+     *
+     * Anybody the throttled RPC hid is left behind on a pool this migration is
+     * about to have frozen against new supply. In a dry run that is a line to
+     * read; with `--execute` it is somebody's money, so it stops.
+     */
+    if (scan.partial) {
+      throw new Error(
+        "The log scan was incomplete — some windows were throttled or refused, so this list of\n" +
+        "  suppliers is not the whole set. Migrating now leaves whoever is missing behind.\n" +
+        "  Re-run until that warning is gone, then --execute.",
+      );
+    }
+
     // Stop rather than start something that cannot finish: a half-migrated set is
     // recoverable but it is the confusing state worth not creating.
     if (!afford.ok) throw new Error("Refusing to start a migration the deployer cannot finish.");
+
 
     console.log(`\n── Executing ───────────────────────────────────────────`);
     let done = 0;
