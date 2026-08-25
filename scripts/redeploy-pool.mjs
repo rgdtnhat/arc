@@ -498,7 +498,7 @@ async function main() {
     }
     if (REUSE.toLowerCase() === OLD.toLowerCase()) throw new Error("--reuse names the pool being replaced");
     console.log(`  reuse  the pool already deployed at ${REUSE} (${live.length / 2 - 1} bytes, owned by the deployer)`);
-    console.log(`         every step below is a setter, so re-applying what already took is a no-op`);
+    console.log(`         reserves already listed are re-applied with the setters, not re-added`);
   }
 
   /*
@@ -519,11 +519,51 @@ async function main() {
   }
 
   for (const a of config.assets) {
-    await send(
-      `list ${a.symbol}${a.borrowable || a.promote ? " (borrowable)" : ""}`,
-      NEW, tesseraPoolAbi, "addReserve",
-      [a.address, a.cFactor, a.liqFactor, a.lFactor, a.reserveFactor, a.borrowable || a.promote, a.decimals, a.price],
-    );
+    /*
+     * `addReserve` is the one call in this section that is not a setter.
+     *
+     * A resumed run walks the same list, and a reserve that is already listed
+     * makes it revert — `--reuse` claimed everything below was idempotent, and
+     * everything below is, except this. The run then died on the first asset,
+     * which is the least useful place to discover it.
+     *
+     * Listed already? Apply the same configuration through the setters that
+     * exist for it, so the reserve ends in the state a fresh `addReserve`
+     * would have left it in. `decimals` is the only field with no setter, and
+     * it is immutable for a good reason: it describes the token, not the
+     * policy. A mismatch there means the reuse is pointed at a pool listed
+     * against a different token, and that is worth stopping for rather than
+     * papering over.
+     */
+    const existing = REUSE
+      ? await pub.readContract({ address: NEW, abi: tesseraPoolAbi, functionName: "reserves", args: [a.address] })
+          .catch(() => null)
+      : null;
+    if (existing && existing[0]) {
+      if (Number(existing[2]) !== Number(a.decimals)) {
+        throw new Error(
+          `${a.symbol} is listed on ${NEW} with ${existing[2]} decimals, but the source pool says ${a.decimals}.\n` +
+          `  That is not the same token. Check --reuse before going further.`,
+        );
+      }
+      await send(`re-apply risk params for ${a.symbol} (already listed)`, NEW, tesseraPoolAbi, "setRiskParams",
+        [a.address, a.cFactor, a.liqFactor, a.lFactor]);
+      if (Boolean(existing[1]) !== Boolean(a.borrowable || a.promote)) {
+        // Flag 0 is borrowable on this code. Opening it re-runs the guard check
+        // `addReserve` would have run, which is the point of routing through here.
+        await send(`${a.borrowable || a.promote ? "open" : "close"} borrowing on ${a.symbol}`,
+          NEW, tesseraPoolAbi, "setReserveFlag", [a.address, 0, Boolean(a.borrowable || a.promote)]);
+      }
+      if (existing[7] !== a.price) {
+        await send(`re-apply the mark for ${a.symbol}`, NEW, tesseraPoolAbi, "setPrice", [a.address, a.price]);
+      }
+    } else {
+      await send(
+        `list ${a.symbol}${a.borrowable || a.promote ? " (borrowable)" : ""}`,
+        NEW, tesseraPoolAbi, "addReserve",
+        [a.address, a.cFactor, a.liqFactor, a.lFactor, a.reserveFactor, a.borrowable || a.promote, a.decimals, a.price],
+      );
+    }
     if (a.supplyCap !== 0n || a.borrowCap !== 0n) {
       await send(`caps for ${a.symbol}`, NEW, tesseraPoolAbi, "setCaps", [a.address, a.supplyCap, a.borrowCap]);
     }

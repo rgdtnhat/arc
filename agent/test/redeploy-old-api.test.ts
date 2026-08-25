@@ -71,3 +71,30 @@ test("the usage says how to resume, where somebody looking will find it", () => 
   const header = script.slice(0, script.indexOf("import "));
   assert.match(header, /--reuse=0x/, "the flag exists but is undocumented");
 });
+
+test("a resumed run re-applies a listed reserve instead of re-adding it", () => {
+  /*
+   * `addReserve` is the one call in that section that is not a setter, and
+   * `--reuse` claimed everything was idempotent. A resumed run walked the same
+   * asset list and died on the first one, which is the least useful place to
+   * find out.
+   */
+  // Anchored on the listing loop itself; the script iterates the asset list in
+  // several places.
+  const at = script.indexOf("`re-apply risk params for ${a.symbol}");
+  assert.notEqual(at, -1, "the re-apply path is gone");
+  const body = script.slice(at - 2000, at + 2000);
+  assert.match(body, /existing && existing\[0\]/, "a listed reserve is added again");
+  assert.match(body, /"setRiskParams"/, "the reserve's risk parameters are not re-applied");
+  assert.match(body, /"setReserveFlag"/, "borrowable is not re-applied through the flag setter");
+  // The fresh path must still exist for an asset that genuinely is not listed.
+  assert.match(body, /"addReserve"/, "a new reserve can no longer be listed at all");
+});
+
+test("a reuse pointed at a pool listed against a different token stops", () => {
+  const at = script.indexOf("`re-apply risk params for ${a.symbol}");
+  const body = script.slice(at - 2000, at + 2000);
+  assert.match(body, /That is not the same token/, "a decimals mismatch would be papered over");
+  // Decimals is the field with no setter, which is exactly why it is the check.
+  assert.match(body, /Number\(existing\[2\]\) !== Number\(a\.decimals\)/);
+});
