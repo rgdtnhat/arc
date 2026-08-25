@@ -50,3 +50,4 @@ deployments/arc.history.json
 deployments/reset-state.json
 .qa/
 deployments/.rehearsal.json
+.tessera-log-scan.json

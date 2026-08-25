@@ -43,6 +43,7 @@
  *   npm run migrate:pool -- --to 0xNEW --execute --verify-only
  */
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { createPublicClient, createWalletClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { arcTestnet, erc20Abi, tesseraPoolAbi, tesseraRateLimiterAbi, pacedHttp, formatUsdc } from "@tessera/shared";
@@ -251,7 +252,23 @@ async function main() {
   const scanner = new ArchiveScanner(arcTestnet, RPC);
   const started = Date.now();
   let lastLine = 0;
+  /*
+   * Remember which block ranges have been read, between runs.
+   *
+   * The public endpoint refuses windows under load, and a refused window is a
+   * hole in the holder set — so a run that hits them ends `partial`, and
+   * `--execute` refuses a partial scan because whoever is missing gets left
+   * behind on a pool about to be frozen. Without a record of what was already
+   * read, every attempt re-fought the same windows and a throttled RPC meant
+   * the scan could never complete at all.
+   *
+   * Blocks are immutable, so a range read once never needs reading again. Each
+   * run now fills holes rather than reopening them, and enough runs converge.
+   */
+  const scanCache = path.join(process.env.STATE_DIR ?? process.cwd(), ".tessera-log-scan.json");
+  console.log(`  progress is kept in ${scanCache} — re-run to fill any refused windows\n`);
   const scan = await scanner.scanPool(oldPool, assets, {
+    cacheFile: scanCache,
     onProgress: (p) => {
       // Every window would be hundreds of lines in a log file; every tenth (and
       // always the first) is enough to prove it is moving.
@@ -262,7 +279,7 @@ async function main() {
       console.log(
         `  window ${String(p.windows).padStart(3)}/${p.maxWindows}  ` +
           `at block ${p.from}  ${left} to go  ` +
-          `${p.found} address(es)  ${secs}s${p.partial ? "  ⚠ a window was refused" : ""}`,
+          `${p.found} address(es)  ${secs}s${p.cached ? "  (cached)" : ""}${p.partial ? "  ⚠ a window was refused" : ""}`,
       );
     },
   });

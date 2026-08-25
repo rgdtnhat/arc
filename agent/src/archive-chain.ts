@@ -7,6 +7,7 @@ import {
   pacedHttp,
 } from "@tessera/shared";
 import type { ArchiveKind, HolderBalance } from "./history.js";
+import { writeJsonAtomic, readJson } from "./state-file.js";
 
 /**
  * Reading a retired contract's holders back off the chain.
@@ -66,10 +67,50 @@ export interface ScanProgress {
   found: number;
   /** True once a window has been thrown away — the scan will be partial. */
   partial: boolean;
+  /** This window was answered from an earlier run rather than re-read. */
+  cached?: boolean;
 }
 
 export interface ScanOptions {
   onProgress?: (p: ScanProgress) => void;
+  /**
+   * Where to remember which block ranges have already been read.
+   *
+   * A refused window used to be a hole that the next run re-opened: nothing was
+   * kept between attempts, so a throttled RPC produced the same partial answer
+   * for ever. Blocks are immutable, so a range read once never needs reading
+   * again — and with that written down, each run fills holes instead of
+   * re-fighting them, and enough runs converge.
+   */
+  cacheFile?: string;
+  /** How many times to re-ask for a window the endpoint refused. */
+  attempts?: number;
+}
+
+/** One contract+event's scan history: ranges read, and who was in them. */
+interface ScanCache {
+  /** Inclusive `[from, to]` block ranges already read, as decimal strings. */
+  done: [string, string][];
+  addresses: string[];
+}
+
+/** Merge a range into a sorted, non-overlapping list. */
+export function coverRange(done: [bigint, bigint][], add: [bigint, bigint]): [bigint, bigint][] {
+  const all = [...done, add].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const out: [bigint, bigint][] = [];
+  for (const r of all) {
+    const last = out[out.length - 1];
+    // Touching counts as overlapping: [1,10] and [11,20] are one range, and
+    // leaving a one-block seam between them would re-read it for ever.
+    if (last && r[0] <= last[1] + 1n) last[1] = r[1] > last[1] ? r[1] : last[1];
+    else out.push([r[0], r[1]]);
+  }
+  return out;
+}
+
+/** Is every block in `[from, to]` already inside one covered range? */
+export function isCovered(done: [bigint, bigint][], from: bigint, to: bigint): boolean {
+  return done.some((r) => r[0] <= from && r[1] >= to);
 }
 
 export class ArchiveScanner {
@@ -96,6 +137,29 @@ export class ArchiveScanner {
     const found = new Set<string>();
     let partial = false;
     let to = latest;
+
+    /*
+     * What earlier runs already read, so this one does not read it again.
+     *
+     * Keyed by contract, event and field: two scans of the same pool for
+     * different events cover different ground and must not share a record.
+     */
+    const key = `${address}:${event.name ?? "event"}:${field}`.toLowerCase();
+    const cacheFile = opts.cacheFile ?? null;
+    const store = cacheFile
+      ? (readJson<Record<string, ScanCache>>(cacheFile, {}).value ?? {})
+      : {};
+    const mine: ScanCache = store[key] ?? { done: [], addresses: [] };
+    let covered: [bigint, bigint][] = mine.done.map(([a, b]) => [BigInt(a), BigInt(b)] as [bigint, bigint]);
+    for (const a of mine.addresses) found.add(a);
+    const saveCache = () => {
+      if (!cacheFile) return;
+      store[key] = {
+        done: covered.map(([a, b]) => [a.toString(), b.toString()] as [string, string]),
+        addresses: [...found],
+      };
+      try { writeJsonAtomic(cacheFile, store); } catch { /* a cache that cannot be written is still a scan */ }
+    };
     // Walk backwards so the most recent activity is captured first: if the scan
     // has to stop early, what it has is the part most likely to still matter.
     let windows = 0;
@@ -106,13 +170,42 @@ export class ArchiveScanner {
     while (to > floor) {
       if (windows++ >= MAX_WINDOWS) { partial = true; break; }
       const from = to > LOG_WINDOW ? to - LOG_WINDOW : 0n;
-      try {
-        const logs = await this.public.getLogs({ address, event, fromBlock: from, toBlock: to });
-        for (const l of logs) {
-          const v = (l.args as Record<string, unknown>)[field];
-          if (typeof v === "string") found.add(v.toLowerCase());
+      if (isCovered(covered, from, to)) {
+        // Read by an earlier run. Blocks do not change, so neither does the
+        // answer — and skipping it is what lets a throttled endpoint finish
+        // across several attempts instead of never.
+        opts.onProgress?.({ windows, maxWindows: MAX_WINDOWS, from, to, floor, found: found.size, partial, cached: true });
+        if (from === 0n) break;
+        to = from - 1n;
+        continue;
+      }
+      /*
+       * Ask again before calling it a hole.
+       *
+       * A refused window used to be dropped on the first refusal, which on a
+       * public endpoint that throttles under load meant most of them. The
+       * transport already backs off between calls; this just declines to give
+       * up on the first no.
+       */
+      let got = false;
+      for (let attempt = 0; attempt < Math.max(1, opts.attempts ?? 3) && !got; attempt++) {
+        try {
+          const logs = await this.public.getLogs({ address, event, fromBlock: from, toBlock: to });
+          for (const l of logs) {
+            const v = (l.args as Record<string, unknown>)[field];
+            if (typeof v === "string") found.add(v.toLowerCase());
+          }
+          got = true;
+        } catch {
+          // Give the endpoint room before asking again; the last attempt does
+          // not wait, because nothing follows it.
+          if (attempt < Math.max(1, opts.attempts ?? 3) - 1) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
         }
-      } catch {
+      }
+      if (got) {
+        covered = coverRange(covered, [from, to]);
+        saveCache();
+      } else {
         // A throttled or refused window is a hole in the holder set, and
         // pretending otherwise is how someone gets left out of a payout.
         partial = true;
@@ -123,6 +216,7 @@ export class ArchiveScanner {
       if (from === 0n) break;
       to = from - 1n;
     }
+    saveCache();
     return { addresses: [...found], block: latest.toString(), partial };
   }
 
