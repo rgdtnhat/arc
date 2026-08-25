@@ -81,7 +81,21 @@ EXPOSE 8787
 #
 # A `chown -R 1000:1000 deployments` on the host is still tidier — the record
 # then sits where a reader expects it — but nothing breaks without it.
-RUN mkdir -p /app/state && chown -R node:node /app
+#
+# ## One directory, not the tree
+#
+# This used to be `chown -R node:node /app`, and that filled a small VPS's disk
+# and failed the build with thousands of "No space left on device". A recursive
+# chown rewrites the metadata of every file it touches, and in an overlay build
+# a metadata change is a copy: all ~95 production packages get copied up into a
+# new layer, roughly doubling what the image costs to build.
+#
+# It was also unnecessary. `node` needs to *read* /app, and it already can —
+# the files are world-readable. The only thing it needs to *write* is
+# STATE_DIR, so that is the only thing that changes hands. The named volume
+# compose mounts there inherits this ownership from the image, so it lands
+# writable without anything being done to the host.
+RUN mkdir -p /app/state && chown node:node /app/state
 USER node
 
 # Providers + agent + dashboard, live against Arc.

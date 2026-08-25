@@ -128,5 +128,28 @@ test("the source wires both halves", () => {
 test("the container no longer runs as root", () => {
   const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
   assert.match(dockerfile, /^USER node$/m, "the image still runs as root");
-  assert.match(dockerfile, /chown -R node:node \/app/, "the app tree is not owned by the user that runs it");
+  assert.match(dockerfile, /chown node:node \/app\/state/, "STATE_DIR is not writable by the user that runs it");
+});
+
+test("nothing chowns the whole app tree", () => {
+  /*
+   * `chown -R node:node /app` filled a small VPS's disk and failed the build
+   * with thousands of "No space left on device". A recursive chown rewrites
+   * every file's metadata, and in an overlay build a metadata change is a copy
+   * — all ~95 production packages copied up into a new layer.
+   *
+   * It was also unnecessary. `node` only needs to *read* /app, and npm leaves
+   * those files world-readable; the only thing it writes is STATE_DIR. tsx
+   * caches to /tmp (verified: it creates `/tmp/tsx-<uid>`), not into
+   * node_modules, so nothing else in the image needs to change hands.
+   */
+  const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
+  const commands = dockerfile.split("\n").filter((l) => !l.trimStart().startsWith("#"));
+  for (const line of commands) {
+    assert.equal(
+      /chown\s+-R[^\n]*\s\/app\s*$/.test(line.trim()),
+      false,
+      `a recursive chown of the whole tree is back: ${line.trim()}`,
+    );
+  }
 });
