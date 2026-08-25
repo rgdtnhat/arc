@@ -57,11 +57,15 @@
  *   npm run redeploy:pool                              # survey; sends nothing
  *   npm run redeploy:pool -- --emitter=keep --execute
  *
+ * If a run fails part way, the pool it deployed is still there and still
+ * configured. Carry on with it rather than building another:
+ *   npm run redeploy:pool -- --emitter=keep --reuse=0x… --execute
+ *
  * Then, as the last line prints:
  *   npm run migrate:pool -- --from <old> --to <new> --execute
  */
 import { readFileSync, writeFileSync } from "node:fs";
-import { createPublicClient, createWalletClient } from "viem";
+import { createPublicClient, createWalletClient, toFunctionSelector } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   arcChain,
@@ -89,6 +93,21 @@ const flag = (name, fallback = null) => {
 };
 const EMITTER = flag("emitter");
 const SAME_CODE = argv.includes("--same-code");
+/**
+ * Continue onto a pool an earlier run already deployed.
+ *
+ * A migration that fails part way otherwise strands a fully configured pool
+ * and makes the next attempt pay to build another one.
+ */
+const REUSE = (() => {
+  const v = flag("reuse");
+  if (v === null) return null;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(v)) {
+    console.error(`--reuse must be an address; got "${v}"`);
+    process.exit(1);
+  }
+  return v;
+})();
 const RECORD_NAME = flag("record", "arc.json");
 const RECORD_URL = new URL(`../deployments/${RECORD_NAME}`, import.meta.url);
 
@@ -454,8 +473,33 @@ async function main() {
 
   // --- 3. deploy and configure ----------------------------------------------
   console.log(`\n[3] deploy the replacement and carry the configuration\n`);
-  const NEW = (await deploy("TesseraPool", tesseraPoolAbi, tesseraPoolBytecode, [config.global.treasury]))
-    ?? "0x0000000000000000000000000000000000000000";
+  /*
+   * `--reuse=0x…` continues onto a pool this script already deployed.
+   *
+   * A run that fails part way leaves a configured pool behind and no way to
+   * carry on with it: re-running deploys a second one and pays to list every
+   * reserve again, while the first sits abandoned holding the gas that made
+   * it. That is a bad enough answer that somebody will instead finish the job
+   * by hand, which is worse.
+   *
+   * Nothing is skipped by reusing — every configuration call below is a setter
+   * whose second application is a no-op with the same result. The one thing
+   * this must not do is reuse a pool that is not this code, so the bytecode is
+   * compared before anything else touches it.
+   */
+  const NEW = REUSE ?? ((await deploy("TesseraPool", tesseraPoolAbi, tesseraPoolBytecode, [config.global.treasury]))
+    ?? "0x0000000000000000000000000000000000000000");
+  if (REUSE) {
+    const live = await pub.getCode({ address: REUSE });
+    if (!live || live.length < 4) throw new Error(`--reuse=${REUSE} has no contract at it`);
+    const ownedBy = await must("the reused pool's owner", REUSE, tesseraPoolAbi, "owner");
+    if (ownedBy.toLowerCase() !== deployer.address.toLowerCase()) {
+      throw new Error(`--reuse=${REUSE} is owned by ${ownedBy}, not the deployer — it cannot be configured from here`);
+    }
+    if (REUSE.toLowerCase() === OLD.toLowerCase()) throw new Error("--reuse names the pool being replaced");
+    console.log(`  reuse  the pool already deployed at ${REUSE} (${live.length / 2 - 1} bytes, owned by the deployer)`);
+    console.log(`         every step below is a setter, so re-applying what already took is a no-op`);
+  }
 
   /*
    * The guard goes on *before* the reserves, so every price this pool is ever
@@ -539,7 +583,38 @@ async function main() {
      * new borrowing the only outflow left is people leaving, and that is the
      * one flow that must not be slowed. `_meter` no-ops on a zero address.
      */
-    await send("detach the limiter from the retired pool", OLD, tesseraPoolAbi, "setWiring", [2, zero]);
+    /*
+     * The retired pool is older code, and its wiring API is not this one.
+     *
+     * Every call above is against the pool this script just deployed, so the
+     * current ABI is right for all of them. This is the one call it makes
+     * against the *old* pool, and `setWiring(uint8,address)` is the newer
+     * consolidated setter — the deployment being replaced predates it and has
+     * `setRateLimiter(address)` instead. Sending the new signature to it hits
+     * no function at all and reverts, twenty transactions into a migration,
+     * with a message naming a function the old pool has never had.
+     *
+     * So ask its bytecode which one it answers to rather than assuming. A
+     * selector either appears in the code or it does not; there is nothing to
+     * guess and nothing to configure.
+     */
+    const oldCode = await pub.getCode({ address: OLD });
+    const answersTo = (sig) => (oldCode ?? "").includes(toFunctionSelector(sig).slice(2));
+    if (answersTo("function setWiring(uint8,address)")) {
+      await send("detach the limiter from the retired pool", OLD, tesseraPoolAbi, "setWiring", [2, zero]);
+    } else if (answersTo("function setRateLimiter(address)")) {
+      await send(
+        "detach the limiter from the retired pool (its own older setter)",
+        OLD, [{ type: "function", name: "setRateLimiter", stateMutability: "nonpayable",
+                inputs: [{ type: "address" }], outputs: [] }], "setRateLimiter", [zero],
+      );
+    } else {
+      throw new Error(
+        `The retired pool ${OLD} exposes neither setWiring nor setRateLimiter, so its outflow\n` +
+        `  limiter cannot be detached from here. Detach it by hand before repointing the limiter,\n` +
+        `  or the retired pool stops letting people withdraw.`,
+      );
+    }
     await send(
       "point the outflow limiter back at the new pool",
       config.global.rateLimiter, tesseraRateLimiterAbi, "setConsumer", [NEW],
