@@ -67,6 +67,8 @@ import {
 } from "./keeper.js";
 import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
 import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emissions-guard.js";
+import { matchErrorTable } from "./error-table.js";
+import { gradeUndelivered, gradeLastPoke } from "./health-grade.js";
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
@@ -1342,80 +1344,19 @@ async function main() {
       );
     }
 
-    const table: [RegExp, string][] = [
-      [/request limit|rate limit|too many requests|429|-32005/, "The Arc network is rate-limiting us right now. Wait a few seconds and try again."],
-      [/timeout|timed out|fetch failed|socket|econnreset|network/, "Couldn't reach the Arc network. Check your connection and try again."],
-      [/noroute|no route/, "No AMM pool can fill that trade right now. Try a smaller amount, or add liquidity for the pair."],
-      [/expired|deadline/, "The order sat too long before it was mined and expired. Try again — this protects you from being filled at a stale price."],
-      [/badpath|bad path/, "That swap route isn't valid. Pick two different assets."],
-      [/slippage/, "The price moved while the order was being sent. Get a fresh quote and try again."],
-      [/pool illiquid/, "The pool doesn't have enough free liquidity for that amount right now. Try withdrawing less."],
-      [/insufficientliquidity/, "The pool is fully lent out at the moment — not enough free liquidity. Try a smaller amount."],
-      [/unhealthy/, "That would push your position below the safe collateral limit. Borrow less or add collateral."],
-      [/min deposit/, "That first deposit is too small. Deposit a slightly larger amount."],
-      [/same token/, "Pick two different assets to swap between."],
-      [/no price/, "That asset has no price configured yet, so it can't be swapped."],
-      [/zero ?amount|zero in|zero out|no shares|\bzero\b/, "Enter an amount greater than zero."],
-      [/not borrowable/, "That asset can't be borrowed from this pool."],
-      [/unknownreserve/, "That asset isn't a reserve in this pool."],
-      [/insufficient liquidity/, "The pool is too shallow to fill that trade. Try a smaller amount, or add liquidity for the pair."],
-      [/\breverted with the following reason:\s*in\b|"in"/, "Couldn't take your input token — approve it for the router first, and check the balance."],
-      [/\breverted with the following reason:\s*out\b|"out"/, "Couldn't send the output token. The pool may have moved since the quote — get a fresh quote."],
-      [/healthoutofband/, "That liquidation percentage would leave the borrower outside the target health band. Pick a percentage that lands them between 1.03 and 1.15."],
-      [/noauction/, "There is no open auction for that account."],
-      [/auctionexists/, "That account already has an open auction. Fill it or cancel it first."],
-      [/stilllocked/, "Those backstop shares are still in the queue period. They unlock 21 days after they were queued."],
-      /*
-       * Session-key refusals, before the generic allowance rule below.
-       *
-       * Every one of these is a limit the wallet's owner set on purpose, and
-       * naming the wrong one is worse than saying nothing: a cap that had run
-       * out was being reported as "approve the spender first", which sends
-       * somebody to re-approve a contract that is working exactly as asked.
-       * The `allowance` rule matched because the honest explanation of a cap
-       * mentions the allowance as one of the three things that bind.
-       */
-      [/pertxexceeded/, "That is more than this session's per-transfer limit. Send a smaller amount, or open a session with a higher limit."],
-      [/capexceeded/, "This session has spent its whole cap. Open a new one to keep paying from that wallet."],
-      [/sessionexpired/, "This session has expired. Open a new one to keep paying from that wallet."],
-      [/sessionrevokederror|sessionrevoked|has been revoked/, "The wallet's owner revoked this session, so it can no longer spend."],
-      [/session (has expired|can pay)|no such session|delegated to a different key/, ""],
-      [/notsessionkey/, "This server is not the key that session was delegated to."],
-      [/recipientnotallowed/, "That recipient is not on this session's allow-list."],
-      [/whichever binds first/, ""],
-      /*
-       * Refusals this app made *before* sending anything.
-       *
-       * These reached the user as "That transaction didn't go through. the
-       * lending pool on this deployment predates…", which reads as a
-       * transaction that was sent and failed — and sends somebody looking at
-       * their balance and the explorer for a transaction that never existed.
-       * Nothing was submitted: the app checked, found the pool has no way to
-       * act for a holder, and stopped. The sentence is already the right one,
-       * so it is passed through whole.
-       */
-      /*
-       * The same refusals, for when one has been embedded in a larger string on
-       * its way here (`settleFailure` composes a sentence around
-       * `friendlyError`) and the class no longer travels with it. Matched by the
-       * part that is common to each pair rather than by either spelling.
-       */
-      [/predates scheduled |not authorised on that \w+ position|its own position/, ""],
-      // A simulation that said no, before anything was signed. Already a whole
-      // sentence — and one whose whole point is that no transaction exists.
-      [/nothing was sent|that would fail, so nothing was touched/, ""],
-      [/refusing new risk because/, ""],
-      [/allowance|transferfrom/, "Token approval failed — approve the spender first, or check the wallet holds enough of that token."],
-      [/exceeds balance|insufficient balance|\bbalance\b/, "Not enough balance for that amount."],
-      [/insufficient funds|gas required|out of gas/, "Not enough USDC to cover network fees. Top up the wallet at faucet.circle.com."],
-      [/nonce/, "A previous transaction is still settling. Wait a moment and try again."],
-      [/user rejected|user denied/, "You cancelled the transaction in your wallet."],
-      [/reverted/, "The contract rejected this transaction. Double-check the amount and try again."],
-    ];
-    // An empty entry marks a message this app wrote itself: it is already the
-    // sentence we want, and running it through the table would replace a
-    // precise reason with a generic one.
-    for (const [re, msg] of table) if (re.test(s)) return msg || raw.split("\n")[0].slice(0, 200);
+    /*
+     * The table lives in `error-table.ts` so a test can read the rules that
+     * actually run. It used to be declared here, which meant the only way to
+     * test the wording was to re-type the pattern in the test — and a rule
+     * missing from the real table (`ActionFrozen` was, for the whole time the
+     * live pool was frozen) is invisible to a test reading its own copy.
+     *
+     * An empty entry marks a message this app wrote itself: it is already the
+     * sentence we want, and running it through the table would replace a
+     * precise reason with a generic one.
+     */
+    const hit = matchErrorTable(s);
+    if (hit) return hit[1] || raw.split("\n")[0].slice(0, 200);
     // Unknown cause: give a short, single-line hint rather than a stack dump.
     return "That transaction didn't go through. " + raw.split("\n")[0].slice(0, 120);
   }
@@ -6347,6 +6288,13 @@ async function main() {
   const emitterAddr = (liveDeployment.tesseraEmitter as Hex) ?? null;
   const KEEPER_MS = Math.max(60_000, Number(process.env.TESSERA_EMITTER_KEEPER_MS ?? 15 * 60_000));
   let keeperBusy = false;
+  /*
+   * When a sink was last actually paid, so `/api/health/protocol` can grade the
+   * emitter's backlog on whether the handle is being turned rather than on how
+   * many tokens have piled up between two healthy rounds. Null until the first
+   * one lands in this run — see `gradeUndelivered`.
+   */
+  let lastDistributeAt: number | null = null;
 
   /**
    * Addresses to keep settled against the reward streams.
@@ -6551,6 +6499,7 @@ async function main() {
         if (pending < 10n ** 18n) continue;
         try {
           const txHash = await owner.write(emitterAddr, tesseraEmitterAbi, "distribute", [i]);
+          lastDistributeAt = Date.now();
           console.log(`[emitter] sink ${i} paid ${Number(pending) / 1e18} TSRA ${txHash}`);
         } catch (e) {
           // One sink reverting must not stop the others — that is why the
@@ -12095,12 +12044,13 @@ async function main() {
         undelivered += (await read<bigint>(emitterAddr, tesseraEmitterAbi, "pendingOf", [BigInt(i)])) ?? 0n;
       }
       const tokens = Number(undelivered) / 1e18;
-      add(
-        "emitter.undelivered",
-        tokens > 500 ? "fail" : tokens > 100 ? "warn" : "ok",
-        `${tokens.toFixed(2)} TSRA released but not yet handed to sinks`,
-        Number(tokens.toFixed(6)),
-      );
+      const backlog = gradeUndelivered({
+        tokens,
+        sinceDistribute: lastDistributeAt === null ? null : Math.floor((Date.now() - lastDistributeAt) / 1000),
+        roundSeconds: Math.round(KEEPER_MS / 1000),
+        canDistribute: Boolean(owner) && process.env.TESSERA_EMITTER_KEEPER !== "off",
+      });
+      add("emitter.undelivered", backlog.status, backlog.detail, Number(tokens.toFixed(6)));
     }
 
     // --- the keeper: could somebody turn it, and did they? -----------------
@@ -12122,8 +12072,8 @@ async function main() {
         add("keeper.bounty", roundsLeft < 10 ? "warn" : "ok",
           `tip jar covers ${roundsLeft} more round(s)`, roundsLeft);
       }
-      add("keeper.lastPoke", rounds === 0 ? "warn" : "ok",
-        `${rounds} round(s), last ${ago(lastPoke)}`, lastPoke);
+      const poke = gradeLastPoke({ rounds, lastPokeSec: lastPoke, nowSec });
+      add("keeper.lastPoke", poke.status, poke.detail, lastPoke);
     }
 
     // --- emissions: is what people are owed actually backed? ---------------

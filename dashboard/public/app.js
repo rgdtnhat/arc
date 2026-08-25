@@ -8520,15 +8520,56 @@ const $ = (id) => document.getElementById(id);
        * permanent empty box is a box people stop reading, and this needs to
        * still be noticed on the day it says something urgent.
        */
+      /*
+       * "Nothing is waiting" and "we could not find out" are different answers.
+       *
+       * The server goes to some trouble to tell them apart — every read is
+       * counted, every failure is named, and the response carries `partial`
+       * and `unreadable` precisely so this card can say which one it is. This
+       * function used to throw all of that away: any response without items hid
+       * the card, so a throttled RPC (the live node refuses roughly a quarter of
+       * calls under load) made the whole "Waiting for you" panel vanish, TSRA
+       * rewards and a matured backstop exit with it. The reader's conclusion was
+       * that the claim feature had been removed.
+       *
+       * Now a partial read keeps the card up and says so, and a card that has
+       * already shown something stays up rather than blinking out on the next
+       * throttled poll — the same rule the emissions and AMM cards follow.
+       */
+      function claimNotice(text, warn) {
+        const el = document.createElement("div");
+        el.style.cssText =
+          "font-size:11.5px;margin-top:2px;color:" + (warn ? "var(--warn,#c47)" : "var(--muted)");
+        el.textContent = text;
+        return el;
+      }
       async function loadClaimables() {
         const card = $("claimCard"), list = $("claimList");
         if (!card || !list) return;
+        const show = () => { card.style.display = ""; card.dataset.everShown = "1"; };
+        // Hide only a card that has never had anything to say. Once it has, a
+        // failed poll leaves the last good answer on screen.
+        const hide = () => { if (!card.dataset.everShown) card.style.display = "none"; };
         const who = String(window.__myAddress || "");
         if (!/^0x[0-9a-fA-F]{40}$/.test(who)) { card.style.display = "none"; return; }
         try {
           const r = await (await fetch("/api/claimables?user=" + encodeURIComponent(who))).json();
-          if (!r || !r.ok || !r.items || !r.items.length) { card.style.display = "none"; return; }
-          card.style.display = "";
+          if (!r || !r.ok) { hide(); return; }
+          const items = r.items || [];
+          if (!items.length && !r.partial) { hide(); return; }
+          if (!items.length) {
+            // Nothing readable came back, and the server says so. Saying "all
+            // clear" here is how a matured backstop exit goes on taking first
+            // loss while the page reassures its owner.
+            show();
+            list.innerHTML = "";
+            list.appendChild(claimNotice(
+              "Couldn't check what's waiting for you — the Arc RPC refused " +
+              (r.unreadable && r.unreadable.length ? r.unreadable.length + " of the reads" : "some reads") +
+              ". This is not an all-clear. Press Refresh in a moment.", true));
+            return;
+          }
+          show();
           list.innerHTML = "";
           for (const it of r.items) {
             const row = document.createElement("div");
@@ -8555,8 +8596,12 @@ const $ = (id) => document.getElementById(id);
             row.appendChild(right);
             list.appendChild(row);
           }
+          if (r.partial) {
+            list.appendChild(claimNotice(
+              "Some checks didn't answer, so there may be more than this. Press Refresh in a moment.", true));
+          }
         } catch {
-          card.style.display = "none";
+          hide();
         }
       }
       // Bound directly rather than through the builder's helper, which is
