@@ -42,6 +42,15 @@ export interface ArchiveScan {
   block: string;
   /** True when the log scan hit its window budget and may have missed holders. */
   partial: boolean;
+  /**
+   * True when the scan stopped because it ran out of its window budget rather
+   * than because a window was refused. Both make the answer incomplete, but
+   * only one of them is fixed by trying again on a quieter node — the other is
+   * fixed by running it again at all, since the cache now carries progress
+   * forward. Saying "throttled or refused" for a budget stop sent operators
+   * chasing an RPC problem that was not there.
+   */
+  budgetSpent?: boolean;
   assets: { address: string; symbol: string; decimals: number }[];
 }
 
@@ -167,18 +176,31 @@ export class ArchiveScanner {
     // exists so a pathological range can't hang a request; hitting it sets
     // `partial` rather than passing off a short scan as a full one.
     const MAX_WINDOWS = Number(process.env.ARC_LOG_MAX_WINDOWS ?? "220");
+    /** Did the scan stop because it ran out of budget rather than out of chain? */
+    let budgetSpent = false;
     while (to > floor) {
-      if (windows++ >= MAX_WINDOWS) { partial = true; break; }
       const from = to > LOG_WINDOW ? to - LOG_WINDOW : 0n;
       if (isCovered(covered, from, to)) {
-        // Read by an earlier run. Blocks do not change, so neither does the
-        // answer — and skipping it is what lets a throttled endpoint finish
-        // across several attempts instead of never.
+        /*
+         * Read by an earlier run. Blocks do not change, so neither does the
+         * answer — and skipping it is what lets a throttled endpoint finish
+         * across several attempts instead of never.
+         *
+         * It must also not cost a window, and for a long time it did: the
+         * budget was charged at the top of the loop, before this check, so
+         * every re-run spent all 220 windows re-walking ground it already had
+         * and stopped at exactly the same block as the run before it. The cache
+         * was added so a scan could converge across attempts and this single
+         * line of ordering made converging impossible — 1,980,000 blocks was
+         * both the budget and, permanently, the depth. The whole point of a
+         * cached window is that it is free, so it is free here too.
+         */
         opts.onProgress?.({ windows, maxWindows: MAX_WINDOWS, from, to, floor, found: found.size, partial, cached: true });
         if (from === 0n) break;
         to = from - 1n;
         continue;
       }
+      if (windows++ >= MAX_WINDOWS) { partial = true; budgetSpent = true; break; }
       /*
        * Ask again before calling it a hole.
        *
@@ -217,7 +239,7 @@ export class ArchiveScanner {
       to = from - 1n;
     }
     saveCache();
-    return { addresses: [...found], block: latest.toString(), partial };
+    return { addresses: [...found], block: latest.toString(), partial, budgetSpent };
   }
 
   /** Retired lending pool: every supplier and what they can still withdraw. */
@@ -226,8 +248,8 @@ export class ArchiveScanner {
     assets: { address: Hex; symbol: string; decimals: number }[],
     opts: ScanOptions = {},
   ): Promise<ArchiveScan> {
-    const { addresses, block, partial } = await this.holderAddresses(pool, EVENTS.poolSupply, "user", opts);
-    if (!addresses.length) return { holders: [], block, partial, assets };
+    const { addresses, block, partial, budgetSpent } = await this.holderAddresses(pool, EVENTS.poolSupply, "user", opts);
+    if (!addresses.length) return { holders: [], block, partial, budgetSpent, assets };
     const calls = addresses.flatMap((who) =>
       assets.map(
         (a) =>
@@ -249,13 +271,13 @@ export class ArchiveScanner {
       // them as a zero row just makes the real work harder to see.
       if (any) holders.push({ address: who, balances });
     });
-    return { holders, block, partial, assets };
+    return { holders, block, partial, budgetSpent, assets };
   }
 
   /** Retired vault: every depositor, their shares, and what those shares are worth. */
   async scanVault(vault: Hex, asset: { address: Hex; symbol: string; decimals: number }): Promise<ArchiveScan> {
-    const { addresses, block, partial } = await this.holderAddresses(vault, EVENTS.vaultDeposit, "user");
-    if (!addresses.length) return { holders: [], block, partial, assets: [asset] };
+    const { addresses, block, partial, budgetSpent } = await this.holderAddresses(vault, EVENTS.vaultDeposit, "user");
+    if (!addresses.length) return { holders: [], block, partial, budgetSpent, assets: [asset] };
     const calls = addresses.flatMap((who) => [
       { address: vault, abi: tesseraVaultAbi, functionName: "sharesOf", args: [who as Hex] } as const,
       { address: vault, abi: tesseraVaultAbi, functionName: "balanceOfAssets", args: [who as Hex] } as const,
@@ -269,12 +291,12 @@ export class ArchiveScanner {
         holders.push({ address: who, shares: sh.toString(), balances: { [asset.address.toLowerCase()]: val.toString() } });
       }
     });
-    return { holders, block, partial, assets: [asset] };
+    return { holders, block, partial, budgetSpent, assets: [asset] };
   }
 
   /** Retired AMM pool: every provider, their shares, and their slice of each asset. */
   async scanAmm(amm: Hex, poolId: number): Promise<ArchiveScan> {
-    const { addresses, block, partial } = await this.holderAddresses(amm, EVENTS.ammAdded, "provider");
+    const { addresses, block, partial, budgetSpent } = await this.holderAddresses(amm, EVENTS.ammAdded, "provider");
     const info = (await this.public.readContract({
       address: amm,
       abi: tesseraAmmAbi,
@@ -294,7 +316,7 @@ export class ArchiveScanner {
       symbol: meta[i * 2]?.status === "success" ? String(meta[i * 2].result) : a.slice(0, 8),
       decimals: meta[i * 2 + 1]?.status === "success" ? Number(meta[i * 2 + 1].result) : 18,
     }));
-    if (!addresses.length || totalShares === 0n) return { holders: [], block, partial, assets };
+    if (!addresses.length || totalShares === 0n) return { holders: [], block, partial, budgetSpent, assets };
 
     const res = await this.public.multicall({
       contracts: addresses.map(
@@ -312,7 +334,7 @@ export class ArchiveScanner {
       });
       holders.push({ address: who, shares: sh.toString(), balances: bal });
     });
-    return { holders, block, partial, assets };
+    return { holders, block, partial, budgetSpent, assets };
   }
 
   /**

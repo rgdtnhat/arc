@@ -344,6 +344,28 @@ default 6000) and `ARC_RPC_CONCURRENCY` (how many RPC calls may be open at once,
 default 6, adapting between 2 and 8). Raise the second on a private endpoint;
 raise the first if the public node throttles you.
 
+### The local event index
+
+`/api/history` reads a SQLite index of chain events kept in `STATE_DIR/index.db`.
+It runs by default. It used to be opt-in behind `TESSERA_INDEX_DB`, which meant
+the history panel answered `404 the indexer is not running` on every deployment
+where nobody happened to know the variable existed.
+
+On a fresh volume it seeds from the earliest indexed contract's own creation
+block — not from block 0, which on Arc is millions of empty windows — and walks
+forward in 20,000-block `eth_getLogs` windows. Arc serves 20,000 and refuses
+50,000 with `requested range too large`. While it is behind it re-ticks after a
+second instead of waiting the full interval, so the first backfill takes about
+an hour; after that it is three `eth_getLogs` every fifteen seconds.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TESSERA_INDEX` | on | `off` disables the indexer entirely; `/api/history` then 404s, by choice. |
+| `TESSERA_INDEX_DB` | `STATE_DIR/index.db` | Where the index file lives. |
+| `TESSERA_INDEX_SPAN` | `20000` | Blocks per `eth_getLogs` window. Do not raise above Arc's cap. |
+| `TESSERA_INDEX_INTERVAL_MS` | `15000` | Gap between ticks once caught up. |
+| `TESSERA_INDEX_CATCHUP_MS` | `1000` | Gap between ticks while still behind. |
+
 `ARC_RPC_MIN_INTERVAL_MS` — the old fixed gap between calls — is still read, as
 a rate of `1000/interval`, so existing `.env` files keep working. It is no
 longer the right knob: measured against Arc's public RPC, fifteen `eth_getLogs`

@@ -113,7 +113,7 @@ import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader, planHarvest, type HarvestCandidate } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
 import { ConfirmationUnknown } from "./confirm.js";
-import { useDeploymentBlockFile } from "./deploy-block.js";
+import { useDeploymentBlockFile, findDeploymentBlock } from "./deploy-block.js";
 import { fillPreview } from "./auction.js";
 import { priceImpact, maxInputWithin, valueCheck, IMPACT_MAX_PCT } from "./impact.js";
 import { DefiOracle } from "@tessera/shared";
@@ -679,12 +679,45 @@ async function main() {
   /**
    * The local event index, and the loop that fills it.
    *
-   * Opt-in via TESSERA_INDEX_DB. Off by default because it writes a file and
-   * makes a steady trickle of RPC calls — neither is something a demo should
-   * start doing without being asked, and on a rate-limited public endpoint the
-   * trickle competes with the app's own reads.
+   * ## Why this is on now
+   * It used to be opt-in via `TESSERA_INDEX_DB`, off unless somebody set it,
+   * on the grounds that it writes a file and trickles RPC calls. The result was
+   * that `/api/history` answered `404 the indexer is not running` on the live
+   * deployment — a whole panel that could never work, for a reason nothing on
+   * the page mentioned, because the environment variable that switches it on is
+   * not something a person discovers. A feature that is off by default and
+   * undiscoverable is a feature that does not exist.
+   *
+   * Both original objections are answered rather than ignored:
+   *
+   *  - *It writes a file.* It writes it into STATE_DIR, the volume this process
+   *    is guaranteed to be able to write (there is a probe at boot that refuses
+   *    to start otherwise), not into the repo.
+   *
+   *  - *It trickles RPC calls.* It did far worse than trickle: an empty index
+   *    starts at block 0, and at the old 2,000-block span that is ~29,000 ticks
+   *    of `eth_getLogs` — five days of continuous scanning on the heaviest
+   *    rate-limited method, to reach a chain whose first Tessera contract was
+   *    deployed at block 52.2M. It now starts at the earliest contract's own
+   *    creation block and walks in 20,000-block windows, and while it is behind
+   *    it re-ticks in a second rather than waiting out the full interval —
+   *    though what actually paces the backfill is the transport's own
+   *    `eth_getLogs` bucket, measured at roughly a window every fourteen
+   *    seconds. That turns a five-day backfill into an hour or so, after which
+   *    it settles into three `eth_getLogs` every fifteen seconds.
+   *
+   *    20,000 is measured, not guessed: Arc answers a 20,000-block
+   *    `eth_getLogs` and refuses 50,000 with `requested range too large`. The
+   *    first version of this used 50,000 and every tick failed with "RPC
+   *    Request failed", which is a worse outcome than the feature being off.
+   *
+   * `TESSERA_INDEX=off` turns it off. `TESSERA_INDEX_DB` still names the file.
    */
-  const eventIndex = process.env.TESSERA_INDEX_DB ? new EventIndex(process.env.TESSERA_INDEX_DB) : null;
+  const indexDbPath =
+    process.env.TESSERA_INDEX === "off"
+      ? null
+      : process.env.TESSERA_INDEX_DB ?? statePath("index.db");
+  const eventIndex = indexDbPath ? new EventIndex(indexDbPath) : null;
   if (eventIndex) {
     const indexed = [
       liveDeployment.tesseraEscrow && { address: liveDeployment.tesseraEscrow as Hex, abi: tesseraEscrowAbi as never, label: "escrow" },
@@ -694,21 +727,66 @@ async function main() {
       liveDeployment.tesseraSubscription && { address: liveDeployment.tesseraSubscription as Hex, abi: tesseraSubscriptionAbi as never, label: "subscription" },
     ].filter(Boolean) as { address: Hex; abi: never; label: string }[];
 
-    console.log(`🗂  Indexing ${indexed.length} contract(s) into ${process.env.TESSERA_INDEX_DB}`);
-    const tick = async () => {
+    console.log(`🗂  Indexing ${indexed.length} contract(s) into ${indexDbPath}`);
+    /*
+     * Where to start, when the index is empty.
+     *
+     * Block 0 is 2.5 million windows of nothing on this chain. The earliest
+     * contract's creation block is the only lower bound that can contain an
+     * event, and `findDeploymentBlock` already knows how to find one without an
+     * indexer (binary search on `getCode`, cached to disk). If every probe is
+     * refused the index simply stays where it was and tries again next boot —
+     * starting at 0 because a probe was throttled would bake days of pointless
+     * scanning into the file.
+     */
+    const seedStart = async () => {
+      if (eventIndex.lastBlock() > 0) return;
+      const found = (
+        await Promise.all(indexed.map((c) => findDeploymentBlock(client.public, c.address).catch(() => null)))
+      ).filter((b): b is bigint => typeof b === "bigint");
+      if (!found.length) {
+        console.warn("🗂  could not find any contract's creation block yet — the index will seed on a later start");
+        return;
+      }
+      const earliest = found.reduce((m, b) => (b < m ? b : m));
+      // One block before, so the creation block itself is inside the first window.
+      eventIndex.setLastBlock(Math.max(0, Number(earliest) - 1));
+      console.log(`🗂  index starts at block ${earliest} (earliest contract creation)`);
+    };
+    // Arc answers 20,000 and refuses 50,000 ("requested range too large").
+    const INDEX_SPAN = Math.max(1, Number(process.env.TESSERA_INDEX_SPAN ?? 20_000));
+    const INDEX_MS = Number(process.env.TESSERA_INDEX_INTERVAL_MS ?? 15_000);
+    /** A full window means there is more chain behind us; come back sooner. */
+    const CATCHUP_MS = Math.max(250, Number(process.env.TESSERA_INDEX_CATCHUP_MS ?? 1_000));
+    const tick = async (): Promise<number> => {
       try {
-        const r = await indexOnce({ client: client.public, index: eventIndex, contracts: indexed });
+        await seedStart();
+        const r = await indexOnce({
+          client: client.public, index: eventIndex, contracts: indexed, maxSpan: INDEX_SPAN,
+        });
         // Only log when something happened. A heartbeat that fires every ten
         // seconds on a quiet chain buries the lines that matter.
         if (r && r.stored > 0) console.log(`🗂  indexed ${r.stored} event(s) from blocks ${r.from}–${r.to}`);
+        // A window that filled up is a window that stopped short of the head.
+        const behind = Boolean(r) && r!.to - r!.from + 1 >= INDEX_SPAN;
+        return behind ? CATCHUP_MS : INDEX_MS;
       } catch (e) {
         // A failed window is retried next tick — progress only advances on
         // success, so nothing is skipped.
         console.warn(`🗂  index tick failed: ${String((e as Error).message).slice(0, 120)}`);
+        return INDEX_MS;
       }
     };
-    void tick();
-    setInterval(tick, Number(process.env.TESSERA_INDEX_INTERVAL_MS ?? 15_000)).unref();
+    /*
+     * Self-scheduling rather than `setInterval`, so a slow tick cannot overlap
+     * the next one and a backfill can run faster than the steady state without
+     * two different timers to reason about.
+     */
+    const loop = async () => {
+      const wait = await tick();
+      setTimeout(loop, wait).unref();
+    };
+    void loop();
   }
   // Wallet-style balance timeline for the dashboard sparkline.
   const balanceHistory: { ts: number; balance: string }[] = [];
@@ -11743,13 +11821,28 @@ async function main() {
     const items: Item[] = [];
     const tsra = (liveDeployment.tesseraToken as Hex) ?? null;
 
+    /*
+     * Every independent read at once, not one after another.
+     *
+     * `await` in a loop is what made this endpoint cost 17 RPC requests. The
+     * clients are built with `batch: { multicall: true }` and Arc has
+     * Multicall3 at the canonical address, so concurrent `readContract` calls
+     * collapse into a single `eth_call` — but a sequential await never has two
+     * calls in flight for the scheduler to collapse, so the batching that was
+     * configured never once happened. Every one of these is a plain read of a
+     * different contract with no dependency on the others; running them
+     * together is the whole fix.
+     */
     // Lending + backstop emissions, and AMM LP emissions.
     if (emissionsAddr) {
-      const total = (await read<bigint>(emissionsAddr, tesseraEmissionsAbi, "claimableTotal", [who])) ?? 0n;
-      if (total > 0n) {
+      const [total, prior] = await Promise.all([
+        read<bigint>(emissionsAddr, tesseraEmissionsAbi, "claimableTotal", [who]),
+        read<Hex>(emissionsAddr, tesseraEmissionsAbi, "prior"),
+      ]);
+      if ((total ?? 0n) > 0n) {
         items.push({
           kind: "emissions", label: "Lending & backstop rewards",
-          amount: formatUnits(total, 18), symbol: "TSRA", route: "defi", urgent: false,
+          amount: formatUnits(total ?? 0n, 18), symbol: "TSRA", route: "defi", urgent: false,
         });
       }
       /*
@@ -11759,7 +11852,6 @@ async function main() {
        * naming it here is the only thing standing between a holder and a
        * balance nobody would otherwise mention.
        */
-      const prior = (await read<Hex>(emissionsAddr, tesseraEmissionsAbi, "prior")) ?? null;
       if (prior && /^0x0{40}$/.test(prior) === false) {
         const strandedTotal = (await read<bigint>(prior, tesseraEmissionsAbi, "claimableTotal", [who])) ?? 0n;
         if (strandedTotal > 0n) {
@@ -11784,43 +11876,69 @@ async function main() {
     // Bribes on closed epochs. Only closed ones: a share of a denominator that
     // is still moving is not a share, and the contract refuses them anyway.
     if (gaugeAddr) {
-      const epoch = (await read<bigint>(gaugeAddr, tesseraGaugeAbi, "currentEpoch")) ?? 0n;
-      const marketCount = (await read<bigint>(gaugeAddr, tesseraGaugeAbi, "marketCount")) ?? 0n;
+      const [epochRaw, marketCountRaw] = await Promise.all([
+        read<bigint>(gaugeAddr, tesseraGaugeAbi, "currentEpoch"),
+        read<bigint>(gaugeAddr, tesseraGaugeAbi, "marketCount"),
+      ]);
+      const epoch = epochRaw ?? 0n;
+      const marketCount = marketCountRaw ?? 0n;
       const byToken = new Map<string, bigint>();
       // Only the epoch that just closed — older ones are a log-scan, and a
       // digest that takes ten seconds is a digest nobody waits for.
       const closed = epoch > 0n ? epoch - 1n : 0n;
       if (epoch > 0n) {
-        for (let m = 0n; m < marketCount && m < 32n; m++) {
-          const count = (await read<bigint>(gaugeAddr, tesseraGaugeAbi, "bribeCount", [closed, m])) ?? 0n;
-          for (let i = 0n; i < count && i < 8n; i++) {
-            const share = (await read<bigint>(gaugeAddr, tesseraGaugeAbi, "bribeShare", [closed, m, i, who])) ?? 0n;
-            if (share === 0n) continue;
-            const info = await read<readonly [Hex, bigint, bigint, Hex]>(
-              gaugeAddr, tesseraGaugeAbi, "bribeAt", [closed, m, i]);
-            const token = info?.[0] ?? (tsra as Hex);
-            byToken.set(token, (byToken.get(token) ?? 0n) + share);
-          }
+        const markets: bigint[] = [];
+        for (let m = 0n; m < marketCount && m < 32n; m++) markets.push(m);
+        // Every market's bribe count at once, then every bribe in every market
+        // at once. Two rounds of multicall instead of up to 32 x 8 x 2 awaits.
+        const counts = await Promise.all(
+          markets.map((m) => read<bigint>(gaugeAddr, tesseraGaugeAbi, "bribeCount", [closed, m])),
+        );
+        const slots: { m: bigint; i: bigint }[] = [];
+        markets.forEach((m, idx) => {
+          const count = counts[idx] ?? 0n;
+          for (let i = 0n; i < count && i < 8n; i++) slots.push({ m, i });
+        });
+        const bribes = await Promise.all(
+          slots.map(async ({ m, i }) => {
+            const [share, info] = await Promise.all([
+              read<bigint>(gaugeAddr, tesseraGaugeAbi, "bribeShare", [closed, m, i, who]),
+              read<readonly [Hex, bigint, bigint, Hex]>(gaugeAddr, tesseraGaugeAbi, "bribeAt", [closed, m, i]),
+            ]);
+            return { share: share ?? 0n, token: info?.[0] ?? (tsra as Hex) };
+          }),
+        );
+        for (const { share, token } of bribes) {
+          if (share === 0n || !token) continue;
+          byToken.set(token, (byToken.get(token) ?? 0n) + share);
         }
       }
-      for (const [token, amount] of byToken) {
-        const meta = await tokenMeta(token as Hex);
+      const metas = await Promise.all([...byToken.keys()].map((t) => tokenMeta(t as Hex)));
+      [...byToken.entries()].forEach(([, amount], idx) => {
+        const meta = metas[idx];
         items.push({
           kind: "bribe", label: `Bribes from epoch ${closed}`,
           amount: formatUnits(amount, meta.decimals), symbol: meta.symbol,
           route: "gov", urgent: false,
         });
-      }
+      });
     }
 
     // A matured backstop exit. The one that costs something to ignore.
     if (poolDeployment) {
-      for (const a of poolDeployment.assets) {
-        const queued = (await read<bigint>(
-          poolDeployment.poolAddress, tesseraPoolAbi, "backstopQueued", [a.address as Hex, who])) ?? 0n;
+      // Both reads for every asset in one shot — two per asset sequentially was
+      // eight round-trips for a four-asset pool, and they are all independent.
+      const backstops = await Promise.all(
+        poolDeployment.assets.map(async (a) => {
+          const [queued, unlock] = await Promise.all([
+            read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "backstopQueued", [a.address as Hex, who]),
+            read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "backstopUnlockAt", [a.address as Hex, who]),
+          ]);
+          return { a, queued: queued ?? 0n, unlockAt: Number(unlock ?? 0n) };
+        }),
+      );
+      for (const { a, queued, unlockAt } of backstops) {
         if (queued === 0n) continue;
-        const unlockAt = Number((await read<bigint>(
-          poolDeployment.poolAddress, tesseraPoolAbi, "backstopUnlockAt", [a.address as Hex, who])) ?? 0n);
         const ready = unlockAt > 0 && Date.now() / 1000 >= unlockAt;
         items.push({
           kind: "backstopExit",
@@ -12027,7 +12145,19 @@ async function main() {
 
     // --- the emitter: is the schedule being turned? ------------------------
     if (emitterAddr) {
-      const last = Number((await read<bigint>(emitterAddr, tesseraEmitterAbi, "lastRelease")) ?? 0n);
+      /*
+       * Grouped reads, for the reason spelled out in `/api/claimables`: the
+       * clients batch through Multicall3, but only calls that are in flight at
+       * the same moment can be batched, and an `await` in a loop never has two.
+       * This endpoint cost 49 RPC requests a poll against a node that refuses
+       * roughly a quarter of what it is asked; the groups below turn that into
+       * one request each.
+       */
+      const [lastRaw, countRaw] = await Promise.all([
+        read<bigint>(emitterAddr, tesseraEmitterAbi, "lastRelease"),
+        read<bigint>(emitterAddr, tesseraEmitterAbi, "sinkCount"),
+      ]);
+      const last = Number(lastRaw ?? 0n);
       const stale = nowSec - last;
       add(
         "emitter.release",
@@ -12038,11 +12168,12 @@ async function main() {
 
       // Tokens owed to sinks that have not been handed over yet. Small is
       // normal; large and growing means nobody is distributing.
-      const count = Number((await read<bigint>(emitterAddr, tesseraEmitterAbi, "sinkCount")) ?? 0n);
-      let undelivered = 0n;
-      for (let i = 0; i < count; i++) {
-        undelivered += (await read<bigint>(emitterAddr, tesseraEmitterAbi, "pendingOf", [BigInt(i)])) ?? 0n;
-      }
+      const count = Number(countRaw ?? 0n);
+      const pendings = await Promise.all(
+        Array.from({ length: count }, (_, i) =>
+          read<bigint>(emitterAddr, tesseraEmitterAbi, "pendingOf", [BigInt(i)])),
+      );
+      const undelivered = pendings.reduce<bigint>((t, v) => t + (v ?? 0n), 0n);
       const tokens = Number(undelivered) / 1e18;
       const backlog = gradeUndelivered({
         tokens,
@@ -12055,19 +12186,24 @@ async function main() {
 
     // --- the keeper: could somebody turn it, and did they? -----------------
     if (keeperAddr) {
-      const preview = await read<readonly [bigint, bigint, bigint, bigint, bigint]>(
-        keeperAddr, tesseraKeeperAbi, "previewPoke");
-      const lastPoke = Number((await read<bigint>(keeperAddr, tesseraKeeperAbi, "lastPokedAt")) ?? 0n);
-      const rounds = Number((await read<bigint>(keeperAddr, tesseraKeeperAbi, "rounds")) ?? 0n);
+      const [preview, lastPokeRaw, roundsRaw, jarRaw, bountyRaw] = await Promise.all([
+        read<readonly [bigint, bigint, bigint, bigint, bigint]>(keeperAddr, tesseraKeeperAbi, "previewPoke"),
+        read<bigint>(keeperAddr, tesseraKeeperAbi, "lastPokedAt"),
+        read<bigint>(keeperAddr, tesseraKeeperAbi, "rounds"),
+        liveDeployment.tesseraToken
+          ? read<bigint>(liveDeployment.tesseraToken as Hex, erc20Abi, "balanceOf", [keeperAddr])
+          : Promise.resolve(0n),
+        read<bigint>(keeperAddr, tesseraKeeperAbi, "bounty"),
+      ]);
+      const lastPoke = Number(lastPokeRaw ?? 0n);
+      const rounds = Number(roundsRaw ?? 0n);
       if (preview) {
         add("keeper.ready", "ok",
           `${preview[0]} sink(s) worth ${(Number(preview[1]) / 1e18).toFixed(2)} TSRA; a round needs ${preview[4]} gas`,
           Number(preview[0]));
         // A tip jar that cannot pay is a keeper nobody outside will run.
-        const jar = liveDeployment.tesseraToken
-          ? (await read<bigint>(liveDeployment.tesseraToken as Hex, erc20Abi, "balanceOf", [keeperAddr])) ?? 0n
-          : 0n;
-        const bounty = (await read<bigint>(keeperAddr, tesseraKeeperAbi, "bounty")) ?? 0n;
+        const jar = jarRaw ?? 0n;
+        const bounty = bountyRaw ?? 0n;
         const roundsLeft = bounty > 0n ? Number(jar / bounty) : 0;
         add("keeper.bounty", roundsLeft < 10 ? "warn" : "ok",
           `tip jar covers ${roundsLeft} more round(s)`, roundsLeft);
@@ -12077,15 +12213,25 @@ async function main() {
     }
 
     // --- emissions: is what people are owed actually backed? ---------------
-    for (const [label, addr, abi] of [
-      ["lending", emissionsAddr, tesseraEmissionsAbi],
-      ["amm", lpEmissionsAddr, tesseraLpEmissionsAbi],
-    ] as const) {
-      if (!addr) continue;
-      const owed = (await read<bigint>(addr, abi, "totalOwed")) ?? 0n;
-      const held = liveDeployment.tesseraToken
-        ? (await read<bigint>(liveDeployment.tesseraToken as Hex, erc20Abi, "balanceOf", [addr])) ?? 0n
-        : 0n;
+    const venues: { label: string; addr: Hex; abi: unknown }[] = [];
+    if (emissionsAddr) venues.push({ label: "lending", addr: emissionsAddr, abi: tesseraEmissionsAbi });
+    if (lpEmissionsAddr) venues.push({ label: "amm", addr: lpEmissionsAddr, abi: tesseraLpEmissionsAbi });
+    // Four reads per venue, both venues, one round.
+    const venueReads = await Promise.all(
+      venues.map(async ({ addr, abi }) => {
+        const [owed, held, runway, rate] = await Promise.all([
+          read<bigint>(addr, abi, "totalOwed"),
+          liveDeployment.tesseraToken
+            ? read<bigint>(liveDeployment.tesseraToken as Hex, erc20Abi, "balanceOf", [addr])
+            : Promise.resolve(0n),
+          read<bigint>(addr, abi, "runwaySeconds"),
+          read<bigint>(addr, abi, "totalRatePerSecond"),
+        ]);
+        return { owed: owed ?? 0n, held: held ?? 0n, runway: Number(runway ?? 0n), rate: rate ?? 0n };
+      }),
+    );
+    for (const [idx, { label }] of venues.entries()) {
+      const { owed, held } = venueReads[idx];
       /*
        * The failure that started all of this: a claim page that says you are
        * owed 322 TSRA, and a contract holding none of them. Everything renders;
@@ -12106,8 +12252,7 @@ async function main() {
        * that is accruing debt with nothing behind it, which is the exact shape
        * of the original 322-TSRA-against-an-empty-pot failure.
        */
-      const runway = Number((await read<bigint>(addr, abi, "runwaySeconds")) ?? 0n);
-      const rate = (await read<bigint>(addr, abi, "totalRatePerSecond")) ?? 0n;
+      const { runway, rate } = venueReads[idx];
       const days = runway / 86400;
       const streaming = rate > 0n;
       add(`emissions.${label}.runway`,
@@ -12123,13 +12268,15 @@ async function main() {
     // --- the price feed ----------------------------------------------------
     const oracleAddr = (liveDeployment.tesseraTwapOracle as Hex) ?? null;
     if (oracleAddr) {
-      const lastAt = Number((await read<bigint>(oracleAddr, tesseraTwapOracleAbi, "lastUpdatedAt")) ?? 0n);
+      const [lastAtRaw, consulted] = await Promise.all([
+        read<bigint>(oracleAddr, tesseraTwapOracleAbi, "lastUpdatedAt"),
+        read<readonly [bigint, bigint, bigint, boolean]>(oracleAddr, tesseraTwapOracleAbi, "consult", [1800n]),
+      ]);
+      const lastAt = Number(lastAtRaw ?? 0n);
       const stale = nowSec - lastAt;
       add("oracle.freshness",
         lastAt === 0 ? "warn" : stale > 6 * 3600 ? "fail" : stale > 3600 ? "warn" : "ok",
         `last reading ${ago(lastAt)}`, lastAt);
-      const consulted = await read<readonly [bigint, bigint, bigint, boolean]>(
-        oracleAddr, tesseraTwapOracleAbi, "consult", [1800n]);
       // Declining to price a thin pool is correct behaviour, not a fault — so
       // this reports the state without raising an alarm about it.
       add("oracle.usable", "ok",
@@ -12156,9 +12303,16 @@ async function main() {
      * depositing signal, not a wait-and-see one.
      */
     if (poolDeployment) {
-      for (const a of poolDeployment.assets) {
-        const bal = await read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "backstopBalance", [a.address as Hex]);
-        const shares = await read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "backstopTotalShares", [a.address as Hex]);
+      const pots = await Promise.all(
+        poolDeployment.assets.map(async (a) => {
+          const [bal, shares] = await Promise.all([
+            read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "backstopBalance", [a.address as Hex]),
+            read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "backstopTotalShares", [a.address as Hex]),
+          ]);
+          return { a, bal, shares };
+        }),
+      );
+      for (const { a, bal, shares } of pots) {
         if (bal === null || shares === null) continue;
         if (bal === 0n && shares > 0n) {
           add(`backstop.${a.symbol}.wiped`, "fail",
@@ -12185,16 +12339,24 @@ async function main() {
      */
     const guardAddr = (liveDeployment.tesseraPriceGuard as Hex) ?? null;
     if (guardAddr && poolDeployment) {
-      let unguarded: string[] = [];
-      for (const a of poolDeployment.assets) {
-        const mark = await read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "price", [a.address as Hex]);
-        if (mark === null || mark === 0n) continue;
-        const probe = (mark * 3n) / 2n; // +50%: nobody re-marks by half honestly
-        const checked = await read<readonly [boolean, bigint, bigint]>(
-          guardAddr, tesseraPriceGuardAbi, "check", [a.address as Hex, probe]);
-        if (checked === null) continue;
-        if (checked[0]) unguarded.push(a.symbol);
-      }
+      const unguarded: string[] = [];
+      // Every mark in one round, then every probe in one round.
+      const marks = await Promise.all(
+        poolDeployment.assets.map((a) =>
+          read<bigint>(poolDeployment.poolAddress, tesseraPoolAbi, "price", [a.address as Hex])),
+      );
+      const probes = await Promise.all(
+        poolDeployment.assets.map((a, i) => {
+          const mark = marks[i];
+          if (mark === null || mark === 0n) return Promise.resolve(null);
+          // +50%: nobody re-marks by half honestly
+          return read<readonly [boolean, bigint, bigint]>(
+            guardAddr, tesseraPriceGuardAbi, "check", [a.address as Hex, (mark * 3n) / 2n]);
+        }),
+      );
+      poolDeployment.assets.forEach((a, i) => {
+        if (probes[i]?.[0]) unguarded.push(a.symbol);
+      });
       add("pool.priceGuard",
         unguarded.length === poolDeployment.assets.length ? "fail" : unguarded.length ? "warn" : "ok",
         unguarded.length

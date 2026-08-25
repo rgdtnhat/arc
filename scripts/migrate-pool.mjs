@@ -41,13 +41,15 @@
  *   npm run migrate:pool -- --to 0xNEW                    # dry run against a destination
  *   npm run migrate:pool -- --to 0xNEW --execute
  *   npm run migrate:pool -- --to 0xNEW --execute --verify-only
+ *   npm run migrate:pool -- --to 0xNEW --except 0xAPPWALLET --execute
+ *   npm run migrate:pool -- --to 0xNEW --only 0xA,0xB --execute
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { createPublicClient, createWalletClient } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { loadDeployer } from "./deployer.mjs";
 import { arcTestnet, erc20Abi, tesseraPoolAbi, tesseraRateLimiterAbi, pacedHttp, formatUsdc } from "@tessera/shared";
-import { planMigration, affordability, verifyMigration } from "../agent/src/migrate.ts";
+import { planMigration, affordability, verifyMigration, narrowPlan } from "../agent/src/migrate.ts";
 import { ArchiveScanner } from "../agent/src/archive-chain.ts";
 
 const ZERO = "0x0000000000000000000000000000000000000000";
@@ -64,9 +66,15 @@ const argOf = (flag) => {
   return i >= 0 ? process.argv[i + 1] : undefined;
 };
 
-const deployer = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
+const { account: signer, address: deployerAddress } = loadDeployer({
+  execute: EXECUTE,
+  address: argOf("--deployer") ?? null,
+  what: "migrate:pool",
+});
+// Only an address is needed to survey — see `scripts/deployer.mjs`.
+const deployer = { address: deployerAddress };
 const pub = createPublicClient({ chain: arcTestnet, transport: pacedHttp(RPC), batch: { multicall: true } });
-const wallet = createWalletClient({ account: deployer, chain: arcTestnet, transport: pacedHttp(RPC) });
+const wallet = signer ? createWalletClient({ account: signer, chain: arcTestnet, transport: pacedHttp(RPC) }) : null;
 
 /*
  * The same merge the app uses, not a simpler one that disagrees with it.
@@ -103,7 +111,7 @@ function readDeployment() {
 }
 
 const send = async (address, abi, functionName, args) => {
-  const { request } = await pub.simulateContract({ address, abi, functionName, args, account: deployer });
+  const { request } = await pub.simulateContract({ address, abi, functionName, args, account: signer ?? deployerAddress });
   const hash = await wallet.writeContract(request);
   const rc = await pub.waitForTransactionReceipt({ hash });
   if (rc.status !== "success") throw new Error(`${functionName} reverted (${hash})`);
@@ -286,10 +294,20 @@ async function main() {
   console.log("");
   const users = [...new Set((scan.holders ?? []).map((h) => (h.address ?? h).toLowerCase()))];
   if (scan.partial) {
+    /*
+     * Say which kind of incomplete this is. They look the same and are fixed
+     * differently: a refused window wants a quieter node, while a spent budget
+     * just wants the command run again — the cache carries the covered ground
+     * forward, so each run starts where the last one stopped.
+     */
     console.warn(
-      "⚠  The log scan was incomplete — some windows were throttled or refused.\n" +
-      "   Anybody missing from it will be left behind, so re-run until this line is gone\n" +
-      "   before treating the migration as finished.\n",
+      scan.budgetSpent
+        ? "⚠  The log scan ran out of window budget before reaching the pool's first block.\n" +
+          `   It got as far back as it could this run; progress is cached in ${scanCache}, so\n` +
+          "   simply run this again — each pass resumes deeper — until this line is gone.\n"
+        : "⚠  The log scan was incomplete — some windows were refused by the RPC.\n" +
+          "   Anybody missing from it will be left behind, so re-run until this line is gone\n" +
+          "   before treating the migration as finished.\n",
     );
   }
   console.log(`Found ${users.length} address(es) with history on the old pool.`);
@@ -300,8 +318,37 @@ async function main() {
   const source = await readPositions(oldPool, assets, users);
   const destination = newPool ? await readPositions(newPool, assets, users) : [];
 
-  const plan = planMigration(source, destination);
+  let plan = planMigration(source, destination);
   const bySymbol = Object.fromEntries(assets.map((a) => [a.address, a]));
+
+  /*
+   * A subset, when the whole set is not the operator's to pay for. The rule
+   * itself lives in `narrowPlan` — see there for why the app wallet's own
+   * position is the one that gets left out, and why the cost is re-derived.
+   */
+  const addressList = (v) =>
+    (v ?? "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const ONLY = addressList(argOf("--only"));
+  const EXCEPT = addressList(argOf("--except"));
+  for (const a of [...ONLY, ...EXCEPT]) {
+    if (!/^0x[0-9a-f]{40}$/.test(a)) {
+      console.error(`\n✗ --only/--except take comma-separated addresses; got "${a}"\n`);
+      process.exit(1);
+    }
+  }
+  if (ONLY.length && EXCEPT.length) {
+    console.error("\n✗ pass --only or --except, not both.\n");
+    process.exit(1);
+  }
+  if (ONLY.length || EXCEPT.length) {
+    const before = plan.steps.length;
+    plan = narrowPlan(plan, { only: ONLY, except: EXCEPT });
+    console.log(
+      `\n  subset: ${plan.steps.length} of ${before} position(s) — ` +
+        (ONLY.length ? `only ${ONLY.join(", ")}` : `excluding ${EXCEPT.join(", ")}`),
+    );
+    console.log("  Everyone left out keeps their position on the old pool, untouched.");
+  }
 
   console.log(`\n── Plan ────────────────────────────────────────────────`);
   console.log(`  ${plan.steps.length} position(s) to move`);
@@ -417,9 +464,12 @@ async function main() {
      */
     if (scan.partial) {
       throw new Error(
-        "The log scan was incomplete — some windows were throttled or refused, so this list of\n" +
-        "  suppliers is not the whole set. Migrating now leaves whoever is missing behind.\n" +
-        "  Re-run until that warning is gone, then --execute.",
+        (scan.budgetSpent
+          ? "The log scan ran out of window budget before reaching the pool's first block, so this\n"
+          : "The log scan was incomplete — some windows were refused by the RPC, so this\n") +
+        "  list of suppliers is not the whole set. Migrating now leaves whoever is missing behind.\n" +
+        "  Run this again (progress is cached, each pass resumes deeper) until that warning is\n" +
+        "  gone, then --execute.",
       );
     }
 

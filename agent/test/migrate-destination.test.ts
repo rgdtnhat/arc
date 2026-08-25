@@ -47,9 +47,22 @@ test("an incomplete log scan is fatal to --execute, not a warning", () => {
    */
   assert.match(guarded, /scan\.partial/, "--execute proceeds on a partial scan");
   assert.match(guarded, /leaves whoever is missing behind/);
-  // And it must still be only a warning in the survey, or nobody can plan.
+  /*
+   * And it must still be only a warning in the survey, or nobody can plan.
+   *
+   * The survey now says *which* kind of incomplete it is — a spent window
+   * budget or a refused window — because the two are fixed differently and
+   * saying "throttled or refused" for a budget stop sent operators chasing an
+   * RPC problem that was not there. Both are still warnings, and both still
+   * say the list is not the whole set.
+   */
   const survey = script.slice(0, script.indexOf("if (!VERIFY_ONLY) {"));
-  assert.match(survey, /console\.warn\([\s\S]{0,80}The log scan was incomplete/);
+  const warned = /console\.warn\(\s*(?:scan\.budgetSpent[\s\S]{0,600}?|)"⚠[\s\S]{0,600}?\);/.exec(survey);
+  assert.ok(warned, "the survey no longer warns about an incomplete scan");
+  assert.match(warned[0], /ran out of window budget/);
+  assert.match(warned[0], /refused by the RPC/);
+  assert.doesNotMatch(survey.slice(0, survey.indexOf("console.warn(")), /throw new Error\([\s\S]{0,80}log scan/,
+    "the survey must not throw on a partial scan");
 });
 
 test("the destination is checked before the operator's balance", () => {

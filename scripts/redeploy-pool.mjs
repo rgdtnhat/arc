@@ -66,7 +66,7 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { createPublicClient, createWalletClient, toFunctionSelector } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { loadDeployer } from "./deployer.mjs";
 import {
   arcChain,
   pacedHttp,
@@ -87,9 +87,16 @@ const pace = (ms = PACE_MS) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) :
 
 const argv = process.argv.slice(2);
 const EXECUTE = argv.includes("--execute");
+/*
+ * `--name=value` and `--name value` both, because only one of them used to
+ * work and the other failed as "no such flag" rather than as a typo.
+ */
 const flag = (name, fallback = null) => {
   const hit = argv.find((a) => a.startsWith(`--${name}=`));
-  return hit ? hit.slice(name.length + 3) : fallback;
+  if (hit) return hit.slice(name.length + 3);
+  const i = argv.indexOf(`--${name}`);
+  if (i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--")) return argv[i + 1];
+  return fallback;
 };
 const EMITTER = flag("emitter");
 const SAME_CODE = argv.includes("--same-code");
@@ -111,7 +118,17 @@ const REUSE = (() => {
 const RECORD_NAME = flag("record", "arc.json");
 const RECORD_URL = new URL(`../deployments/${RECORD_NAME}`, import.meta.url);
 
-const deployer = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
+const { account: signer, address: deployerAddress, canSend } = loadDeployer({
+  execute: EXECUTE,
+  address: flag("deployer"),
+  what: "redeploy:pool",
+});
+/*
+ * `deployer` is what the ownership checks read, and it only ever needs an
+ * address. The key — when there is one — lives in `signer`, which nothing but
+ * `send` and `deploy` touch. A survey runs with `signer` null.
+ */
+const deployer = { address: deployerAddress };
 /*
  * No multicall batching, deliberately.
  *
@@ -124,7 +141,7 @@ const deployer = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
  * dependency whose absence looks like corruption.
  */
 const pub = createPublicClient({ chain: arcChain, transport: pacedHttp(RPC) });
-const wallet = createWalletClient({ account: deployer, chain: arcChain, transport: pacedHttp(RPC) });
+const wallet = signer ? createWalletClient({ account: signer, chain: arcChain, transport: pacedHttp(RPC) }) : null;
 
 /*
  * Reads that fail are failures, not zeroes.
@@ -159,7 +176,7 @@ async function send(label, address, abi, functionName, args) {
     console.log(`  plan   ${label}`);
     return null;
   }
-  const { request } = await pub.simulateContract({ address, abi, functionName, args, account: deployer });
+  const { request } = await pub.simulateContract({ address, abi, functionName, args, account: signer ?? deployerAddress });
   const hash = await wallet.writeContract(request);
   const rc = await pub.waitForTransactionReceipt({ hash });
   if (rc.status !== "success") throw new Error(`${label} reverted (${hash})`);
@@ -174,7 +191,7 @@ async function deploy(label, abi, bytecode, args) {
     console.log(`  plan   deploy ${label}`);
     return null;
   }
-  const hash = await wallet.deployContract({ abi, bytecode, args, account: deployer, chain: arcChain });
+  const hash = await wallet.deployContract({ abi, bytecode, args, account: signer, chain: arcChain });
   const rc = await pub.waitForTransactionReceipt({ hash });
   if (rc.status !== "success" || !rc.contractAddress) throw new Error(`${label} did not deploy (${hash})`);
   console.log(`  ok     deploy ${label} → ${rc.contractAddress}`);

@@ -225,3 +225,48 @@ export function validateReserves(reserves: ReserveConfig[]): string[] {
   if (!reserves.length) problems.push("no reserves — a pool with none cannot be migrated into");
   return problems;
 }
+
+/**
+ * Migrate a subset, because the whole set is not always the operator's to pay
+ * for.
+ *
+ * `supplyFor` re-creates a position out of the *operator's* tokens and leaves
+ * the original where it is. That is deliberate — the emitter sizes emissions
+ * from the retired pool's balances, so draining it would freeze the schedule —
+ * but it means the operator funds a second copy of every position they carry
+ * across. On this deployment that came to 47,650 TSRA for a single address: the
+ * app wallet's own supply. Nobody is going to front that, and nobody should.
+ * The app wallet holds its own keys and its `withdraw` is not frozen, so it can
+ * move itself for nothing.
+ *
+ * So the operator carries everybody else and leaves that one out.
+ *
+ * Two things this deliberately does *not* touch:
+ *
+ *  - `blockedByDebt` stays whole. It is the list of people the migration is
+ *    knowingly leaving behind, and narrowing it would hide them.
+ *  - `alreadyDone` / `skippedDust` stay as counted. They describe the source
+ *    data, not the plan, and a subset does not make them untrue.
+ *
+ * The cost *is* re-derived, because an affordability check run against the
+ * unfiltered total would refuse a migration the operator can plainly afford —
+ * which is the exact failure this exists to get past.
+ */
+export function narrowPlan(
+  plan: MigrationPlan,
+  filter: { only?: string[]; except?: string[] },
+): MigrationPlan {
+  const only = (filter.only ?? []).map((a) => a.toLowerCase());
+  const except = (filter.except ?? []).map((a) => a.toLowerCase());
+  if (!only.length && !except.length) return plan;
+  if (only.length && except.length) {
+    throw new Error("narrowPlan takes only or except, not both");
+  }
+  const steps = plan.steps.filter((s) => {
+    const u = s.user.toLowerCase();
+    return only.length ? only.includes(u) : !except.includes(u);
+  });
+  const cost = new Map<`0x${string}`, bigint>();
+  for (const s of steps) cost.set(s.asset, (cost.get(s.asset) ?? 0n) + s.topUp);
+  return { ...plan, steps, cost };
+}

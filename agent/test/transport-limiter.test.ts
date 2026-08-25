@@ -204,8 +204,21 @@ test("a revert does not move the rate", async () => {
     const before = rpcStats();
     n.says(() => ({ error: { code: 3, message: "execution reverted: NoUsablePrice" } }));
     await assert.rejects(call(request, 400));
-    assert.equal(rpcStats().throttled, before.throttled);
-    assert.equal(rpcStats().rate, before.rate);
+    assert.equal(rpcStats().throttled, before.throttled, "a revert was counted as a refusal");
+    /*
+     * Not `equal`, because the rate is allowed to move in one direction.
+     *
+     * The limiter widens on every success and recovers over wall-clock time, so
+     * pinning the rate to exactly what it was is a bet on nothing else having
+     * happened in the process — which held when this file ran alone and failed
+     * roughly once a suite when it did not. Widening is the limiter working;
+     * the guarantee that matters, and the only one a revert could break, is
+     * that it does not *narrow*.
+     */
+    assert.ok(
+      rpcStats().rate >= before.rate,
+      `a revert cut the rate from ${before.rate} to ${rpcStats().rate}`,
+    );
   } finally {
     await n.stop();
   }
