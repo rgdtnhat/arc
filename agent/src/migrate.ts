@@ -270,3 +270,87 @@ export function narrowPlan(
   for (const s of steps) cost.set(s.asset, (cost.get(s.asset) ?? 0n) + s.topUp);
   return { ...plan, steps, cost };
 }
+
+/**
+ * Which pools, and whose positions — worked out once and then remembered.
+ *
+ * A migration is deliberately several runs: survey, survey again until the log
+ * scan reaches the pool's first block, then `--execute`, then `--verify-only`.
+ * Each of those needed `--from`, `--to` and `--except` retyped, which is 197
+ * characters of hex per run and three chances to paste one of them wrong. The
+ * addresses do not change between runs of the same migration, so they are
+ * settled once and carried forward.
+ *
+ * Provenance travels with each field because a remembered destination is a
+ * thing an operator must be able to see before it is used. The caller prints
+ * where every address came from; nothing is silently assumed.
+ *
+ * `app` and `self` resolve to the app wallet, which is the address this is
+ * almost always used to exclude — it holds its own keys and its `withdraw` is
+ * not frozen, so it moves itself for nothing rather than being re-supplied out
+ * of the operator's pocket.
+ */
+export interface MigrationTargets {
+  from: `0x${string}` | undefined;
+  to: `0x${string}` | undefined;
+  only: string[];
+  except: string[];
+}
+
+export type TargetSource = "flag" | "remembered" | "record" | "none";
+
+export function resolveMigrationTargets(input: {
+  flags: { from?: string | null; to?: string | null; only?: string | null; except?: string | null };
+  remembered?: Partial<MigrationTargets> | null;
+  record?: { tesseraPool?: string; tesseraPoolLegacy?: string } | null;
+  /** The app wallet, so `--except app` needs no address. */
+  appWallet?: string | null;
+}): { targets: MigrationTargets; from: TargetSource; to: TargetSource; filter: TargetSource } {
+  const lower = (v: unknown) => (typeof v === "string" && v ? v.toLowerCase() : undefined);
+  const rec = input.record ?? {};
+  const mem = input.remembered ?? {};
+
+  const pick = (flag?: string | null, remembered?: string, fallback?: string):
+    { value: `0x${string}` | undefined; source: TargetSource } => {
+    const f = lower(flag);
+    if (f) return { value: f as `0x${string}`, source: "flag" };
+    const r = lower(remembered);
+    if (r) return { value: r as `0x${string}`, source: "remembered" };
+    const d = lower(fallback);
+    if (d) return { value: d as `0x${string}`, source: "record" };
+    return { value: undefined, source: "none" };
+  };
+
+  /*
+   * The record's own default is asymmetric on purpose. After a redeploy the
+   * record names the replacement as `tesseraPool` and the pool it superseded as
+   * `tesseraPoolLegacy`, so defaulting `--from` to `tesseraPool` would point
+   * this at the destination right after a redeploy — it would scan the new
+   * pool, find the positions it was about to create, and report the migration
+   * as already done.
+   */
+  const from = pick(input.flags.from, mem.from, rec.tesseraPoolLegacy ?? rec.tesseraPool);
+  const to = pick(input.flags.to, mem.to, rec.tesseraPoolLegacy ? rec.tesseraPool : undefined);
+
+  const expand = (raw: string): string[] =>
+    raw
+      .split(",")
+      .map((x) => x.trim().toLowerCase())
+      .filter(Boolean)
+      .map((x) => (x === "app" || x === "self" ? lower(input.appWallet) ?? x : x));
+
+  let only: string[] = [];
+  let except: string[] = [];
+  let filter: TargetSource = "none";
+  if (input.flags.only || input.flags.except) {
+    only = input.flags.only ? expand(input.flags.only) : [];
+    except = input.flags.except ? expand(input.flags.except) : [];
+    filter = "flag";
+  } else if ((mem.only?.length ?? 0) || (mem.except?.length ?? 0)) {
+    only = mem.only ?? [];
+    except = mem.except ?? [];
+    filter = "remembered";
+  }
+
+  return { targets: { from: from.value, to: to.value, only, except }, from: from.source, to: to.source, filter };
+}

@@ -41,15 +41,27 @@
  *   npm run migrate:pool -- --to 0xNEW                    # dry run against a destination
  *   npm run migrate:pool -- --to 0xNEW --execute
  *   npm run migrate:pool -- --to 0xNEW --execute --verify-only
- *   npm run migrate:pool -- --to 0xNEW --except 0xAPPWALLET --execute
+ *   npm run migrate:pool -- --to 0xNEW --except app --execute
  *   npm run migrate:pool -- --to 0xNEW --only 0xA,0xB --execute
+ *
+ * The pools are remembered between runs, so a migration is set up once and then
+ * driven with bare commands:
+ *
+ *   npm run migrate:pool -- --from 0xOLD --to 0xNEW --except app
+ *   npm run migrate:pool                    # same migration, surveyed again
+ *   npm run migrate:pool -- --execute
+ *   npm run migrate:pool -- --verify-only
+ *
+ * A flag always beats the memory; `--forget` clears it. "app" (or "self")
+ * resolves to the app wallet from AGENT_PRIVATE_KEY / AGENT_ADDRESS.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createPublicClient, createWalletClient } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { loadDeployer } from "./deployer.mjs";
 import { arcTestnet, erc20Abi, tesseraPoolAbi, tesseraRateLimiterAbi, pacedHttp, formatUsdc } from "@tessera/shared";
-import { planMigration, affordability, verifyMigration, narrowPlan } from "../agent/src/migrate.ts";
+import { planMigration, affordability, verifyMigration, narrowPlan, resolveMigrationTargets } from "../agent/src/migrate.ts";
 import { ArchiveScanner } from "../agent/src/archive-chain.ts";
 
 const ZERO = "0x0000000000000000000000000000000000000000";
@@ -60,11 +72,28 @@ const PACE_MS = Number(process.env.TESSERA_PACE_MS ?? 6000);
 const pace = (ms = PACE_MS) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 
 const EXECUTE = process.argv.includes("--execute");
+/** Drop the remembered pools and start the next run from flags alone. */
+const FORGET = process.argv.includes("--forget");
 const VERIFY_ONLY = process.argv.includes("--verify-only");
 const argOf = (flag) => {
   const i = process.argv.indexOf(flag);
   return i >= 0 ? process.argv[i + 1] : undefined;
 };
+
+/*
+ * The app wallet, so `--except app` needs no address typed.
+ *
+ * Derived from the agent key when this environment has one, or named directly
+ * by AGENT_ADDRESS. It is only ever compared against addresses from the chain,
+ * never used to sign here.
+ */
+const APP_WALLET = (() => {
+  const explicit = process.env.AGENT_ADDRESS;
+  if (explicit) return explicit.toLowerCase();
+  const k = process.env.AGENT_PRIVATE_KEY;
+  if (!k) return null;
+  try { return privateKeyToAccount(k).address.toLowerCase(); } catch { return null; }
+})();
 
 const { account: signer, address: deployerAddress } = loadDeployer({
   execute: EXECUTE,
@@ -169,8 +198,37 @@ async function main() {
    * to create, and report the whole migration as already done. Nothing lost,
    * but a convincing way to believe you had migrated when you had not.
    */
-  const oldPool = (argOf("--from") ?? dep.tesseraPoolLegacy ?? dep.tesseraPool)?.toLowerCase();
-  const newPool = (argOf("--to") ?? (dep.tesseraPoolLegacy ? dep.tesseraPool : undefined))?.toLowerCase();
+  /*
+   * Settle the addresses once, then remember them.
+   *
+   * A migration is several runs on purpose — survey, survey again until the log
+   * scan reaches the pool's first block, `--execute`, then `--verify-only` —
+   * and each of those was 197 characters of hex retyped, with three chances to
+   * paste one wrong. The pools do not change between runs of one migration, so
+   * the first run that names them writes them down and the rest need nothing:
+   *
+   *   npm run migrate:pool -- --from 0x… --to 0x… --except app
+   *   npm run migrate:pool                       # same migration, surveyed
+   *   npm run migrate:pool -- --execute
+   *
+   * A flag always beats the memory, `--forget` clears it, and every resolved
+   * address is printed with where it came from — a remembered destination is
+   * exactly the kind of thing that must never be used without being seen.
+   */
+  const memoryFile = path.join(process.env.STATE_DIR ?? process.cwd(), ".tessera-migration.json");
+  const readMemory = () => {
+    if (FORGET) return null;
+    try { return JSON.parse(readFileSync(memoryFile, "utf8")); } catch { return null; }
+  };
+  const remembered = readMemory();
+  const resolved = resolveMigrationTargets({
+    flags: { from: argOf("--from"), to: argOf("--to"), only: argOf("--only"), except: argOf("--except") },
+    remembered,
+    record: dep,
+    appWallet: APP_WALLET,
+  });
+  const oldPool = resolved.targets.from;
+  const newPool = resolved.targets.to;
   const assets = (dep.poolAssets ?? []).map((a) => ({ ...a, address: a.address.toLowerCase() }));
 
   if (!oldPool) throw new Error("No source pool: pass --from, or record tesseraPool in deployments/arc.json");
@@ -233,9 +291,18 @@ async function main() {
     }
   }
 
-  console.log(`\nSource pool  ${oldPool}`);
+  /*
+   * Say where every address came from before using any of them. A remembered
+   * destination is exactly the kind of thing that must never be acted on
+   * unseen, so its provenance sits on the same line as the address.
+   */
+  const where = (src) =>
+    src === "flag" ? "" : src === "remembered" ? "  (remembered)" : src === "record" ? "  (from arc.json)" : "";
+  if (FORGET) console.log("\nForgot the remembered migration — reading flags and the record only.");
+  console.log(`\nSource pool  ${oldPool}${where(resolved.from)}`);
   console.log(
-    `Destination  ${newPool ?? "(none — run `npm run redeploy:pool -- --emitter=keep --execute` first, or pass --to)"}`,
+    `Destination  ${newPool ?? "(none — run `npm run redeploy:pool -- --emitter=keep --execute` first, or pass --to)"}` +
+      (newPool ? where(resolved.to) : ""),
   );
   console.log(`Assets       ${assets.map((a) => a.symbol).join(", ")}`);
   console.log(`Mode         ${EXECUTE ? "EXECUTE — this sends transactions" : "dry run — nothing will be sent"}\n`);
@@ -326,13 +393,16 @@ async function main() {
    * itself lives in `narrowPlan` — see there for why the app wallet's own
    * position is the one that gets left out, and why the cost is re-derived.
    */
-  const addressList = (v) =>
-    (v ?? "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
-  const ONLY = addressList(argOf("--only"));
-  const EXCEPT = addressList(argOf("--except"));
+  const ONLY = resolved.targets.only;
+  const EXCEPT = resolved.targets.except;
   for (const a of [...ONLY, ...EXCEPT]) {
     if (!/^0x[0-9a-f]{40}$/.test(a)) {
-      console.error(`\n✗ --only/--except take comma-separated addresses; got "${a}"\n`);
+      console.error(
+        `\n✗ --only/--except take comma-separated addresses (or "app" for the app wallet); got "${a}"\n` +
+          (a === "app" || a === "self"
+            ? '  "app" needs AGENT_PRIVATE_KEY or AGENT_ADDRESS in the environment to resolve.\n'
+            : ""),
+      );
       process.exit(1);
     }
   }
@@ -347,7 +417,26 @@ async function main() {
       `\n  subset: ${plan.steps.length} of ${before} position(s) — ` +
         (ONLY.length ? `only ${ONLY.join(", ")}` : `excluding ${EXCEPT.join(", ")}`),
     );
-    console.log("  Everyone left out keeps their position on the old pool, untouched.");
+    console.log("  Everyone left out keeps their position on the old pool, untouched." +
+      (resolved.filter === "remembered" ? "  (remembered)" : ""));
+  }
+
+  /*
+   * Write down what this run settled on, so the next one needs no flags.
+   *
+   * Only once the addresses have survived every shape and existence check
+   * above: remembering a mistyped destination would hand the next run a bad
+   * default wearing the word "remembered", which is worse than retyping.
+   */
+  if (newPool && !FORGET) {
+    try {
+      writeFileSync(
+        memoryFile,
+        JSON.stringify({ from: oldPool, to: newPool, only: ONLY, except: EXCEPT }, null, 2) + "\n",
+      );
+    } catch {
+      /* a migration that cannot write a convenience file is still a migration */
+    }
   }
 
   console.log(`\n── Plan ────────────────────────────────────────────────`);

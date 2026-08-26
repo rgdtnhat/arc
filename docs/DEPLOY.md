@@ -344,6 +344,37 @@ default 6000) and `ARC_RPC_CONCURRENCY` (how many RPC calls may be open at once,
 default 6, adapting between 2 and 8). Raise the second on a private endpoint;
 raise the first if the public node throttles you.
 
+### Driving a pool migration
+
+`migrate:pool` is several runs by design: survey, survey again until the log
+scan reaches the pool's first block, `--execute`, then `--verify-only`. The
+pools do not change between them, so the first run that names them writes them
+down and the rest need no addresses.
+
+```bash
+npm run migrate:pool -- --from 0xOLD --to 0xNEW --except app   # set it up
+npm run migrate:pool                                           # survey again
+npm run migrate:pool -- --execute
+npm run migrate:pool -- --verify-only
+```
+
+A flag always beats the memory and `--forget` clears it. Every resolved address
+is printed with where it came from — `(remembered)`, `(from arc.json)`, or
+nothing at all when it came from a flag — because a destination this run was not
+told about is about to receive other people's positions.
+
+`app` (or `self`) in `--only` / `--except` resolves to the app wallet from
+`AGENT_PRIVATE_KEY` or `AGENT_ADDRESS`. Excluding the app wallet is the usual
+case: `supplyFor` re-creates a position out of the operator's tokens, and the app
+wallet holds its own keys, so it moves itself with a withdraw and a supply
+instead of being re-bought out of the operator's pocket. The memory lives in
+`STATE_DIR/.tessera-migration.json` and is gitignored.
+
+A survey needs no private key. Pass `--deployer 0x…` and both `migrate:pool` and
+`redeploy:pool` will read ownership and affordability against that address;
+`--execute` still requires `DEPLOYER_PRIVATE_KEY`, and a key that disagrees with
+`--deployer` is a stop rather than a merge.
+
 ### The local event index
 
 `/api/history` reads a SQLite index of chain events kept in `STATE_DIR/index.db`.
