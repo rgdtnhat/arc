@@ -7161,6 +7161,121 @@ const $ = (id) => document.getElementById(id);
        */
       window.__myAmmShares = {};
       /** The pool as it should be shown: the caller's own position when known. */
+      /* ---- What a liquidity deposit or withdrawal actually does -----------
+       *
+       * The form asked for a number per asset and told you nothing back. The
+       * hint said "deposit every asset in proportion" and "withdrawing returns
+       * a proportional slice", both true, and neither answers the question the
+       * reader has: *how much*. What is the other side of this pair, how many
+       * shares does it buy, and — the one that costs money — how much of what I
+       * typed buys nothing at all.
+       *
+       * That last one is not hypothetical. `_addLiquidity` credits the
+       * *smallest* ratio across the assets supplied:
+       *
+       *     shares = min_i(amounts[i] * totalShares / reserves[i])
+       *
+       * so anything above that ratio is added to the reserves and mints no
+       * shares. It is a donation to every other provider, made silently, by
+       * someone who typed two numbers that looked reasonable. The contract's own
+       * comment says so; the page never did.
+       *
+       * These mirror the contract's arithmetic exactly, in the same integer
+       * order, so a preview and the transaction cannot disagree.
+       */
+
+      /** The pool's minimum-liquidity burn, from TesseraAMM. */
+      const AMM_MINIMUM_LIQUIDITY = 1000n;
+
+      /** Reserve of each asset, in base units, in the pool's own order. */
+      function lpReserves(pool) {
+        return (pool.assets || []).map((a) => BigInt(a.raw ?? "0"));
+      }
+
+      /**
+       * The matching amounts at the pool's current ratio.
+       *
+       * Given one asset's amount, what every other asset needs to be for the
+       * deposit to be balanced — which is to say, for none of it to be donated.
+       * Returns null when the pool has no ratio yet: the first deposit *sets*
+       * the price, so there is nothing to match.
+       */
+      function lpPairFor(pool, index, rawAmount) {
+        const res = lpReserves(pool);
+        const from = res[index];
+        if (!from || from <= 0n || res.some((r) => r <= 0n)) return null;
+        const amt = BigInt(rawAmount || 0);
+        if (amt <= 0n) return null;
+        return res.map((r, i) => (i === index ? amt : (amt * r) / from));
+      }
+
+      /**
+       * What this deposit buys, and what it gives away.
+       *
+       * `donated` is the part of each amount above the credited ratio: it goes
+       * into the reserves and mints nothing.
+       */
+      function lpAddPreview(pool, typedRaws) {
+        const res = lpReserves(pool);
+        const total = BigInt(pool.totalShares || "0");
+        const typed = typedRaws.map((v) => BigInt(v || 0));
+        if (typed.some((v) => v <= 0n)) return null;
+
+        if (total === 0n) {
+          // First deposit: shares are the sum, less the burned minimum. There
+          // is no ratio to be unbalanced against.
+          const sum = typed.reduce((t, v) => t + v, 0n);
+          if (sum <= AMM_MINIMUM_LIQUIDITY) return { first: true, shares: 0n, tooSmall: true, donated: typed.map(() => 0n), sharePct: 0 };
+          return { first: true, shares: sum - AMM_MINIMUM_LIQUIDITY, tooSmall: false, donated: typed.map(() => 0n), sharePct: 100 };
+        }
+        if (res.some((r) => r <= 0n)) return null;
+
+        let shares = null;
+        for (let i = 0; i < typed.length; i++) {
+          const minted = (typed[i] * total) / res[i];
+          if (shares === null || minted < shares) shares = minted;
+        }
+        shares = shares ?? 0n;
+        /*
+         * What each asset contributed at the credited ratio; the rest is the
+         * donation — above a dust bound that is derived, not guessed.
+         *
+         * Both `shares` and `credited` are floored, so a deposit matched exactly
+         * to the pool's ratio still comes out a few base units "unbalanced". The
+         * error is bounded: `shares` can be short by one, which costs
+         * `res[i] / total` units of `credited`, plus one more for the second
+         * floor. Anything at or below that is the arithmetic, not the deposit,
+         * and reporting it would put "0.000006 USDC mints nothing" under a
+         * perfectly balanced pair — which teaches the reader to ignore the one
+         * warning on this panel that costs real money.
+         */
+        const credited = res.map((r) => (shares * r) / total);
+        const dust = res.map((r) => r / total + 2n);
+        const donated = typed.map((v, i) => {
+          const over = v > credited[i] ? v - credited[i] : 0n;
+          return over > dust[i] ? over : 0n;
+        });
+        const after = total + shares;
+        return {
+          first: false,
+          shares,
+          donated,
+          balanced: donated.every((d) => d === 0n),
+          sharePct: after > 0n ? (Number(shares) / Number(after)) * 100 : 0,
+        };
+      }
+
+      /** What burning these shares pays out, per asset, in base units. */
+      function lpRemovePreview(pool, sharesRaw) {
+        const res = lpReserves(pool);
+        const total = BigInt(pool.totalShares || "0");
+        const shares = BigInt(sharesRaw || 0);
+        if (shares <= 0n || total <= 0n) return null;
+        // The contract divides by the total *before* the burn — see
+        // `removeLiquidity`, which caches `total` and only then decrements.
+        return { out: res.map((r) => (r * shares) / total), shares };
+      }
+
       function amMine(p) {
         const own = selfMode() ? window.__myAmmShares[p.id] : undefined;
         if (own === undefined) return p;
@@ -7234,6 +7349,7 @@ const $ = (id) => document.getElementById(id);
           renderAmLpInputs();
         }
         renderAmLpHint();
+        renderAmLpPreview();
       };
 
       /** Add mode needs one amount per asset; remove mode needs a share count. */
@@ -7253,6 +7369,103 @@ const $ = (id) => document.getElementById(id);
           host.innerHTML =
             `<input id="amLpShares" class="field" inputmode="decimal" placeholder="Shares to burn" style="width:170px" />`;
         }
+      }
+
+      /**
+       * The line that answers "how much am I actually moving?".
+       *
+       * Everything here is derived from figures already on the page — reserves,
+       * total shares, the amounts typed — so it costs no RPC and cannot lag the
+       * form. It renders under the inputs and updates as they change.
+       */
+      function renderAmLpPreview() {
+        const box = $("amLpPreview");
+        const raw = amSelected();
+        if (!box || !raw) return;
+        const p = amMine(raw);
+        const hide = () => { box.style.display = "none"; box.innerHTML = ""; };
+        const amt = (v, a) => `${esc(fmtUnitsStr(String(v), Number(a.decimals) || 6))} ${esc(a.symbol)}`;
+
+        if ($("amLpAction").value === "remove") {
+          const el = $("amLpShares");
+          const want = el && el.value.trim();
+          if (!want) return hide();
+          let sharesRaw;
+          try { sharesRaw = BigInt(want.replace(/[,\s]/g, "")); } catch { return hide(); }
+          const pre = lpRemovePreview(p, sharesRaw);
+          if (!pre) return hide();
+          const held = BigInt(p.myShares || "0");
+          const ofMine = held > 0n ? (Number(pre.shares) / Number(held)) * 100 : null;
+          box.style.display = "block";
+          box.innerHTML =
+            `<div style="font-weight:600;margin-bottom:5px">You would receive</div>` +
+            `<div>${p.assets.map((a, i) => `<b>${amt(pre.out[i], a)}</b>`).join(' <span style="opacity:.6">+</span> ')}</div>` +
+            (ofMine === null ? "" :
+              `<div style="color:var(--muted);margin-top:5px">Burning ${esc(String(pre.shares))} of your ` +
+              `${esc(String(held))} shares — ${esc(ofMine.toFixed(ofMine < 0.01 ? 4 : 2))}% of your position.` +
+              (pre.shares > held ? " <b style=\"color:var(--warn)\">That is more than you hold.</b>" : "") +
+              `</div>`);
+          return;
+        }
+
+        const boxes = [...document.querySelectorAll(".amLpAmt")];
+        if (!boxes.length) return hide();
+        const typed = boxes.map((b, i) => {
+          const v = b.value.trim();
+          if (!v) return null;
+          const r = parseAmount(v, Number(p.assets[i]?.decimals ?? 6));
+          return r.error ? null : BigInt(r.raw);
+        });
+        const filled = typed.filter((v) => v !== null && v > 0n).length;
+        if (!filled) return hide();
+
+        /*
+         * One box filled is the common case, and the useful answer is the other
+         * side of the pair rather than a share count for a deposit that is not
+         * yet valid. Every box filled gets the full preview.
+         */
+        if (filled < boxes.length) {
+          const idx = typed.findIndex((v) => v !== null && v > 0n);
+          const pair = lpPairFor(p, idx, typed[idx]);
+          box.style.display = "block";
+          if (!pair) {
+            box.innerHTML =
+              `<div style="color:var(--muted)">This pool has no ratio yet — the first deposit sets it, ` +
+              `so fill in every asset and the amounts you choose become the opening price.</div>`;
+            return;
+          }
+          box.innerHTML =
+            `<div style="font-weight:600;margin-bottom:5px">To stay in proportion, pair it with</div>` +
+            `<div>${p.assets.map((a, i) => (i === idx ? "" : `<b>${amt(pair[i], a)}</b>`)).filter(Boolean).join(' <span style="opacity:.6">+</span> ')}</div>` +
+            `<div style="color:var(--muted);margin-top:5px">Press <b>Pair</b> to fill these in.</div>`;
+          return;
+        }
+
+        const pre = lpAddPreview(p, typed.map((v) => v ?? 0n));
+        if (!pre) return hide();
+        box.style.display = "block";
+        if (pre.first) {
+          box.innerHTML = pre.tooSmall
+            ? `<div style="color:var(--warn)">Too small for a first deposit — the pool burns ` +
+              `${esc(String(AMM_MINIMUM_LIQUIDITY))} units of the first shares, so this would mint none.</div>`
+            : `<div style="font-weight:600;margin-bottom:5px">You would mint ${esc(String(pre.shares))} shares</div>` +
+              `<div style="color:var(--muted)">This is the pool's first deposit, so these amounts set its ` +
+              `opening ratio — and its price.</div>`;
+          return;
+        }
+        const donatedRows = p.assets
+          .map((a, i) => (pre.donated[i] > 0n ? `<b>${amt(pre.donated[i], a)}</b>` : null))
+          .filter(Boolean);
+        box.innerHTML =
+          `<div style="font-weight:600;margin-bottom:5px">You would mint ${esc(String(pre.shares))} shares` +
+          ` — ${esc(pre.sharePct.toFixed(pre.sharePct < 0.01 ? 4 : 2))}% of the pool</div>` +
+          `<div>${p.assets.map((a, i) => `${amt(typed[i] ?? 0n, a)}`).join(' <span style="opacity:.6">+</span> ')}</div>` +
+          (donatedRows.length
+            ? `<div style="color:var(--warn);margin-top:6px">` +
+              `${donatedRows.join(" and ")} of that mints nothing. Shares are credited at the smallest ratio ` +
+              `you supply, so the excess is added to the reserves and shared with every other provider. ` +
+              `Press <b>Pair</b> to match the pool instead.</div>`
+            : `<div style="color:var(--good);margin-top:6px">In proportion — none of it is donated.</div>`);
       }
 
       function renderAmLpHint() {
@@ -7276,7 +7489,16 @@ const $ = (id) => document.getElementById(id);
           sel.dataset.pool = ""; // rebuild the per-pool controls for the new pool
           renderAmm();
         });
-        $("amLpAction").addEventListener("change", () => { renderAmLpInputs(); renderAmLpHint(); });
+        $("amLpAction").addEventListener("change", () => {
+          renderAmLpInputs(); renderAmLpHint(); renderAmLpPreview();
+        });
+        /*
+         * Delegated, because the inputs are rebuilt whenever the pool or the
+         * action changes — a listener bound to the boxes themselves would be
+         * thrown away with them and the preview would go quiet after the first
+         * switch.
+         */
+        if ($("amLpInputs")) $("amLpInputs").addEventListener("input", () => renderAmLpPreview());
         $("amSwapIn").addEventListener("change", () => scheduleAmQuote());
         $("amSwapOut").addEventListener("change", () => scheduleAmQuote());
         $("amSwapAmount").addEventListener("input", () => scheduleAmQuote());
@@ -7465,6 +7687,49 @@ const $ = (id) => document.getElementById(id);
 
         // "Max" fills the boxes: for a withdrawal, every share you hold; for a
         // deposit, the largest balanced deposit your wallet can actually cover.
+        /*
+         * Fill the rest of the pair at the pool's current ratio.
+         *
+         * The whole cost of an unbalanced deposit is the part that mints
+         * nothing, and it is invisible at the moment somebody types. Max already
+         * fills every box from the wallet; this fills them from *one* number the
+         * reader has chosen, which is the other half of the same need — "I want
+         * to put in 10 USDC, what does that pair with?"
+         */
+        if ($("amLpPair")) {
+          $("amLpPair").addEventListener("click", () => {
+            const raw = amSelected();
+            if (!raw || $("amLpAction").value !== "add") return;
+            const p = amMine(raw);
+            const boxes = [...document.querySelectorAll(".amLpAmt")];
+            const m = $("ammMsg");
+            const say = (t) => { if (m) { m.style.display = "block"; m.style.color = "var(--warn)"; m.textContent = t; } };
+            // Whichever box the reader filled in. The first one wins, so a
+            // half-typed second value cannot silently drive the ratio.
+            let idx = -1;
+            let from = 0n;
+            for (let i = 0; i < boxes.length; i++) {
+              const v = boxes[i].value.trim();
+              if (!v) continue;
+              const r = parseAmount(v, Number(p.assets[i]?.decimals ?? 6));
+              if (r.error) continue;
+              if (BigInt(r.raw) > 0n) { idx = i; from = BigInt(r.raw); break; }
+            }
+            if (idx < 0) { say("Type an amount into one of the boxes first — Pair fills in the others."); return; }
+            const pair = lpPairFor(p, idx, from);
+            if (!pair) {
+              say("This pool has no ratio yet — the first deposit sets it, so there is nothing to match.");
+              return;
+            }
+            boxes.forEach((b, i) => {
+              if (i === idx) return;
+              b.value = fmtUnitsStr(String(pair[i]), Number(p.assets[i]?.decimals ?? 6)).replace(/,/g, "");
+            });
+            if (m) m.style.display = "none";
+            renderAmLpPreview();
+          });
+        }
+
         $("amLpMax").addEventListener("click", async () => {
           const raw = amSelected();
           if (!raw) return;
@@ -7472,6 +7737,10 @@ const $ = (id) => document.getElementById(id);
           if ($("amLpAction").value === "remove") {
             const el = $("amLpShares");
             if (el) el.value = p.myShares;
+            // Filling a value in code fires no `input` event, so the preview is
+            // told by hand — otherwise Max leaves the panel describing the
+            // amount that was there before it.
+            renderAmLpPreview();
             return;
           }
           const boxes = [...document.querySelectorAll(".amLpAmt")];
@@ -7520,6 +7789,7 @@ const $ = (id) => document.getElementById(id);
               ? "This pool is empty, so your deposit sets its opening price. Enter the two sides at the " +
                 "rate you believe is fair — Max has filled your whole balance of each, which is unlikely to be it."
               : "Your wallet holds none of these assets.", "var(--warn)");
+            renderAmLpPreview();
             return;
           }
 
@@ -7547,6 +7817,8 @@ const $ = (id) => document.getElementById(id);
           });
           if (!filled) say("Your balance is too small to fund a deposit at this pool's ratio.");
           else say("Filled the largest balanced deposit your wallet can cover.", "var(--muted)");
+          // Programmatic fills fire no `input` event; the preview is told.
+          renderAmLpPreview();
         });
 
         /** The connected wallet's balance of each pool asset (self-custody only). */
