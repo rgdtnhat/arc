@@ -68,7 +68,7 @@ import {
 import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
 import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emissions-guard.js";
 import { matchErrorTable } from "./error-table.js";
-import { gradeUndelivered, gradeLastPoke } from "./health-grade.js";
+import { gradeUndelivered, gradeLastPoke, gradeEmissionsFunding } from "./health-grade.js";
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
@@ -12257,6 +12257,31 @@ async function main() {
         canDistribute: Boolean(owner) && process.env.TESSERA_EMITTER_KEEPER !== "off",
       });
       add("emitter.undelivered", backlog.status, backlog.detail, Number(tokens.toFixed(6)));
+
+      /*
+       * Is the emissions contract this app serves still on the payroll?
+       *
+       * Every other emissions check reads the contract itself and so cannot see
+       * this: a retired sink's pot covers what it owes (nothing new can accrue)
+       * and its runway reads "no streams running", so `backing` and `runway`
+       * both pass while rewards are permanently dead. The fact lives on the
+       * emitter, which is why it needed a check of its own.
+       */
+      const sinkRows = await Promise.all(
+        Array.from({ length: count }, async (_, i) => {
+          const sk = await read<readonly [Hex, number, bigint, string]>(
+            emitterAddr, tesseraEmitterAbi, "sinks", [BigInt(i)]);
+          return sk ? { index: i, to: String(sk[0]).toLowerCase(), weight: sk[2], label: sk[3] } : null;
+        }),
+      );
+      const totalWeight = (await read<bigint>(emitterAddr, tesseraEmitterAbi, "totalWeight")) ?? 0n;
+      const funding = gradeEmissionsFunding({
+        // `emissionsAddr` rather than the record: same value, already typed.
+        served: emissionsAddr,
+        sinks: sinkRows.filter((r): r is NonNullable<typeof r> => r !== null),
+        totalWeight,
+      });
+      if (funding) add("emissions.funded", funding.status, funding.detail, funding.status === "ok" ? 1 : 0);
     }
 
     // --- the keeper: could somebody turn it, and did they? -----------------

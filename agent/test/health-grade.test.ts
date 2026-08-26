@@ -90,3 +90,74 @@ test("a stale poke never escalates to fail — the app's own keeper covers it", 
     assert.equal(g.status, "warn", `${days} days`);
   }
 });
+
+/* ---- emissions funding ------------------------------------------------- */
+
+import { gradeEmissionsFunding, type EmitterSink } from "../src/health-grade.ts";
+
+const SERVED = "0x0830935213349d64bebceeb781ab3c8d41bbc316";
+const HEIR = "0xf3f30ce53fb962ec2bdbd021b3fb35e00bc69857";
+const AMM = "0x3f8a8f7f9612ba42b64f92120f55af0fd28d0d14";
+const JAR = "0xf43e9057bffd74a933e6cef36c29da3220971889";
+
+/** The live emitter, exactly as it was read. */
+const LIVE: EmitterSink[] = [
+  { index: 3, to: AMM, weight: 40n, label: "AMM liquidity emissions" },
+  { index: 9, to: JAR, weight: 2n, label: "keeper bounty" },
+  { index: 11, to: SERVED, weight: 0n, label: "lending emissions" },
+  { index: 12, to: HEIR, weight: 60n, label: "lending emissions" },
+];
+
+test("a retired sink is a failure, however healthy the pot looks", () => {
+  /*
+   * The case every other check passed. `redeploy:pool` step [4] moved the
+   * weight to a replacement and step [6] never ran, so the app served a
+   * contract the emitter had already retired: pot 214.4798 against 214.4798
+   * owed, guard paused, claim panel reading "0 TSRA", replacement holding
+   * 1,101,223. `backing` was ok because nothing new can accrue, and `runway`
+   * said "no streams running" rather than a fault.
+   */
+  const g = gradeEmissionsFunding({ served: SERVED, sinks: LIVE, totalWeight: 102n });
+  assert.equal(g?.status, "fail");
+  assert.match(g!.detail, /weight 0/);
+  // Name the successor, or the operator has nowhere to go.
+  assert.match(g!.detail, /0xf3f30ce5/);
+  assert.match(g!.detail, /58\.8%/);
+});
+
+test("the successor named is one carrying the same label, never the AMM's or the tip jar's", () => {
+  /*
+   * "Some other sink has weight" is true of both of those, and pointing an
+   * operator at either would send them to break something that works.
+   */
+  const noHeir: EmitterSink[] = LIVE.filter((s) => s.to !== HEIR);
+  const g = gradeEmissionsFunding({ served: SERVED, sinks: noHeir, totalWeight: 42n });
+  assert.equal(g?.status, "fail");
+  assert.doesNotMatch(g!.detail, /0x3f8a8f7f|0xf43e9057/);
+  assert.match(g!.detail, /by hand/);
+});
+
+test("a funded sink passes and says its share", () => {
+  const funded = LIVE.map((s) => (s.to === SERVED ? { ...s, weight: 60n } : s));
+  const g = gradeEmissionsFunding({ served: SERVED, sinks: funded, totalWeight: 162n });
+  assert.equal(g?.status, "ok");
+  assert.match(g!.detail, /sink 11/);
+});
+
+test("a contract that is not a sink at all can never be funded", () => {
+  const g = gradeEmissionsFunding({ served: "0x" + "9".repeat(40), sinks: LIVE, totalWeight: 102n });
+  assert.equal(g?.status, "fail");
+  assert.match(g!.detail, /not a sink on the emitter/);
+});
+
+test("no emitter or no emissions contract is not a finding", () => {
+  // A deployment without one of them has nothing to be wrong about, and a
+  // check that fires on absence is a check people learn to ignore.
+  assert.equal(gradeEmissionsFunding({ served: null, sinks: LIVE, totalWeight: 102n }), null);
+  assert.equal(gradeEmissionsFunding({ served: SERVED, sinks: [], totalWeight: 0n }), null);
+});
+
+test("the served address matches regardless of case", () => {
+  const g = gradeEmissionsFunding({ served: SERVED.toUpperCase(), sinks: LIVE, totalWeight: 102n });
+  assert.equal(g?.status, "fail", "a checksummed record address failed to match its own sink");
+});

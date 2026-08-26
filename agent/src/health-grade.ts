@@ -116,3 +116,73 @@ export function gradeLastPoke(input: PokeInput): { status: HealthStatus; detail:
   }
   return { status: "ok", detail: said };
 }
+
+export interface EmitterSink {
+  index: number;
+  /** Lowercased recipient. */
+  to: string;
+  weight: bigint;
+  label: string;
+}
+
+/**
+ * Is the emissions contract the app serves still being funded?
+ *
+ * `TesseraEmitter` splits every release across its sinks by weight, and a sink
+ * at weight zero is retired: it receives nothing, ever again. Nothing checked
+ * that the contract named in the deployment record was still one of the funded
+ * ones, and the two can come apart in a completely ordinary way —
+ * `redeploy:pool` step [4] moves the weight to a replacement contract and step
+ * [6] rewrites the record, so a run that does the first and stops leaves the app
+ * reading a contract the emitter has already retired.
+ *
+ * That is what happened here, and it starves silently and with certainty. The
+ * served contract sat at weight 0 with a pot of 214.4798 TSRA against 214.4798
+ * owed — the emissions guard correctly paused it for having nothing spare, and
+ * the panel explained the pause perfectly while saying nothing about the cause.
+ * Meanwhile the replacement held 1,101,223 TSRA. Every existing check passed:
+ * `backing` was fine (the pot covers what is owed, because nothing new can
+ * accrue), and `runway` reads "no streams running" rather than a fault.
+ *
+ * A pot that cannot be topped up is not a slow problem, so this is `fail`.
+ */
+export function gradeEmissionsFunding(input: {
+  /** The emissions contract the deployment record names, lowercased. */
+  served: string | null;
+  sinks: EmitterSink[];
+  totalWeight: bigint;
+}): { status: HealthStatus; detail: string } | null {
+  const { served, sinks, totalWeight } = input;
+  // No emitter, no sinks, or no emissions contract: nothing to be wrong about.
+  if (!served || !sinks.length) return null;
+  const mine = sinks.find((s) => s.to === served.toLowerCase());
+  if (!mine) {
+    return {
+      status: "fail",
+      detail:
+        `the emissions contract this app serves (${served.slice(0, 10)}…) is not a sink on the emitter at all, ` +
+        "so it can never be funded — nothing new will accrue to anybody",
+    };
+  }
+  const pct = (w: bigint) => (totalWeight > 0n ? `${((Number(w) / Number(totalWeight)) * 100).toFixed(1)}%` : "—");
+  if (mine.weight > 0n) {
+    return { status: "ok", detail: `emitter sink ${mine.index} at weight ${mine.weight} (${pct(mine.weight)})` };
+  }
+  /*
+   * Name the successor when there is an obvious one, and only when it carries
+   * the same label — "some other sink has weight" is true of the AMM's and of
+   * the keeper's tip jar, and pointing an operator at either would send them to
+   * break something that is working.
+   */
+  const heir = sinks.find((s) => s.weight > 0n && s.label === mine.label && s.to !== mine.to);
+  return {
+    status: "fail",
+    detail:
+      `emitter sink ${mine.index} is at weight 0 — this contract is retired on the emitter and receives nothing, ` +
+      "so rewards stop accruing however healthy the pot looks" +
+      (heir
+        ? `. ${heir.to.slice(0, 10)}… (sink ${heir.index}) holds the ${pct(heir.weight)} share instead — either point the ` +
+          "deployment record at it, or move the weight back with `npm run pool:rollback -- --execute`"
+        : ". No sink with the same label holds the weight, so it has to be set by hand on the emitter"),
+  };
+}
