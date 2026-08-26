@@ -515,3 +515,45 @@ export class TesseraPoolClient {
     }) as Promise<bigint>;
   }
 }
+
+/**
+ * `frozenActions` as four booleans and a sentence.
+ *
+ * The pool stores which actions an operator has switched off on a reserve as a
+ * bitmask, and nothing in this app read it — so a reserve frozen against supply
+ * and borrow was invisible everywhere. `capacityOf` is a cap calculation and
+ * knows nothing about the freeze, so the lending panel went on advertising
+ * "89.49 USDC of borrow room" against a pool where every borrow reverted, and
+ * the only way to discover it was to sign one and read the revert.
+ *
+ * The bits are the contract's own: 1 supply, 2 withdraw, 4 borrow, 8 repay.
+ */
+export interface FreezeState {
+  supply: boolean;
+  withdraw: boolean;
+  borrow: boolean;
+  repay: boolean;
+  /** True when anything at all is frozen. */
+  any: boolean;
+  /** "supply and borrow", for putting in a sentence. */
+  label: string;
+}
+
+export function describeFreeze(mask: number | bigint | null | undefined): FreezeState {
+  const m = Number(mask ?? 0);
+  const supply = (m & 1) !== 0;
+  const withdraw = (m & 2) !== 0;
+  const borrow = (m & 4) !== 0;
+  const repay = (m & 8) !== 0;
+  const on = [
+    supply && "supply",
+    withdraw && "withdraw",
+    borrow && "borrow",
+    repay && "repay",
+  ].filter((x): x is string => typeof x === "string");
+  const label =
+    on.length === 0 ? "nothing"
+    : on.length === 1 ? on[0]
+    : `${on.slice(0, -1).join(", ")} and ${on[on.length - 1]}`;
+  return { supply, withdraw, borrow, repay, any: on.length > 0, label };
+}

@@ -108,7 +108,7 @@ interface PoolDeploymentRef {
   assets: PoolAsset[];
 }
 import { TesseraTreasury } from "./treasury.js";
-import { TesseraPoolClient, PRICE_IX } from "./pool.js";
+import { TesseraPoolClient, PRICE_IX, describeFreeze } from "./pool.js";
 import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader, planHarvest, type HarvestCandidate } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
@@ -1706,11 +1706,29 @@ async function main() {
         // Read once, above every cap that uses it: both withdraw and borrow are
         // metered, so both need it and the withdraw line comes first.
         const outflow = outflowBudget.get(a.address.toLowerCase());
-        const supplyMax = wallet; // can't supply more than you hold
+        /*
+         * A frozen action has no maximum, whatever the caps would allow.
+         *
+         * `reserveMeta` has carried this bitmask all along and every figure
+         * below ignored it. On the live pool that meant the panel offered
+         * "max borrow 89.490463 USDC" on a reserve frozen against borrowing,
+         * and named the cause as `liquidity` — so the reader pressed Borrow,
+         * signed, and got a revert, and the honest reading of the screen was
+         * that the app was broken rather than that an operator had switched
+         * the action off.
+         *
+         * A freeze is a switch, not a limit: no smaller number works. It binds
+         * first, above every other cap, and `limitedBy` names it so the hint
+         * can say what happened instead of blaming the pool's cash.
+         */
+        const fz = describeFreeze(row.meta?.frozen);
+        const supplyMax = fz.supply ? 0n : wallet; // can't supply more than you hold
         // Withdrawal is metered too, so the same third cap applies.
-        const withdrawMax = outflow === undefined
-          ? minB(supplied, r.cash)
-          : minB(minB(supplied, r.cash), outflow);
+        const withdrawMax = fz.withdraw
+          ? 0n
+          : outflow === undefined
+            ? minB(supplied, r.cash)
+            : minB(minB(supplied, r.cash), outflow);
         /*
          * Your debt, capped by what the wallet actually holds — and the gap
          * between those two, which is the thing nobody could see.
@@ -1726,13 +1744,13 @@ async function main() {
          * `repayShortRaw` is what would still be owed afterwards, so the panel
          * can say it before the button is pressed.
          */
-        const repayMax = minB(borrowed, wallet);
+        const repayMax = fz.repay ? 0n : minB(borrowed, wallet);
         const repayShort = borrowed > repayMax ? borrowed - repayMax : 0n;
         // Collateral headroom, capped by the cash that is there, capped again by
         // what the limiter will release this second. All three bind a borrow;
         // quoting the first two was quoting a number the third would refuse.
         let borrowMax = 0n;
-        if (cfg.borrowable && cfg.priceE8 > 0n) {
+        if (!fz.borrow && cfg.borrowable && cfg.priceE8 > 0n) {
           borrowMax = minB((headroomUsd * unit) / cfg.priceE8, r.cash);
           if (outflow !== undefined) borrowMax = minB(borrowMax, outflow);
         }
@@ -1747,6 +1765,12 @@ async function main() {
           borrowable: cfg.borrowable,
           hidden: !!row.meta?.hidden,
           frozen: Number(row.meta?.frozen ?? 0),
+          /*
+           * The same mask, spelled out, so the page does not have to know that
+           * 4 means borrow. `null` when nothing is frozen keeps "not frozen"
+           * distinguishable from "we did not look".
+           */
+          frozenActions: fz.any ? { supply: fz.supply, withdraw: fz.withdraw, borrow: fz.borrow, repay: fz.repay, label: fz.label } : null,
           // False when a wired oracle feed is stale or broken: price-dependent
           // actions will revert, so the UI must say so rather than quote on.
           priceOk: row.priceOk !== false,
@@ -1786,15 +1810,22 @@ async function main() {
            * the reader to wonder why it is not the 545 of cash on the row above.
            */
           limitedBy: {
+            // "frozen" first: it is the only one of these that no smaller
+            // amount gets around, so naming any other cause sends the reader
+            // to try a number that cannot work.
             borrow:
-              !cfg.borrowable ? "not-borrowable"
+              fz.borrow ? "frozen"
+              : !cfg.borrowable ? "not-borrowable"
               : outflow !== undefined && borrowMax === outflow && outflow < r.cash ? "outflow"
               : borrowMax === r.cash ? "liquidity"
               : "collateral",
             withdraw:
-              outflow !== undefined && withdrawMax === outflow && outflow < supplied ? "outflow"
+              fz.withdraw ? "frozen"
+              : outflow !== undefined && withdrawMax === outflow && outflow < supplied ? "outflow"
               : withdrawMax === r.cash && r.cash < supplied ? "liquidity"
               : "balance",
+            supply: fz.supply ? "frozen" : null,
+            repay: fz.repay ? "frozen" : null,
           },
           /** What the limiter will release this second, or null when unmetered. */
           outflowBudget: outflow === undefined ? null : fmtUnits(outflow, dec),
@@ -2770,7 +2801,7 @@ async function main() {
       const perAsset = await Promise.all(
         assets.map(async (a) => {
           const addr = a.address as Hex;
-          const [stats, capacity, oracleStatus] = await Promise.all([
+          const [stats, capacity, oracleStatus, frozenMask] = await Promise.all([
             poolClient.reserveData(addr).catch(() => null),
             poolClient.public
               .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "capacityOf", args: [addr] })
@@ -2780,13 +2811,29 @@ async function main() {
                   .readContract({ address: oracleAddr, abi: tesseraOracleAbi, functionName: "status", args: [addr] })
                   .catch(() => null)
               : Promise.resolve(null),
+            /*
+             * Which actions an operator has switched off on this reserve.
+             *
+             * Nothing in this app read it, so a frozen reserve was invisible
+             * everywhere: `capacityOf` is a cap calculation and knows nothing
+             * about the freeze, so the panel went on advertising "89.49 USDC
+             * of borrow room" against a pool where every borrow reverted. The
+             * only way to find out was to sign one and read the revert.
+             *
+             * A pool that predates `frozenActions` has no such switch, and a
+             * missing function is not a frozen reserve — hence 0 on failure.
+             */
+            poolClient.public
+              .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "frozenActions", args: [addr] })
+              .catch(() => 0),
           ]);
-          return { a, addr, stats, capacity, oracleStatus };
+          return { a, addr, stats, capacity, oracleStatus, frozenMask: Number(frozenMask ?? 0) };
         }),
       );
 
-      for (const { a, addr, stats, capacity, oracleStatus } of perAsset) {
+      for (const { a, addr, stats, capacity, oracleStatus, frozenMask } of perAsset) {
         if (!stats) continue;
+        const frozen = describeFreeze(frozenMask);
         // Amounts come back in the asset's own units, so the asset's own
         // decimals are what format them. Using USDC's six for everything
         // reported cirBTC a hundred times larger than it is.
@@ -2794,7 +2841,29 @@ async function main() {
         const fmtAmt = (v: bigint) => fmtUnits(v, dp);
 
         const utilPct = Number(stats.utilizationWad) / 1e16;
-        const [supplyRoom, borrowRoom] = capacity as readonly [bigint, bigint];
+        const [rawSupplyRoom, rawBorrowRoom] = capacity as readonly [bigint, bigint];
+        /*
+         * Room you cannot use is not room.
+         *
+         * `capacityOf` answers "how much would the cap allow", which is a
+         * different question from "how much can anybody actually supply or
+         * borrow right now". Reporting the cap figure while the action is
+         * frozen is how the panel came to offer a borrow that could never
+         * succeed at any amount. The freeze wins, and the reason travels with
+         * it so nothing has to infer a zero.
+         */
+        const supplyRoom = frozen.supply ? 0n : rawSupplyRoom;
+        const borrowRoom = frozen.borrow ? 0n : rawBorrowRoom;
+        if (frozen.any) {
+          alerts.push({
+            level: "critical",
+            asset: a.symbol,
+            message:
+              `${a.symbol}: an operator has frozen ${frozen.label} on this reserve. ` +
+              "No amount will go through until it is lifted; nothing already supplied is at risk, " +
+              "and the actions that are not frozen still work.",
+          });
+        }
 
         // Utilization is the one that strands depositors: at 100% the cash is
         // gone and a withdrawal reverts for reasons the withdrawer did not cause.
@@ -2803,7 +2872,10 @@ async function main() {
         } else if (utilPct >= 90) {
           alerts.push({ level: "warn", asset: a.symbol, message: `${a.symbol} is ${utilPct.toFixed(1)}% utilised — little cash left for withdrawals` });
         }
-        if (supplyRoom === 0n) {
+        // Only when the cap is what stopped it. A frozen reserve has already
+        // said so, in stronger words, and two alarms for one cause is how a
+        // panel gets skimmed.
+        if (rawSupplyRoom === 0n && !frozen.supply) {
           alerts.push({ level: "warn", asset: a.symbol, message: `${a.symbol} is at its supply cap — no new deposits will be accepted` });
         }
 
@@ -2856,6 +2928,9 @@ async function main() {
           supplyAprPct: Number((Number(stats.supplyAprWad) / 1e16).toFixed(2)),
           supplyRoom: supplyRoom === (1n << 256n) - 1n ? null : fmtAmt(supplyRoom),
           borrowRoom: fmtAmt(borrowRoom),
+          // Null when nothing is frozen, so a reader (and the page) can tell
+          // "not frozen" from "we did not look".
+          frozen: frozen.any ? { mask: frozenMask, ...frozen } : null,
           oracle,
         });
       }

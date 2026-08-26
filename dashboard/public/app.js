@@ -2637,6 +2637,9 @@ const $ = (id) => document.getElementById(id);
          * pool's own ABI cannot decode.
          */
         const bound = a.limitedBy && a.limitedBy[action];
+        // A frozen action never reaches here — the freeze check above returns
+        // first, disables Execute and names the action. `limitedBy` still
+        // carries "frozen" for the market table and every other consumer.
         if (bound === "outflow" && a.outflowBudget != null) {
           /*
            * A wait, not a wall.
