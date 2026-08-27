@@ -133,6 +133,61 @@ decremented by what was escrowed rather than by what was billed.
 The cost is one 402 quote request for a spend that is then declined. A quote
 moves nothing; the alternative was moving money nobody approved.
 
+### 9. The tab rail reached the chain without passing the cap — HIGH → fixed
+
+Tessera has two payment rails. The escrow rail was brought behind one gate in
+finding 8, and `agentkit`'s `open_tab` action caps its deposit — `kit-cap.test.ts`
+even reads `agentkit.ts` so that a sixth action cannot quietly skip it.
+
+`Agent.streamTicks` used neither. It called `client.openTab` directly: no cap, no
+guardian, no blocklist. That is the same shortcut past the gate that the kit was
+fixed for, in the one file the kit's structural test does not scan.
+
+Three things made it worse than a missing check on a small number:
+
+- **The deposit is not the tick price.** It is `price * ticks * depositMultiple`
+  — with the shipped scenario's six ticks and a multiple of two, twelve times
+  larger. Capping the tick price would have authorised a figure nobody sees.
+- **The price is the provider's.** It comes from `discover()`, which reads the
+  provider's own `/catalog` over HTTP and converts `price` with no validation, so
+  a large enough listing opened a tab for any amount at all.
+- **It is on the autonomous path.** `runScenario` calls `agent.run()` (gated),
+  then `streamTicks` (not), then `processInvoices` (gated). An operator pressing
+  Run authorises a scenario, not an unbounded deposit with whoever the catalog
+  names. The blocklist was bypassable the same way: a provider refused on the
+  escrow rail was still payable by opening a tab with it.
+
+Reproduced against a stub tab contract: a service listed at 0.01/tick with a cap
+of 0.005 funded a 0.12 USDC tab with no guardian asked.
+
+**Fix:** the same gate the escrow rail uses, in front of `openTab` and measured
+against the deposit — the number that actually leaves the wallet. A blocked
+provider gets no tab; an over-cap deposit escalates and, if declined, opens
+nothing. `tab-cap.test.ts` covers the behaviour and pins the gate ahead of the
+spend, the way `kit-cap.test.ts` pins the kit's.
+
+### 10. A closed tab reported the provider's figure, not the chain's — LOW → fixed
+
+When a stream ends the agent asks the provider to close the tab, and the
+provider answers with `{ settled, txHash }`. That response was rendered straight
+into the activity feed: "N USDC to provider, deposit − N returned".
+
+Both numbers are the provider's own account of what it took. A provider that
+claimed the full deposit on-chain could report zero and the operator would read a
+refund that never happened. This is the same defect as showing the catalog price
+for an escrow that moved the quoted one — the feed is where an unexpected spend
+is supposed to become visible.
+
+**Fix:** `TesseraTab.tabs(tabId)` already exposes `claimed`, so the settled
+figure is now read from the contract and the provider's number is used only if
+that read fails. The tab's own ledger is the authority on what it paid out.
+
+*Related, not fixed:* nothing sweeps expired tabs. When a provider never settles,
+the log says the deposit "will reclaim after expiry", but `reclaimTab` is only
+reachable through the action kit — no scheduled job calls it. The funds are
+recoverable, not automatically recovered, and the wording overstates what the
+system does on its own.
+
 ## Two custody modes (and why they differ)
 
 The dashboard exposes the same DeFi actions through two distinct paths:
