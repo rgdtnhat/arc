@@ -173,6 +173,24 @@ export class TesseraClient {
   }
 
   /** Reclaim an expired tab's unclaimed funds. */
+  /**
+   * The tab as the chain has it: what was deposited and what the provider has
+   * actually claimed. The provider reports its own settlement when it closes a
+   * tab, and that report is the provider's word — this is the ledger's.
+   */
+  async tabState(
+    tabId: bigint
+  ): Promise<{ agent: Hex; provider: Hex; deposit: bigint; claimed: bigint; expiry: bigint; closed: boolean }> {
+    if (!this.tab) throw new Error("tabAddress not configured");
+    const t = (await this.public.readContract({
+      address: this.tab,
+      abi: tesseraTabAbi,
+      functionName: "tabs",
+      args: [tabId],
+    })) as [Hex, Hex, bigint, bigint, bigint, boolean];
+    return { agent: t[0], provider: t[1], deposit: t[2], claimed: t[3], expiry: t[4], closed: t[5] };
+  }
+
   async reclaimTab(tabId: bigint): Promise<Hex> {
     if (!this.tab) throw new Error("tabAddress not configured");
     const hash = await this.wallet.writeContract({

@@ -761,10 +761,23 @@ export class TesseraAgent {
        * activity feed would show the operator a refund that never happened.
        * The tab's `claimed` field is the settled figure the contract recorded.
        */
+      let settled: bigint;
+      let verified = true;
+      try {
+        settled = (await this.cfg.client.tabState(tabId)).claimed;
+      } catch {
+        // Falling back keeps the stream's summary useful when the read fails,
+        // but an unverified figure must not look like a verified one.
+        settled = BigInt(closed.settled);
+        verified = false;
+      }
       this.emit({
         level: "settle",
         resource,
-        message: `Tab #${tabId} closed — ${formatUsdc(BigInt(closed.settled))} USDC to provider, ${formatUsdc(deposit - BigInt(closed.settled))} USDC returned`,
+        message:
+          `Tab #${tabId} closed — ${formatUsdc(settled)} USDC to provider, ` +
+          `${formatUsdc(deposit - settled)} USDC returned` +
+          (verified ? "" : " (unverified — reported by the provider, chain read failed)"),
         txHash: closed.txHash as `0x${string}`,
       });
     } else {

@@ -34,7 +34,7 @@ const TICKS = 6;
 const DEPOSIT = TICK_PRICE * BigInt(TICKS) * 2n;
 const CAP = usdc("0.005");
 
-function stubClient() {
+function stubClient(claimedOnChain = 0n, failTabRead = false) {
   const openedTabs: { provider: string; deposit: bigint }[] = [];
   return {
     openedTabs,
@@ -45,6 +45,17 @@ function stubClient() {
     },
     async signVoucher() {
       return "0xvoucher" as const;
+    },
+    async tabState() {
+      if (failTabRead) throw new Error("rpc down");
+      return {
+        agent: honest.address,
+        provider: honest.address,
+        deposit: DEPOSIT,
+        claimed: claimedOnChain,
+        expiry: 0n,
+        closed: true,
+      };
     },
   };
 }
@@ -90,10 +101,10 @@ async function tabProvider(provider: `0x${string}`, reportsSettled: bigint) {
 
 async function stream(
   policy: Record<string, unknown> | undefined,
-  opts: { payee?: `0x${string}`; reportsSettled?: bigint } = {}
+  opts: { payee?: `0x${string}`; reportsSettled?: bigint; claimedOnChain?: bigint; failTabRead?: boolean } = {}
 ) {
   const payee = opts.payee ?? honest.address;
-  const client = stubClient();
+  const client = stubClient(opts.claimedOnChain ?? 0n, opts.failTabRead ?? false);
   const server = await tabProvider(payee, opts.reportsSettled ?? 0n);
   const events: AgentEvent[] = [];
   try {
@@ -151,6 +162,18 @@ test("with no policy configured there is nothing to enforce", async () => {
   assert.equal(openedTabs.length, 1);
 });
 
+test("the settled figure comes from the chain, not the provider's close response", async () => {
+  // The provider claims it took nothing; the chain says it claimed the lot.
+  const { events } = await stream(
+    { autoApproveMax: usdc("1") },
+    { reportsSettled: 0n, claimedOnChain: DEPOSIT }
+  );
+  const settle = events.find((e) => e.level === "settle");
+  assert.ok(settle, "closing a tab should report a settlement");
+  assert.match(settle.message, /0\.12 USDC to provider/);
+  assert.match(settle.message, /\b0 USDC returned/);
+});
+
 test("streamTicks cannot reach openTab without passing the policy first", () => {
   /*
    * The behavioural tests above pass if the gate exists anywhere; this pins it
@@ -165,3 +188,12 @@ test("streamTicks cannot reach openTab without passing the policy first", () => 
   assert.ok(blocklist !== -1 && blocklist < spend, "the blocklist must be checked before openTab");
 });
 
+test("a provider figure used because the chain read failed is labelled as such", async () => {
+  const { events } = await stream(
+    { autoApproveMax: usdc("1") },
+    { reportsSettled: usdc("0.01"), failTabRead: true }
+  );
+  const settle = events.find((e) => e.level === "settle");
+  assert.ok(settle);
+  assert.match(settle.message, /unverified/);
+});
