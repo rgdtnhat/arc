@@ -74,7 +74,7 @@ import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
 import { SeriesStore, SERIES_LIMITS, walkSequentially, type TaskSeries, type SeriesStep } from "./series.js";
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
-import { read as chainRead } from "./chain-read.js";
+import { read as chainRead, valueOr } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import {
   proposeFromSources,
@@ -2821,11 +2821,14 @@ async function main() {
              * only way to find out was to sign one and read the revert.
              *
              * A pool that predates `frozenActions` has no such switch, and a
-             * missing function is not a frozen reserve — hence 0 on failure.
+             * missing function is not a frozen reserve — so nothing frozen is
+             * the right answer here. It goes through `valueOr` rather than a
+             * bare catch so that default is written down next to the read it
+             * belongs to, which is what `chain-read` asks for.
              */
-            poolClient.public
-              .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "frozenActions", args: [addr] })
-              .catch(() => 0),
+            chainRead<number>(poolClient.public, poolClient.pool, tesseraPoolAbi, "frozenActions", [addr]).then(
+              (r) => valueOr(r, 0),
+            ),
           ]);
           return { a, addr, stats, capacity, oracleStatus, frozenMask: Number(frozenMask ?? 0) };
         }),
