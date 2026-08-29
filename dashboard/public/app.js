@@ -11446,8 +11446,10 @@ const $ = (id) => document.getElementById(id);
         loadAppConfig();
         renderCfgAmm();
         renderCfgLending();
-        loadCfgHistory();
         loadCfgNotices();
+        // Opens where it was left, and the records list loads with its own tab
+        // rather than on every open.
+        setCfgTab(cfgTab);
         syncCfgDock();
       }
 
@@ -11610,11 +11612,52 @@ const $ = (id) => document.getElementById(id);
          two places on one page. */
       var shortAddr = (a) => String(a).slice(0, 8) + "…" + String(a).slice(-4);
 
+      /* ---- App Config tabs -------------------------------------------------
+       *
+       * One scroll of forty settings is where a setting goes to be lost. The
+       * groups already existed as headings; this makes them navigable, using
+       * the same strip the wallet and DeFi panes use.
+       *
+       * The choice is remembered, because an operator who came here to change
+       * one thing usually comes back for the same thing.
+       */
+      const CFG_TABS = ["vault", "guardian", "amm", "lending", "records", "notices"];
+      const CFG_TAB_KEY = "tessera_cfg_tab";
+      let cfgTab = (() => {
+        try { return localStorage.getItem(CFG_TAB_KEY) || "vault"; } catch { return "vault"; }
+      })();
+
+      function setCfgTab(tab) {
+        if (!CFG_TABS.includes(tab)) tab = "vault";
+        cfgTab = tab;
+        try { localStorage.setItem(CFG_TAB_KEY, tab); } catch {}
+        for (const t of CFG_TABS) {
+          const pane = $("cfgPane" + t[0].toUpperCase() + t.slice(1));
+          if (pane) pane.hidden = t !== tab;
+        }
+        document.querySelectorAll("[data-cfgtab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.cfgtab === tab));
+        // The records pane is the only one that reads anything, and it reads on
+        // arrival rather than every time the dialog opens.
+        if (tab === "records" && typeof loadCfgHistory === "function") loadCfgHistory().catch(() => {});
+        const body = $("cfgBody");
+        if (body) body.scrollTop = 0;
+      }
+
+      if ($("cfgTabs")) {
+        $("cfgTabs").addEventListener("click", (ev) => {
+          const b = ev.target.closest("[data-cfgtab]");
+          if (b) setCfgTab(b.dataset.cfgtab);
+        });
+      }
+
       async function loadCfgHistory() {
         const host = $("cfgHiList");
         if (!host) return;
         try {
-          const r = await (await fetch("/api/history", { headers: authHeaders() })).json();
+          // `/api/archive`, not `/api/history` — the latter is the event
+          // indexer, and it was shadowing this one.
+          const r = await (await fetch("/api/archive", { headers: authHeaders() })).json();
           if (!r.ok) { host.innerHTML = `<span style="color:var(--warn)">${esc(r.error || "Couldn't load history.")}</span>`; return; }
           historyState = r;
           host.innerHTML = r.records.length
@@ -13278,6 +13321,16 @@ const $ = (id) => document.getElementById(id);
           $("cfgTime").value = c.feeTimeUtc || "09:00";
           if ($("cfgMaxReserves")) $("cfgMaxReserves").value = String(c.maxVisibleReserves ?? 0);
           if ($("cfgMaxAmmPools")) $("cfgMaxAmmPools").value = String(c.maxVisibleAmmPools ?? 0);
+          // The Guardian tab's copies of the list caps, so both stay in step.
+          if ($("cfgMaxReservesG")) $("cfgMaxReservesG").value = String(c.maxVisibleReserves ?? 0);
+          if ($("cfgMaxPoolsG")) $("cfgMaxPoolsG").value = String(c.maxVisibleAmmPools ?? 0);
+          if ($("cfgGuardianCap")) $("cfgGuardianCap").value = String(c.guardianCapUsdc ?? "0.005");
+          if ($("cfgLaunchpadFee")) $("cfgLaunchpadFee").value = String((c.launchpadFeeBps ?? 250) / 100);
+          if ($("cfgGuardianNote")) {
+            const max = (r.limits && r.limits.guardianCapMaxUsdc) || 100;
+            $("cfgGuardianNote").lastElementChild.textContent =
+              `Anything above ${max} USDC is refused — that ceiling is in code and no configuration can raise it.`;
+          }
           syncScheduleRows(r.schedule && r.schedule.nextRunUtc);
           $("cfgNote").textContent =
             ((r.enforced && r.enforced.note) || "") +
@@ -13330,8 +13383,18 @@ const $ = (id) => document.getElementById(id);
             feeScheduleMode: $("cfgMode").value,
             feeWeekday: Number($("cfgWeekday").value),
             feeTimeUtc: $("cfgTime").value || "09:00",
-            maxVisibleReserves: Math.max(0, parseInt($("cfgMaxReserves").value || "0", 10)),
-            maxVisibleAmmPools: Math.max(0, parseInt($("cfgMaxAmmPools").value || "0", 10)),
+            maxVisibleReserves: Math.max(0, parseInt(
+              ($("cfgMaxReservesG") && $("cfgMaxReservesG").value) || $("cfgMaxReserves").value || "0", 10)),
+            maxVisibleAmmPools: Math.max(0, parseInt(
+              ($("cfgMaxPoolsG") && $("cfgMaxPoolsG").value) || $("cfgMaxAmmPools").value || "0", 10)),
+            /*
+             * Sent as typed. The server parses and bounds it — doing the
+             * arithmetic here would mean two places deciding what a cap means,
+             * and the one that matters is the one the agent actually enforces.
+             */
+            guardianCapUsdc: (($("cfgGuardianCap") && $("cfgGuardianCap").value) || "0.005").trim(),
+            launchpadFeeBps: Math.round(
+              Number(($("cfgLaunchpadFee") && $("cfgLaunchpadFee").value) || "2.5") * 100),
           };
           showBusy("cfgMsg", "Saving, and pushing what belongs on-chain…");
           try {

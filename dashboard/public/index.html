@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v174" />
+    <meta name="tessera-shell" content="tessera-v175" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -646,6 +646,13 @@
 
 
       /* ---- App Config panel ---------------------------------------------- */
+      /* Tabs, because one scroll of forty settings is a place things get lost.
+         Same shape as the wallet and DeFi tab strips. */
+      .cfgTabs { display:flex; gap:6px; flex-wrap:wrap; padding:12px 20px 4px; position:sticky; top:0;
+                 background:var(--card, #0d1117); z-index:2; border-bottom:1px solid var(--line); }
+      .cfgTabs .btn { padding:6px 12px; font-size:12.5px; }
+      .cfgTabs .btn.active { border-color:var(--accent, #6f8cff); color:var(--accent, #6f8cff); }
+      .cfgPane[hidden] { display:none; }
       .cfgCard {
         position: relative; display: flex; flex-direction: column;
         width: min(96vw, 720px); max-height: min(88vh, 900px);
@@ -3483,6 +3490,15 @@
         </div>
         <div class="kv" id="cfgMsg" style="padding:8px 20px;display:none"></div>
         <div class="cfgBody" id="cfgBody">
+          <div class="cfgTabs" id="cfgTabs" role="tablist">
+            <button class="btn" data-cfgtab="vault">Vault &amp; fees</button>
+            <button class="btn" data-cfgtab="guardian">Guardian</button>
+            <button class="btn" data-cfgtab="amm">Liquidity</button>
+            <button class="btn" data-cfgtab="lending">Lending</button>
+            <button class="btn" data-cfgtab="records">Contracts</button>
+            <button class="btn" data-cfgtab="notices">Notices</button>
+          </div>
+          <div class="cfgPane" id="cfgPaneVault" hidden>
           <div class="cfgRow"><span>Vault liquid reserve</span><span><input id="cfgReserve" type="number" min="80" max="100" step="1" />%</span></div>
           <div class="cfgRow"><span>App share of vault yield</span><span><input id="cfgPerfFee" type="number" min="0" max="30" step="1" />%</span></div>
           <div class="menuSep"></div>
@@ -3529,7 +3545,41 @@
             <span>Next run</span><span id="cfgNextRun">—</span>
           </div>
           <div class="menuSep"></div>
+          </div>
+          <div class="cfgPane" id="cfgPaneGuardian" hidden>
+            <div class="menuHead">Guardian — what the agent may spend unattended</div>
+            <p style="padding:2px 20px 10px;font-size:12px;color:var(--muted);margin:0">
+              Every autonomous spend at or under this goes through. Anything above it stops and waits for a
+              human to co-sign. The ceiling on this field is in code, not in this form — one mistyped figure
+              should not be able to hand an unattended agent the balance.
+            </p>
+            <div class="cfgRow"><span>Cap per autonomous call</span>
+              <span><input id="cfgGuardianCap" class="field" inputmode="decimal" style="width:120px" /> USDC</span>
+            </div>
+            <div class="cfgRow" id="cfgGuardianNote" style="color:var(--muted);font-size:12px"><span></span><span></span></div>
 
+            <div class="menuSep"></div>
+            <div class="menuHead">NFT launchpad</div>
+            <div class="cfgRow"><span>Protocol fee per mint</span>
+              <span><input id="cfgLaunchpadFee" type="number" min="0" max="10" step="0.01" style="width:90px" />%</span>
+            </div>
+            <div class="cfgRow" style="color:var(--muted);font-size:12px"><span></span>
+              <span>The rest goes to the drop's creator. The contract refuses more than 10% whatever is set here.</span>
+            </div>
+
+            <div class="menuSep"></div>
+            <div class="menuHead">Lists</div>
+            <div class="cfgRow"><span>Max lending reserves shown</span>
+              <span><input id="cfgMaxReservesG" type="number" min="0" max="50" step="1" style="width:90px" /></span>
+            </div>
+            <div class="cfgRow"><span>Max AMM pools shown</span>
+              <span><input id="cfgMaxPoolsG" type="number" min="0" max="50" step="1" style="width:90px" /></span>
+            </div>
+            <div class="cfgRow" style="color:var(--muted);font-size:12px"><span></span>
+              <span>0 means no limit. Presentational only — a capped list never hides a market you hold a position in.</span>
+            </div>
+          </div>
+          <div class="cfgPane" id="cfgPaneAmm" hidden>
           <div class="menuHead">Liquidity pools (AMM)</div>
           <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
             Providers always keep at least 50% of swap fees — the contract rejects anything lower,
@@ -3563,7 +3613,8 @@
           <div class="cfgRow" id="cfgAmmMsg" style="display:none;font-size:12px"><span></span><span></span></div>
 
           <div class="menuSep"></div>
-
+          </div>
+          <div class="cfgPane" id="cfgPaneLending" hidden>
           <div class="menuHead">Lending reserves</div>
           <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
             Freezing is per action. Leaving <b>withdraw</b> and <b>repay</b> unfrozen lets people reduce
@@ -3627,7 +3678,8 @@
           <div class="cfgRow" id="cfgLnMsg" style="display:none;font-size:12px"><span></span><span></span></div>
 
           <div class="menuSep"></div>
-
+          </div>
+          <div class="cfgPane" id="cfgPaneRecords" hidden>
           <div class="menuHead">Contract history &amp; fund recovery</div>
           <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
             Archive a retired contract to keep a record of who still holds funds in it. Balances are
@@ -3702,7 +3754,8 @@
           </div>
 
           <div class="menuSep"></div>
-
+          </div>
+          <div class="cfgPane" id="cfgPaneNotices" hidden>
           <div class="menuHead">Notifications</div>
           <div class="cfgRow"><span>Message</span>
             <span><input id="cfgNoText" class="field" placeholder="What should people see?" style="width:210px" /></span>
@@ -3752,6 +3805,7 @@
 
           <div class="menuSep"></div>
           <div style="padding:6px 20px 10px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>
+          </div>
         </div>
         <div class="cfgDock">
           <button id="cfgToTop" title="Top of App Config" aria-label="Scroll config to top">↑</button>

@@ -765,6 +765,33 @@ receiver cannot mint past the supply, and rejection is final — un-approving a
 drop after somebody minted from it would leave their token a claim on a drop the
 admin had disowned.
 
+## The guardian cap is configurable; the guardian is not
+
+`guardianCapUsdc` in App Config sets how much the agent may spend on one
+autonomous call before a human has to co-sign. Three things bound it:
+
+- **A ceiling in code.** `LIMITS.guardianCapMaxUsdc` (100 USDC) is the ceiling
+  on the ceiling. No saved config, no API call and no typo can raise the
+  per-call risk above it — changing it means editing that line and redeploying,
+  which is the amount of friction the decision deserves.
+- **Strict parsing.** Junk, negatives, exponents and more precision than USDC
+  holds are refused rather than coerced, and a refusal leaves the stored value
+  where it was.
+- **Known keys only.** `AppConfigStore.update` used to spread the patch
+  wholesale, so any key at all was persisted — including `autoApprove`, the
+  switch that turns the guardian off. Nothing read it, so it did nothing; but a
+  stored setting named after a bypass is how a bypass gets wired up later by
+  somebody who finds it in the file and reasonably assumes it means something.
+  Only fields present in `DEFAULT_CONFIG` are accepted now.
+
+`autoApprove` remains what it was: env-only, forced off on a live chain, and
+absent from the config surface entirely. Raising a limit and removing the
+limiter are different decisions and do not belong on the same screen.
+
+The cap is applied by mutating the running policy, so a change takes effect
+immediately rather than at the next restart — a cap an operator cannot tell has
+been applied is one they cannot rely on.
+
 ## Secrets policy
 
 - Private keys, the admin password, and the app wallet key are **never committed**

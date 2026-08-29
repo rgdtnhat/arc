@@ -69,7 +69,7 @@ import {
 import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
 import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emissions-guard.js";
 import { matchErrorTable } from "./error-table.js";
-import { gradeUndelivered, gradeLastPoke, gradeEmissionsFunding } from "./health-grade.js";
+import { gradeUndelivered, gradeLastPoke, gradeEmissionsFunding, shadowedRoutes } from "./health-grade.js";
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
@@ -585,6 +585,28 @@ async function main() {
   const policy = {
     ...AGENT_POLICY,
     autoApprove: wantsAutoApprove && !live,
+  };
+
+  /**
+   * Apply the configured guardian cap to the running policy.
+   *
+   * `policy` is captured by reference all over this file, so the cap is
+   * *mutated* rather than the object replaced — every existing holder has to
+   * see the new number, or half the app would keep enforcing the old one and
+   * the operator would have no way to tell which.
+   *
+   * Only the cap. `autoApprove` is untouched here and unreachable from the
+   * config on purpose: raising a limit and removing the limiter are different
+   * decisions, and only one of them belongs in a form.
+   */
+  const applyGuardianCap = (from: { guardianCapUsdc?: string }) => {
+    try {
+      const next = parseUsdcAmount(from.guardianCapUsdc ?? "");
+      if (next > 0n) policy.autoApproveMax = next;
+    } catch {
+      // A stored value that will not parse leaves the env default in place —
+      // the safe direction, and the save path refuses bad input anyway.
+    }
   };
   const memory = new TrustMemory(
     statePath(".tessera-memory.json")
@@ -4778,9 +4800,24 @@ async function main() {
   });
 
   /** Run the split now, without waiting for the cadence. Owner-gated on-chain. */
+  /*
+   * There was a second handler for this exact route further down the file,
+   * unreachable behind this one since whenever it was added. It did the same
+   * thing and said one thing better: `allocateNow()` is `onlyOwner` and the
+   * deployer owns the collector, so a missing owner key is a specific problem
+   * with a specific fix, not "no fee collector, or…". That sentence is kept
+   * here; the dead copy is gone.
+   */
   app.post("/api/fees/allocate", requireOperator, async (req, res) => {
-    if (!owner || !liveDeployment.tesseraFeeCollector) {
-      res.status(404).json({ ok: false, error: "no fee collector, or no deployer key to sign with" });
+    if (!liveDeployment.tesseraFeeCollector) {
+      res.status(404).json({ ok: false, error: "Fee collector isn't deployed yet — run npm run pool:arc." });
+      return;
+    }
+    if (!owner) {
+      res.status(503).json({
+        ok: false,
+        error: "Set DEPLOYER_PRIVATE_KEY on the server to allocate fees — the deployer owns the collector.",
+      });
       return;
     }
     try {
@@ -5303,7 +5340,22 @@ async function main() {
     return list.map((a) => ({ address: a.address as Hex, symbol: a.symbol, decimals: a.decimals }));
   };
 
-  app.get("/api/history", requireOperator, (_req, res) => {
+  /*
+   * Archived contract records.
+   *
+   * This used to be `GET /api/history`, which is also the event indexer's path
+   * — registered earlier, so Express matched that one and this was unreachable
+   * from the day the indexer was added. App Config's history list has been
+   * reading the indexer's answer, finding no `records` in it, and rendering
+   * "Couldn't load history" ever since.
+   *
+   * Two features cannot share a method and a path. The indexer's claim on
+   * "history" is the better one — it is a history of what happened — so the
+   * archive moves to its own name. The `POST /api/history/*` routes below are
+   * untouched: they are distinct paths, and their order relative to
+   * `/api/history/:id` is deliberate.
+   */
+  app.get("/api/archive", requireOperator, (_req, res) => {
     res.json({
       ok: true,
       records: archive.all().map((r) => archive.summary(r)),
@@ -14181,6 +14233,9 @@ async function main() {
   const appConfig = new AppConfigStore(
     statePath(".tessera-config.json"),
   );
+  // The stored cap takes effect at boot, not only after the next save.
+  applyGuardianCap(appConfig.get());
+  console.log(`🛡  Guardian cap: ${formatUsdc(policy.autoApproveMax)} USDC per autonomous call`);
 
   /**
    * Fee-allocation scheduler for the "weekly at a specific time" cadence.
@@ -14268,6 +14323,10 @@ async function main() {
     if (!r.ok) { res.status(400).json({ ok: false, error: r.error }); return; }
     const cfg = r.config;
 
+    // Takes effect on the running policy immediately — a cap that only applies
+    // after a restart is a cap the operator cannot trust they have set.
+    applyGuardianCap(cfg);
+
     const onchain: { target: string; ok: boolean; txHash?: string; error?: string }[] = [];
     if (!owner) {
       onchain.push({
@@ -14284,6 +14343,26 @@ async function main() {
           onchain.push({ target: "vault", ok: true, txHash: tx });
         } catch (e) {
           onchain.push({ target: "vault", ok: false, error: friendlyError(e) });
+        }
+      }
+      /*
+       * The launchpad fee, pushed like the vault's parameters.
+       *
+       * Skipped when it already matches, because `setFeeBps` costs gas and a
+       * save that touches an unrelated field should not spend any. The contract
+       * caps it at `MAX_FEE_BPS` regardless of what is stored here.
+       */
+      if (launchpadAddr) {
+        try {
+          const nowBps = Number(await client.public.readContract({
+            address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "feeBps",
+          }));
+          if (nowBps !== cfg.launchpadFeeBps) {
+            const tx = await owner.write(launchpadAddr, tesseraLaunchpadAbi, "setFeeBps", [cfg.launchpadFeeBps]);
+            onchain.push({ target: "launchpadFee", ok: true, txHash: tx });
+          }
+        } catch (e) {
+          onchain.push({ target: "launchpadFee", ok: false, error: friendlyError(e) });
         }
       }
       if (collector) {
@@ -14317,30 +14396,6 @@ async function main() {
    * `allocateNow()`, which ignores the scheduled interval. Operator-gated
    * because it moves the app's own fee balance.
    */
-  app.post("/api/fees/allocate", requireOperator, async (_req, res) => {
-    const collector = liveDeployment.tesseraFeeCollector as Hex | undefined;
-    if (!collector) {
-      res.status(404).json({ ok: false, error: "Fee collector isn't deployed yet — run npm run pool:arc." });
-      return;
-    }
-    // allocateNow() is onlyOwner and the deployer owns the collector, so this
-    // must be signed by the owner key — the agent account would revert.
-    if (!owner) {
-      res.status(503).json({
-        ok: false,
-        error: "Set DEPLOYER_PRIVATE_KEY on the server to allocate fees (the deployer owns the collector).",
-      });
-      return;
-    }
-    try {
-      const hash = await owner.allocateNow(collector);
-      invalidateAll(); // the allocation touches the agent, pool, vault and swap
-      res.json({ ok: true, txHash: hash });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
-    }
-  });
-
   app.get("/api/defi/config", (_req, res) => {
     res.json({
       chainId: liveDeployment.chainId,
@@ -14657,6 +14712,35 @@ async function main() {
     console.log("\n✅ Scenario complete (one-shot mode). Exiting.");
     node?.kill();
     process.exit(0);
+  }
+
+  /*
+   * Refuse to start with a route nothing can reach.
+   *
+   * Express matches in registration order, so a duplicate path is silent: the
+   * second registration is dead code that reads exactly like live code. That is
+   * how the archive's record list sat unreachable behind the event indexer,
+   * with App Config rendering "Couldn't load history" and neither file looking
+   * wrong. A startup check costs nothing and turns a silent class of bug into a
+   * boot failure.
+   */
+  {
+    const stack = (app as unknown as { _router?: { stack: unknown[] } })._router?.stack ?? [];
+    const routes: { method: string; path: string }[] = [];
+    for (const layer of stack as { route?: { path: unknown; methods?: Record<string, boolean> } }[]) {
+      const path = layer.route?.path;
+      if (typeof path !== "string") continue;
+      for (const [method, on] of Object.entries(layer.route?.methods ?? {})) {
+        if (on) routes.push({ method, path });
+      }
+    }
+    const clashes = shadowedRoutes(routes);
+    if (clashes.length) {
+      console.error("\n✗ Two handlers claim the same route. The later one can never run:\n");
+      for (const c of clashes) console.error(`    ${c.method} ${c.path}`);
+      console.error("\n  Give one of them a different path.\n");
+      process.exit(1);
+    }
   }
 
   await new Promise<void>((r) => app.listen(DASHBOARD_PORT, DASHBOARD_HOST, r));
