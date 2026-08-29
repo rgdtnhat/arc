@@ -17,20 +17,19 @@
  * local edits to `deployments/` in favour of the committed copy — deliberately,
  * because a stale record there blocks every future pull. So an address written
  * only to that file survives exactly until the next deploy, which is how a
- * launchpad that had been deployed came back reading "not deployed on this
- * network yet".
+ * contract that had been deployed came back reading "not deployed on this
+ * network yet" while it sat on-chain holding tokens.
  *
- * The address therefore also goes to `STATE_DIR/arc.local.json`, which lives on
- * the container's own volume and is nothing to do with git. `mergeDeployment`
- * applies a key the committed record has never heard of without needing to be
- * asked, so the local copy carries the deployment until the committed one
- * catches up — and once it does, the two agree and the local one is ignored.
+ * `recordDeployment` therefore also writes a gitignored local record — the one
+ * this run can reach, `STATE_DIR/arc.local.json` inside the container or
+ * `deployments/arc.local.json` on the host — which `deploy.sh` never checks out
+ * and the app reads at startup. Commit the tracked file when convenient; until
+ * then the local one keeps this host working, and afterwards the two agree.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createPublicClient, createWalletClient } from "viem";
-import { loadDeployer } from "./deployer.mjs";
+import { loadDeployer, recordDeployment } from "./deployer.mjs";
 import { arcTestnet as arcChain, pacedHttp, tesseraLaunchpadAbi, tesseraLaunchpadBytecode } from "@tessera/shared";
-import path from "node:path";
 
 const argv = process.argv.slice(2);
 const EXECUTE = argv.includes("--execute");
@@ -153,35 +152,4 @@ const receipt = await pub.waitForTransactionReceipt({ hash });
 const address = receipt.contractAddress;
 console.log(`${hash}\n  at ${address}`);
 
-dep.tesseraLaunchpad = address;
-writeFileSync(RECORD, JSON.stringify(dep, null, 2) + "\n");
-console.log(`\n  wrote tesseraLaunchpad to deployments/arc.json`);
-
-/*
- * And to the state volume, which `deploy.sh` cannot discard.
- *
- * The tracked record is the one that should end up carrying this, but it only
- * does once somebody commits it — and `deploy.sh` throws away local edits to
- * `deployments/` in the meantime. Writing here as well means the address
- * survives the very next deploy rather than the next commit.
- */
-const stateDir = process.env.STATE_DIR ?? null;
-if (stateDir) {
-  const localPath = path.join(stateDir, "arc.local.json");
-  let local = {};
-  try { local = JSON.parse(readFileSync(localPath, "utf8")); } catch { /* first write */ }
-  local.tesseraLaunchpad = address;
-  try {
-    writeFileSync(localPath, JSON.stringify(local, null, 2) + "\n");
-    console.log(`  wrote tesseraLaunchpad to ${localPath} (survives ./scripts/deploy.sh)`);
-  } catch (e) {
-    console.log(`  could not write ${localPath}: ${String(e).slice(0, 100)}`);
-  }
-} else {
-  console.log("  STATE_DIR is unset, so nothing was written to the state volume.");
-}
-
-console.log(
-  "\n  Commit deployments/arc.json when you can — the state-volume copy keeps the app\n" +
-    "  working until then, and the two agree once it lands.\n",
-);
+recordDeployment({ key: "tesseraLaunchpad", address, recordUrl: RECORD, record: dep });

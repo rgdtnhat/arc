@@ -2,7 +2,7 @@ import express from "express";
 import path from "node:path";
 import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
-import { mergeDeployment, explorerFrom, normaliseAssets } from "./deployment.js";
+import { mergeDeployment, combineLocal, explorerFrom, normaliseAssets } from "./deployment.js";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
 import { verifyMessage, verifyTypedData, formatUnits, parseUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
@@ -259,16 +259,17 @@ const liveDeployment = (() => {
    * `deployments/` is a bind mount from the host, so its ownership is the
    * host's whatever the image says. Where the process cannot write there it
    * writes into STATE_DIR instead — its own volume, which it always can — and
-   * this is the other half of that: read both, and let the copy this process
-   * could actually have written win. Preferring the state-dir file is right
-   * because it is the only one a locked-down container can keep current.
+   * this is the other half of that: read both and merge them. Merging rather
+   * than choosing matters, because a host-run deploy script writes the beside
+   * copy while the container writes the state-dir one, and picking either
+   * would drop the addresses in the other.
    */
   const localBeside = read("arc.local.json");
   const localState = STATE_DIR === dir ? null : readFrom(path.join(STATE_DIR, "arc.local.json"));
   if (localState && localBeside) {
-    console.log("[deployment] arc.local.json exists in both deployments/ and STATE_DIR — using the STATE_DIR copy");
+    console.log("[deployment] arc.local.json exists in both deployments/ and STATE_DIR — merging, STATE_DIR wins a clash");
   }
-  const local = localState ?? localBeside;
+  const local = combineLocal(localBeside, localState);
   const { merged, applied, ignored } = mergeDeployment(base, local);
   // A mistyped capital in one asset address used to throw inside every loop
   // that touched the list, taking whole panels down with a 500.
@@ -7814,7 +7815,22 @@ async function main() {
    *  · **Log what moved.** Every send records what the chain actually charged.
    */
   const launchpadAddr = ((liveDeployment as Record<string, unknown>).tesseraLaunchpad as Hex) ?? null;
-  const NFT_NOT_DEPLOYED = "The NFT launchpad is not deployed on this network yet — run `npm run nft:deploy -- --execute`.";
+  /*
+   * "Not deployed" is a claim this server cannot actually make.
+   *
+   * All it knows is that its deployment record names no launchpad — which is
+   * also exactly what a *deployed* launchpad looks like after `deploy.sh`
+   * discards an uncommitted `deployments/arc.json`. The old wording asserted
+   * the stronger thing and told the operator to run `--execute`, which would
+   * have deployed a second launchpad and stranded every drop and every minted
+   * token on the first. So: say what is actually known, and put the
+   * non-destructive recovery ahead of the destructive one.
+   */
+  const NFT_NOT_DEPLOYED =
+    "No NFT launchpad address is recorded for this network. If one has already been deployed, " +
+    "recover it with `npm run nft:deploy -- --find` and add it to deployments/arc.json — running " +
+    "`--execute` again would deploy a second launchpad and strand every drop and minted token on " +
+    "the first. If there genuinely isn't one, `npm run nft:deploy -- --execute` deploys it.";
 
   /** One drop, as the page shows it. */
   const readDrop = async (id: bigint) => {
@@ -8243,7 +8259,12 @@ async function main() {
   /* ---- NFTs you hold, transfers, and the market ------------------------- */
 
   const marketAddr = ((liveDeployment as Record<string, unknown>).tesseraNftMarket as Hex) ?? null;
-  const MARKET_NOT_DEPLOYED = "The NFT market is not deployed on this network yet — run `npm run nft:market -- --execute`.";
+  /* Same reasoning as NFT_NOT_DEPLOYED above — and the same bug, one week later. */
+  const MARKET_NOT_DEPLOYED =
+    "No NFT market address is recorded for this network. If one has already been deployed, " +
+    "recover it with `npm run nft:market -- --find` and add it to deployments/arc.json — running " +
+    "`--execute` again would deploy a second market and strand the listings, and the tokens held " +
+    "against them, in the first. If there genuinely isn't one, `npm run nft:market -- --execute` deploys it.";
 
   /**
    * Which launchpad tokens an address holds.

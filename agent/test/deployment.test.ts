@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mergeDeployment, explorerFrom, normaliseAssets } from "../src/deployment.js";
+import { mergeDeployment, combineLocal, explorerFrom, normaliseAssets } from "../src/deployment.js";
 
 /**
  * The rule that decides which contracts a running server talks to.
@@ -83,6 +83,49 @@ test("ignores the bookkeeping fields themselves", () => {
 test("falls back to the local file when nothing is committed", () => {
   const { merged } = mergeDeployment(null, { tesseraEscrow: "0xonly-local" });
   assert.equal(merged.tesseraEscrow, "0xonly-local");
+});
+
+/**
+ * Two local records, and the one that used to be thrown away.
+ *
+ * A host can end up with `arc.local.json` in both places: a deploy script run
+ * on the host writes it beside the committed record, and a container that
+ * cannot write into that bind mount writes it into STATE_DIR instead. The
+ * loader picked one — `localState ?? localBeside` — which is not the same as
+ * reading both, and drops every address in the loser.
+ */
+test("reads both local records rather than picking one", () => {
+  const beside = { tesseraNftMarket: "0xmarket" };
+  const state = { tesseraLaunchpad: "0xpad" };
+  const local = combineLocal(beside, state)!;
+  const { merged } = mergeDeployment(BASE, local);
+  assert.equal(merged.tesseraNftMarket, "0xmarket", "the host-written address was dropped");
+  assert.equal(merged.tesseraLaunchpad, "0xpad");
+});
+
+test("the state-dir copy still wins a real clash", () => {
+  // It is the only one a locked-down container can keep current, so where the
+  // two genuinely disagree about the same key it is the better answer.
+  const local = combineLocal({ tesseraPool: "0xbeside" }, { tesseraPool: "0xstate" })!;
+  assert.equal(local.tesseraPool, "0xstate");
+});
+
+test("claims from both records are kept", () => {
+  // Dropping one file's `overrides` would silently demote the addresses it
+  // claimed back to "overruled by the repo".
+  const local = combineLocal(
+    { tesseraPool: "0xa", overrides: ["tesseraPool"] },
+    { tesseraGauge: "0xb", overrides: ["tesseraGauge"] },
+  )!;
+  assert.deepEqual((local.overrides as string[]).sort(), ["tesseraGauge", "tesseraPool"]);
+  const { applied } = mergeDeployment(BASE, local);
+  assert.deepEqual(applied.sort(), ["tesseraGauge", "tesseraPool"]);
+});
+
+test("one record, or neither, is left exactly as it is", () => {
+  assert.deepEqual(combineLocal({ a: 1 }, null), { a: 1 });
+  assert.deepEqual(combineLocal(null, { b: 2 }), { b: 2 });
+  assert.equal(combineLocal(null, null), null);
 });
 
 test("treats a blank explorer variable as unset", () => {
