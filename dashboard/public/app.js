@@ -8842,7 +8842,27 @@ const $ = (id) => document.getElementById(id);
       let nftMine = { tokens: [], listed: [], market: null };
 
       async function loadNftHeld() {
-        const who = String(window.__myAddress || "");
+        /*
+         * Who we are is decided asynchronously — an operator session learns its
+         * acting address from `/api/profile`, which may not have answered yet
+         * when somebody lands straight on this tab. Returning silently left the
+         * token pickers reading "Nothing held by this wallet" for a wallet that
+         * holds several, with nothing to make them try again. So it waits for
+         * the address rather than giving up on it.
+         */
+        let who = String(window.__myAddress || "");
+        /*
+         * Only wait if an address is actually coming. A signed-in session
+         * learns its acting address from `/api/profile` a moment after load, so
+         * waiting is right there; a visitor with no token has nothing to wait
+         * for, and waiting anyway made the whole tab take three seconds to draw
+         * for the people least able to use it.
+         */
+        const expectsOne = Boolean(authToken()) || selfMode();
+        for (let i = 0; expectsOne && i < 10 && !/^0x[0-9a-fA-F]{40}$/.test(who); i++) {
+          await new Promise((r) => setTimeout(r, 300));
+          who = String(window.__myAddress || "");
+        }
         if (!/^0x[0-9a-fA-F]{40}$/.test(who)) return;
         try {
           const r = await (await fetch("/api/nft/mine?user=" + encodeURIComponent(who), { headers: authHeaders() })).json();
@@ -8890,10 +8910,26 @@ const $ = (id) => document.getElementById(id);
             nftMetric("Market fee", (Number(r.feeBps) / 100).toFixed(2) + "%") +
             nftMetric("Contract", short(r.address));
           const me = String(window.__myAddress || "").toLowerCase();
+          /*
+           * Buying, listing and taking back all spend or move the app wallet's
+           * property, so the server gates them on an operator session. A button
+           * that always answers 403 reads as the feature being broken rather
+           * than as not being yours to press, so it is not drawn — and the
+           * reason is said once, above the table.
+           */
+          const can = r.canAct !== false;
+          const why = $("nftMarketMsg");
+          if (why && !can && r.listings.length) {
+            why.style.display = "block";
+            why.style.color = "var(--muted)";
+            why.textContent = "Sign in as operator to buy, list or take back a listing.";
+          }
+          if ($("nftListGo")) $("nftListGo").disabled = !can;
           $("nftMarketRows").innerHTML = r.listings.length
             ? r.listings.map((l) => {
                 const mine = String(l.seller).toLowerCase() === me;
-                const action = mine
+                const action = !can ? ""
+                  : mine
                   ? `<button class="btn" data-mkt="cancel" data-id="${l.id}">Take back</button>`
                   : `<button class="btn" data-mkt="buy" data-id="${l.id}" data-price="${esc(l.price)}">Buy</button>`;
                 return `<tr><td><b>#${l.tokenId}</b>` +
@@ -8958,6 +8994,12 @@ const $ = (id) => document.getElementById(id);
 
       if ($("nftXferGo")) {
         $("nftXferGo").addEventListener("click", async () => {
+          if (nftMine.canAct === false) {
+            const m = $("nftXferMsg");
+            m.style.display = "block"; m.style.color = "var(--warn)";
+            m.textContent = "Sign in as operator to send from the app wallet.";
+            return;
+          }
           const m = $("nftXferMsg");
           const say = (t, good) => { m.style.display = "block"; m.style.color = good ? "var(--good)" : "var(--warn)"; m.innerHTML = t; };
           const tokenId = Number($("nftXferToken").value);
@@ -9068,7 +9110,9 @@ const $ = (id) => document.getElementById(id);
               const tone = d.status === "approved" ? "ok" : d.status === "rejected" ? "warn" : "";
               const label = d.status === "pending" ? "waiting for review" : d.status;
               const actions = [];
-              if (d.mintable) {
+              // Minting spends the app wallet, so it is operator-only — drawing
+              // it for a visitor would promise a 403.
+              if (d.mintable && nftState.canAct !== false) {
                 actions.push(
                   `<button class="btn" data-nft="mint" data-id="${d.id}" data-price="${esc(d.price)}">Mint</button>`,
                 );
@@ -12318,6 +12362,9 @@ const $ = (id) => document.getElementById(id);
           if (!window.__myAddress && p.actingAs && !selfMode()) {
             window.__myAddress = p.actingAs;
             if (typeof loadClaimables === "function") loadClaimables().catch(() => {});
+            // The NFT pickers key off this address too, and may have drawn
+            // themselves empty before it was known.
+            if (typeof loadNftHeld === "function") loadNftHeld().catch(() => {});
           }
           if (selfMode()) adoptConnectedAccount();
           if (wrap) wrap.style.display = "inline-block";

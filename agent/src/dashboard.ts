@@ -8054,6 +8054,8 @@ async function main() {
       res.json({
         ok: true, deployed: true, address: launchpadAddr, feeBps: Number(feeBps), treasury,
         admin: padOwner, total, drops,
+        // Same question as the market's: minting from the app wallet spends it.
+        canAct: Boolean(admin?.session(bearer(req))),
         canDecide: decide.ok,
         // When it is false, say which half is missing — "the buttons are gone"
         // is not something anybody can act on, and the causes differ.
@@ -8305,7 +8307,10 @@ async function main() {
         }));
         listedByMe = found.filter((x): x is NonNullable<typeof x> => x !== null);
       }
-      res.json({ ok: true, collection: launchpadAddr, market: marketAddr, tokens, listed: listedByMe });
+      res.json({
+        ok: true, collection: launchpadAddr, market: marketAddr, tokens, listed: listedByMe,
+        canAct: Boolean(admin?.session(bearer(req))),
+      });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), tokens: [] });
     }
@@ -8340,7 +8345,7 @@ async function main() {
   });
 
   /** Every live listing, newest first. */
-  app.get("/api/nft/market", async (_req, res) => {
+  app.get("/api/nft/market", async (req, res) => {
     if (!marketAddr) { res.json({ ok: true, deployed: false, error: MARKET_NOT_DEPLOYED, listings: [] }); return; }
     try {
       const [count, feeBps] = await Promise.all([
@@ -8368,6 +8373,14 @@ async function main() {
       res.json({
         ok: true, deployed: true, address: marketAddr, feeBps: Number(feeBps),
         listings: rows.filter((x): x is NonNullable<typeof x> => x !== null),
+        /*
+         * Whether this session can sign at all. Buying, listing and taking a
+         * listing back all spend or move the app wallet's property, so they are
+         * `requireOperator` — and a button that always answers 403 is worse
+         * than no button, because it reads as the feature being broken rather
+         * than as not being yours to press.
+         */
+        canAct: Boolean(admin?.session(bearer(req))),
       });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), listings: [] });
@@ -8561,9 +8574,24 @@ async function main() {
 
   async function readSessionFresh(id: Hex) {
     if (!sessionKeysAddr) return null;
-    const s = (await client.public.readContract({
+    /*
+     * Retried, because one dropped call here costs a save.
+     *
+     * Saving a scheduled task validates it against the session it spends from,
+     * and that validation runs under a form deadline. Four reads went out with
+     * no retry at all, so a public RPC dropping any one of them surfaced as
+     * "reading that session took too long — the chain is not answering", and
+     * the operator pressed Create two or three times until a run got lucky.
+     * The list endpoint beside this has retried since it was written; this path
+     * simply never did.
+     *
+     * Nothing is written before this succeeds, so retrying is free of
+     * consequence — the only cost of a dropped read was making somebody click
+     * again, which is also the worst thing to do to a throttled endpoint.
+     */
+    const s = (await retryRead(() => client.public.readContract({
       address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "sessions", args: [id],
-    })) as readonly [Hex, Hex, Hex, bigint, bigint, bigint, bigint, boolean, boolean];
+    }))) as readonly [Hex, Hex, Hex, bigint, bigint, bigint, bigint, boolean, boolean];
     if (s[0] === "0x0000000000000000000000000000000000000000") return null;
     /*
      * Three ceilings, and the page has to be able to name the one that binds.
@@ -8577,15 +8605,15 @@ async function main() {
      * rather than adding to it.
      */
     const [spendable, allowance, balance] = await Promise.all([
-      client.public.readContract({
+      retryRead(() => client.public.readContract({
         address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "spendable", args: [id],
-      }) as Promise<bigint>,
-      client.public.readContract({
+      }) as Promise<bigint>),
+      retryRead(() => client.public.readContract({
         address: s[2], abi: erc20Abi, functionName: "allowance", args: [s[0], sessionKeysAddr],
-      }) as Promise<bigint>,
-      client.public.readContract({
+      }) as Promise<bigint>),
+      retryRead(() => client.public.readContract({
         address: s[2], abi: erc20Abi, functionName: "balanceOf", args: [s[0]],
-      }) as Promise<bigint>,
+      }) as Promise<bigint>),
     ]);
     const meta = assetMeta(s[2]);
     const capLeft = s[3] > s[4] ? s[3] - s[4] : 0n;
@@ -8718,8 +8746,17 @@ async function main() {
     });
     return Promise.race([p, bell]).finally(() => clearTimeout(timer)) as Promise<T>;
   }
-  /** How long a form may wait on the chain before it is told to give up. */
-  const FORM_DEADLINE = 12_000;
+  /**
+   * How long a form may wait on the chain before it is told to give up.
+   *
+   * Raised from 12s once the reads underneath started retrying: three attempts
+   * with backoff, behind a transport that also backs off, can legitimately take
+   * longer than twelve seconds on a throttled endpoint. A deadline shorter than
+   * the work it is timing turns a slow save into a failed one, which is what
+   * had operators pressing Create three times — and pressing again is the worst
+   * thing to do to an endpoint that is already refusing calls.
+   */
+  const FORM_DEADLINE = Number(process.env.TESSERA_FORM_DEADLINE_MS ?? 25_000);
 
   async function retryRead<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
     let last: unknown;

@@ -48,9 +48,19 @@ test("the page sends credentials to every one of them", () => {
      * options object, if there is one. Matching to the first `)` does not
      * work: `authHeaders()` contains one.
      */
-    const needle = `fetch("${route}"`;
+    /*
+     * The path, however the URL is built around it. A route with a query string
+     * is written `fetch("/api/nft/mine?user=" + who)`, so matching only
+     * `fetch("<route>"` misses it — and missing it is the same as not checking,
+     * which is what this test exists to prevent.
+     */
+    const needle = `fetch("${route}`;
     let found = 0;
     for (let i = app.indexOf(needle); i !== -1; i = app.indexOf(needle, i + 1)) {
+      // `/api/nft` must not swallow `/api/nft/mine`: the character after the
+      // path has to end it, not continue it.
+      const after = app[i + needle.length];
+      if (after !== '"' && after !== "?") continue;
       found++;
       const window = app.slice(i, i + 160);
       assert.match(
