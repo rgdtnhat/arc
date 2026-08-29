@@ -48,7 +48,9 @@ import {
   tesseraRouterBytecode,
   tesseraFeeCollectorBytecode,
   tesseraAmmBytecode,
-  tesseraLaunchpadAbi,} from "@tessera/shared";
+  tesseraLaunchpadAbi,
+  tesseraNftMarketAbi,
+} from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { faucetFromEnv, FAUCET_ASSETS, type FaucetAsset } from "./circle/faucet.js";
 import { createProviderApp, type ProviderEvent } from "@tessera/providers";
@@ -8231,6 +8233,223 @@ async function main() {
         detail: `drop #${id} → ${to.slice(0, 10)}…`,
       });
       res.json({ ok: true, txHash, to });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /* ---- NFTs you hold, transfers, and the market ------------------------- */
+
+  const marketAddr = ((liveDeployment as Record<string, unknown>).tesseraNftMarket as Hex) ?? null;
+  const MARKET_NOT_DEPLOYED = "The NFT market is not deployed on this network yet — run `npm run nft:market -- --execute`.";
+
+  /**
+   * Which launchpad tokens an address holds.
+   *
+   * The launchpad is a minimal ERC-721 with no enumeration — deliberately, it
+   * is the extension that costs gas on every transfer to serve a question only
+   * a reader ever asks. So the scan happens here, off chain, where it is free:
+   * `ownerOf` for each id, batched into one multicall by the client.
+   *
+   * Bounded by `totalSupply`, which is the whole collection rather than a page
+   * of it. That is fine at this size and would not be at a hundred thousand; if
+   * it ever is, the answer is an index, not an on-chain loop.
+   */
+  const tokensOwnedBy = async (who: Hex): Promise<{ tokenId: number; dropId: number; uri: string }[]> => {
+    if (!launchpadAddr) return [];
+    const supply = Number(await client.public.readContract({
+      address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "totalSupply",
+    }));
+    const ids = Array.from({ length: Math.min(supply, 2000) }, (_, i) => BigInt(i + 1));
+    const owners = await Promise.all(ids.map((id) =>
+      client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "ownerOf", args: [id] })
+        .catch(() => null) as Promise<Hex | null>));
+    const mine = ids.filter((_, i) => String(owners[i]).toLowerCase() === who.toLowerCase());
+    return Promise.all(mine.map(async (id) => {
+      const [dropId, uri] = await Promise.all([
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropOf", args: [id] })
+          .catch(() => 0n) as Promise<bigint>,
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [id] })
+          .catch(() => "") as Promise<string>,
+      ]);
+      return { tokenId: Number(id), dropId: Number(dropId), uri };
+    }));
+  };
+
+  /** The tokens an address holds, plus whether each is currently listed. */
+  app.get("/api/nft/mine", async (req, res) => {
+    const who = String(req.query.user ?? "");
+    if (!/^0x[0-9a-fA-F]{40}$/.test(who)) {
+      res.status(400).json({ ok: false, error: "a wallet address is required" });
+      return;
+    }
+    if (!launchpadAddr) { res.json({ ok: true, tokens: [], collection: null }); return; }
+    try {
+      const tokens = await tokensOwnedBy(who as Hex);
+      // Anything this wallet has listed is escrowed by the market, so it no
+      // longer shows as theirs — read those back or a seller loses sight of it.
+      let listedByMe: { tokenId: number; listingId: number; price: string; uri: string; dropId: number }[] = [];
+      if (marketAddr) {
+        const escrowed = await tokensOwnedBy(marketAddr);
+        const found = await Promise.all(escrowed.map(async (t) => {
+          const [ok, id] = (await client.public.readContract({
+            address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listingOf",
+            args: [launchpadAddr, BigInt(t.tokenId)],
+          }).catch(() => [false, 0n])) as readonly [boolean, bigint];
+          if (!ok) return null;
+          const l = (await client.public.readContract({
+            address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listings", args: [id],
+          })) as readonly [Hex, Hex, bigint, bigint, boolean];
+          if (String(l[0]).toLowerCase() !== who.toLowerCase()) return null;
+          return { ...t, listingId: Number(id), price: fmtUnits(l[3], 6) };
+        }));
+        listedByMe = found.filter((x): x is NonNullable<typeof x> => x !== null);
+      }
+      res.json({ ok: true, collection: launchpadAddr, market: marketAddr, tokens, listed: listedByMe });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), tokens: [] });
+    }
+  });
+
+  /** Send an NFT the app wallet holds to somebody. */
+  app.post("/api/nft/transfer", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    const to = String(req.body?.to ?? "");
+    const tokenId = Math.floor(Number(req.body?.tokenId));
+    if (!/^0x[0-9a-fA-F]{40}$/.test(to)) { res.status(400).json({ ok: false, error: "Where should it go? That is not an address." }); return; }
+    if (!Number.isFinite(tokenId) || tokenId < 1) { res.status(400).json({ ok: false, error: "which token?" }); return; }
+    try {
+      /*
+       * `safeTransferFrom`, so a contract that cannot receive an ERC-721 refuses
+       * the transfer instead of swallowing the token. A plain `transferFrom` to
+       * the wrong address is unrecoverable, and this is exactly the field
+       * somebody pastes into.
+       */
+      const txHash = await asAgentWrite(
+        launchpadAddr, tesseraLaunchpadAbi, "safeTransferFrom",
+        [agentAccount.address as Hex, to as Hex, BigInt(tokenId)],
+      );
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "transfer",
+        status: "success", txHash, detail: `#${tokenId} → ${to.slice(0, 10)}…`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Every live listing, newest first. */
+  app.get("/api/nft/market", async (_req, res) => {
+    if (!marketAddr) { res.json({ ok: true, deployed: false, error: MARKET_NOT_DEPLOYED, listings: [] }); return; }
+    try {
+      const [count, feeBps] = await Promise.all([
+        client.public.readContract({ address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listingCount" }) as Promise<bigint>,
+        client.public.readContract({ address: marketAddr, abi: tesseraNftMarketAbi, functionName: "feeBps" }) as Promise<number>,
+      ]);
+      const total = Number(count);
+      const ids = Array.from({ length: Math.min(total, 200) }, (_, i) => BigInt(total - 1 - i));
+      const rows = await Promise.all(ids.map(async (id) => {
+        const l = (await client.public.readContract({
+          address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listings", args: [id],
+        })) as readonly [Hex, Hex, bigint, bigint, boolean];
+        if (!l[4]) return null;
+        let uri = "";
+        if (launchpadAddr && String(l[1]).toLowerCase() === launchpadAddr.toLowerCase()) {
+          uri = (await client.public.readContract({
+            address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [l[2]],
+          }).catch(() => "")) as string;
+        }
+        return {
+          id: Number(id), seller: l[0], collection: l[1], tokenId: Number(l[2]),
+          priceRaw: l[3].toString(), price: fmtUnits(l[3], 6), uri,
+        };
+      }));
+      res.json({
+        ok: true, deployed: true, address: marketAddr, feeBps: Number(feeBps),
+        listings: rows.filter((x): x is NonNullable<typeof x> => x !== null),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), listings: [] });
+    }
+  });
+
+  /** List a token the app wallet holds. Approves the market for that one token. */
+  app.post("/api/nft/market/list", requireOperator, async (req, res) => {
+    if (!marketAddr || !launchpadAddr) { res.status(404).json({ ok: false, error: MARKET_NOT_DEPLOYED }); return; }
+    const tokenId = Math.floor(Number(req.body?.tokenId));
+    if (!Number.isFinite(tokenId) || tokenId < 1) { res.status(400).json({ ok: false, error: "which token?" }); return; }
+    let priceRaw: bigint;
+    try { priceRaw = usdcUnits(req.body?.price ?? "0"); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+    try {
+      // One token, not the whole collection: `setApprovalForAll` would leave the
+      // market able to move every NFT this wallet will ever hold.
+      await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "approve", [marketAddr, BigInt(tokenId)]);
+      const txHash = await asAgentWrite(
+        marketAddr, tesseraNftMarketAbi, "list", [launchpadAddr, BigInt(tokenId), priceRaw],
+      );
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "list",
+        status: "success", txHash, asset: "USDC", amount: `${fmtUnits(priceRaw, 6)} USDC`,
+        detail: `#${tokenId} listed`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Take a listing back. */
+  app.post("/api/nft/market/cancel", requireOperator, async (req, res) => {
+    if (!marketAddr) { res.status(404).json({ ok: false, error: MARKET_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which listing?" }); return; }
+    try {
+      const txHash = await asAgentWrite(marketAddr, tesseraNftMarketAbi, "cancel", [BigInt(id)]);
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Buy a listing from the app wallet.
+   *
+   * `maxPrice` is the figure the caller was shown, passed through untouched —
+   * re-reading it here would agree to whatever the seller had set a block
+   * earlier, which is the substitution the contract's `maxPrice` refuses.
+   */
+  app.post("/api/nft/market/buy", requireOperator, async (req, res) => {
+    if (!marketAddr) { res.status(404).json({ ok: false, error: MARKET_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which listing?" }); return; }
+    let maxPrice: bigint;
+    try { maxPrice = usdcUnits(req.body?.maxPrice ?? ""); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+
+    // The same choke point every other autonomous spend goes through.
+    if (maxPrice > policy.autoApproveMax) {
+      res.status(400).json({
+        ok: false,
+        error:
+          `That purchase costs ${fmtUnits(maxPrice, 6)} USDC, over the guardian cap of ` +
+          `${fmtUnits(policy.autoApproveMax, 6)} USDC per autonomous spend. Raise the cap in App Config, ` +
+          "or buy it from your own wallet.",
+      });
+      return;
+    }
+    try {
+      if (maxPrice > 0n) {
+        await asAgentWrite(usdcAddress as Hex, erc20Abi, "approve", [marketAddr, maxPrice]);
+      }
+      const txHash = await asAgentWrite(marketAddr, tesseraNftMarketAbi, "buy", [BigInt(id), maxPrice]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "buy",
+        status: "success", txHash, asset: "USDC", amount: `${fmtUnits(maxPrice, 6)} USDC`,
+        valueRaw: maxPrice.toString(), detail: `listing #${id}`,
+      });
+      res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e) });
     }

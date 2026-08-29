@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v175" />
+    <meta name="tessera-shell" content="tessera-v176" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1109,11 +1109,11 @@
               <path d="M3.8 19.2h16.4"/>
             </svg></span><span class="navLbl">Governance</span>
           </button>
-          <button class="btn" data-nav="nft" title="NFT launchpad" aria-label="NFT launchpad">
+          <button class="btn" data-nav="nft" title="NFT" aria-label="NFT">
             <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect x="3.6" y="3.6" width="16.8" height="16.8" rx="3.2"/>
               <path d="m6.4 16.2 3.6-4.4 2.6 3.1 2-2.3 3 3.6"/><circle cx="9.1" cy="8.6" r="1.35"/>
-            </svg></span><span class="navLbl">NFT launchpad</span>
+            </svg></span><span class="navLbl">NFT</span>
           </button>
           <button class="btn" data-nav="wallet" title="Wallet" aria-label="Wallet">
             <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -3359,8 +3359,17 @@
         <!-- ---------- TREASURY & SYSTEM ---------- -->
         <!-- ---------- NFT LAUNCHPAD ---------- -->
         <div class="tabPane" id="paneNft" hidden>
+          <!-- Three jobs on one pane: create a drop, move a token you hold, buy
+               and sell. Sub-tabs rather than one scroll, the same strip the
+               wallet and DeFi panes use. -->
+          <div class="row-actions" id="nftTabs" role="tablist" style="margin-bottom:14px;flex-wrap:wrap">
+            <button class="btn" data-nfttab="pad">Launch pad</button>
+            <button class="btn" data-nfttab="market">Marketplace</button>
+            <button class="btn" data-nfttab="transfer">Transfer</button>
+          </div>
+
           <div class="card" id="nftCard">
-            <h2>🖼 NFT launchpad — submit a drop, an admin decides</h2>
+            <h2>🖼 NFT launch pad — submit a drop, an admin decides</h2>
             <div class="notready" id="nftNotReady" style="display:none"></div>
             <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
               Anyone may submit a drop; nothing mints until an admin approves it. An approved drop mints for a
@@ -3431,6 +3440,65 @@
               <tbody id="nftRows"></tbody>
             </table></div>
             <div class="kv" id="nftMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <!-- ---------- MARKETPLACE ---------- -->
+          <div class="card" id="nftMarketCard" hidden>
+            <h2>🏷 NFT marketplace — list what you hold, buy what you want</h2>
+            <div class="notready" id="nftMarketNotReady" style="display:none"></div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Listing moves the token into the market until it sells or you take it back, so a live listing is
+              something the contract can actually deliver — a buyer never pays gas to discover the seller moved it
+              first. You state the price you agreed to when you buy, so a seller who re-prices mid-flight is
+              refused rather than paid. Cancelling is always open to the seller.
+            </div>
+            <div class="metrics tight" id="nftMarketMeta" style="margin-bottom:16px"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:4px 0 9px">List one you hold</div>
+            <div class="row-actions" style="flex-wrap:wrap;align-items:flex-end">
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Token
+                <select id="nftListToken" class="field" style="width:230px"></select>
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Price (USDC)
+                <input id="nftListPrice" class="field" inputmode="decimal" placeholder="0 for free" style="width:140px" />
+              </label>
+              <button class="btn primary" id="nftListGo">List for sale</button>
+            </div>
+            <div class="kv" id="nftListMsg" style="margin-top:9px;display:none"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">On sale</div>
+            <div class="tblWrap auto"><table class="data">
+              <thead><tr><th>Token</th><th>Seller</th><th class="num">Price</th><th></th></tr></thead>
+              <tbody id="nftMarketRows"></tbody>
+            </table></div>
+            <div class="kv" id="nftMarketMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <!-- ---------- TRANSFER ---------- -->
+          <div class="card" id="nftTransferCard" hidden>
+            <h2>➦ Transfer an NFT</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Sends one of the app wallet's tokens to another address. It goes by
+              <span class="mono">safeTransferFrom</span>, so a contract that cannot hold an ERC-721 refuses it
+              rather than swallowing it — a transfer to the wrong address cannot be undone, and this is the field
+              people paste into.
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap;align-items:flex-end">
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Token
+                <select id="nftXferToken" class="field" style="width:230px"></select>
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                To
+                <input id="nftXferTo" class="field" placeholder="0x…" style="width:280px" />
+              </label>
+              <button class="btn primary" id="nftXferGo">Send</button>
+            </div>
+            <div class="kv" id="nftXferMsg" style="margin-top:9px;display:none"></div>
+            <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">Held by the app wallet</div>
+            <div id="nftHeld" style="display:flex;gap:9px;flex-wrap:wrap"></div>
           </div>
         </div>
 

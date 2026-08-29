@@ -765,6 +765,36 @@ receiver cannot mint past the supply, and rejection is final — un-approving a
 drop after somebody minted from it would leave their token a claim on a drop the
 admin had disowned.
 
+## The NFT marketplace
+
+`TesseraNftMarket` is a separate contract rather than more functions on the
+launchpad. Folding listings in would have needed no approval step — same
+contract, same token — but the launchpad is deployed and holds a minted token,
+and adding functions means replacing it, which would strand that token and every
+drop beside it. The separation turns out to be the better shape anyway: a market
+welded to one collection can only sell that collection.
+
+A listing **escrows** the token. The alternative — leave it with the seller and
+pull it on sale — lets a buyer pay gas to discover the seller moved, sold or
+un-approved it a block earlier. Escrow makes a live listing something the
+contract can deliver, and `cancel` stays open to the seller, so nothing is
+trapped.
+
+| Rule | How it is kept |
+|---|---|
+| Escrow only what was vetted | `buy(id, maxPrice)` reverts above `maxPrice`. A seller may re-price at any time; without it they could watch a purchase in the mempool, raise the price, and be paid the higher one out of a wallet that never agreed. The server passes through the price the caller was **shown** and never re-reads it. |
+| Every spend passes the policy gate | An operator purchase spends `AGENT_PRIVATE_KEY`, so `/api/nft/market/buy` checks it against the guardian cap before granting any allowance. |
+| Operator-only for anything that signs | Listing, cancelling, buying and transferring from the app wallet are all behind `requireOperator`. Reads are public. |
+| The contract never holds USDC | Payment splits to seller and treasury in the same call. The only custody is the listed token, until it sells or is taken back. |
+| Fee capped in code | `MAX_FEE_BPS` is 10%, at construction and in `setFeeBps`. |
+| State before value | The listing is cleared before either transfer, so a re-entrant token or recipient finds nothing left to buy. |
+
+Transfers go by `safeTransferFrom`, so a contract that cannot hold an ERC-721
+refuses rather than swallowing the token — a transfer to the wrong address
+cannot be undone, and that field is one people paste into. Listing approves the
+market for **one token**, never `setApprovalForAll`, which would leave it able
+to move every NFT the wallet will ever hold.
+
 ## The guardian cap is configurable; the guardian is not
 
 `guardianCapUsdc` in App Config sets how much the agent may spend on one

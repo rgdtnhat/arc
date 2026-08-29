@@ -42,7 +42,8 @@
     "pool:guard-collateral": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/guard-collateral.mjs",
     "pool:unblock": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/unblock-migration.mjs",
     "pool:rollback": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/rollback-pool.mjs",
-    "nft:deploy": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/deploy-launchpad.mjs"
+    "nft:deploy": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/deploy-launchpad.mjs",
+    "nft:market": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/deploy-nft-market.mjs"
   },
   "overrides": {
     "adm-zip": "^0.6.0",

@@ -188,7 +188,10 @@ const $ = (id) => document.getElementById(id);
           if (route === "wallet" && typeof setWalletTab === "function") setWalletTab(walletTab, { scroll: false });
           // A loop of contract reads over every drop, so it loads on arrival
           // rather than on every poll of every other tab.
-          if (route === "nft" && typeof loadNft === "function") loadNft().catch(() => {});
+          if (route === "nft" && typeof loadNft === "function") {
+            loadNft().catch(() => {});
+            if (typeof setNftTab === "function") setNftTab(nftTab);
+          }
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -8800,6 +8803,178 @@ const $ = (id) => document.getElementById(id);
        * the launchpad's on-chain owner — rather than by hiding buttons that
        * would fail anyway.
        */
+      /* ---- NFT sub-tabs ----------------------------------------------------
+       *
+       * Three jobs — create, trade, move — that used to be one pane called
+       * "launchpad". The menu entry is just "NFT" now, because a launchpad is
+       * one of the things you do with an NFT rather than the name of all of
+       * them.
+       */
+      const NFT_TABS = { pad: "nftCard", market: "nftMarketCard", transfer: "nftTransferCard" };
+      const NFT_TAB_KEY = "tessera_nft_tab";
+      let nftTab = (() => {
+        try { return localStorage.getItem(NFT_TAB_KEY) || "pad"; } catch { return "pad"; }
+      })();
+
+      function setNftTab(tab) {
+        if (!(tab in NFT_TABS)) tab = "pad";
+        nftTab = tab;
+        try { localStorage.setItem(NFT_TAB_KEY, tab); } catch {}
+        for (const [name, id] of Object.entries(NFT_TABS)) {
+          const el = $(id);
+          if (el) el.hidden = name !== tab;
+        }
+        document.querySelectorAll("[data-nfttab]").forEach((b) =>
+          b.classList.toggle("active", b.dataset.nfttab === tab));
+        // Each tab reads on arrival rather than on every poll of the others.
+        if (tab === "market" && typeof loadNftMarket === "function") loadNftMarket().catch(() => {});
+        if (tab === "transfer" && typeof loadNftHeld === "function") loadNftHeld().catch(() => {});
+      }
+
+      if ($("nftTabs")) {
+        $("nftTabs").addEventListener("click", (ev) => {
+          const b = ev.target.closest("[data-nfttab]");
+          if (b) setNftTab(b.dataset.nfttab);
+        });
+      }
+
+      /** Tokens the acting wallet holds, and the ones it has listed. */
+      let nftMine = { tokens: [], listed: [], market: null };
+
+      async function loadNftHeld() {
+        const who = String(window.__myAddress || "");
+        if (!/^0x[0-9a-fA-F]{40}$/.test(who)) return;
+        try {
+          const r = await (await fetch("/api/nft/mine?user=" + encodeURIComponent(who), { headers: authHeaders() })).json();
+          if (!r || !r.ok) return;
+          nftMine = r;
+          const label = (t) => `#${t.tokenId} · drop ${t.dropId}`;
+          for (const id of ["nftXferToken", "nftListToken"]) {
+            const sel = $(id);
+            if (!sel) continue;
+            const keep = sel.value;
+            sel.innerHTML = r.tokens.length
+              ? r.tokens.map((t) => `<option value="${t.tokenId}">${esc(label(t))}</option>`).join("")
+              : `<option value="">Nothing held by this wallet</option>`;
+            if (keep) sel.value = keep;
+          }
+          const held = $("nftHeld");
+          if (held) {
+            held.innerHTML = r.tokens.length
+              ? r.tokens.map((t) =>
+                  `<span class="tag" title="${esc(t.uri)}">${esc(label(t))}</span>`).join("")
+              : `<span style="color:var(--muted);font-size:12px">This wallet holds none yet.</span>`;
+          }
+        } catch { /* the panel keeps whatever it last showed */ }
+      }
+
+      window.loadNftMarket = async function loadNftMarket() {
+        const card = $("nftMarketCard");
+        if (!card) return;
+        const notReady = $("nftMarketNotReady");
+        await loadNftHeld();
+        try {
+          const r = await (await fetch("/api/nft/market", { headers: authHeaders() })).json();
+          if (!r || !r.ok || !r.deployed) {
+            if (notReady) {
+              notReady.style.display = "block";
+              notReady.textContent = (r && r.error) || "The NFT market is not deployed on this network yet.";
+            }
+            $("nftMarketRows").innerHTML = emptyRow(4, "Nothing to show until the market is deployed.");
+            $("nftMarketMeta").innerHTML = "";
+            return;
+          }
+          if (notReady) notReady.style.display = "none";
+          $("nftMarketMeta").innerHTML =
+            nftMetric("On sale", String(r.listings.length)) +
+            nftMetric("Market fee", (Number(r.feeBps) / 100).toFixed(2) + "%") +
+            nftMetric("Contract", short(r.address));
+          const me = String(window.__myAddress || "").toLowerCase();
+          $("nftMarketRows").innerHTML = r.listings.length
+            ? r.listings.map((l) => {
+                const mine = String(l.seller).toLowerCase() === me;
+                const action = mine
+                  ? `<button class="btn" data-mkt="cancel" data-id="${l.id}">Take back</button>`
+                  : `<button class="btn" data-mkt="buy" data-id="${l.id}" data-price="${esc(l.price)}">Buy</button>`;
+                return `<tr><td><b>#${l.tokenId}</b>` +
+                  `<div style="font-size:11px;color:var(--muted)">${esc(l.uri || l.collection)}</div></td>` +
+                  `<td class="mono" style="font-size:11px">${esc(short(l.seller))}${mine ? " (you)" : ""}</td>` +
+                  `<td class="num mono">${esc(l.price)} USDC</td>` +
+                  `<td class="num">${action}</td></tr>`;
+              }).join("")
+            : emptyRow(4, "Nothing is listed yet.");
+        } catch {
+          if (notReady) {
+            notReady.style.display = "block";
+            notReady.textContent = "Could not read the market just now.";
+          }
+        }
+      };
+
+      if ($("nftListGo")) {
+        $("nftListGo").addEventListener("click", async () => {
+          const m = $("nftListMsg");
+          const say = (t, good) => { m.style.display = "block"; m.style.color = good ? "var(--good)" : "var(--warn)"; m.innerHTML = t; };
+          const tokenId = Number($("nftListToken").value);
+          if (!tokenId) return say("This wallet holds no NFT to list.");
+          $("nftListGo").disabled = true;
+          try {
+            const r = await (await postJson("/api/nft/market/list", {
+              tokenId, price: $("nftListPrice").value.trim() || "0",
+            })).json();
+            if (r.ok) { say(`Listed. ${txLink(r.txHash)}`, true); $("nftListPrice").value = ""; loadNftMarket(); }
+            else say(esc(r.error || "Listing failed."));
+          } catch { say("The listing request failed."); }
+          $("nftListGo").disabled = false;
+        });
+      }
+
+      if ($("nftMarketRows")) {
+        $("nftMarketRows").addEventListener("click", async (ev) => {
+          const btn = ev.target.closest("[data-mkt]");
+          if (!btn) return;
+          const m = $("nftMarketMsg");
+          const say = (t, good) => { m.style.display = "block"; m.style.color = good ? "var(--good)" : "var(--warn)"; m.innerHTML = t; };
+          const id = Number(btn.dataset.id);
+          let url = "/api/nft/market/cancel";
+          let body = { id };
+          if (btn.dataset.mkt === "buy") {
+            // The price the row was showing, not one re-read at send time —
+            // see the contract's `maxPrice`.
+            if (!confirm(`Buy listing #${id} for ${btn.dataset.price} USDC?`)) return;
+            url = "/api/nft/market/buy";
+            body = { id, maxPrice: btn.dataset.price };
+          }
+          btn.disabled = true;
+          try {
+            const r = await (await postJson(url, body)).json();
+            if (r.ok) say(`Done. ${txLink(r.txHash)}`, true);
+            else say(esc(r.error || "That did not go through."));
+          } catch { say("The request failed."); }
+          btn.disabled = false;
+          loadNftMarket();
+        });
+      }
+
+      if ($("nftXferGo")) {
+        $("nftXferGo").addEventListener("click", async () => {
+          const m = $("nftXferMsg");
+          const say = (t, good) => { m.style.display = "block"; m.style.color = good ? "var(--good)" : "var(--warn)"; m.innerHTML = t; };
+          const tokenId = Number($("nftXferToken").value);
+          const to = $("nftXferTo").value.trim();
+          if (!tokenId) return say("This wallet holds no NFT to send.");
+          if (!/^0x[0-9a-fA-F]{40}$/.test(to)) return say("That is not an address.");
+          if (!confirm(`Send NFT #${tokenId} to ${to}?\n\nA transfer cannot be undone.`)) return;
+          $("nftXferGo").disabled = true;
+          try {
+            const r = await (await postJson("/api/nft/transfer", { tokenId, to })).json();
+            if (r.ok) { say(`Sent. ${txLink(r.txHash)}`, true); $("nftXferTo").value = ""; loadNftHeld(); }
+            else say(esc(r.error || "Transfer failed."));
+          } catch { say("The transfer request failed."); }
+          $("nftXferGo").disabled = false;
+        });
+      }
+
       let nftState = null;
       /** One figure in the metrics strip, the same shape every other panel uses. */
       const nftMetric = (k, v) =>
