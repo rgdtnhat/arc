@@ -8838,11 +8838,23 @@ const $ = (id) => document.getElementById(id);
         }
       };
 
-      /** Am I the launchpad's admin in this session? */
+      /**
+       * Can this session decide a drop?
+       *
+       * The server answers for the operator case, because only it knows all
+       * three parts: signed in as operator, holding an owner key, and that key
+       * being the launchpad's owner. This used to compare the launchpad's owner
+       * against `window.__myAddress` — which in an operator session is the *app
+       * wallet*, while the launchpad is owned by the *deployer*, the key that
+       * deployed it. Two different addresses, so the check was false for the
+       * one person who could actually decide and the buttons never appeared.
+       *
+       * A connected wallet that is itself the owner is still an address
+       * comparison, because there that genuinely is the question.
+       */
       function nftIsAdmin() {
         if (!nftState || !nftState.admin) return false;
-        // An operator session acts as the app wallet; a connected wallet acts as
-        // itself. Either can be the owner, and neither is assumed to be.
+        if (nftState.canDecide) return true;
         const me = String(window.__myAddress || "").toLowerCase();
         return Boolean(me) && me === String(nftState.admin).toLowerCase();
       }
@@ -8853,6 +8865,18 @@ const $ = (id) => document.getElementById(id);
         const want = ($("nftFilter") && $("nftFilter").value) || "all";
         const rows = nftState.drops.filter((d) => want === "all" || d.status === want);
         const admin = nftIsAdmin();
+        /*
+         * A pending drop nobody in this session can act on is worth explaining
+         * once, above the table. Silence reads as a missing feature.
+         */
+        const why = $("nftMsg");
+        const pending = (nftState.drops || []).filter((d) => d.status === "pending").length;
+        if (why && pending && !admin && nftState.cannotDecideWhy) {
+          why.style.display = "block";
+          why.style.color = "var(--muted)";
+          why.textContent =
+            `${pending} drop${pending === 1 ? " is" : "s are"} waiting for a decision. ${nftState.cannotDecideWhy}`;
+        }
         body.innerHTML = rows.length
           ? rows.map((d) => {
               const tone = d.status === "approved" ? "ok" : d.status === "rejected" ? "warn" : "";

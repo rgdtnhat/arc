@@ -108,7 +108,7 @@ interface PoolDeploymentRef {
   assets: PoolAsset[];
 }
 import { TesseraTreasury } from "./treasury.js";
-import { TesseraPoolClient, PRICE_IX, describeFreeze } from "./pool.js";
+import { TesseraPoolClient, PRICE_IX, describeFreeze, canDecideDrops } from "./pool.js";
 import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader, planHarvest, type HarvestCandidate } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
@@ -7974,9 +7974,35 @@ async function main() {
       const ids: bigint[] = [];
       for (let i = total - 1; i >= 0 && ids.length < limit; i--) ids.push(BigInt(i));
       const drops = await Promise.all(ids.map(readDrop));
+      /*
+       * Whether *this session* can decide, answered by the server.
+       *
+       * The page was working it out by comparing the launchpad's owner against
+       * `window.__myAddress`, which in an operator session is the **app
+       * wallet** — and the launchpad is owned by the **deployer**, because that
+       * is the key that deployed it. Two different addresses, so the comparison
+       * was false for the one person who can actually decide, and Approve and
+       * Reject never appeared. The routes themselves worked the whole time:
+       * `/api/nft/decide` signs with `owner`, the deployer key.
+       *
+       * Three things have to be true, and only the server knows all three: the
+       * caller is signed in as operator, this process holds an owner key, and
+       * that key is the launchpad's owner. A connected wallet that *is* the
+       * owner is handled separately, in the page, because there the address
+       * comparison is the right question.
+       */
+      const decide = canDecideDrops({
+        operator: Boolean(admin?.session(bearer(req))),
+        signer: owner?.account.address ?? null,
+        launchpadOwner: String(padOwner),
+      });
       res.json({
         ok: true, deployed: true, address: launchpadAddr, feeBps: Number(feeBps), treasury,
         admin: padOwner, total, drops,
+        canDecide: decide.ok,
+        // When it is false, say which half is missing — "the buttons are gone"
+        // is not something anybody can act on, and the causes differ.
+        cannotDecideWhy: decide.why,
       });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), drops: [] });
