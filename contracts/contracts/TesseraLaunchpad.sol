@@ -85,6 +85,14 @@ contract TesseraLaunchpad is ReentrancyGuard {
     mapping(address => mapping(address => bool)) public isApprovedForAll;
     /// @notice Which drop a token was minted from, so `tokenURI` can find it.
     mapping(uint256 => uint256) public dropOf;
+    /**
+     * @notice Which item within its drop a token is: 1, 2, 3 … up to the supply.
+     * @dev `tokenURI` needs this rather than the global id. A creator uploading
+     *      a hundred images numbers them 1..100; the global id is whatever the
+     *      launchpad happened to be at when they minted, so a drop that opened
+     *      second would look for image 431 in a folder holding a hundred.
+     */
+    mapping(uint256 => uint32) public indexInDrop;
     uint256 public totalSupply;
 
     event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
@@ -278,6 +286,7 @@ contract TesseraLaunchpad is ReentrancyGuard {
         }
         tokenId = ++totalSupply;
         dropOf[tokenId] = id;
+        indexInDrop[tokenId] = d.minted;
 
         uint256 fee = (price * feeBps) / 10_000;
         if (price != 0) {
@@ -337,10 +346,15 @@ contract TesseraLaunchpad is ReentrancyGuard {
         return _balanceOf[holder];
     }
 
-    /// @notice `<drop uri>/<index within the drop>`, so one base URI serves a whole drop.
+    /**
+     * @notice `<drop uri>/<index within the drop>`, so one base URI serves a
+     *         whole collection: 1, 2, 3 … up to its supply.
+     * @dev A drop of supply 1 — a single NFT rather than a collection — is
+     *      `<uri>/1`, which a creator can point straight at one file.
+     */
     function tokenURI(uint256 tokenId) external view returns (string memory) {
         if (_ownerOf[tokenId] == address(0)) revert BadDrop(tokenId);
-        return string.concat(_drops[dropOf[tokenId]].uri, "/", _toString(tokenId));
+        return string.concat(_drops[dropOf[tokenId]].uri, "/", _toString(indexInDrop[tokenId]));
     }
 
     function supportsInterface(bytes4 id) external pure returns (bool) {

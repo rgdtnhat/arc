@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
 import { verifyMessage, verifyTypedData, formatUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
 import type { Hex, Chain, Account } from "viem";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import {
   formatUsdc,
   HEADERS,
@@ -7750,6 +7750,174 @@ async function main() {
       why,
     };
   };
+
+  /* ---- Drop media: images in, ERC-721 metadata out ----------------------
+   *
+   * A launchpad that only accepts a URI asks every creator to have solved
+   * hosting before they arrive, which for most of them means IPFS, a pinning
+   * service and an account. This takes the images instead and serves the
+   * metadata a wallet actually asks for.
+   *
+   * `tokenURI` is `<base>/<index within the drop>`, so a collection of a
+   * hundred images is one upload and one base URI, and item 7 of that drop
+   * resolves to item 7 of that upload — which is why the contract numbers
+   * tokens per drop rather than globally.
+   *
+   * ## What is refused, and why
+   *  · **SVG.** It is a document, and this is served from the app's own origin,
+   *    so an SVG with a script tag in it is stored XSS against every visitor who
+   *    opens the drop. PNG, JPEG, GIF and WebP are pixels.
+   *  · **Anything whose bytes disagree with its type.** The declared MIME is
+   *    the uploader's word; the magic number is the file's. They have to match,
+   *    or a `.png` that is really HTML gets served as an image and sniffed as a
+   *    document by somebody's browser.
+   *  · **Anything over the size cap, or more than the item cap.** A drop board
+   *    anybody can post to is a disk-filling primitive otherwise.
+   */
+  const MEDIA_DIR = statePath("nft-media");
+  const MEDIA_MAX_BYTES = 4 * 1024 * 1024;
+  const MEDIA_MAX_ITEMS = 200;
+  /** Declared type -> extension and the bytes a real file of that type starts with. */
+  const MEDIA_TYPES: Record<string, { ext: string; magic: number[][] }> = {
+    "image/png": { ext: "png", magic: [[0x89, 0x50, 0x4e, 0x47]] },
+    "image/jpeg": { ext: "jpg", magic: [[0xff, 0xd8, 0xff]] },
+    "image/gif": { ext: "gif", magic: [[0x47, 0x49, 0x46, 0x38]] },
+    "image/webp": { ext: "webp", magic: [[0x52, 0x49, 0x46, 0x46]] },
+  };
+  const looksLike = (buf: Buffer, magic: number[][]) =>
+    magic.some((m) => m.every((b, i) => buf[i] === b));
+
+  /**
+   * Upload one image or a whole collection.
+   *
+   * Behind `requireAuth` rather than `requireOperator`: submitting a drop is
+   * something a visitor does, and it would be strange to let them submit and
+   * not to let them bring the artwork. It is still a gate — an unauthenticated
+   * write that puts bytes on disk is a disk-filling primitive.
+   */
+  app.post("/api/nft/media", requireAuth, express.json({ limit: "48mb" }), async (req, res) => {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) { res.status(400).json({ ok: false, error: "No images were sent." }); return; }
+    if (items.length > MEDIA_MAX_ITEMS) {
+      res.status(400).json({ ok: false, error: `A collection tops out at ${MEDIA_MAX_ITEMS} images.` });
+      return;
+    }
+    const collectionName = String(req.body?.name ?? "").slice(0, 120);
+    const description = String(req.body?.description ?? "").slice(0, 600);
+
+    const decoded: { ext: string; type: string; bytes: Buffer }[] = [];
+    for (const [i, raw] of items.entries()) {
+      const dataUrl = String((raw as { dataUrl?: unknown })?.dataUrl ?? "");
+      const m = /^data:([a-z/+-]+);base64,(.+)$/i.exec(dataUrl);
+      if (!m) { res.status(400).json({ ok: false, error: `Image ${i + 1} is not a base64 data URL.` }); return; }
+      const type = m[1].toLowerCase();
+      const spec = MEDIA_TYPES[type];
+      if (!spec) {
+        res.status(400).json({
+          ok: false,
+          error: `Image ${i + 1} is ${type}. PNG, JPEG, GIF and WebP only — SVG is a document, not a picture, and this serves from the app's own origin.`,
+        });
+        return;
+      }
+      let bytes: Buffer;
+      try { bytes = Buffer.from(m[2], "base64"); }
+      catch { res.status(400).json({ ok: false, error: `Image ${i + 1} is not valid base64.` }); return; }
+      if (!bytes.length || bytes.length > MEDIA_MAX_BYTES) {
+        res.status(400).json({ ok: false, error: `Image ${i + 1} is ${(bytes.length / 1e6).toFixed(1)} MB; the cap is 4 MB.` });
+        return;
+      }
+      // The declared type is the uploader's word; the magic number is the file's.
+      if (!looksLike(bytes, spec.magic)) {
+        res.status(400).json({ ok: false, error: `Image ${i + 1} says it is ${type} but its bytes are not.` });
+        return;
+      }
+      decoded.push({ ext: spec.ext, type, bytes });
+    }
+
+    // Content-addressed, so the same upload twice is the same folder and a
+    // creator re-submitting does not double the disk.
+    const digest = createHash("sha256");
+    for (const d of decoded) digest.update(d.bytes);
+    digest.update(collectionName);
+    const id = digest.digest("hex").slice(0, 32);
+    const dir = path.join(MEDIA_DIR, id);
+    try {
+      mkdirSync(dir, { recursive: true });
+      decoded.forEach((d, i) => writeFileSync(path.join(dir, `${i + 1}.${d.ext}`), d.bytes));
+      writeFileSync(
+        path.join(dir, "meta.json"),
+        JSON.stringify({
+          name: collectionName,
+          description,
+          items: decoded.map((d, i) => ({ file: `${i + 1}.${d.ext}`, type: d.type })),
+          at: Date.now(),
+        }, null, 2),
+      );
+    } catch (e) {
+      res.status(500).json({ ok: false, error: `Could not store the images: ${String(e).slice(0, 120)}` });
+      return;
+    }
+
+    /*
+     * An absolute URI, because this ends up in `tokenURI` and is read by
+     * wallets and marketplaces that have no idea what host the page came from.
+     * A relative path would resolve against whoever is asking.
+     */
+    const base = `${req.protocol}://${req.get("host")}/nft/media/${id}`;
+    res.json({ ok: true, id, base, count: decoded.length });
+  });
+
+  /** The metadata a wallet asks for: `<base>/<n>`, one per item in the drop. */
+  app.get("/nft/media/:id/:n", (req, res) => {
+    const id = String(req.params.id);
+    const n = Number(req.params.n);
+    if (!/^[0-9a-f]{32}$/.test(id) || !Number.isInteger(n) || n < 1) { res.status(404).json({ error: "not found" }); return; }
+    try {
+      const meta = JSON.parse(readFileSync(path.join(MEDIA_DIR, id, "meta.json"), "utf8")) as {
+        name?: string; description?: string; items: { file: string }[];
+      };
+      /*
+       * A drop may have a larger supply than it has images — a hundred editions
+       * of one picture is an ordinary thing to sell. Wrapping is the reading
+       * that never 404s a token somebody legitimately owns.
+       */
+      const item = meta.items[(n - 1) % meta.items.length];
+      if (!item) { res.status(404).json({ error: "not found" }); return; }
+      res.set("cache-control", "public, max-age=300");
+      res.json({
+        name: `${meta.name || "Tessera drop"} #${n}`,
+        description: meta.description || "",
+        image: `${req.protocol}://${req.get("host")}/nft/media/${id}/file/${item.file}`,
+      });
+    } catch {
+      res.status(404).json({ error: "not found" });
+    }
+  });
+
+  /** The bytes themselves. */
+  app.get("/nft/media/:id/file/:file", (req, res) => {
+    const id = String(req.params.id);
+    const file = String(req.params.file);
+    // Names this route generated, and nothing else — no traversal, no dotfiles.
+    if (!/^[0-9a-f]{32}$/.test(id) || !/^[0-9]{1,4}\.(png|jpg|gif|webp)$/.test(file)) {
+      res.status(404).end();
+      return;
+    }
+    const full = path.join(MEDIA_DIR, id, file);
+    const type = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" }[
+      file.split(".").pop() as string
+    ]!;
+    try {
+      const bytes = readFileSync(full);
+      // Never sniffed as anything but the type we checked on the way in.
+      res.set("content-type", type);
+      res.set("x-content-type-options", "nosniff");
+      res.set("cache-control", "public, max-age=31536000, immutable");
+      res.send(bytes);
+    } catch {
+      res.status(404).end();
+    }
+  });
 
   app.get("/api/nft", async (req, res) => {
     if (!launchpadAddr) {

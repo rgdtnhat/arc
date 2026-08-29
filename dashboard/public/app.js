@@ -8883,6 +8883,121 @@ const $ = (id) => document.getElementById(id);
       if ($("nftFilter")) $("nftFilter").addEventListener("change", renderNftRows);
       if ($("nftRefresh")) $("nftRefresh").addEventListener("click", () => loadNft().catch(() => {}));
 
+      /* ---- Artwork: upload it, or bring your own URI -----------------------
+       *
+       * A launchpad that only takes a URI asks every creator to have solved
+       * hosting before they arrive. Both paths end at the same field, because
+       * the contract only ever sees a URI — uploading just fills it in.
+       *
+       * Single and collection are the same drop with a different supply. The
+       * mode exists because "supply" is not the word anybody reaches for when
+       * they mean "one of one", and because a collection wants many images
+       * where a single wants one.
+       */
+      function nftIsCollection() {
+        return $("nftKind") && $("nftKind").value === "collection";
+      }
+
+      function renderNftKind() {
+        const many = nftIsCollection();
+        const files = $("nftFiles");
+        if (files) files.multiple = many;
+        const supply = $("nftSupply");
+        if (supply) {
+          supply.disabled = !many;
+          // A single NFT is one of one — the field says so rather than being a
+          // number somebody has to know to type.
+          if (!many) supply.value = "1";
+          else if (supply.value === "1") supply.value = "";
+          supply.placeholder = many ? "Editions" : "1";
+        }
+        const plural = $("nftFilesPlural");
+        if (plural) plural.textContent = many ? "s" : "";
+        const note = $("nftKindNote");
+        if (note) {
+          note.textContent = many
+            ? "One drop, many editions. Upload one image per edition — item 7 of the drop gets image 7 — or one image for all of them."
+            : "A single token. One image, supply of one.";
+        }
+        const uri = $("nftUri");
+        if (uri) uri.placeholder = many
+          ? "…or a metadata base URI you already host"
+          : "…or a metadata URI you already host";
+        nftPicked = [];
+        if ($("nftFilesPicked")) $("nftFilesPicked").textContent = "";
+        if ($("nftUpload")) $("nftUpload").disabled = true;
+        if ($("nftPreview")) { $("nftPreview").style.display = "none"; $("nftPreview").innerHTML = ""; }
+      }
+
+      let nftPicked = [];
+      if ($("nftKind")) { $("nftKind").addEventListener("change", renderNftKind); renderNftKind(); }
+
+      if ($("nftFiles")) {
+        $("nftFiles").addEventListener("change", async () => {
+          const list = [...($("nftFiles").files || [])];
+          const msg = $("nftSubmitMsg");
+          const say = (t) => { msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = t; };
+          nftPicked = [];
+          // 4 MB each is the server's cap; saying so here beats a rejected
+          // upload after the file has been read and sent.
+          const tooBig = list.find((f) => f.size > 4 * 1024 * 1024);
+          if (tooBig) { say(`${tooBig.name} is ${(tooBig.size / 1e6).toFixed(1)} MB — the cap is 4 MB per image.`); return; }
+          if (list.length > 200) { say("A collection tops out at 200 images."); return; }
+          for (const f of list) {
+            const dataUrl = await new Promise((resolve, reject) => {
+              const r = new FileReader();
+              r.onload = () => resolve(String(r.result));
+              r.onerror = () => reject(r.error);
+              r.readAsDataURL(f);
+            }).catch(() => null);
+            if (dataUrl) nftPicked.push({ name: f.name, dataUrl });
+          }
+          $("nftFilesPicked").textContent = nftPicked.length
+            ? `${nftPicked.length} image${nftPicked.length === 1 ? "" : "s"} ready`
+            : "";
+          $("nftUpload").disabled = !nftPicked.length;
+          const prev = $("nftPreview");
+          if (prev) {
+            prev.style.display = nftPicked.length ? "flex" : "none";
+            prev.innerHTML = nftPicked.slice(0, 12).map((p) =>
+              `<img src="${esc(p.dataUrl)}" alt="" style="width:54px;height:54px;object-fit:cover;border-radius:8px;border:1px solid var(--line)" />`,
+            ).join("") + (nftPicked.length > 12 ? `<span style="font-size:11.5px;color:var(--muted);align-self:center">+${nftPicked.length - 12} more</span>` : "");
+          }
+          if (msg) msg.style.display = "none";
+        });
+      }
+
+      if ($("nftUpload")) {
+        $("nftUpload").addEventListener("click", async () => {
+          const msg = $("nftSubmitMsg");
+          const say = (t, good) => {
+            msg.style.display = "block";
+            msg.style.color = good ? "var(--good)" : "var(--warn)";
+            msg.textContent = t;
+          };
+          if (!nftPicked.length) return say("Choose an image first.");
+          $("nftUpload").disabled = true;
+          say("Uploading…", true);
+          try {
+            const r = await (await postJson("/api/nft/media", {
+              name: $("nftName").value.trim(),
+              items: nftPicked.map((p) => ({ dataUrl: p.dataUrl })),
+            })).json();
+            if (r.ok) {
+              $("nftUri").value = r.base;
+              // Supply follows the upload for a collection: one image per
+              // edition is the common case and typing the count again is a
+              // chance to get it wrong.
+              if (nftIsCollection() && !$("nftSupply").value.trim()) $("nftSupply").value = String(r.count);
+              say(`Hosted ${r.count} image${r.count === 1 ? "" : "s"} — the URI is filled in below.`, true);
+            } else say(r.error || "Upload failed.");
+          } catch {
+            say("The upload request failed.");
+          }
+          $("nftUpload").disabled = false;
+        });
+      }
+
       if ($("nftSubmit")) {
         $("nftSubmit").addEventListener("click", async () => {
           const m = $("nftSubmitMsg");
@@ -8897,15 +9012,22 @@ const $ = (id) => document.getElementById(id);
             price: $("nftPrice").value.trim() || "0",
             supply: Number($("nftSupply").value.trim()),
           };
-          if (!body.name || !body.uri) return say("A drop needs a name and a metadata URI.");
-          if (!Number.isFinite(body.supply) || body.supply < 1) return say("Supply must be a whole number of at least 1.");
+          if (!body.name) return say("A drop needs a name.");
+          if (!body.uri) return say("Upload an image, or paste a metadata URI you already host.");
+          if (!Number.isFinite(body.supply) || body.supply < 1) {
+            return say(nftIsCollection()
+              ? "How many editions? Enter a whole number of at least 1."
+              : "Supply must be a whole number of at least 1.");
+          }
+          if (!nftIsCollection() && body.supply !== 1) return say("A single NFT has a supply of 1.");
           $("nftSubmit").disabled = true;
           try {
             const r = await (await postJson("/api/nft/submit", body)).json();
             if (r.ok) {
               say(`Submitted — an admin decides next. ${txLink(r.txHash)}`, true);
               $("nftName").value = ""; $("nftUri").value = "";
-              $("nftPrice").value = ""; $("nftSupply").value = "";
+              $("nftPrice").value = "";
+              renderNftKind();
               loadNft().catch(() => {});
             } else say(esc(r.error || "Submission failed."));
           } catch {

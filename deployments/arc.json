@@ -61,5 +61,6 @@
   "tesseraPriceGuardLegacy": "0x2809b689299974769b8b82e2884f832c986a02c0",
   "redeployedAt": "2026-08-08T16:13:00.000Z",
   "tesseraSessionKeys": "0xb072581ce190e11d9d7b7ca482cb9eab90625a19",
-  "emissionsRedeployedAt": "2026-08-15T01:20:24.123Z"
+  "emissionsRedeployedAt": "2026-08-15T01:20:24.123Z",
+  "tesseraLaunchpad": "0x8e47B054CA110267832ec906e1314089613163EA"
 }

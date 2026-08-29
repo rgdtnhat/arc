@@ -727,6 +727,29 @@ it a spend path rather than a gallery, so the money rules apply to it:
 | Log what actually moved | The ledger records the drop's own price, read for the record, not the `maxPrice` ceiling the caller authorised. Writing the ceiling would report a spend that did not happen. |
 | Admin fees capped in code | `MAX_FEE_BPS` is 10% and `setFeeBps` refuses more, at construction and afterwards. A fee an admin can set to 100% makes the creator's share a promise rather than a property. |
 
+### Uploaded artwork
+
+`POST /api/nft/media` takes images and serves ERC-721 metadata from the app's
+own origin, which makes the upload path an XSS surface rather than a storage
+one. Three rules keep it closed:
+
+- **SVG is refused.** It is a document, not a picture, and one with a `<script>`
+  in it served same-origin is stored XSS against every visitor who opens the
+  drop. PNG, JPEG, GIF and WebP only.
+- **The bytes must agree with the declared type.** The MIME type is the
+  uploader's word; the magic number is the file's. A `.png` that is really HTML
+  is refused rather than served as an image and sniffed as a document.
+- **Served with `nosniff` and a fixed content type**, from filenames this server
+  generated — `^[0-9]{1,4}\.(png|jpg|gif|webp)$` under a 32-hex directory, so
+  there is no traversal and no dotfile to reach.
+
+It sits behind `requireAuth` (a connected wallet or an admin session), not
+`requireOperator` — submitting a drop is something a visitor does, and it would
+be odd to let them submit and not bring the artwork. It is still a gate: an
+unauthenticated write that puts bytes on disk is a disk-filling primitive.
+4 MB per image, 200 images per collection, content-addressed so the same upload
+twice is the same folder.
+
 The contract never holds the money: payment splits to creator and treasury
 inside the same call, so there is no balance to sweep and no withdrawal function
 to get wrong. `minted` is incremented before any transfer, so a re-entrant

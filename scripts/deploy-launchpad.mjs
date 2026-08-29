@@ -10,11 +10,27 @@
  *   npm run nft:deploy                       # survey
  *   npm run nft:deploy -- --execute
  *   npm run nft:deploy -- --execute --fee 250 --treasury 0x…
+ *   npm run nft:deploy -- --find             # recover a lost address
+ *
+ * ## Where the address is written, and why it is written twice
+ * `deployments/arc.json` is tracked by git, and `scripts/deploy.sh` discards
+ * local edits to `deployments/` in favour of the committed copy — deliberately,
+ * because a stale record there blocks every future pull. So an address written
+ * only to that file survives exactly until the next deploy, which is how a
+ * launchpad that had been deployed came back reading "not deployed on this
+ * network yet".
+ *
+ * The address therefore also goes to `STATE_DIR/arc.local.json`, which lives on
+ * the container's own volume and is nothing to do with git. `mergeDeployment`
+ * applies a key the committed record has never heard of without needing to be
+ * asked, so the local copy carries the deployment until the committed one
+ * catches up — and once it does, the two agree and the local one is ignored.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { createPublicClient, createWalletClient } from "viem";
 import { loadDeployer } from "./deployer.mjs";
 import { arcTestnet as arcChain, pacedHttp, tesseraLaunchpadAbi, tesseraLaunchpadBytecode } from "@tessera/shared";
+import path from "node:path";
 
 const argv = process.argv.slice(2);
 const EXECUTE = argv.includes("--execute");
@@ -49,6 +65,61 @@ console.log(`  USDC       ${USDC}`);
 console.log(`  treasury   ${TREASURY}`);
 console.log(`  fee        ${FEE_BPS} bps (${(FEE_BPS / 100).toFixed(2)}%)`);
 console.log(`  deployer   ${deployerAddress}`);
+
+/**
+ * Recover an address the record lost.
+ *
+ * A contract's address is `keccak(rlp([deployer, nonce]))`, so every address the
+ * deployer has ever created can be recomputed without an indexer, an explorer,
+ * or a log scan. Walk the recent nonces, ask for code, and compare it against
+ * this build's own runtime bytecode.
+ */
+if (argv.includes("--find")) {
+  const { getContractAddress } = await import("viem");
+  const runtime = (await import("@tessera/shared")).tesseraLaunchpadDeployedBytecode?.toLowerCase() ?? null;
+  const depth = Math.max(1, Number(flag("depth") ?? 2000));
+  const nonce = await pub.getTransactionCount({ address: deployerAddress });
+  console.log(`
+  searching ${depth} nonces back from ${nonce} for a launchpad deployed by ${deployerAddress}
+`);
+  const hits = [];
+  for (let hi = nonce - 1; hi >= Math.max(0, nonce - depth); hi -= 10) {
+    const batch = [];
+    for (let n = hi; n > hi - 10 && n >= 0; n--) batch.push(n);
+    const out = await Promise.all(batch.map(async (n) => {
+      const address = getContractAddress({ from: deployerAddress, nonce: BigInt(n) });
+      const code = await pub.getCode({ address }).catch(() => null);
+      return { n, address, code };
+    }));
+    for (const r of out) {
+      if (!r.code || r.code === "0x") continue;
+      /*
+       * Byte-for-byte only when this build matches what was deployed. A
+       * launchpad deployed before a source change is still a launchpad, so it
+       * is reported as a candidate rather than skipped — the views below are
+       * what actually identify it.
+       */
+      const exact = runtime !== null && r.code.toLowerCase() === runtime;
+      let identified = false;
+      try {
+        const nm = await pub.readContract({
+          address: r.address, abi: tesseraLaunchpadAbi, functionName: "name",
+        });
+        identified = nm === "Tessera Launchpad";
+      } catch { /* not this contract */ }
+      if (identified) {
+        hits.push({ ...r, exact });
+        console.log(`  nonce ${String(r.n).padStart(6)}  ${r.address}  ${exact ? "this build" : "an EARLIER build"}`);
+      }
+    }
+  }
+  if (!hits.length) console.log("  nothing found. Try a larger --depth, or deploy a fresh one with --execute.\n");
+  else {
+    console.log(`\n  Add the one you want to deployments/arc.json as "tesseraLaunchpad", commit it,`);
+    console.log(`  and redeploy the app.\n`);
+  }
+  process.exit(0);
+}
 
 const existing = dep.tesseraLaunchpad ?? null;
 if (existing) {
@@ -85,7 +156,32 @@ console.log(`${hash}\n  at ${address}`);
 dep.tesseraLaunchpad = address;
 writeFileSync(RECORD, JSON.stringify(dep, null, 2) + "\n");
 console.log(`\n  wrote tesseraLaunchpad to deployments/arc.json`);
+
+/*
+ * And to the state volume, which `deploy.sh` cannot discard.
+ *
+ * The tracked record is the one that should end up carrying this, but it only
+ * does once somebody commits it — and `deploy.sh` throws away local edits to
+ * `deployments/` in the meantime. Writing here as well means the address
+ * survives the very next deploy rather than the next commit.
+ */
+const stateDir = process.env.STATE_DIR ?? null;
+if (stateDir) {
+  const localPath = path.join(stateDir, "arc.local.json");
+  let local = {};
+  try { local = JSON.parse(readFileSync(localPath, "utf8")); } catch { /* first write */ }
+  local.tesseraLaunchpad = address;
+  try {
+    writeFileSync(localPath, JSON.stringify(local, null, 2) + "\n");
+    console.log(`  wrote tesseraLaunchpad to ${localPath} (survives ./scripts/deploy.sh)`);
+  } catch (e) {
+    console.log(`  could not write ${localPath}: ${String(e).slice(0, 100)}`);
+  }
+} else {
+  console.log("  STATE_DIR is unset, so nothing was written to the state volume.");
+}
+
 console.log(
-  "\n  Commit that file before the next ./scripts/deploy.sh — it discards local edits to\n" +
-    "  deployments/ and takes the committed version, which would drop this address.\n",
+  "\n  Commit deployments/arc.json when you can — the state-volume copy keeps the app\n" +
+    "  working until then, and the two agree once it lands.\n",
 );

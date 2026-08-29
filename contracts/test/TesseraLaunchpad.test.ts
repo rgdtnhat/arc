@@ -202,6 +202,28 @@ describe("TesseraLaunchpad", () => {
     await expect(f.pad.read.tokenURI([99n])).to.be.rejected;
   });
 
+  it("a collection numbers its own items 1..N, whatever the global ids are", async () => {
+    /*
+     * The distinction that matters once a creator uploads a folder of images.
+     * They number them 1..100; the global token id is whatever the launchpad
+     * happened to be at, so a drop that opened second would send a wallet
+     * looking for image 431 in a folder holding a hundred.
+     */
+    const f = await loadFixture(fixture);
+    const first = await approvedDrop(f, 0n, 3);
+    const second = await approvedDrop(f, 0n, 3);
+    const b = await f.as(f.buyer);
+    await b.write.mint([first, f.buyer.account.address, 0n]); // global 1
+    await b.write.mint([second, f.buyer.account.address, 0n]); // global 2
+    await b.write.mint([second, f.buyer.account.address, 0n]); // global 3
+
+    expect(await f.pad.read.tokenURI([1n])).to.equal("ipfs://base/1");
+    // Second drop, first item — not "2".
+    expect(await f.pad.read.tokenURI([2n])).to.equal("ipfs://base/1");
+    expect(await f.pad.read.tokenURI([3n])).to.equal("ipfs://base/2");
+    expect(await f.pad.read.indexInDrop([3n])).to.equal(2);
+  });
+
   it("transfers behave, and only for the holder or an approved spender", async () => {
     const f = await loadFixture(fixture);
     const id = await approvedDrop(f, 0n);
