@@ -5,11 +5,12 @@ import type { ChildProcess } from "node:child_process";
 import { mergeDeployment, explorerFrom, normaliseAssets } from "./deployment.js";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
-import { verifyMessage, verifyTypedData, formatUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
+import { verifyMessage, verifyTypedData, formatUnits, parseUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
 import type { Hex, Chain, Account } from "viem";
 import { randomUUID, createHash } from "node:crypto";
 import {
   formatUsdc,
+  parseUsdcAmount,
   HEADERS,
   PaymentStatus,
   arcTestnet,
@@ -8021,8 +8022,8 @@ async function main() {
       return;
     }
     let priceRaw: bigint;
-    try { priceRaw = baseUnits(String(req.body?.price ?? "0")); }
-    catch { res.status(400).json({ ok: false, error: "Price must be a plain decimal amount of USDC." }); return; }
+    try { priceRaw = usdcUnits(req.body?.price ?? "0"); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
     try {
       const txHash = await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "submit", [name, uri, priceRaw, supply]);
       txlog.record({
@@ -8076,6 +8077,42 @@ async function main() {
   });
 
   /**
+   * Re-price a drop the app wallet created.
+   *
+   * `setDropPrice` is the creator's, not the admin's — the contract enforces
+   * that — so this only ever works for drops this wallet submitted. It exists
+   * because a price is the one field a submission can get wrong and cannot
+   * otherwise fix: the drop is on chain, and there was no way to correct it
+   * from the app. A re-price is safe against buyers because `mint` takes their
+   * own `maxPrice`, so it cannot reach into a transaction already signed at the
+   * old figure.
+   */
+  app.post("/api/nft/price", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
+    let priceRaw: bigint;
+    try { priceRaw = usdcUnits(req.body?.price ?? "0"); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+    try {
+      const txHash = await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "setDropPrice", [BigInt(id), priceRaw]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "reprice",
+        status: "success", txHash, detail: `drop #${id} → ${fmtUnits(priceRaw, 6)} USDC`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({
+        ok: false,
+        // The contract's own rule, said plainly: only the creator re-prices.
+        error: /NotCreator/i.test(String(e))
+          ? "Only the wallet that submitted this drop can change its price."
+          : friendlyError(e),
+      });
+    }
+  });
+
+  /**
    * Mint from the app wallet.
    *
    * `maxPrice` is the price the caller was shown, passed through untouched. It
@@ -8088,8 +8125,8 @@ async function main() {
     const id = Math.floor(Number(req.body?.id));
     if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
     let maxPrice: bigint;
-    try { maxPrice = baseUnits(String(req.body?.maxPrice ?? "")); }
-    catch { res.status(400).json({ ok: false, error: "Send the price you were shown, as a plain decimal." }); return; }
+    try { maxPrice = usdcUnits(req.body?.maxPrice ?? ""); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
 
     /*
      * The guardian cap, at the choke point for this path.
@@ -8750,6 +8787,16 @@ async function main() {
    * hex string gets a number they did not mean rather than the refusal every
    * other malformed amount receives.
    */
+  /*
+   * A price a person typed. `parseUsdcAmount` lives in @tessera/shared beside
+   * `usdc()`; see there for why reading a human figure is not the same job as
+   * scaling a known number, and for the launchpad bug that proved it.
+   *
+   * Deliberately not `baseUnits`, which sits directly below and does the
+   * opposite: it takes an integer already in the token's smallest unit.
+   */
+  const usdcUnits = (v: unknown): bigint => parseUsdcAmount(v);
+
   function baseUnits(v: unknown): bigint {
     const raw = String(v ?? "0").trim();
     if (!/^\d+$/.test(raw)) throw new Error("not base units");

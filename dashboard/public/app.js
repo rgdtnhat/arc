@@ -8902,6 +8902,12 @@ const $ = (id) => document.getElementById(id);
                 actions.push(`<button class="btn" data-nft="approve" data-id="${d.id}">Approve</button>`);
                 actions.push(`<button class="btn" data-nft="reject" data-id="${d.id}">Reject</button>`);
               }
+              // Only the wallet that submitted it — the contract refuses anyone
+              // else, and a button that always fails is worse than none.
+              const me = String(window.__myAddress || "").toLowerCase();
+              if (me && String(d.creator).toLowerCase() === me && d.status !== "rejected") {
+                actions.push(`<button class="btn" data-nft="price" data-id="${d.id}" data-price="${esc(d.price)}">Re-price</button>`);
+              }
               if (admin && d.status === "approved") {
                 actions.push(
                   `<button class="btn" data-nft="pause" data-id="${d.id}" data-paused="${d.paused ? "0" : "1"}">` +
@@ -9175,6 +9181,15 @@ const $ = (id) => document.getElementById(id);
             url = "/api/nft/mint";
             body = { id, maxPrice: btn.dataset.price };
             if (!confirm(`Mint drop #${id} for ${btn.dataset.price} USDC?`)) return;
+          } else if (what === "price") {
+            const next = prompt(
+              `New price for drop #${id}, in USDC.\n\nBuyers are protected either way: a mint carries the ` +
+                `price the buyer was shown, so re-pricing cannot reach a transaction already signed.`,
+              btn.dataset.price,
+            );
+            if (next === null) return;
+            url = "/api/nft/price";
+            body = { id, price: next.trim() };
           } else if (what === "pause") {
             url = "/api/nft/pause";
             body = { id, paused: btn.dataset.paused === "1" };
