@@ -8810,7 +8810,18 @@ const $ = (id) => document.getElementById(id);
         if (!card) return;
         const notReady = $("nftNotReady");
         try {
-          const r = await (await fetch("/api/nft")).json();
+          /*
+           * With the session token. `/api/nft` is a public read, but part of
+           * its answer — whether this session may decide a drop — depends on
+           * who is asking, and a `fetch` with no headers is nobody.
+           *
+           * That is why "Sign in as operator to approve or reject drops"
+           * appeared to somebody who was signed in as operator: the POST that
+           * submitted the drop went through `postJson`, which attaches the
+           * token, and this GET did not. The server was answering the question
+           * it was actually asked.
+           */
+          const r = await (await fetch("/api/nft", { headers: authHeaders() })).json();
           nftState = r;
           if (!r || !r.ok || !r.deployed) {
             if (notReady) {
