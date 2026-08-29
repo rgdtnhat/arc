@@ -110,7 +110,7 @@ const $ = (id) => document.getElementById(id);
        * The hash drives it (#/dashboard, #/defi, …) so links and the browser
        * back button work, and "#" (or no hash) is the landing page.
        * ==================================================================== */
-      const TABS = ["dashboard", "defi", "agents", "wallet", "gov", "other"];
+      const TABS = ["dashboard", "defi", "agents", "nft", "wallet", "gov", "other"];
       // Plain names: the icons live in the drawer markup as SVG now, so the
       // labels no longer smuggle a glyph that would end up in the tab title.
       const NAV_LABELS = {
@@ -186,6 +186,9 @@ const $ = (id) => document.getElementById(id);
           // The wallet's tabs load their own data, so arriving here is just a
           // matter of showing the one that was last open.
           if (route === "wallet" && typeof setWalletTab === "function") setWalletTab(walletTab, { scroll: false });
+          // A loop of contract reads over every drop, so it loads on arrival
+          // rather than on every poll of every other tab.
+          if (route === "nft" && typeof loadNft === "function") loadNft().catch(() => {});
         }
         // The document title is now the only "where am I" indicator besides the
         // drawer's own highlight, which is deliberate — the breadcrumb strip it
@@ -8777,6 +8780,187 @@ const $ = (id) => document.getElementById(id);
         $("myAssetNext").addEventListener("click", () => { assetPage++; loadMyAssets(); });
       }
       setInterval(() => { if (typeof loadMyAssets === "function") loadMyAssets().catch(() => {}); }, 30000);
+
+      /* ---- The NFT launchpad ------------------------------------------------
+       *
+       * Two audiences on one panel. Anybody can submit a drop and watch for a
+       * verdict; an operator additionally sees Approve and Reject on everything
+       * still pending. Which one you are is decided by the server — `admin` is
+       * the launchpad's on-chain owner — rather than by hiding buttons that
+       * would fail anyway.
+       */
+      let nftState = null;
+      /** One figure in the metrics strip, the same shape every other panel uses. */
+      const nftMetric = (k, v) =>
+        `<div class="metric"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+
+      window.loadNft = async function loadNft() {
+        const card = $("nftCard");
+        if (!card) return;
+        const notReady = $("nftNotReady");
+        try {
+          const r = await (await fetch("/api/nft")).json();
+          nftState = r;
+          if (!r || !r.ok || !r.deployed) {
+            if (notReady) {
+              notReady.style.display = "block";
+              notReady.textContent = (r && r.error) ||
+                "The NFT launchpad is not deployed on this network yet.";
+            }
+            $("nftRows").innerHTML = emptyRow(6, "Nothing to show until the launchpad is deployed.");
+            $("nftMeta").innerHTML = "";
+            return;
+          }
+          if (notReady) notReady.style.display = "none";
+          const pct = (Number(r.feeBps) / 100).toFixed(2);
+          $("nftMeta").innerHTML =
+            nftMetric("Drops", String(r.total)) +
+            nftMetric("Protocol fee", pct + "%") +
+            nftMetric("Contract", short(r.address)) +
+            nftMetric("Admin", short(r.admin));
+          renderNftRows();
+        } catch {
+          if (notReady) {
+            notReady.style.display = "block";
+            notReady.textContent = "Could not read the launchpad just now — retrying on the next visit.";
+          }
+        }
+      };
+
+      /** Am I the launchpad's admin in this session? */
+      function nftIsAdmin() {
+        if (!nftState || !nftState.admin) return false;
+        // An operator session acts as the app wallet; a connected wallet acts as
+        // itself. Either can be the owner, and neither is assumed to be.
+        const me = String(window.__myAddress || "").toLowerCase();
+        return Boolean(me) && me === String(nftState.admin).toLowerCase();
+      }
+
+      function renderNftRows() {
+        const body = $("nftRows");
+        if (!body || !nftState || !nftState.drops) return;
+        const want = ($("nftFilter") && $("nftFilter").value) || "all";
+        const rows = nftState.drops.filter((d) => want === "all" || d.status === want);
+        const admin = nftIsAdmin();
+        body.innerHTML = rows.length
+          ? rows.map((d) => {
+              const tone = d.status === "approved" ? "ok" : d.status === "rejected" ? "warn" : "";
+              const label = d.status === "pending" ? "waiting for review" : d.status;
+              const actions = [];
+              if (d.mintable) {
+                actions.push(
+                  `<button class="btn" data-nft="mint" data-id="${d.id}" data-price="${esc(d.price)}">Mint</button>`,
+                );
+              }
+              if (admin && d.status === "pending") {
+                actions.push(`<button class="btn" data-nft="approve" data-id="${d.id}">Approve</button>`);
+                actions.push(`<button class="btn" data-nft="reject" data-id="${d.id}">Reject</button>`);
+              }
+              if (admin && d.status === "approved") {
+                actions.push(
+                  `<button class="btn" data-nft="pause" data-id="${d.id}" data-paused="${d.paused ? "0" : "1"}">` +
+                    `${d.paused ? "Unpause" : "Pause"}</button>`,
+                );
+              }
+              return (
+                `<tr><td><b>${esc(d.name)}</b>` +
+                `<div style="font-size:11px;color:var(--muted)">#${d.id} · ${esc(d.uri)}</div>` +
+                (d.status === "rejected" && d.reason
+                  ? `<div style="font-size:11px;color:var(--warn)">${esc(d.reason)}</div>` : "") +
+                (!d.mintable && d.status === "approved"
+                  ? `<div style="font-size:11px;color:var(--muted)">${esc(d.why)}</div>` : "") +
+                `</td>` +
+                `<td class="mono" style="font-size:11px">${esc(short(d.creator))}</td>` +
+                `<td class="num mono">${esc(d.price)} USDC</td>` +
+                `<td class="num mono">${d.minted} / ${d.supply}</td>` +
+                `<td><span class="tag ${tone}">${esc(label)}</span></td>` +
+                `<td class="num">${actions.join(" ")}</td></tr>`
+              );
+            }).join("")
+          : emptyRow(6, want === "all" ? "No drops submitted yet." : `No ${want} drops.`);
+      }
+
+      if ($("nftFilter")) $("nftFilter").addEventListener("change", renderNftRows);
+      if ($("nftRefresh")) $("nftRefresh").addEventListener("click", () => loadNft().catch(() => {}));
+
+      if ($("nftSubmit")) {
+        $("nftSubmit").addEventListener("click", async () => {
+          const m = $("nftSubmitMsg");
+          const say = (t, good) => {
+            m.style.display = "block";
+            m.style.color = good ? "var(--good)" : "var(--warn)";
+            m.innerHTML = t;
+          };
+          const body = {
+            name: $("nftName").value.trim(),
+            uri: $("nftUri").value.trim(),
+            price: $("nftPrice").value.trim() || "0",
+            supply: Number($("nftSupply").value.trim()),
+          };
+          if (!body.name || !body.uri) return say("A drop needs a name and a metadata URI.");
+          if (!Number.isFinite(body.supply) || body.supply < 1) return say("Supply must be a whole number of at least 1.");
+          $("nftSubmit").disabled = true;
+          try {
+            const r = await (await postJson("/api/nft/submit", body)).json();
+            if (r.ok) {
+              say(`Submitted — an admin decides next. ${txLink(r.txHash)}`, true);
+              $("nftName").value = ""; $("nftUri").value = "";
+              $("nftPrice").value = ""; $("nftSupply").value = "";
+              loadNft().catch(() => {});
+            } else say(esc(r.error || "Submission failed."));
+          } catch {
+            say("Submission request failed.");
+          }
+          $("nftSubmit").disabled = false;
+        });
+      }
+
+      if ($("nftRows")) {
+        // Delegated: the rows are rebuilt on every load and filter change, so a
+        // listener bound to a button would be thrown away with it.
+        $("nftRows").addEventListener("click", async (ev) => {
+          const btn = ev.target.closest("[data-nft]");
+          if (!btn) return;
+          const what = btn.dataset.nft;
+          const id = Number(btn.dataset.id);
+          const m = $("nftMsg");
+          const say = (t, good) => {
+            m.style.display = "block";
+            m.style.color = good ? "var(--good)" : "var(--warn)";
+            m.innerHTML = t;
+          };
+          let url = "/api/nft/decide";
+          let body = { id, verdict: what };
+          if (what === "reject") {
+            const reason = prompt("Why is this drop rejected? The submitter sees this.", "");
+            if (reason === null) return;
+            body.reason = reason;
+          } else if (what === "mint") {
+            /*
+             * The price the row was showing, not one re-read at send time.
+             * That is the whole point: the contract refuses anything above the
+             * figure the buyer agreed to, and re-reading here would agree to
+             * whatever the creator had set a moment ago.
+             */
+            url = "/api/nft/mint";
+            body = { id, maxPrice: btn.dataset.price };
+            if (!confirm(`Mint drop #${id} for ${btn.dataset.price} USDC?`)) return;
+          } else if (what === "pause") {
+            url = "/api/nft/pause";
+            body = { id, paused: btn.dataset.paused === "1" };
+          }
+          btn.disabled = true;
+          try {
+            const r = await (await postJson(url, body)).json();
+            if (r.ok) say(`Done. ${txLink(r.txHash)}`, true);
+            else say(esc(r.error || "That did not go through."));
+          } catch {
+            say("The request failed.");
+          }
+          btn.disabled = false;
+          loadNft().catch(() => {});
+        });
+      }
 
       /* ---- Governance sub-tabs ---------------------------------------------
        *

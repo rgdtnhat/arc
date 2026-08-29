@@ -712,6 +712,28 @@ re-runs ~26 probes per contract into the rate limit it is about to trip.
 - **Fee rounding direction**: the app's cut is rounded down and the LP cut takes
   the remainder, so an odd wei always lands with liquidity providers.
 
+## The NFT launchpad
+
+`TesseraLaunchpad` is a curated drop board: `submit` is permissionless and mints
+nothing, `approveDrop` is owner-only and is the only path to a mintable drop,
+and `mint` moves USDC from a buyer to a stranger. That last fact is what makes
+it a spend path rather than a gallery, so the money rules apply to it:
+
+| Rule | How it is kept |
+|---|---|
+| Escrow only what was vetted | `mint(id, to, maxPrice)` reverts above `maxPrice`. A creator may re-price their own drop at any time; without this they could watch a mint in the mempool, raise the price, and be paid the higher one out of a wallet that never agreed to it. The server passes through the price the caller was **shown** and never re-reads it at send time — re-reading would agree to whatever had just been set. |
+| Every spend passes the policy gate | An operator mint spends `AGENT_PRIVATE_KEY`, so `/api/nft/mint` checks the amount against the guardian cap **before** granting any allowance. An approval left standing over a refused cap would be a spend waiting to happen. |
+| Spending endpoints are operator-only | `/api/nft/submit`, `/api/nft/decide`, `/api/nft/pause` and `/api/nft/mint` are all behind `requireOperator`. `GET /api/nft` is public, because reading a drop board is. A visitor with their own wallet needs none of them — the browser holds selectors for `submit` and `mint`. |
+| Log what actually moved | The ledger records the drop's own price, read for the record, not the `maxPrice` ceiling the caller authorised. Writing the ceiling would report a spend that did not happen. |
+| Admin fees capped in code | `MAX_FEE_BPS` is 10% and `setFeeBps` refuses more, at construction and afterwards. A fee an admin can set to 100% makes the creator's share a promise rather than a property. |
+
+The contract never holds the money: payment splits to creator and treasury
+inside the same call, so there is no balance to sweep and no withdrawal function
+to get wrong. `minted` is incremented before any transfer, so a re-entrant
+receiver cannot mint past the supply, and rejection is final — un-approving a
+drop after somebody minted from it would leave their token a claim on a drop the
+admin had disowned.
+
 ## Secrets policy
 
 - Private keys, the admin password, and the app wallet key are **never committed**

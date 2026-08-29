@@ -47,7 +47,7 @@ import {
   tesseraRouterBytecode,
   tesseraFeeCollectorBytecode,
   tesseraAmmBytecode,
-} from "@tessera/shared";
+  tesseraLaunchpadAbi,} from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { faucetFromEnv, FAUCET_ASSETS, type FaucetAsset } from "./circle/faucet.js";
 import { createProviderApp, type ProviderEvent } from "@tessera/providers";
@@ -377,6 +377,10 @@ const CLIENT_SELECTORS = Object.fromEntries(
     ammSwap: "function swap(uint256,address,address,uint256,uint256)",
     ammAdd: "function addLiquidity(uint256,uint256[],uint256)",
     ammRemove: "function removeLiquidity(uint256,uint256,uint256[])",
+    // The launchpad, so a visitor submits and mints from their own wallet
+    // rather than asking the operator to spend on their behalf.
+    nftSubmit: "function submit(string,string,uint256,uint32)",
+    nftMint: "function mint(uint256,address,uint256)",
     ammShares: "function sharesOf(uint256,address)",
   }).map(([k, sig]) => [k, toFunctionSelector(sig)]),
 );
@@ -7672,6 +7676,246 @@ async function main() {
       guardBusy = false;
     }
   }, GUARD_MS).unref();
+
+  /**
+   * Send from the app wallet, with the same gas margin `OwnerClient` uses.
+   *
+   * These calls are permissionless and self-scoped — a submission, a mint the
+   * agent pays for itself — so they need the agent's key rather than the
+   * owner's. Every route that reaches it is behind `requireOperator`.
+   */
+  const asAgentWrite = async (address: Hex, abi: unknown, fn: string, args: unknown[]): Promise<Hex> => {
+    const est = await client.public
+      .estimateContractGas({ address, abi: abi as never, functionName: fn as never, args: args as never, account: client.account })
+      .catch(() => 500_000n);
+    const hash = await client.wallet.writeContract({
+      address, abi: abi as never, functionName: fn as never, args: args as never,
+      account: client.account, chain: client.wallet.chain,
+      gas: (est * 3n) / 2n + 50_000n,
+    } as never);
+    const receipt = await client.public.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success") throw new Error(`${fn} reverted (${hash})`);
+    return hash;
+  };
+
+  /* ---- The NFT launchpad ------------------------------------------------ */
+
+  /**
+   * A curated drop board: anybody submits, an admin approves or rejects, an
+   * approved drop mints for a price in USDC.
+   *
+   * ## Which of the money rules apply, and how
+   * Minting moves USDC, so this is a spend path and the invariants bite:
+   *
+   *  · **Escrow only what was vetted.** The chain enforces it rather than this
+   *    server: `mint` takes the buyer's `maxPrice` and reverts above it, so a
+   *    creator who re-prices between the quote and the transaction is refused
+   *    by the contract. The route below passes the price the caller was shown,
+   *    never the price it re-reads at send time — re-reading would defeat the
+   *    whole mechanism by agreeing to whatever the creator had just set.
+   *  · **Every spend passes the policy gate.** An operator mint spends
+   *    `AGENT_PRIVATE_KEY`, so it is checked against the same guardian cap as
+   *    any other autonomous spend before anything is signed.
+   *  · **Operator-only for anything that signs.** Reads are public; submitting,
+   *    deciding and minting from the app wallet are all behind
+   *    `requireOperator`. A visitor with their own wallet does not need any of
+   *    them — the browser holds selectors for `submit` and `mint`.
+   *  · **Log what moved.** Every send records what the chain actually charged.
+   */
+  const launchpadAddr = ((liveDeployment as Record<string, unknown>).tesseraLaunchpad as Hex) ?? null;
+  const NFT_NOT_DEPLOYED = "The NFT launchpad is not deployed on this network yet — run `npm run nft:deploy -- --execute`.";
+
+  /** One drop, as the page shows it. */
+  const readDrop = async (id: bigint) => {
+    const d = (await client.public.readContract({
+      address: launchpadAddr!, abi: tesseraLaunchpadAbi, functionName: "drops", args: [id],
+    })) as readonly [Hex, bigint, number, number, number, boolean, string, string, string];
+    const [ok, why] = (await client.public.readContract({
+      address: launchpadAddr!, abi: tesseraLaunchpadAbi, functionName: "mintable", args: [id],
+    })) as readonly [boolean, string];
+    const status = ["pending", "approved", "rejected"][Number(d[4])] ?? "pending";
+    return {
+      id: Number(id),
+      creator: d[0],
+      priceRaw: d[1].toString(),
+      price: fmtUnits(d[1], 6),
+      supply: Number(d[2]),
+      minted: Number(d[3]),
+      status,
+      paused: d[5],
+      name: d[6],
+      uri: d[7],
+      reason: d[8],
+      mintable: ok,
+      why,
+    };
+  };
+
+  app.get("/api/nft", async (req, res) => {
+    if (!launchpadAddr) {
+      res.json({ ok: true, deployed: false, error: NFT_NOT_DEPLOYED, drops: [] });
+      return;
+    }
+    try {
+      const [count, feeBps, treasury, padOwner] = await Promise.all([
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropCount" }) as Promise<bigint>,
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "feeBps" }) as Promise<number>,
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "treasury" }) as Promise<Hex>,
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "owner" }) as Promise<Hex>,
+      ]);
+      // Newest first, and bounded: a launchpad with ten thousand drops must not
+      // make the panel a log scan.
+      const total = Number(count);
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 60)));
+      const ids: bigint[] = [];
+      for (let i = total - 1; i >= 0 && ids.length < limit; i--) ids.push(BigInt(i));
+      const drops = await Promise.all(ids.map(readDrop));
+      res.json({
+        ok: true, deployed: true, address: launchpadAddr, feeBps: Number(feeBps), treasury,
+        admin: padOwner, total, drops,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), drops: [] });
+    }
+  });
+
+  /** Submit a drop from the app wallet. A visitor signs their own instead. */
+  app.post("/api/nft/submit", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    const name = String(req.body?.name ?? "").trim().slice(0, 300);
+    const uri = String(req.body?.uri ?? "").trim().slice(0, 300);
+    const supply = Math.floor(Number(req.body?.supply ?? 0));
+    if (!name || !uri) { res.status(400).json({ ok: false, error: "A drop needs a name and a metadata URI." }); return; }
+    if (!Number.isFinite(supply) || supply < 1 || supply > 4_294_967_295) {
+      res.status(400).json({ ok: false, error: "Supply must be a whole number of at least 1." });
+      return;
+    }
+    let priceRaw: bigint;
+    try { priceRaw = baseUnits(String(req.body?.price ?? "0")); }
+    catch { res.status(400).json({ ok: false, error: "Price must be a plain decimal amount of USDC." }); return; }
+    try {
+      const txHash = await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "submit", [name, uri, priceRaw, supply]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "submit",
+        status: "success", txHash, detail: `${name} — ${supply} at ${fmtUnits(priceRaw, 6)} USDC`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Approve or reject a pending drop. The admin's decision, and it is final. */
+  app.post("/api/nft/decide", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    const verdict = String(req.body?.verdict ?? "");
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
+    if (verdict !== "approve" && verdict !== "reject") {
+      res.status(400).json({ ok: false, error: "verdict must be approve or reject" });
+      return;
+    }
+    const reason = String(req.body?.reason ?? "").slice(0, 300);
+    try {
+      const txHash = verdict === "approve"
+        ? await owner.write(launchpadAddr, tesseraLaunchpadAbi, "approveDrop", [BigInt(id)])
+        : await owner.write(launchpadAddr, tesseraLaunchpadAbi, "rejectDrop", [BigInt(id), reason]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: `drop ${verdict}`,
+        status: "success", txHash, detail: `drop #${id}${reason ? ` — ${reason}` : ""}`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Pause or restart a drop. The admin's kill switch over any drop. */
+  app.post("/api/nft/pause", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
+    try {
+      const txHash = await owner.write(launchpadAddr, tesseraLaunchpadAbi, "setDropPaused", [BigInt(id), Boolean(req.body?.paused)]);
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Mint from the app wallet.
+   *
+   * `maxPrice` is the price the caller was shown, passed through untouched. It
+   * is deliberately *not* re-read here: re-reading and sending the fresh price
+   * would agree to whatever the creator had set a block earlier, which is the
+   * exact substitution the contract's `maxPrice` exists to refuse.
+   */
+  app.post("/api/nft/mint", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
+    let maxPrice: bigint;
+    try { maxPrice = baseUnits(String(req.body?.maxPrice ?? "")); }
+    catch { res.status(400).json({ ok: false, error: "Send the price you were shown, as a plain decimal." }); return; }
+
+    /*
+     * The guardian cap, at the choke point for this path.
+     *
+     * A mint spends the operator's USDC on a stranger's drop, so it is exactly
+     * the kind of autonomous spend the cap exists for. Checked before the
+     * allowance is granted, not after — an approval left standing over a cap
+     * this refused would be a spend waiting to happen.
+     */
+    const cap = policy.autoApproveMax;
+    if (maxPrice > cap) {
+      res.status(400).json({
+        ok: false,
+        error:
+          `That mint costs ${fmtUnits(maxPrice, 6)} USDC, over the guardian cap of ${fmtUnits(cap, 6)} USDC ` +
+          `per autonomous spend. Raise the cap in App Config, or mint it from your own wallet.`,
+      });
+      return;
+    }
+
+    try {
+      const to = /^0x[0-9a-fA-F]{40}$/.test(String(req.body?.to ?? ""))
+        ? (String(req.body.to) as Hex)
+        : (agentAccount.address as Hex);
+      if (maxPrice > 0n) {
+        // Exactly what this mint may cost, and no more: an allowance is a
+        // standing permission, so it is sized to the one call that needs it.
+        await asAgentWrite(usdcAddress as Hex, erc20Abi, "approve", [launchpadAddr, maxPrice]);
+      }
+      /*
+       * What the drop charges at the moment of the send, read once for the
+       * ledger. `maxPrice` is the ceiling the caller agreed to and the contract
+       * charges the drop's own price, which can be lower — writing the ceiling
+       * into the log would report a spend that did not happen. The contract
+       * still refuses anything above `maxPrice`, so this read is for the record
+       * and never for the decision.
+       */
+      const priced = (await client.public.readContract({
+        address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "drops", args: [BigInt(id)],
+      })) as readonly [Hex, bigint, number, number, number, boolean, string, string, string];
+      const paid = priced[1] <= maxPrice ? priced[1] : maxPrice;
+      const txHash = await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "mint", [BigInt(id), to, maxPrice]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "mint",
+        // What actually moved, not what was budgeted: `maxPrice` is a ceiling,
+        // and the contract charges the drop's price. Read the receipt's own
+        // figure so the ledger cannot overstate a spend.
+        status: "success", txHash, asset: "USDC",
+        amount: `${fmtUnits(paid, 6)} USDC`, valueRaw: paid.toString(),
+        detail: `drop #${id} → ${to.slice(0, 10)}…`,
+      });
+      res.json({ ok: true, txHash, to });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
 
   /* ---- The wallet, and standing instructions --------------------------- */
 

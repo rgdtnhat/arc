@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v168" />
+    <meta name="tessera-shell" content="tessera-v169" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1101,6 +1101,12 @@
               <path d="M12 3.4 4.2 7.2v1.4h15.6V7.2Z"/><path d="M6.4 10.4v6.2M10.1 10.4v6.2M13.9 10.4v6.2M17.6 10.4v6.2"/>
               <path d="M3.8 19.2h16.4"/>
             </svg></span><span class="navLbl">Governance</span>
+          </button>
+          <button class="btn" data-nav="nft" title="NFT launchpad" aria-label="NFT launchpad">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3.6" y="3.6" width="16.8" height="16.8" rx="3.2"/>
+              <path d="m6.4 16.2 3.6-4.4 2.6 3.1 2-2.3 3 3.6"/><circle cx="9.1" cy="8.6" r="1.35"/>
+            </svg></span><span class="navLbl">NFT launchpad</span>
           </button>
           <button class="btn" data-nav="wallet" title="Wallet" aria-label="Wallet">
             <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -3335,6 +3341,50 @@
         </div><!-- /#paneGov -->
 
         <!-- ---------- TREASURY & SYSTEM ---------- -->
+        <!-- ---------- NFT LAUNCHPAD ---------- -->
+        <div class="tabPane" id="paneNft" hidden>
+          <div class="card" id="nftCard">
+            <h2>🖼 NFT launchpad — submit a drop, an admin decides</h2>
+            <div class="notready" id="nftNotReady" style="display:none"></div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Anyone may submit a drop; nothing mints until an admin approves it. An approved drop mints for a
+              price in USDC that goes straight to its creator, minus the protocol fee — the contract never holds
+              the money. You state the price you agreed to when you mint, so a creator who re-prices mid-flight
+              is refused rather than paid.
+            </div>
+            <div class="metrics tight" id="nftMeta" style="margin-bottom:16px"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:4px 0 9px">Submit a drop</div>
+            <div class="row-actions" style="flex-wrap:wrap">
+              <input id="nftName" class="field" placeholder="Collection name" style="width:190px" maxlength="300" />
+              <input id="nftUri" class="field" placeholder="Metadata base URI (ipfs://…)" style="width:250px" maxlength="300" />
+              <input id="nftPrice" class="field" inputmode="decimal" placeholder="Price (USDC)" style="width:130px" />
+              <input id="nftSupply" class="field" inputmode="numeric" placeholder="Supply" style="width:100px" />
+              <button class="btn primary" id="nftSubmit">Submit for review</button>
+            </div>
+            <div class="kv" id="nftSubmitMsg" style="margin-top:9px;display:none"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">Drops</div>
+            <div class="row-actions" style="margin-bottom:9px">
+              <select id="nftFilter" class="field">
+                <option value="all">All</option>
+                <option value="pending">Waiting for review</option>
+                <option value="approved">Approved</option>
+                <option value="rejected">Rejected</option>
+              </select>
+              <button class="btn" id="nftRefresh">Refresh</button>
+            </div>
+            <div class="tblWrap auto"><table class="data">
+              <thead><tr>
+                <th>Drop</th><th>Creator</th><th class="num">Price</th><th class="num">Minted</th>
+                <th>Status</th><th></th>
+              </tr></thead>
+              <tbody id="nftRows"></tbody>
+            </table></div>
+            <div class="kv" id="nftMsg" style="margin-top:11px;display:none"></div>
+          </div>
+        </div>
+
         <div class="tabPane" id="paneOther" hidden>
           <div class="card">
             <h2>Treasury &amp; faucet — working capital</h2>
