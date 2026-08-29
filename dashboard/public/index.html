@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v170" />
+    <meta name="tessera-shell" content="tessera-v171" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -1579,6 +1579,15 @@
                 <button class="btn primary" id="lnEmClaim">Claim</button>
               </div>
               <div class="kv" id="lnEmNote" style="margin-top:8px"></div>
+              <!-- "Pot" and "owed" are the two words every line below uses, and
+                   neither is obvious. Saying them once here saves reading the
+                   paragraph twice. -->
+              <p class="feedNote" style="margin-top:6px">
+                <b>Pot</b> is the TSRA this contract is holding. <b>Owed</b> is what people have already
+                earned and not yet claimed — a debt against that pot, not a second pile of tokens. When
+                owed catches up with the pot there is nothing spare, so emission stops until it is topped
+                up; what you have earned stays yours either way.
+              </p>
               <!-- The balance left on the contract this one replaced. Hidden
                    unless there is one, because for most wallets there is not. -->
               <div id="lnEmLegacy" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--line-strong);border-radius:12px">
@@ -3362,15 +3371,30 @@
               </select>
               <span id="nftKindNote" style="font-size:11.5px;color:var(--muted)"></span>
             </div>
-            <div class="row-actions" style="flex-wrap:wrap">
-              <input id="nftName" class="field" placeholder="Name" style="width:190px" maxlength="300" />
-              <input id="nftPrice" class="field" inputmode="decimal" placeholder="Price (USDC)" style="width:130px" />
-              <input id="nftSupply" class="field" inputmode="numeric" placeholder="Supply" style="width:100px" value="1" />
+            <!-- Labelled, because a placeholder disappears the moment there is a
+                 value in the box. Two fields both reading "1" with no label is
+                 not a form, it is a quiz. -->
+            <div class="row-actions" style="flex-wrap:wrap;align-items:flex-end">
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Name
+                <input id="nftName" class="field" placeholder="What is it called?" style="width:190px" maxlength="300" />
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Price per mint (USDC)
+                <input id="nftPrice" class="field" inputmode="decimal" placeholder="0 for free" style="width:150px" />
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                <span id="nftSupplyLabel">Supply</span>
+                <input id="nftSupply" class="field" inputmode="numeric" placeholder="1" style="width:110px" value="1" />
+              </label>
             </div>
             <!-- Artwork: upload it here, or bring a URI you already host. Either
                  fills the same field, because the contract only ever sees a URI. -->
             <div class="row-actions" style="flex-wrap:wrap;margin-top:9px">
               <label class="btn" for="nftFiles" style="cursor:pointer">Choose image<span id="nftFilesPlural"></span></label>
+              <span style="font-size:11px;color:var(--muted)">Large photos are resized to fit before they are sent.
+                Uploads are hosted here, which is convenient rather than permanent — for artwork that must
+                outlive this site, host it yourself and paste the URI instead.</span>
               <input id="nftFiles" type="file" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none" />
               <button class="btn" id="nftUpload" disabled>Upload</button>
               <span id="nftFilesPicked" style="font-size:11.5px;color:var(--muted)"></span>

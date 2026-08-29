@@ -750,6 +750,14 @@ unauthenticated write that puts bytes on disk is a disk-filling primitive.
 4 MB per image, 200 images per collection, content-addressed so the same upload
 twice is the same folder.
 
+**Where the art actually lives.** Uploaded images sit in `STATE_DIR/nft-media`,
+on the container's volume, and are served from this app's own domain. That is
+convenient and it is not permanence: a drop's `tokenURI` points at this host, so
+if the volume is recreated or the site goes away, the token survives on chain and
+its picture does not. A creator who needs the artwork to outlive the deployment
+should host it themselves — IPFS, Arweave, anywhere content-addressed — and paste
+that URI instead. The form takes either, and says so.
+
 The contract never holds the money: payment splits to creator and treasury
 inside the same call, so there is no balance to sweep and no withdrawal function
 to get wrong. `minted` is incremented before any transfer, so a re-entrant

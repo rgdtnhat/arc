@@ -8547,8 +8547,19 @@ const $ = (id) => document.getElementById(id);
         const owed = BigInt(rw.owedRaw || "0");
         if (held === 0n) return "the reward pot is empty.";
         if (owed >= held) {
-          return `the pot holds ${rw.balance} ${rw.symbol} but ${rw.owed} is already owed to claimants, ` +
-            "so there is nothing spare to keep emitting.";
+          /*
+           * "Owed" needs saying in words, not just as a number.
+           *
+           * It is the standing debt of the emissions contract: rewards people
+           * have already earned and not yet claimed. Beside a pot of the same
+           * size it is the whole explanation for the pause — every token there
+           * is already spoken for — and a reader who does not know that reads
+           * two identical figures and a stop, which looks like a fault rather
+           * than the accounting working.
+           */
+          return `the pot holds ${rw.balance} ${rw.symbol} and ${rw.owed} of that is already owed — ` +
+            "earned by people who have not claimed it yet — so every token there is spoken for and " +
+            "there is nothing spare to keep emitting.";
         }
         return "the pot no longer covers the current rates for long enough.";
       }
@@ -8906,11 +8917,17 @@ const $ = (id) => document.getElementById(id);
         if (supply) {
           supply.disabled = !many;
           // A single NFT is one of one — the field says so rather than being a
-          // number somebody has to know to type.
+          // number somebody has to know to type. Greyed rather than merely
+          // unresponsive: a box that ignores typing and looks editable reads as
+          // broken, which is exactly how it was reported.
+          supply.style.opacity = many ? "" : "0.55";
+          supply.title = many ? "" : "A single NFT is one of one — switch to Collection to mint more than one.";
           if (!many) supply.value = "1";
           else if (supply.value === "1") supply.value = "";
-          supply.placeholder = many ? "Editions" : "1";
+          supply.placeholder = many ? "How many?" : "1";
         }
+        const supplyLabel = $("nftSupplyLabel");
+        if (supplyLabel) supplyLabel.textContent = many ? "Editions" : "Supply (fixed at 1)";
         const plural = $("nftFilesPlural");
         if (plural) plural.textContent = many ? "s" : "";
         const note = $("nftKindNote");
@@ -8930,6 +8947,59 @@ const $ = (id) => document.getElementById(id);
       }
 
       let nftPicked = [];
+
+      /**
+       * Shrink a picture in the browser before it is ever sent.
+       *
+       * A phone camera produces 4–12 MB files, and the server's cap is 4 MB per
+       * image — so the honest options were "refuse most photographs" or "resize
+       * them". Uploading eight megabytes to display a thumbnail is wasteful
+       * anyway, on a connection the reader is probably paying for.
+       *
+       * Longest edge to 1600px, re-encoded as JPEG at 0.85, which is
+       * indistinguishable at any size this is displayed and lands around
+       * 200–400 KB. Images already smaller than the limit in both dimensions
+       * are passed through untouched rather than re-encoded — re-encoding a
+       * small PNG would lose its transparency for nothing.
+       */
+      const NFT_MAX_EDGE = 1600;
+      const NFT_MAX_BYTES = 4 * 1024 * 1024;
+      function nftShrink(file) {
+        return new Promise((resolve) => {
+          const read = new FileReader();
+          read.onerror = () => resolve(null);
+          read.onload = () => {
+            const dataUrl = String(read.result);
+            const img = new Image();
+            img.onerror = () => resolve(null);
+            img.onload = () => {
+              const longest = Math.max(img.width, img.height);
+              // Small enough already, and under the cap: leave it alone.
+              if (longest <= NFT_MAX_EDGE && file.size <= NFT_MAX_BYTES) {
+                resolve({ name: file.name, dataUrl, resized: false });
+                return;
+              }
+              const scale = Math.min(1, NFT_MAX_EDGE / longest);
+              const c = document.createElement("canvas");
+              c.width = Math.max(1, Math.round(img.width * scale));
+              c.height = Math.max(1, Math.round(img.height * scale));
+              const ctx = c.getContext("2d");
+              if (!ctx) { resolve(null); return; }
+              ctx.drawImage(img, 0, 0, c.width, c.height);
+              try {
+                resolve({ name: file.name, dataUrl: c.toDataURL("image/jpeg", 0.85), resized: true });
+              } catch {
+                // A canvas tainted by something cross-origin cannot be read
+                // back. Nothing here is cross-origin, but failing loudly beats
+                // sending the original and being refused by the server.
+                resolve(null);
+              }
+            };
+            img.src = dataUrl;
+          };
+          read.readAsDataURL(file);
+        });
+      }
       if ($("nftKind")) { $("nftKind").addEventListener("change", renderNftKind); renderNftKind(); }
 
       if ($("nftFiles")) {
@@ -8938,22 +9008,22 @@ const $ = (id) => document.getElementById(id);
           const msg = $("nftSubmitMsg");
           const say = (t) => { msg.style.display = "block"; msg.style.color = "var(--warn)"; msg.textContent = t; };
           nftPicked = [];
-          // 4 MB each is the server's cap; saying so here beats a rejected
-          // upload after the file has been read and sent.
-          const tooBig = list.find((f) => f.size > 4 * 1024 * 1024);
-          if (tooBig) { say(`${tooBig.name} is ${(tooBig.size / 1e6).toFixed(1)} MB — the cap is 4 MB per image.`); return; }
           if (list.length > 200) { say("A collection tops out at 200 images."); return; }
-          for (const f of list) {
-            const dataUrl = await new Promise((resolve, reject) => {
-              const r = new FileReader();
-              r.onload = () => resolve(String(r.result));
-              r.onerror = () => reject(r.error);
-              r.readAsDataURL(f);
-            }).catch(() => null);
-            if (dataUrl) nftPicked.push({ name: f.name, dataUrl });
+          if (list.length) {
+            $("nftFilesPicked").textContent = `Reading ${list.length} image${list.length === 1 ? "" : "s"}…`;
           }
+          let resized = 0;
+          const refused = [];
+          for (const f of list) {
+            const out = await nftShrink(f);
+            if (!out) { refused.push(f.name); continue; }
+            if (out.resized) resized++;
+            nftPicked.push(out);
+          }
+          if (refused.length) say(`Could not read ${refused.join(", ")} — is it really an image?`);
           $("nftFilesPicked").textContent = nftPicked.length
-            ? `${nftPicked.length} image${nftPicked.length === 1 ? "" : "s"} ready`
+            ? `${nftPicked.length} image${nftPicked.length === 1 ? "" : "s"} ready` +
+              (resized ? ` · ${resized} resized to fit` : "")
             : "";
           $("nftUpload").disabled = !nftPicked.length;
           const prev = $("nftPreview");
@@ -8983,16 +9053,19 @@ const $ = (id) => document.getElementById(id);
               name: $("nftName").value.trim(),
               items: nftPicked.map((p) => ({ dataUrl: p.dataUrl })),
             })).json();
-            if (r.ok) {
+            if (r && r.ok) {
               $("nftUri").value = r.base;
               // Supply follows the upload for a collection: one image per
               // edition is the common case and typing the count again is a
               // chance to get it wrong.
               if (nftIsCollection() && !$("nftSupply").value.trim()) $("nftSupply").value = String(r.count);
               say(`Hosted ${r.count} image${r.count === 1 ? "" : "s"} — the URI is filled in below.`, true);
-            } else say(r.error || "Upload failed.");
-          } catch {
-            say("The upload request failed.");
+            } else say((r && r.error) || "Upload failed.");
+          } catch (e) {
+            // Say what actually went wrong. "The upload request failed" was the
+            // one sentence that gave the reader nothing to act on, and it was
+            // covering a 413 the whole time.
+            say(`The upload did not go through: ${String((e && e.message) || e).slice(0, 140)}`);
           }
           $("nftUpload").disabled = false;
         });

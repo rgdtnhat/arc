@@ -878,7 +878,43 @@ async function main() {
   });
 
   app.use(express.static(dashboardDir));
+  /*
+   * Artwork gets its own parser, and it has to be mounted above the global one.
+   *
+   * `express.json` consumes the request stream, so the first parser to match
+   * wins: a 64kb limit in front of a 48mb route means every real photograph is
+   * refused with a 413 before the route it was addressed to ever runs. Mounting
+   * a larger limit *inside* the route — which is what this did first — is a
+   * no-op for exactly that reason, and it surfaced as "The upload request
+   * failed" on any image a phone had actually taken.
+   *
+   * Scoped to the one path that needs it. Everything else keeps the 64kb
+   * ceiling, because a body limit is a denial-of-service control and widening
+   * it globally to serve one route would be the wrong trade.
+   */
+  app.use("/api/nft/media", express.json({ limit: "48mb" }));
   app.use(express.json({ limit: "64kb" }));
+
+  /**
+   * A body that was too big, said in words.
+   *
+   * `express.json` throws a 413 with an HTML body, which reaches the page as a
+   * failed `res.json()` and reads as "the request failed" — the one explanation
+   * that gives the reader nothing to do about it.
+   */
+  app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const e = err as { type?: string; status?: number };
+    if (e?.type === "entity.too.large" || e?.status === 413) {
+      res.status(413).json({
+        ok: false,
+        error: req.path.startsWith("/api/nft/media")
+          ? "That image is too large to upload. The cap is 4 MB per image — try a smaller one."
+          : "That request body is too large.",
+      });
+      return;
+    }
+    next(err);
+  });
 
   /*
    * A ceiling on how fast one address may ask.
@@ -7795,7 +7831,7 @@ async function main() {
    * not to let them bring the artwork. It is still a gate — an unauthenticated
    * write that puts bytes on disk is a disk-filling primitive.
    */
-  app.post("/api/nft/media", requireAuth, express.json({ limit: "48mb" }), async (req, res) => {
+  app.post("/api/nft/media", requireAuth, async (req, res) => {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     if (!items.length) { res.status(400).json({ ok: false, error: "No images were sent." }); return; }
     if (items.length > MEDIA_MAX_ITEMS) {
