@@ -57,7 +57,7 @@ import { createProviderApp, type ProviderEvent } from "@tessera/providers";
 import { CATALOG } from "@tessera/providers/catalog";
 import { TesseraClient } from "./client.js";
 import { TesseraAgent, type AgentEvent, type LedgerEntry } from "./agent.js";
-import { writeJsonAtomic } from "./state-file.js";
+import { writeJsonAtomic, readJson } from "./state-file.js";
 import { quoteMatchesOffer } from "./decide.js";
 import {
   planDeleverage,
@@ -79,6 +79,7 @@ import { SeriesStore, SERIES_LIMITS, walkSequentially, type TaskSeries, type Ser
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
+import { scanNftHistory, tokenDates, loadHistory, EMPTY_HISTORY, type NftHistoryState } from "./nft-history.js";
 import {
   proposeFromSources,
   actionable as actionablePrices,
@@ -381,10 +382,30 @@ const CLIENT_SELECTORS = Object.fromEntries(
     ammSwap: "function swap(uint256,address,address,uint256,uint256)",
     ammAdd: "function addLiquidity(uint256,uint256[],uint256)",
     ammRemove: "function removeLiquidity(uint256,uint256,uint256[])",
-    // The launchpad, so a visitor submits and mints from their own wallet
-    // rather than asking the operator to spend on their behalf.
+    /*
+     * The launchpad and the market, so a visitor submits, mints, sells and buys
+     * from their own wallet rather than asking the operator to spend on their
+     * behalf.
+     *
+     * This is the better path, not merely an alternative one. Every operator
+     * route here signs with `AGENT_PRIVATE_KEY` and so is gated on an admin
+     * session and clamped by the guardian cap — correct, and it means a visitor
+     * either cannot act at all or acts with somebody else's money. Signing in
+     * their own wallet spends their own USDC and needs neither.
+     *
+     * `approve` is not repeated: ERC-721's `approve(address,uint256)` has the
+     * same signature, and therefore the same selector, as ERC-20's.
+     */
     nftSubmit: "function submit(string,string,uint256,uint32)",
     nftMint: "function mint(uint256,address,uint256)",
+    nftList: "function list(address,uint256,uint256)",
+    nftSetPrice: "function setPrice(uint256,uint256)",
+    nftCancel: "function cancel(uint256)",
+    nftBuy: "function buy(uint256,uint256)",
+    // `safeTransferFrom`, so a contract that cannot hold an ERC-721 refuses the
+    // token instead of swallowing it. This is the field people paste into.
+    nftTransfer: "function safeTransferFrom(address,address,uint256)",
+    nftOwnerOf: "function ownerOf(uint256)",
     ammShares: "function sharesOf(uint256,address)",
   }).map(([k, sig]) => [k, toFunctionSelector(sig)]),
 );
@@ -8266,6 +8287,66 @@ async function main() {
     "`--execute` again would deploy a second market and strand the listings, and the tokens held " +
     "against them, in the first. If there genuinely isn't one, `npm run nft:market -- --execute` deploys it.";
 
+  /* ---- When each token was minted, and when its holder got it ------------
+   *
+   * `ownerOf` is a snapshot with no dates in it, and the gallery filters on
+   * dates. They exist only in the `Transfer` logs, so those are tailed into a
+   * small file and folded — see agent/src/nft-history.ts for why this does not
+   * ride on `EventIndex`.
+   *
+   * Deliberately advisory. Every ownership answer still comes from `ownerOf`;
+   * this only supplies "when", and a token whose mint predates the scan gets a
+   * null date rather than a wrong one. A history the gallery *depended* on
+   * would turn a lagging tail into a token that has vanished.
+   */
+  const NFT_HISTORY_FILE = statePath("nft-history.json");
+  let nftHistory: NftHistoryState = (() => {
+    const loaded = loadHistory(readJson<unknown>(NFT_HISTORY_FILE, EMPTY_HISTORY).value);
+    if (loaded.reset) {
+      console.log("🖼  NFT history was written by an older shape — rescanning from the launchpad's creation block");
+    }
+    return loaded.state;
+  })();
+  const NFT_SCAN_SPAN = Math.max(1, Number(process.env.TESSERA_NFT_SCAN_SPAN ?? 20_000));
+  const NFT_SCAN_WINDOWS = Math.max(1, Number(process.env.TESSERA_NFT_SCAN_WINDOWS ?? 3));
+  const NFT_SCAN_MS = Math.max(10_000, Number(process.env.TESSERA_NFT_SCAN_MS ?? 60_000));
+  /** Sooner when a full budget was spent, because that means more chain behind us. */
+  const NFT_SCAN_CATCHUP_MS = Math.max(1_000, Number(process.env.TESSERA_NFT_SCAN_CATCHUP_MS ?? 3_000));
+
+  if (launchpadAddr && process.env.TESSERA_NFT_SCAN !== "off") {
+    const tick = async (): Promise<number> => {
+      try {
+        /*
+         * The creation block, not block 0. This chain is at 59 million; seeding
+         * from zero is three thousand windows of provably empty history, and
+         * every one of them a request the RPC counts.
+         */
+        const start = nftHistory.lastBlock > 0
+          ? nftHistory.lastBlock
+          : Number(await findDeploymentBlock(client.public, launchpadAddr));
+        const r = await scanNftHistory({
+          client: client.public as never, address: launchpadAddr, state: nftHistory,
+          startBlock: start, span: NFT_SCAN_SPAN, windows: NFT_SCAN_WINDOWS,
+        });
+        if (r.state !== nftHistory) {
+          nftHistory = r.state;
+          // Written every tick that moved, so a restart resumes rather than
+          // rescanning the week it already read.
+          try { writeJsonAtomic(NFT_HISTORY_FILE, nftHistory); } catch { /* a cache, not state */ }
+        }
+        if (r.found) console.log(`🖼  NFT history: ${r.found} transfer(s), through block ${r.state.lastBlock}`);
+        return r.caughtUp ? NFT_SCAN_MS : NFT_SCAN_CATCHUP_MS;
+      } catch (e) {
+        // A failed window is retried; progress only advances on success, so a
+        // throttled RPC costs a delay rather than a gap.
+        console.warn(`🖼  NFT history tick failed: ${String((e as Error).message).slice(0, 120)}`);
+        return NFT_SCAN_MS;
+      }
+    };
+    const loop = () => { void tick().then((ms) => setTimeout(loop, ms).unref?.()); };
+    setTimeout(loop, 4_000).unref?.();
+  }
+
   /**
    * Which launchpad tokens an address holds.
    *
@@ -8278,7 +8359,9 @@ async function main() {
    * of it. That is fine at this size and would not be at a hundred thousand; if
    * it ever is, the answer is an index, not an on-chain loop.
    */
-  const tokensOwnedBy = async (who: Hex): Promise<{ tokenId: number; dropId: number; uri: string }[]> => {
+  const tokensOwnedBy = async (
+    who: Hex,
+  ): Promise<{ tokenId: number; dropId: number; uri: string; mintedAt: number | null; receivedAt: number | null }[]> => {
     if (!launchpadAddr) return [];
     const supply = Number(await client.public.readContract({
       address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "totalSupply",
@@ -8295,7 +8378,10 @@ async function main() {
         client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [id] })
           .catch(() => "") as Promise<string>,
       ]);
-      return { tokenId: Number(id), dropId: Number(dropId), uri };
+      // The dates come from the folded `Transfer` log, and are null until the
+      // scan has reached that block — the gallery sorts nulls last rather than
+      // inventing a date.
+      return { tokenId: Number(id), dropId: Number(dropId), uri, ...tokenDates(nftHistory, Number(id), who) };
     }));
   };
 
@@ -8311,7 +8397,10 @@ async function main() {
       const tokens = await tokensOwnedBy(who as Hex);
       // Anything this wallet has listed is escrowed by the market, so it no
       // longer shows as theirs — read those back or a seller loses sight of it.
-      let listedByMe: { tokenId: number; listingId: number; price: string; uri: string; dropId: number }[] = [];
+      let listedByMe: {
+        tokenId: number; listingId: number; price: string; uri: string; dropId: number;
+        mintedAt: number | null; receivedAt: number | null;
+      }[] = [];
       if (marketAddr) {
         const escrowed = await tokensOwnedBy(marketAddr);
         const found = await Promise.all(escrowed.map(async (t) => {
@@ -8324,13 +8413,29 @@ async function main() {
             address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listings", args: [id],
           })) as readonly [Hex, Hex, bigint, bigint, boolean];
           if (String(l[0]).toLowerCase() !== who.toLowerCase()) return null;
-          return { ...t, listingId: Number(id), price: fmtUnits(l[3], 6) };
+          /*
+           * The dates on `t` were read for the market, which is the current
+           * holder — listing escrows the token there. The seller's own
+           * "received" is one hop back, which is what the gallery is asking
+           * about when it draws this row under their name.
+           */
+          return {
+            ...t, listingId: Number(id), price: fmtUnits(l[3], 6),
+            ...tokenDates(nftHistory, t.tokenId, who),
+          };
         }));
         listedByMe = found.filter((x): x is NonNullable<typeof x> => x !== null);
       }
       res.json({
         ok: true, collection: launchpadAddr, market: marketAddr, tokens, listed: listedByMe,
         canAct: Boolean(admin?.session(bearer(req))),
+        /*
+         * How far the date scan has got. The gallery says "still reading the
+         * chain" rather than showing a token with no date and letting somebody
+         * conclude the app lost it.
+         */
+        historyThrough: nftHistory.lastBlock,
+        historyKnown: Object.keys(nftHistory.tokens).length,
       });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e), tokens: [] });
@@ -8431,6 +8536,64 @@ async function main() {
       res.json({ ok: true, txHash });
     } catch (e) {
       res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Re-price a listing the app wallet owns.
+   *
+   * A price is the one thing about a listing that is worth changing, and the
+   * only alternative was cancel-and-relist: two transactions, a new listing id,
+   * and a window in between where the token is back in the wallet and the
+   * listing anybody had open 404s. `setPrice` is the seller's alone — the
+   * contract enforces that — so this only ever works for listings this wallet
+   * made.
+   *
+   * Safe against a buyer mid-flight because `buy` takes their own `maxPrice`:
+   * a raise cannot reach into a transaction already signed at the old figure,
+   * it just makes it revert. That is the correct outcome, and the reason a
+   * re-price does not need to be a two-step dance.
+   */
+  app.post("/api/nft/market/price", requireOperator, async (req, res) => {
+    if (!marketAddr) { res.status(404).json({ ok: false, error: MARKET_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which listing?" }); return; }
+    let priceRaw: bigint;
+    try { priceRaw = usdcUnits(req.body?.price ?? "0"); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+    if (priceRaw <= 0n) {
+      // The contract refuses it too; saying so here costs nothing and saves gas.
+      res.status(400).json({ ok: false, error: "A listing needs a price above zero. To stop selling it, cancel the listing." });
+      return;
+    }
+    try {
+      /*
+       * `setPrice` does not check that the listing is still live — a sold or
+       * cancelled one would take the new price and mean nothing by it, and the
+       * caller would get a green tick for a no-op. Read it back to refuse, not
+       * to decide: the price that goes on chain is the one that was typed.
+       */
+      const cur = (await client.public.readContract({
+        address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listings", args: [BigInt(id)],
+      })) as readonly [Hex, Hex, bigint, bigint, boolean];
+      if (!cur[4]) {
+        res.status(400).json({ ok: false, error: `Listing #${id} is no longer live — it has been sold or taken back.` });
+        return;
+      }
+      const txHash = await asAgentWrite(marketAddr, tesseraNftMarketAbi, "setPrice", [BigInt(id), priceRaw]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "reprice",
+        status: "success", txHash, asset: "USDC", amount: `${fmtUnits(priceRaw, 6)} USDC`,
+        detail: `listing #${id} → ${fmtUnits(priceRaw, 6)} USDC`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({
+        ok: false,
+        error: /NotSeller/i.test(String(e))
+          ? "Only the wallet that listed this token can change its price."
+          : friendlyError(e),
+      });
     }
   });
 
@@ -14697,6 +14860,11 @@ async function main() {
       serviceFees: (liveDeployment.tesseraServiceFees as Hex) ?? null,
       assetRegistry: (liveDeployment.tesseraAssetRegistry as Hex) ?? null,
       sessionKeys: (liveDeployment.tesseraSessionKeys as Hex) ?? null,
+      // Both, because listing is a two-contract action: approve the market on
+      // the launchpad, then list. A page that only knew one of them would have
+      // to guess the other.
+      launchpad: ((liveDeployment as Record<string, unknown>).tesseraLaunchpad as Hex) ?? null,
+      nftMarket: ((liveDeployment as Record<string, unknown>).tesseraNftMarket as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded

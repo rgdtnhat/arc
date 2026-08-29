@@ -8810,7 +8810,250 @@ const $ = (id) => document.getElementById(id);
        * one of the things you do with an NFT rather than the name of all of
        * them.
        */
-      const NFT_TABS = { pad: "nftCard", market: "nftMarketCard", transfer: "nftTransferCard" };
+      /* ---- NFT artwork, everywhere a token is named ------------------------
+       *
+       * The launchpad stores a metadata URI, not a picture. Wallets resolve
+       * that URI to JSON and read `.image` out of it, and until now this app
+       * did not — so every list of NFTs was a list of token ids and a grey URL,
+       * and the only way to see what you owned was to paste the link into
+       * another tab. That is the whole reason the gallery exists, and it is
+       * just as true of the drop table and the market.
+       *
+       * ## Why the browser resolves it and the server does not
+       * The URI is written by whoever submitted the drop. Fetching it from the
+       * server would hand any submitter a request originating inside the app's
+       * network — an SSRF primitive aimed at whatever else lives there — and
+       * would do it with no user present to have chosen it. Resolving in the
+       * browser keeps the fetch in the reader's own context, which is where a
+       * marketplace's image loads belong. The cost is that a cross-origin host
+       * without CORS headers cannot be read; that degrades to a placeholder,
+       * which is the right failure.
+       */
+      const nftArtCache = new Map();
+      const NFT_ART_TIMEOUT_MS = 6000;
+
+      /**
+       * Where a token's artwork can be read from, if anywhere.
+       *
+       * The app's Content-Security-Policy is `img-src 'self' data:` and
+       * `connect-src 'self'` — deliberately, and it is not loosened for this.
+       * `connect-src *` would let any injected script post the reader's session
+       * anywhere it liked, which is a poor trade for a picture; and without the
+       * metadata fetch, a permissive `img-src` buys nothing anyway, because
+       * `.image` lives inside that JSON.
+       *
+       * Artwork uploaded through this app is served from this app, so the
+       * common case is same-origin and resolves. A creator who brought a URI of
+       * their own — IPFS, their own host — gets a labelled placeholder that
+       * links out, rather than a broken image and a console full of CSP
+       * refusals. Saying "hosted elsewhere" is honest; pretending there is no
+       * picture is not.
+       */
+      function nftArtSource(uri) {
+        // Trimmed, because `new URL("   ", origin)` is the origin's root — a
+        // blank URI would resolve to the app's own home page and be reported as
+        // artwork this app hosts.
+        const raw = String(uri == null ? "" : uri).trim();
+        if (!raw) return { kind: "none" };
+        let url;
+        try { url = new URL(raw, location.origin); } catch { return { kind: "none" }; }
+        // `javascript:` and `data:` are not pictures, whatever they claim.
+        if (url.protocol !== "http:" && url.protocol !== "https:") return { kind: "none" };
+        return { kind: url.origin === location.origin ? "same-origin" : "offsite", url: url.href };
+      }
+
+      /**
+       * Resolve one metadata URI to `{image, name}`, once.
+       *
+       * Cached by URI including the misses, so a drop whose host is down costs
+       * one failed request per page rather than one per render — the tables
+       * re-render on every filter change and every poll.
+       */
+      async function nftArt(uri) {
+        const key = String(uri || "");
+        if (nftArtCache.has(key)) return nftArtCache.get(key);
+        const src = nftArtSource(key);
+        const done = (v) => { nftArtCache.set(key, v); return v; };
+        if (src.kind === "none") return done(null);
+        if (src.kind === "offsite") return done({ offsite: true, href: src.url });
+        try {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), NFT_ART_TIMEOUT_MS);
+          const r = await fetch(src.url, { signal: ctrl.signal, credentials: "omit" });
+          clearTimeout(t);
+          if (!r.ok) return done(null);
+          const j = await r.json();
+          // The image has to pass the same test: metadata this app serves can
+          // still name a picture somewhere else, and CSP would refuse it.
+          const img = nftArtSource(j && j.image);
+          return done(
+            img.kind === "same-origin"
+              ? { image: img.url, name: String((j && j.name) || "") }
+              : img.kind === "offsite"
+              ? { offsite: true, href: img.url, name: String((j && j.name) || "") }
+              : null,
+          );
+        } catch {
+          // A dead host, a body that is not JSON, or a timeout. All the same
+          // outcome here: there is no picture to show.
+          return done(null);
+        }
+      }
+
+      /**
+       * The markup for one thumbnail: a placeholder now, the picture when it
+       * resolves. `data-art` is what `hydrateNftArt` looks for, and `data-lb`
+       * names the gallery this thumbnail belongs to so the viewer can page
+       * through its siblings rather than showing one image and dead arrows.
+       */
+      function nftThumbTag(uri, label, group) {
+        const u = String(uri || "");
+        if (!u) return `<span class="nftThumb empty" aria-hidden="true">🖼</span>`;
+        return `<button type="button" class="nftThumb empty" data-art="${esc(u)}" ` +
+          `data-lb="${esc(group || "")}" title="${esc(label || u)}" aria-label="View ${esc(label || "artwork")}">🖼</button>`;
+      }
+
+      /**
+       * Fill in every unresolved thumbnail under `root`.
+       *
+       * Sequential rather than a parallel storm: a drop table can hold sixty
+       * rows, and sixty simultaneous fetches to one host is the sort of thing
+       * that gets an app rate-limited by the very server hosting its pictures.
+       * The cache means this only ever runs once per URI.
+       */
+      async function hydrateNftArt(root) {
+        const nodes = [...(root || document).querySelectorAll("[data-art]:not([data-arted])")];
+        for (const el of nodes) {
+          el.dataset.arted = "1";
+          const art = await nftArt(el.dataset.art);
+          // The row may have been re-rendered out from under us mid-fetch.
+          if (!el.isConnected) continue;
+          if (!art) { el.title = "No picture could be read from this URI"; continue; }
+          if (art.offsite) {
+            // Still openable — the viewer offers the link. It just cannot be
+            // drawn inline without weakening the page's CSP for everyone.
+            el.textContent = "↗";
+            el.title = `${art.name || "Artwork"} is hosted off-site — open it to view`;
+            el.dataset.offsite = "1";
+            el.classList.remove("empty");
+            el.classList.add("offsite");
+            continue;
+          }
+          el.classList.remove("empty");
+          el.innerHTML = `<img src="${esc(art.image)}" alt="${esc(art.name || "NFT artwork")}" loading="lazy" />`;
+          if (art.name) el.title = art.name;
+        }
+      }
+
+      /* ---- The viewer ------------------------------------------------------
+       * One overlay for the whole pane. It is handed a list rather than a
+       * single image so the arrows work: a gallery you can only open one tile
+       * of at a time is a slideshow with the slides removed.
+       */
+      let nftLb = { items: [], at: 0 };
+
+      function nftLbRender() {
+        const body = $("nftLbBody");
+        const item = nftLb.items[nftLb.at];
+        if (!body) return;
+        $("nftLbTitle").textContent = item ? item.label : "";
+        $("nftLbCount").textContent = nftLb.items.length > 1
+          ? `${nftLb.at + 1} of ${nftLb.items.length}` : "";
+        const many = nftLb.items.length > 1;
+        $("nftLbPrev").hidden = !many;
+        $("nftLbNext").hidden = !many;
+        body.innerHTML = `<div class="lbNone">Loading…</div>`;
+        const wanted = nftLb.at;
+        nftArt(item && item.uri).then((art) => {
+          // Ignore a resolution that lost a race with the arrow keys.
+          if (nftLb.at !== wanted || $("nftLightbox").dataset.open !== "1") return;
+          body.innerHTML = art && art.image
+            ? `<img src="${esc(art.image)}" alt="${esc(art.name || item.label)}" />`
+            : art && art.offsite
+            ? `<div class="lbNone">This token's artwork is hosted off-site, so the page will not load it inline —` +
+              ` that would mean letting this app fetch from anywhere, which is not a trade worth making for a picture.<br />` +
+              `<a href="${esc(art.href)}" target="_blank" rel="noopener noreferrer"` +
+              ` style="color:#9fc0ff">Open it in a new tab →</a></div>`
+            : `<div class="lbNone">No picture could be read for this token.<br />` +
+              `<span style="font-size:11.5px">${esc(item && item.uri ? item.uri : "It has no metadata URI.")}</span></div>`;
+        });
+      }
+
+      function nftLbOpen(items, at) {
+        const box = $("nftLightbox");
+        if (!box || !items.length) return;
+        nftLb = { items, at: Math.max(0, Math.min(items.length - 1, at || 0)) };
+        box.dataset.open = "1";
+        nftLbRender();
+      }
+      function nftLbClose() {
+        const box = $("nftLightbox");
+        if (box) box.dataset.open = "0";
+      }
+      function nftLbStep(by) {
+        if (nftLb.items.length < 2) return;
+        // Wraps, so the last picture's "next" is the first rather than nothing.
+        nftLb.at = (nftLb.at + by + nftLb.items.length) % nftLb.items.length;
+        nftLbRender();
+      }
+
+      if ($("nftLightbox")) {
+        $("nftLbClose").addEventListener("click", nftLbClose);
+        $("nftLbPrev").addEventListener("click", () => nftLbStep(-1));
+        $("nftLbNext").addEventListener("click", () => nftLbStep(1));
+        // The backdrop closes; the picture does not, or a click to dismiss a
+        // wallet prompt would shut the viewer behind it.
+        $("nftLightbox").addEventListener("click", (ev) => {
+          if (ev.target === $("nftLightbox") || ev.target === $("nftLbBody")) nftLbClose();
+        });
+        document.addEventListener("keydown", (ev) => {
+          if ($("nftLightbox").dataset.open !== "1") return;
+          if (ev.key === "Escape") nftLbClose();
+          else if (ev.key === "ArrowLeft") nftLbStep(-1);
+          else if (ev.key === "ArrowRight") nftLbStep(1);
+        });
+        /*
+         * One delegated listener for every thumbnail on the pane, present and
+         * future. The tables are rebuilt on each render, so a listener bound to
+         * a button would be discarded with it.
+         */
+        $("paneNft").addEventListener("click", (ev) => {
+          const t = ev.target.closest("[data-art]");
+          if (!t || t.classList.contains("empty")) return;
+          const group = t.dataset.lb || "";
+          const siblings = [...$("paneNft").querySelectorAll(`[data-art][data-lb="${CSS.escape(group)}"]`)];
+          const items = siblings.map((el) => ({ uri: el.dataset.art, label: el.title || el.dataset.art }));
+          nftLbOpen(items, siblings.indexOf(t));
+        });
+      }
+
+      /* ---- Who signs an NFT action ----------------------------------------
+       *
+       * Every NFT write used to be `requireOperator`, because every one of them
+       * signed with `AGENT_PRIVATE_KEY`. That is right for the app wallet and
+       * wrong as the only option: it means a visitor with their own wallet and
+       * their own USDC either cannot mint at all, or mints by asking the
+       * operator to spend on their behalf. So there are two paths now, and the
+       * connected wallet is the better one — it spends the visitor's own money,
+       * needs no admin session, and never touches the operator's key.
+       *
+       * The guardian cap deliberately does not apply to the self-custody path.
+       * It is the ceiling on what the *agent* may spend unattended; a person
+       * signing their own transaction in their own wallet is the co-signer that
+       * cap exists to summon, and clamping them to it would be theatre.
+       */
+      function nftSignVia(canAct) {
+        if (selfMode() && eth()) return "self";
+        return canAct !== false ? "operator" : null;
+      }
+
+      /** The one sentence to show when neither path is open. */
+      const NFT_NO_SIGNER =
+        "Sign in as operator, or switch to My wallet and connect one, to act here.";
+
+      const NFT_TABS = {
+        pad: "nftCard", gallery: "nftGalleryCard", market: "nftMarketCard", transfer: "nftTransferCard",
+      };
       const NFT_TAB_KEY = "tessera_nft_tab";
       let nftTab = (() => {
         try { return localStorage.getItem(NFT_TAB_KEY) || "pad"; } catch { return "pad"; }
@@ -8829,6 +9072,7 @@ const $ = (id) => document.getElementById(id);
         // Each tab reads on arrival rather than on every poll of the others.
         if (tab === "market" && typeof loadNftMarket === "function") loadNftMarket().catch(() => {});
         if (tab === "transfer" && typeof loadNftHeld === "function") loadNftHeld().catch(() => {});
+        if (tab === "gallery" && typeof loadNftGallery === "function") loadNftGallery().catch(() => {});
       }
 
       if ($("nftTabs")) {
@@ -8882,10 +9126,360 @@ const $ = (id) => document.getElementById(id);
           if (held) {
             held.innerHTML = r.tokens.length
               ? r.tokens.map((t) =>
-                  `<span class="tag" title="${esc(t.uri)}">${esc(label(t))}</span>`).join("")
+                  `<span style="display:flex;align-items:center;gap:7px">` +
+                  nftThumbTag(t.uri, label(t), "held") +
+                  `<span class="tag" title="${esc(t.uri)}">${esc(label(t))}</span></span>`).join("")
               : `<span style="color:var(--muted);font-size:12px">This wallet holds none yet.</span>`;
+            hydrateNftArt(held);
           }
         } catch { /* the panel keeps whatever it last showed */ }
+      }
+
+      /* ---- One NFT action, two possible signers ----------------------------
+       *
+       * Each of these is called from more than one place — the gallery tile,
+       * the market row, the form at the top of a tab — and each has to work
+       * both for an operator session signing with the app wallet and for a
+       * visitor signing in their own. Writing that choice out at every call
+       * site is how one of them ends up quietly operator-only, which is the
+       * state the whole NFT pane was in.
+       */
+      function nftSay(msgId, text, good) {
+        const m = $(msgId);
+        if (!m) return;
+        m.style.display = "block";
+        m.style.color = good ? "var(--good)" : "var(--warn)";
+        m.innerHTML = text;
+      }
+
+      /** Like `toRaw`, but zero is a legitimate price here — free drops exist. */
+      function nftRaw(human) {
+        const s = String(human == null ? "" : human).trim().replace(/,/g, "");
+        if (/^0*(\.0*)?$/.test(s || "0")) return "0";
+        const r = parseAmount(s, 6);
+        if (r.error) throw new Error(r.error);
+        return r.raw;
+      }
+
+      /** Post to an operator route and report the outcome into `msgId`. */
+      async function nftPost(url, body, msgId, done) {
+        try {
+          const r = await (await postJson(url, body)).json();
+          if (r.ok) { nftSay(msgId, `${done} ${txLink(r.txHash)}`, true); return true; }
+          nftSay(msgId, esc(r.error || "That did not go through."));
+        } catch {
+          nftSay(msgId, "The request failed.");
+        }
+        return false;
+      }
+
+      /** Mint one from a drop. `maxPrice` is the figure the reader was shown. */
+      async function nftDoMint(id, shownPrice, msgId) {
+        const via = nftSignVia(nftState && nftState.canAct);
+        if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
+        if (!confirm(`Mint drop #${id} for ${shownPrice} USDC?`)) return false;
+        if (via === "operator") return nftPost("/api/nft/mint", { id, maxPrice: shownPrice }, msgId, "Minted.");
+        let raw;
+        try { raw = nftRaw(shownPrice); } catch (e) { nftSay(msgId, esc(e.message)); return false; }
+        return selfCustody(msgId, `mint drop #${id}`, async (from, cfg) => {
+          if (!cfg.launchpad) throw new Error("No launchpad is recorded on this network.");
+          // Sized to this one mint. An unlimited approval to a contract anybody
+          // can submit a drop to is a standing permission to take the lot.
+          if (raw !== "0") await ensureAllowance(from, cfg.usdc, cfg.launchpad, raw);
+          // The price the row showed, unchanged: the contract refuses anything
+          // above it, which is what protects against a re-price mid-flight.
+          return sendTx(from, cfg.launchpad, callData(
+            cfg.selectors.nftMint, encUint(id), encAddr(from), encUint(raw),
+          ));
+        });
+      }
+
+      /** Put a token up for sale. Two transactions: approve, then list. */
+      async function nftDoList(tokenId, price, msgId) {
+        const via = nftSignVia(nftMine.canAct);
+        if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
+        let raw;
+        try { raw = nftRaw(price); } catch (e) { nftSay(msgId, esc(e.message)); return false; }
+        if (raw === "0") { nftSay(msgId, "A listing needs a price above zero."); return false; }
+        if (via === "operator") return nftPost("/api/nft/market/list", { tokenId, price }, msgId, "Listed.");
+        return selfCustody(msgId, `list NFT #${tokenId}`, async (from, cfg) => {
+          if (!cfg.launchpad || !cfg.nftMarket) throw new Error("The launchpad or the market is not recorded on this network.");
+          /*
+           * `approve(market, tokenId)` — one token, not `setApprovalForAll`.
+           * The blanket version would leave the market able to move every NFT
+           * this wallet will ever hold, long after this sale.
+           *
+           * ERC-721's `approve` has the same signature as ERC-20's, so it is
+           * the same selector; the second word is a token id here rather than
+           * an amount.
+           */
+          const approve = await sendTx(from, cfg.launchpad, callData(
+            cfg.selectors.approve, encAddr(cfg.nftMarket), encUint(tokenId),
+          ));
+          const receipt = await waitForTx(approve);
+          if (receipt && !receiptOkHex(receipt.status)) {
+            throw new Error("The approval failed on chain, so nothing was listed.");
+          }
+          return sendTx(from, cfg.nftMarket, callData(
+            cfg.selectors.nftList, encAddr(cfg.launchpad), encUint(tokenId), encUint(raw),
+          ));
+        });
+      }
+
+      /** Change what a live listing is asking. */
+      async function nftDoRepriceListing(id, price, msgId) {
+        const via = nftSignVia(nftMine.canAct);
+        if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
+        let raw;
+        try { raw = nftRaw(price); } catch (e) { nftSay(msgId, esc(e.message)); return false; }
+        if (raw === "0") {
+          nftSay(msgId, "A listing needs a price above zero. To stop selling it, take it back.");
+          return false;
+        }
+        if (via === "operator") return nftPost("/api/nft/market/price", { id, price }, msgId, "Re-priced.");
+        return selfCustody(msgId, `re-price listing #${id}`, async (from, cfg) =>
+          sendTx(from, cfg.nftMarket, callData(cfg.selectors.nftSetPrice, encUint(id), encUint(raw))));
+      }
+
+      /** Take a listing back. Always the seller's to do. */
+      async function nftDoCancel(id, msgId) {
+        const via = nftSignVia(nftMine.canAct);
+        if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
+        if (via === "operator") return nftPost("/api/nft/market/cancel", { id }, msgId, "Taken back.");
+        return selfCustody(msgId, `take listing #${id} back`, async (from, cfg) =>
+          sendTx(from, cfg.nftMarket, callData(cfg.selectors.nftCancel, encUint(id))));
+      }
+
+      /** Buy a listing at the price the row was showing. */
+      async function nftDoBuy(id, shownPrice, msgId) {
+        const via = nftSignVia(nftMine.canAct);
+        if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
+        if (!confirm(`Buy listing #${id} for ${shownPrice} USDC?`)) return false;
+        if (via === "operator") return nftPost("/api/nft/market/buy", { id, maxPrice: shownPrice }, msgId, "Bought.");
+        let raw;
+        try { raw = nftRaw(shownPrice); } catch (e) { nftSay(msgId, esc(e.message)); return false; }
+        return selfCustody(msgId, `buy listing #${id}`, async (from, cfg) => {
+          if (!cfg.nftMarket) throw new Error("No market is recorded on this network.");
+          if (raw !== "0") await ensureAllowance(from, cfg.usdc, cfg.nftMarket, raw);
+          return sendTx(from, cfg.nftMarket, callData(cfg.selectors.nftBuy, encUint(id), encUint(raw)));
+        });
+      }
+
+      /** Send a token to somebody. Irreversible, so it asks first. */
+      async function nftDoTransfer(tokenId, to, msgId) {
+        const via = nftSignVia(nftMine.canAct);
+        if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
+        if (!/^0x[0-9a-fA-F]{40}$/.test(to)) { nftSay(msgId, "That is not an address."); return false; }
+        if (!confirm(`Send NFT #${tokenId} to ${to}?\n\nA transfer cannot be undone.`)) return false;
+        if (via === "operator") return nftPost("/api/nft/transfer", { tokenId, to }, msgId, "Sent.");
+        return selfCustody(msgId, `send NFT #${tokenId}`, async (from, cfg) =>
+          // `safeTransferFrom`, so a contract that cannot hold an ERC-721
+          // refuses it rather than swallowing the token.
+          sendTx(from, cfg.launchpad, callData(
+            cfg.selectors.nftTransfer, encAddr(from), encAddr(to), encUint(tokenId),
+          )));
+      }
+
+      /** Submit a drop for review. */
+      async function nftDoSubmit(body, msgId) {
+        const via = nftSignVia(nftState && nftState.canAct);
+        if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
+        if (via === "operator") {
+          return nftPost("/api/nft/submit", body, msgId, "Submitted — an admin decides next.");
+        }
+        let raw;
+        try { raw = nftRaw(body.price); } catch (e) { nftSay(msgId, esc(e.message)); return false; }
+        return selfCustody(msgId, "submit the drop", async (from, cfg) => {
+          if (!cfg.launchpad) throw new Error("No launchpad is recorded on this network.");
+          /*
+           * `submit(string,string,uint256,uint32)`: two dynamic arguments, so
+           * the four-word head carries an offset to each tail (128 bytes in)
+           * and the tails carry length + right-padded bytes.
+           */
+          const nameTail = encStringTail(body.name);
+          return sendTx(from, cfg.launchpad, callData(
+            cfg.selectors.nftSubmit,
+            encUint(128),
+            encUint(128 + nameTail.length / 2),
+            encUint(raw),
+            encUint(body.supply),
+            nameTail,
+            encStringTail(body.uri),
+          ));
+        });
+      }
+
+      /* ---- The gallery -----------------------------------------------------
+       *
+       * Everything the acting wallet holds, as pictures. It reads the same
+       * `/api/nft/mine` the transfer and market panes do rather than a route of
+       * its own — the tokens are the same tokens, and a second endpoint
+       * answering the same question is a second thing to keep in step.
+       *
+       * Listed tokens are in here too. Listing escrows the token in the market
+       * contract, so `ownerOf` stops naming the seller and a gallery that only
+       * asked that question would show somebody's collection shrinking every
+       * time they put something up for sale.
+       */
+      const NFT_DAY = 86400;
+
+      const nftWhen = (secs) => {
+        if (!secs) return "date not known yet";
+        const d = new Date(secs * 1000);
+        return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+      };
+
+      /** Held and listed as one list, each row saying which it is. */
+      function nftGalleryItems() {
+        const held = (nftMine.tokens || []).map((t) => ({ ...t, listing: null }));
+        const listed = (nftMine.listed || []).map((t) => ({
+          ...t, listing: { id: t.listingId, price: t.price },
+        }));
+        return [...held, ...listed];
+      }
+
+      /**
+       * Apply the date filter and the order.
+       *
+       * A token whose date is unknown — minted before the log scan reached its
+       * block — is kept when no range is set and dropped when one is, because
+       * "in the last 7 days" cannot be true of a date nobody knows. It sorts
+       * last either way rather than as 1970.
+       */
+      function nftGalleryView(items, basis, days, order) {
+        const now = Math.floor(Date.now() / 1000);
+        const at = (t) => Number(t[basis] || 0);
+        const kept = days > 0 ? items.filter((t) => at(t) > 0 && now - at(t) <= days * NFT_DAY) : items;
+        const dir = order === "asc" ? 1 : -1;
+        return [...kept].sort((a, b) => {
+          const av = at(a);
+          const bv = at(b);
+          if (!av && !bv) return a.tokenId - b.tokenId;
+          if (!av) return 1;
+          if (!bv) return -1;
+          return (av - bv) * dir;
+        });
+      }
+
+      function renderNftGallery() {
+        const grid = $("nftGalleryGrid");
+        if (!grid) return;
+        const basis = ($("nftGalBasis") && $("nftGalBasis").value) || "receivedAt";
+        const days = Number(($("nftGalRange") && $("nftGalRange").value) || 0);
+        const order = ($("nftGalOrder") && $("nftGalOrder").value) || "desc";
+        const all = nftGalleryItems();
+        const rows = nftGalleryView(all, basis, days, order);
+        const signer = nftSignVia(nftMine.canAct);
+
+        $("nftGalleryMeta").innerHTML =
+          nftMetric("Held", String((nftMine.tokens || []).length)) +
+          nftMetric("Listed", String((nftMine.listed || []).length)) +
+          nftMetric("Showing", `${rows.length} of ${all.length}`);
+
+        if (!rows.length) {
+          grid.innerHTML =
+            `<div style="color:var(--muted);font-size:12.5px;grid-column:1/-1">` +
+            (all.length
+              ? `Nothing in that window. ${esc(basis === "mintedAt" ? "Minted" : "Received")} dates come from the ` +
+                `chain's transfer log, which the server is still reading back — widen the range, or try again shortly.`
+              : `This wallet holds no NFTs yet. Mint one from the launch pad, or buy one on the marketplace.`) +
+            `</div>`;
+          return;
+        }
+
+        grid.innerHTML = rows.map((t) => {
+          const label = `#${t.tokenId} · drop ${t.dropId}`;
+          const acts = [];
+          if (signer) {
+            if (t.listing) {
+              acts.push(`<button class="btn" data-gal="price" data-id="${t.listing.id}" data-price="${esc(t.listing.price)}">Change price</button>`);
+              acts.push(`<button class="btn" data-gal="cancel" data-id="${t.listing.id}">Take back</button>`);
+            } else {
+              acts.push(`<button class="btn" data-gal="list" data-token="${t.tokenId}">Sell</button>`);
+              acts.push(`<button class="btn" data-gal="send" data-token="${t.tokenId}">Send</button>`);
+            }
+          }
+          return `<div class="nftTile">` +
+            nftTileArt(t.uri, label) +
+            `<div class="meta"><b>${esc(label)}</b>` +
+            `<div class="sub">${esc(basis === "mintedAt" ? "Minted" : "Received")} ${esc(nftWhen(t[basis]))}</div>` +
+            (t.listing
+              ? `<div class="sub" style="color:var(--good)">Listed at ${esc(t.listing.price)} USDC</div>`
+              : "") +
+            (acts.length ? `<div class="acts">${acts.join("")}</div>` : "") +
+            `</div></div>`;
+        }).join("");
+        hydrateNftArt(grid);
+      }
+
+      /** A tile's picture: the same `data-art` contract as a row thumbnail. */
+      function nftTileArt(uri, label) {
+        const u = String(uri || "");
+        if (!u) return `<div class="art empty" aria-hidden="true">🖼</div>`;
+        return `<button type="button" class="art empty" data-art="${esc(u)}" data-lb="gallery" ` +
+          `title="${esc(label)}" aria-label="View ${esc(label)}">🖼</button>`;
+      }
+
+      window.loadNftGallery = async function loadNftGallery() {
+        const card = $("nftGalleryCard");
+        if (!card) return;
+        const notReady = $("nftGalleryNotReady");
+        await loadNftHeld();
+        /*
+         * Three different empty states, and they are not interchangeable. A
+         * visitor with no wallet connected is not looking at a broken
+         * launchpad, and telling them one is not deployed sends them to fix
+         * something that is not wrong.
+         */
+        const who = String(window.__myAddress || "");
+        const problem = !/^0x[0-9a-fA-F]{40}$/.test(who)
+          ? "Connect a wallet, or sign in as operator, to see the gallery of whichever wallet this page is acting as."
+          : !nftMine.collection
+          ? "No NFT launchpad is recorded on this network yet, so there is nothing to show."
+          : "";
+        if (notReady) {
+          notReady.style.display = problem ? "block" : "none";
+          notReady.textContent = problem;
+        }
+        renderNftGallery();
+      };
+
+      for (const id of ["nftGalBasis", "nftGalRange", "nftGalOrder"]) {
+        if ($(id)) $(id).addEventListener("change", renderNftGallery);
+      }
+      if ($("nftGalRefresh")) {
+        $("nftGalRefresh").addEventListener("click", () => loadNftGallery().catch(() => {}));
+      }
+
+      if ($("nftGalleryGrid")) {
+        $("nftGalleryGrid").addEventListener("click", async (ev) => {
+          const btn = ev.target.closest("[data-gal]");
+          if (!btn) return;
+          const what = btn.dataset.gal;
+          btn.disabled = true;
+          try {
+            if (what === "price") {
+              const next = prompt(
+                `New asking price for listing #${btn.dataset.id}, in USDC.\n\n` +
+                  `Buyers are safe either way: a purchase carries the price the buyer was shown, so a re-price ` +
+                  `cannot reach a transaction already signed.`,
+                btn.dataset.price,
+              );
+              if (next !== null) await nftDoRepriceListing(Number(btn.dataset.id), next.trim(), "nftGalleryMsg");
+            } else if (what === "cancel") {
+              await nftDoCancel(Number(btn.dataset.id), "nftGalleryMsg");
+            } else if (what === "list") {
+              const price = prompt(`Asking price for NFT #${btn.dataset.token}, in USDC.`, "1");
+              if (price !== null) await nftDoList(Number(btn.dataset.token), price.trim(), "nftGalleryMsg");
+            } else if (what === "send") {
+              const to = prompt(`Send NFT #${btn.dataset.token} to which address?\n\nA transfer cannot be undone.`, "");
+              if (to !== null) await nftDoTransfer(Number(btn.dataset.token), to.trim(), "nftGalleryMsg");
+            }
+          } finally {
+            btn.disabled = false;
+          }
+          loadNftGallery().catch(() => {});
+        });
       }
 
       window.loadNftMarket = async function loadNftMarket() {
@@ -8900,7 +9494,7 @@ const $ = (id) => document.getElementById(id);
               notReady.style.display = "block";
               notReady.textContent = (r && r.error) || "The NFT market is not deployed on this network yet.";
             }
-            $("nftMarketRows").innerHTML = emptyRow(4, "Nothing to show until the market is deployed.");
+            $("nftMarketRows").innerHTML = emptyRow(5, "Nothing to show until the market is deployed.");
             $("nftMarketMeta").innerHTML = "";
             return;
           }
@@ -8917,28 +9511,37 @@ const $ = (id) => document.getElementById(id);
            * than as not being yours to press, so it is not drawn — and the
            * reason is said once, above the table.
            */
-          const can = r.canAct !== false;
+          const can = Boolean(nftSignVia(r.canAct));
           const why = $("nftMarketMsg");
           if (why && !can && r.listings.length) {
             why.style.display = "block";
             why.style.color = "var(--muted)";
-            why.textContent = "Sign in as operator to buy, list or take back a listing.";
+            why.textContent = NFT_NO_SIGNER;
           }
           if ($("nftListGo")) $("nftListGo").disabled = !can;
           $("nftMarketRows").innerHTML = r.listings.length
             ? r.listings.map((l) => {
                 const mine = String(l.seller).toLowerCase() === me;
+                /*
+                 * The seller's own row offers a re-price as well as a take-back.
+                 * Changing what you are asking used to mean cancel-and-relist:
+                 * two transactions, a new listing id, and a gap in between where
+                 * the token is back in the wallet and any open link 404s.
+                 */
                 const action = !can ? ""
                   : mine
-                  ? `<button class="btn" data-mkt="cancel" data-id="${l.id}">Take back</button>`
+                  ? `<button class="btn" data-mkt="price" data-id="${l.id}" data-price="${esc(l.price)}">Change price</button> ` +
+                    `<button class="btn" data-mkt="cancel" data-id="${l.id}">Take back</button>`
                   : `<button class="btn" data-mkt="buy" data-id="${l.id}" data-price="${esc(l.price)}">Buy</button>`;
-                return `<tr><td><b>#${l.tokenId}</b>` +
+                return `<tr><td>${nftThumbTag(l.uri, `#${l.tokenId}`, "market")}</td>` +
+                  `<td><b>#${l.tokenId}</b>` +
                   `<div style="font-size:11px;color:var(--muted)">${esc(l.uri || l.collection)}</div></td>` +
                   `<td class="mono" style="font-size:11px">${esc(short(l.seller))}${mine ? " (you)" : ""}</td>` +
                   `<td class="num mono">${esc(l.price)} USDC</td>` +
                   `<td class="num">${action}</td></tr>`;
               }).join("")
-            : emptyRow(4, "Nothing is listed yet.");
+            : emptyRow(5, "Nothing is listed yet.");
+          hydrateNftArt($("nftMarketRows"));
         } catch {
           if (notReady) {
             notReady.style.display = "block";
@@ -8949,18 +9552,11 @@ const $ = (id) => document.getElementById(id);
 
       if ($("nftListGo")) {
         $("nftListGo").addEventListener("click", async () => {
-          const m = $("nftListMsg");
-          const say = (t, good) => { m.style.display = "block"; m.style.color = good ? "var(--good)" : "var(--warn)"; m.innerHTML = t; };
           const tokenId = Number($("nftListToken").value);
-          if (!tokenId) return say("This wallet holds no NFT to list.");
+          if (!tokenId) { nftSay("nftListMsg", "This wallet holds no NFT to list."); return; }
           $("nftListGo").disabled = true;
-          try {
-            const r = await (await postJson("/api/nft/market/list", {
-              tokenId, price: $("nftListPrice").value.trim() || "0",
-            })).json();
-            if (r.ok) { say(`Listed. ${txLink(r.txHash)}`, true); $("nftListPrice").value = ""; loadNftMarket(); }
-            else say(esc(r.error || "Listing failed."));
-          } catch { say("The listing request failed."); }
+          const ok = await nftDoList(tokenId, $("nftListPrice").value.trim() || "0", "nftListMsg");
+          if (ok) { $("nftListPrice").value = ""; loadNftMarket(); }
           $("nftListGo").disabled = false;
         });
       }
@@ -8969,50 +9565,40 @@ const $ = (id) => document.getElementById(id);
         $("nftMarketRows").addEventListener("click", async (ev) => {
           const btn = ev.target.closest("[data-mkt]");
           if (!btn) return;
-          const m = $("nftMarketMsg");
-          const say = (t, good) => { m.style.display = "block"; m.style.color = good ? "var(--good)" : "var(--warn)"; m.innerHTML = t; };
           const id = Number(btn.dataset.id);
-          let url = "/api/nft/market/cancel";
-          let body = { id };
-          if (btn.dataset.mkt === "buy") {
-            // The price the row was showing, not one re-read at send time —
-            // see the contract's `maxPrice`.
-            if (!confirm(`Buy listing #${id} for ${btn.dataset.price} USDC?`)) return;
-            url = "/api/nft/market/buy";
-            body = { id, maxPrice: btn.dataset.price };
-          }
+          const what = btn.dataset.mkt;
           btn.disabled = true;
           try {
-            const r = await (await postJson(url, body)).json();
-            if (r.ok) say(`Done. ${txLink(r.txHash)}`, true);
-            else say(esc(r.error || "That did not go through."));
-          } catch { say("The request failed."); }
-          btn.disabled = false;
+            if (what === "buy") {
+              // The price the row was showing, not one re-read at send time —
+              // see the contract's `maxPrice`.
+              await nftDoBuy(id, btn.dataset.price, "nftMarketMsg");
+            } else if (what === "price") {
+              const next = prompt(
+                `New asking price for listing #${id}, in USDC.\n\nBuyers are safe either way: a purchase ` +
+                  `carries the price the buyer was shown, so a re-price cannot reach a transaction already signed.`,
+                btn.dataset.price,
+              );
+              if (next !== null) await nftDoRepriceListing(id, next.trim(), "nftMarketMsg");
+            } else {
+              await nftDoCancel(id, "nftMarketMsg");
+            }
+          } finally {
+            btn.disabled = false;
+          }
           loadNftMarket();
         });
       }
 
       if ($("nftXferGo")) {
         $("nftXferGo").addEventListener("click", async () => {
-          if (nftMine.canAct === false) {
-            const m = $("nftXferMsg");
-            m.style.display = "block"; m.style.color = "var(--warn)";
-            m.textContent = "Sign in as operator to send from the app wallet.";
-            return;
-          }
-          const m = $("nftXferMsg");
-          const say = (t, good) => { m.style.display = "block"; m.style.color = good ? "var(--good)" : "var(--warn)"; m.innerHTML = t; };
           const tokenId = Number($("nftXferToken").value);
-          const to = $("nftXferTo").value.trim();
-          if (!tokenId) return say("This wallet holds no NFT to send.");
-          if (!/^0x[0-9a-fA-F]{40}$/.test(to)) return say("That is not an address.");
-          if (!confirm(`Send NFT #${tokenId} to ${to}?\n\nA transfer cannot be undone.`)) return;
+          if (!tokenId) { nftSay("nftXferMsg", "This wallet holds no NFT to send."); return; }
           $("nftXferGo").disabled = true;
-          try {
-            const r = await (await postJson("/api/nft/transfer", { tokenId, to })).json();
-            if (r.ok) { say(`Sent. ${txLink(r.txHash)}`, true); $("nftXferTo").value = ""; loadNftHeld(); }
-            else say(esc(r.error || "Transfer failed."));
-          } catch { say("The transfer request failed."); }
+          // `nftDoTransfer` owns the address check, the confirmation and the
+          // choice of signer, so the form and the gallery tile cannot drift.
+          const ok = await nftDoTransfer(tokenId, $("nftXferTo").value.trim(), "nftXferMsg");
+          if (ok) { $("nftXferTo").value = ""; loadNftHeld(); }
           $("nftXferGo").disabled = false;
         });
       }
@@ -9046,7 +9632,7 @@ const $ = (id) => document.getElementById(id);
               notReady.textContent = (r && r.error) ||
                 "The NFT launchpad is not deployed on this network yet.";
             }
-            $("nftRows").innerHTML = emptyRow(6, "Nothing to show until the launchpad is deployed.");
+            $("nftRows").innerHTML = emptyRow(7, "Nothing to show until the launchpad is deployed.");
             $("nftMeta").innerHTML = "";
             return;
           }
@@ -9110,9 +9696,14 @@ const $ = (id) => document.getElementById(id);
               const tone = d.status === "approved" ? "ok" : d.status === "rejected" ? "warn" : "";
               const label = d.status === "pending" ? "waiting for review" : d.status;
               const actions = [];
-              // Minting spends the app wallet, so it is operator-only — drawing
-              // it for a visitor would promise a 403.
-              if (d.mintable && nftState.canAct !== false) {
+              /*
+               * Mint is drawn for anyone who can actually sign it. That used to
+               * mean an operator session only, because the mint spent the app
+               * wallet — a visitor with their own wallet and their own USDC saw
+               * no button at all. `nftSignVia` answers for both paths, and a
+               * button is still never drawn for somebody who would get a 403.
+               */
+              if (d.mintable && nftSignVia(nftState.canAct)) {
                 actions.push(
                   `<button class="btn" data-nft="mint" data-id="${d.id}" data-price="${esc(d.price)}">Mint</button>`,
                 );
@@ -9134,7 +9725,10 @@ const $ = (id) => document.getElementById(id);
                 );
               }
               return (
-                `<tr><td><b>${esc(d.name)}</b>` +
+                // Item 1 of the drop, which is the cover for a collection and
+                // the whole thing for a single.
+                `<tr><td>${nftThumbTag(d.uri ? d.uri.replace(/\/+$/, "") + "/1" : "", d.name, "drops")}</td>` +
+                `<td><b>${esc(d.name)}</b>` +
                 `<div style="font-size:11px;color:var(--muted)">#${d.id} · ${esc(d.uri)}</div>` +
                 (d.status === "rejected" && d.reason
                   ? `<div style="font-size:11px;color:var(--warn)">${esc(d.reason)}</div>` : "") +
@@ -9148,7 +9742,8 @@ const $ = (id) => document.getElementById(id);
                 `<td class="num">${actions.join(" ")}</td></tr>`
               );
             }).join("")
-          : emptyRow(6, want === "all" ? "No drops submitted yet." : `No ${want} drops.`);
+          : emptyRow(7, want === "all" ? "No drops submitted yet." : `No ${want} drops.`);
+        hydrateNftArt(body);
       }
 
       if ($("nftFilter")) $("nftFilter").addEventListener("change", renderNftRows);
@@ -9354,17 +9949,12 @@ const $ = (id) => document.getElementById(id);
           }
           if (!nftIsCollection() && body.supply !== 1) return say("A single NFT has a supply of 1.");
           $("nftSubmit").disabled = true;
-          try {
-            const r = await (await postJson("/api/nft/submit", body)).json();
-            if (r.ok) {
-              say(`Submitted — an admin decides next. ${txLink(r.txHash)}`, true);
-              $("nftName").value = ""; $("nftUri").value = "";
-              $("nftPrice").value = "";
-              renderNftKind();
-              loadNft().catch(() => {});
-            } else say(esc(r.error || "Submission failed."));
-          } catch {
-            say("Submission request failed.");
+          const ok = await nftDoSubmit(body, "nftSubmitMsg");
+          if (ok) {
+            $("nftName").value = ""; $("nftUri").value = "";
+            $("nftPrice").value = "";
+            renderNftKind();
+            loadNft().catch(() => {});
           }
           $("nftSubmit").disabled = false;
         });
@@ -9396,10 +9986,17 @@ const $ = (id) => document.getElementById(id);
              * That is the whole point: the contract refuses anything above the
              * figure the buyer agreed to, and re-reading here would agree to
              * whatever the creator had set a moment ago.
+             *
+             * Handled by `nftDoMint` rather than inline, because a visitor
+             * signing in their own wallet takes a different path to the same
+             * transaction and both have to stay in step.
              */
-            url = "/api/nft/mint";
-            body = { id, maxPrice: btn.dataset.price };
-            if (!confirm(`Mint drop #${id} for ${btn.dataset.price} USDC?`)) return;
+            btn.disabled = true;
+            await nftDoMint(id, btn.dataset.price, "nftMsg");
+            btn.disabled = false;
+            loadNft().catch(() => {});
+            if (nftTab === "gallery") loadNftGallery().catch(() => {});
+            return;
           } else if (what === "price") {
             const next = prompt(
               `New price for drop #${id}, in USDC.\n\nBuyers are protected either way: a mint carries the ` +

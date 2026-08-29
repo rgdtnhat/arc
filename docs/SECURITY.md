@@ -154,6 +154,53 @@ Because self-custody needs no sign-in, keeping the operator path admin-only
 (Finding 2) costs users nothing: anyone can transact with their own money, while
 only the operator can spend the app's.
 
+### The NFT pane, which had only one of them
+
+Every NFT write — submit, mint, list, re-price, cancel, buy, transfer — signed
+with `AGENT_PRIVATE_KEY`, so every one was `requireOperator` and every spend was
+clamped by the guardian cap. Correct for the app wallet, and useless as the only
+option: a visitor holding their own USDC could not mint at all, and the
+marketplace was a shop only the shopkeeper could use. The buttons were simply
+not drawn for them, which reads as a broken feature rather than as somebody
+else's money.
+
+Both paths now exist, on the same terms as the DeFi ones:
+
+- The operator routes are unchanged. `POST /api/nft/market/price` is new and is
+  `requireOperator` like its siblings; `/api/nft/mint` and `/api/nft/market/buy`
+  still check `policy.autoApproveMax` **before** granting the ERC-20 allowance,
+  so a spend the cap refused cannot leave an approval standing behind it.
+- The browser path assembles the same calls from `GET /api/defi/config`
+  selectors and the connected wallet signs them. The guardian cap deliberately
+  does not apply there: it bounds what the *agent* may spend unattended, and a
+  person signing in their own wallet is the co-signer that cap exists to
+  summon. Clamping them to it would be theatre.
+- `/api/nft/media` remains `requireAuth` rather than `requireOperator`. It
+  spends nothing; the gate is there because an unauthenticated write that puts
+  bytes on disk is a disk-filling primitive.
+
+`agent/test/nft-self-custody.test.ts` holds both halves in place: every action
+must have a self-custody branch *and* an operator branch, the browser's
+selectors must match the shipped ABIs (a wrong selector is four bytes no
+function matches, which lands in the fallback rather than failing loudly), and
+every POST under `/api/nft` except the media upload must be `requireOperator`.
+
+### Artwork is resolved in the browser, never by the server
+
+A drop's metadata URI is written by whoever submitted it. Resolving it
+server-side to find the picture would hand any submitter a request originating
+inside the app's network — an SSRF primitive aimed at whatever else lives there,
+fired with no user present to have chosen it. So the fetch happens in the
+reader's own browser, where an image load belongs.
+
+The page's CSP (`connect-src 'self'`, `img-src 'self' data:`) then decides what
+can actually be drawn. Artwork uploaded through this app is served by this app
+and resolves; a URI the creator brought from elsewhere does not, and gets a
+labelled placeholder that links out. Loosening the CSP to draw it inline would
+give any injected script somewhere to post a reader's session, which is not a
+trade worth making for a thumbnail — `agent/test/nft-gallery.test.ts` fails if a
+wildcard appears in either directive.
+
 ## Economic safety model (AMM liquidity pools)
 
 `TesseraAMM` lets anyone provide liquidity and earn swap fees. Its design choices

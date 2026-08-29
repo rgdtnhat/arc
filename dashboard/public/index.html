@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v178" />
+    <meta name="tessera-shell" content="tessera-v179" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -648,6 +648,50 @@
       /* ---- App Config panel ---------------------------------------------- */
       /* Tabs, because one scroll of forty settings is a place things get lost.
          Same shape as the wallet and DeFi tab strips. */
+      /* ---- NFT artwork: thumbnails, the gallery grid, and the viewer -------
+         A launchpad that shows only a token id and a URI is asking people to
+         recognise their own pictures by number. Every list that names a token
+         now shows it, and every thumbnail opens.
+
+         `object-fit:cover` in a fixed square, because the alternative is rows
+         whose height depends on whoever uploaded the tallest image. */
+      .nftThumb {
+        width:46px; height:46px; flex:0 0 46px; padding:0; border-radius:9px; overflow:hidden;
+        border:1px solid var(--line); background:var(--bg-soft); cursor:zoom-in; display:block;
+      }
+      .nftThumb img { width:100%; height:100%; object-fit:cover; display:block; }
+      .nftThumb.empty { display:grid; place-items:center; font-size:15px; color:var(--muted); cursor:default; }
+      /* Hosted somewhere this page's CSP will not fetch from. Openable, not drawable. */
+      .nftThumb.offsite, .nftTile .art.offsite {
+        display:grid; place-items:center; color:var(--muted); cursor:zoom-in;
+        border-style:dashed;
+      }
+      .nftThumb.offsite { font-size:15px; }
+      .nftTile .art.offsite { font-size:26px; }
+      .nftGrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(132px, 1fr)); gap:13px; }
+      .nftTile { border:1px solid var(--line); border-radius:13px; overflow:hidden; background:var(--bg-soft); }
+      .nftTile .art {
+        width:100%; aspect-ratio:1/1; display:block; padding:0; border:0; background:var(--bg);
+        cursor:zoom-in; overflow:hidden;
+      }
+      .nftTile .art img { width:100%; height:100%; object-fit:cover; display:block; }
+      .nftTile .art.empty { display:grid; place-items:center; font-size:26px; color:var(--muted); cursor:default; }
+      .nftTile .meta { padding:8px 10px 10px; font-size:12px; }
+      .nftTile .meta b { display:block; font-size:12.5px; }
+      .nftTile .meta .sub { color:var(--muted); font-size:11px; margin-top:2px; }
+      .nftTile .meta .acts { display:flex; gap:5px; flex-wrap:wrap; margin-top:7px; }
+      .nftTile .meta .acts .btn { padding:3px 8px; font-size:11px; }
+      /* The viewer. Fixed, not a popup: a new window is blocked as often as it
+         is opened, and this has to work on a phone. */
+      #nftLightbox { position:fixed; inset:0; z-index:60; display:none; background:rgba(0,0,0,.86); }
+      #nftLightbox[data-open="1"] { display:grid; grid-template-rows:auto 1fr auto; }
+      #nftLightbox .lbBar { display:flex; justify-content:space-between; align-items:center; gap:12px;
+                            padding:12px 16px; color:#fff; font-size:13px; }
+      #nftLightbox .lbBody { display:grid; place-items:center; padding:0 16px; min-height:0; }
+      #nftLightbox img { max-width:100%; max-height:100%; object-fit:contain; border-radius:12px; }
+      #nftLightbox .lbFoot { display:flex; justify-content:center; gap:10px; padding:14px 16px 20px; }
+      #nftLightbox .btn { background:rgba(255,255,255,.12); border-color:rgba(255,255,255,.3); color:#fff; }
+      #nftLightbox .lbNone { color:rgba(255,255,255,.72); font-size:13px; text-align:center; padding:40px 16px; }
       .cfgTabs { display:flex; gap:6px; flex-wrap:wrap; padding:12px 20px 4px; position:sticky; top:0;
                  background:var(--card, #0d1117); z-index:2; border-bottom:1px solid var(--line); }
       .cfgTabs .btn { padding:6px 12px; font-size:12.5px; }
@@ -3364,6 +3408,7 @@
                wallet and DeFi panes use. -->
           <div class="row-actions" id="nftTabs" role="tablist" style="margin-bottom:14px;flex-wrap:wrap">
             <button class="btn" data-nfttab="pad">Launch pad</button>
+            <button class="btn" data-nfttab="gallery">Gallery</button>
             <button class="btn" data-nfttab="market">Marketplace</button>
             <button class="btn" data-nfttab="transfer">Transfer</button>
           </div>
@@ -3434,12 +3479,54 @@
             </div>
             <div class="tblWrap auto"><table class="data">
               <thead><tr>
+                <th style="width:56px"></th>
                 <th>Drop</th><th>Creator</th><th class="num">Price</th><th class="num">Minted</th>
                 <th>Status</th><th></th>
               </tr></thead>
               <tbody id="nftRows"></tbody>
             </table></div>
             <div class="kv" id="nftMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <!-- ---------- GALLERY ---------- -->
+          <div class="card" id="nftGalleryCard" hidden>
+            <h2>🖼 Your gallery — everything this wallet holds</h2>
+            <div class="notready" id="nftGalleryNotReady" style="display:none"></div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Every token held by the wallet this page is acting as, plus the ones it has listed — those live in
+              the market contract until they sell, so they would otherwise vanish from view. Click any picture to
+              open it; the arrows walk the whole gallery.
+            </div>
+            <div class="metrics tight" id="nftGalleryMeta" style="margin-bottom:16px"></div>
+            <div class="row-actions" style="flex-wrap:wrap;align-items:flex-end;margin-bottom:13px">
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                By date
+                <select id="nftGalBasis" class="field" style="width:150px">
+                  <option value="receivedAt">Received</option>
+                  <option value="mintedAt">Minted</option>
+                </select>
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Within
+                <select id="nftGalRange" class="field" style="width:150px">
+                  <option value="0">Any time</option>
+                  <option value="1">Last 24 hours</option>
+                  <option value="7">Last 7 days</option>
+                  <option value="30">Last 30 days</option>
+                  <option value="90">Last 90 days</option>
+                </select>
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Order
+                <select id="nftGalOrder" class="field" style="width:150px">
+                  <option value="desc">Newest first</option>
+                  <option value="asc">Oldest first</option>
+                </select>
+              </label>
+              <button class="btn" id="nftGalRefresh">Refresh</button>
+            </div>
+            <div class="nftGrid" id="nftGalleryGrid"></div>
+            <div class="kv" id="nftGalleryMsg" style="margin-top:11px;display:none"></div>
           </div>
 
           <!-- ---------- MARKETPLACE ---------- -->
@@ -3470,7 +3557,10 @@
 
             <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">On sale</div>
             <div class="tblWrap auto"><table class="data">
-              <thead><tr><th>Token</th><th>Seller</th><th class="num">Price</th><th></th></tr></thead>
+              <thead><tr>
+                <th style="width:56px"></th>
+                <th>Token</th><th>Seller</th><th class="num">Price</th><th></th>
+              </tr></thead>
               <tbody id="nftMarketRows"></tbody>
             </table></div>
             <div class="kv" id="nftMarketMsg" style="margin-top:11px;display:none"></div>
@@ -3499,6 +3589,20 @@
             <div class="kv" id="nftXferMsg" style="margin-top:9px;display:none"></div>
             <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">Held by the app wallet</div>
             <div id="nftHeld" style="display:flex;gap:9px;flex-wrap:wrap"></div>
+          </div>
+
+          <!-- The viewer. One per pane, shared by every thumbnail on it. -->
+          <div id="nftLightbox" role="dialog" aria-modal="true" aria-label="NFT viewer">
+            <div class="lbBar">
+              <div id="nftLbTitle" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+              <button class="btn" id="nftLbClose" aria-label="Close">Close</button>
+            </div>
+            <div class="lbBody" id="nftLbBody"></div>
+            <div class="lbFoot">
+              <button class="btn" id="nftLbPrev" aria-label="Previous">← Previous</button>
+              <span id="nftLbCount" style="color:rgba(255,255,255,.72);font-size:12.5px;align-self:center"></span>
+              <button class="btn" id="nftLbNext" aria-label="Next">Next →</button>
+            </div>
           </div>
         </div>
 
