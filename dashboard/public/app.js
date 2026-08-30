@@ -8929,19 +8929,26 @@ const $ = (id) => document.getElementById(id);
           // The row may have been re-rendered out from under us mid-fetch.
           if (!el.isConnected) continue;
           if (!art) { el.title = "No picture could be read from this URI"; continue; }
+          /*
+           * The label the caller set stays. It is the drop's name — the whole
+           * point of the naming fix — and replacing it with the metadata's own
+           * name, or with a note about hosting, is how the viewer ended up
+           * titled "Artwork is hosted off-site" instead of "Matcha #1".
+           */
+          const label = el.title || art.name || "NFT artwork";
           if (art.offsite) {
             // Still openable — the viewer offers the link. It just cannot be
             // drawn inline without weakening the page's CSP for everyone.
             el.textContent = "↗";
-            el.title = `${art.name || "Artwork"} is hosted off-site — open it to view`;
+            el.title = `${label} — hosted off-site, open it to view`;
             el.dataset.offsite = "1";
             el.classList.remove("empty");
             el.classList.add("offsite");
             continue;
           }
           el.classList.remove("empty");
-          el.innerHTML = `<img src="${esc(art.image)}" alt="${esc(art.name || "NFT artwork")}" loading="lazy" />`;
-          if (art.name) el.title = art.name;
+          el.innerHTML = `<img src="${esc(art.image)}" alt="${esc(label)}" loading="lazy" />`;
+          el.title = label;
         }
       }
 
@@ -9047,6 +9054,32 @@ const $ = (id) => document.getElementById(id);
         return canAct !== false ? "operator" : null;
       }
 
+      /**
+       * What to call a token.
+       *
+       * Every list said "#1 · drop 0". The token id at least identifies it; the
+       * drop id is an ordinal that means nothing to the person holding it. The
+       * drop's name was on chain the whole time and nothing read it, so
+       * somebody who minted "Matcha" had to recognise their own picture by a
+       * number.
+       *
+       * The name leads, the id stays — two editions of one drop are both called
+       * "Matcha", and the id is what tells them apart.
+       */
+      function nftLabel(t) {
+        const name = String((t && t.name) || "").trim();
+        const id = t && t.tokenId != null ? `#${t.tokenId}` : "";
+        return name ? `${name} ${id}`.trim() : id || "NFT";
+      }
+
+      /** The line underneath: where it came from, for anybody who wants it. */
+      function nftSubLabel(t) {
+        const parts = [];
+        if (t && t.tokenId != null) parts.push(`Token #${t.tokenId}`);
+        if (t && t.dropId != null) parts.push(`drop ${t.dropId}`);
+        return parts.join(" · ");
+      }
+
       /** The one sentence to show when neither path is open. */
       const NFT_NO_SIGNER =
         "Sign in as operator, or switch to My wallet and connect one, to act here.";
@@ -9112,7 +9145,7 @@ const $ = (id) => document.getElementById(id);
           const r = await (await fetch("/api/nft/mine?user=" + encodeURIComponent(who), { headers: authHeaders() })).json();
           if (!r || !r.ok) return;
           nftMine = r;
-          const label = (t) => `#${t.tokenId} · drop ${t.dropId}`;
+          const label = nftLabel;
           for (const id of ["nftXferToken", "nftListToken"]) {
             const sel = $(id);
             if (!sel) continue;
@@ -9388,7 +9421,7 @@ const $ = (id) => document.getElementById(id);
         }
 
         grid.innerHTML = rows.map((t) => {
-          const label = `#${t.tokenId} · drop ${t.dropId}`;
+          const label = nftLabel(t);
           const acts = [];
           if (signer) {
             if (t.listing) {
@@ -9402,6 +9435,7 @@ const $ = (id) => document.getElementById(id);
           return `<div class="nftTile">` +
             nftTileArt(t.uri, label) +
             `<div class="meta"><b>${esc(label)}</b>` +
+            `<div class="sub">${esc(nftSubLabel(t))}</div>` +
             `<div class="sub">${esc(basis === "mintedAt" ? "Minted" : "Received")} ${esc(nftWhen(t[basis]))}</div>` +
             (t.listing
               ? `<div class="sub" style="color:var(--good)">Listed at ${esc(t.listing.price)} USDC</div>`
@@ -9533,9 +9567,9 @@ const $ = (id) => document.getElementById(id);
                   ? `<button class="btn" data-mkt="price" data-id="${l.id}" data-price="${esc(l.price)}">Change price</button> ` +
                     `<button class="btn" data-mkt="cancel" data-id="${l.id}">Take back</button>`
                   : `<button class="btn" data-mkt="buy" data-id="${l.id}" data-price="${esc(l.price)}">Buy</button>`;
-                return `<tr><td>${nftThumbTag(l.uri, `#${l.tokenId}`, "market")}</td>` +
-                  `<td><b>#${l.tokenId}</b>` +
-                  `<div style="font-size:11px;color:var(--muted)">${esc(l.uri || l.collection)}</div></td>` +
+                return `<tr><td>${nftThumbTag(l.uri, nftLabel(l), "market")}</td>` +
+                  `<td><b>${esc(nftLabel(l))}</b>` +
+                  `<div style="font-size:11px;color:var(--muted)">${esc(nftSubLabel(l) || l.collection)}</div></td>` +
                   `<td class="mono" style="font-size:11px">${esc(short(l.seller))}${mine ? " (you)" : ""}</td>` +
                   `<td class="num mono">${esc(l.price)} USDC</td>` +
                   `<td class="num">${action}</td></tr>`;

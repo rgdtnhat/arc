@@ -8348,6 +8348,37 @@ async function main() {
   }
 
   /**
+   * What a drop is called.
+   *
+   * Every list of tokens said "#1 · drop 0". The token id identifies it and the
+   * drop id says nothing at all — the drop had a name the whole time, sitting
+   * on chain in `drops(id).name`, and nothing ever read it. Somebody who minted
+   * "Matcha" then had to recognise their own picture by an ordinal.
+   *
+   * Cached without expiry because a drop cannot be renamed: the contract has no
+   * function for it. That matters here, because the alternative is one extra
+   * `drops()` read per token per request on a page that polls.
+   */
+  const dropNames = new Map<number, string>();
+  const dropNameOf = async (dropId: number): Promise<string> => {
+    if (!launchpadAddr) return "";
+    const known = dropNames.get(dropId);
+    if (known !== undefined) return known;
+    try {
+      const d = (await client.public.readContract({
+        address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "drops", args: [BigInt(dropId)],
+      })) as readonly [Hex, bigint, number, number, number, boolean, string, string, string];
+      const name = String(d[6] ?? "");
+      dropNames.set(dropId, name);
+      return name;
+    } catch {
+      // A read that failed is not an answer, so it is not cached — the next
+      // request tries again rather than showing a blank name for ever.
+      return "";
+    }
+  };
+
+  /**
    * Which launchpad tokens an address holds.
    *
    * The launchpad is a minimal ERC-721 with no enumeration — deliberately, it
@@ -8361,7 +8392,10 @@ async function main() {
    */
   const tokensOwnedBy = async (
     who: Hex,
-  ): Promise<{ tokenId: number; dropId: number; uri: string; mintedAt: number | null; receivedAt: number | null }[]> => {
+  ): Promise<{
+    tokenId: number; dropId: number; name: string; uri: string;
+    mintedAt: number | null; receivedAt: number | null;
+  }[]> => {
     if (!launchpadAddr) return [];
     const supply = Number(await client.public.readContract({
       address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "totalSupply",
@@ -8381,7 +8415,10 @@ async function main() {
       // The dates come from the folded `Transfer` log, and are null until the
       // scan has reached that block — the gallery sorts nulls last rather than
       // inventing a date.
-      return { tokenId: Number(id), dropId: Number(dropId), uri, ...tokenDates(nftHistory, Number(id), who) };
+      return {
+        tokenId: Number(id), dropId: Number(dropId), name: await dropNameOf(Number(dropId)), uri,
+        ...tokenDates(nftHistory, Number(id), who),
+      };
     }));
   };
 
@@ -8398,7 +8435,7 @@ async function main() {
       // Anything this wallet has listed is escrowed by the market, so it no
       // longer shows as theirs — read those back or a seller loses sight of it.
       let listedByMe: {
-        tokenId: number; listingId: number; price: string; uri: string; dropId: number;
+        tokenId: number; listingId: number; price: string; uri: string; dropId: number; name: string;
         mintedAt: number | null; receivedAt: number | null;
       }[] = [];
       if (marketAddr) {
@@ -8486,14 +8523,28 @@ async function main() {
         })) as readonly [Hex, Hex, bigint, bigint, boolean];
         if (!l[4]) return null;
         let uri = "";
+        let name = "";
+        let dropId: number | null = null;
+        // Only for tokens from the launchpad this app knows. The market takes
+        // any ERC-721, and a foreign collection has no drop to name.
         if (launchpadAddr && String(l[1]).toLowerCase() === launchpadAddr.toLowerCase()) {
-          uri = (await client.public.readContract({
-            address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [l[2]],
-          }).catch(() => "")) as string;
+          const [tokenUri, drop] = await Promise.all([
+            client.public.readContract({
+              address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [l[2]],
+            }).catch(() => "") as Promise<string>,
+            client.public.readContract({
+              address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropOf", args: [l[2]],
+            }).catch(() => null) as Promise<bigint | null>,
+          ]);
+          uri = tokenUri;
+          if (drop !== null) {
+            dropId = Number(drop);
+            name = await dropNameOf(dropId);
+          }
         }
         return {
           id: Number(id), seller: l[0], collection: l[1], tokenId: Number(l[2]),
-          priceRaw: l[3].toString(), price: fmtUnits(l[3], 6), uri,
+          priceRaw: l[3].toString(), price: fmtUnits(l[3], 6), uri, name, dropId,
         };
       }));
       res.json({

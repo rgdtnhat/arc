@@ -139,3 +139,50 @@ test("the page's CSP was not loosened to make thumbnails work", () => {
   assert.match(csp![1]!, /img-src 'self' data:/);
   assert.doesNotMatch(csp![1]!, /(connect|img)-src[^;]*\*/, "a wildcard source crept into the CSP");
 });
+
+/* ---- what a token is called --------------------------------------------- */
+
+const labels = new Function(`
+  ${grab("nftLabel")}
+  ${grab("nftSubLabel")}
+  return { nftLabel, nftSubLabel };
+`)() as { nftLabel: (t: unknown) => string; nftSubLabel: (t: unknown) => string };
+
+/**
+ * "#1 · drop 0" was every list's idea of a name.
+ *
+ * The token id at least identifies it. The drop id is an ordinal that means
+ * nothing to the person holding the thing — and the drop's name was on chain in
+ * `drops(id).name` the whole time, unread. Somebody who minted "Matcha" had to
+ * recognise their own picture by a number.
+ */
+test("the drop's name leads, and the token id stays to tell editions apart", () => {
+  assert.equal(labels.nftLabel({ name: "Matcha", tokenId: 1, dropId: 0 }), "Matcha #1");
+  // Two editions of one drop share a name; the id is the whole difference.
+  assert.equal(labels.nftLabel({ name: "Matcha", tokenId: 7, dropId: 0 }), "Matcha #7");
+  assert.equal(labels.nftSubLabel({ name: "Matcha", tokenId: 1, dropId: 0 }), "Token #1 · drop 0");
+});
+
+test("a token with no name is still identified, not called 'undefined'", () => {
+  /*
+   * The market takes any ERC-721, so a listing from a collection this app does
+   * not know has no drop and no name to read. Falling back to the id is right;
+   * printing an empty name, or the string "undefined", is what a template does
+   * when nobody thought about it.
+   */
+  assert.equal(labels.nftLabel({ tokenId: 4 }), "#4");
+  assert.equal(labels.nftLabel({ name: "   ", tokenId: 4 }), "#4");
+  assert.equal(labels.nftLabel({}), "NFT");
+  assert.equal(labels.nftLabel(null), "NFT");
+  assert.equal(labels.nftSubLabel({ tokenId: 4 }), "Token #4");
+});
+
+test("the server sends a name with every token and listing", () => {
+  // The label has nothing to show unless the read supplies it, and the drop
+  // name costs one cached `drops()` call rather than one per token per poll.
+  const server = readFileSync(new URL("../src/dashboard.ts", import.meta.url), "utf8");
+  assert.match(server, /const dropNameOf = async/, "the drop name is never read");
+  assert.match(server, /name: await dropNameOf\(Number\(dropId\)\)/, "held tokens carry no name");
+  assert.match(server, /priceRaw: l\[3\]\.toString\(\), price: fmtUnits\(l\[3\], 6\), uri, name, dropId/,
+    "market listings carry no name");
+});
