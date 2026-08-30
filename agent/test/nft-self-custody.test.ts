@@ -151,3 +151,61 @@ test("the guardian cap still stands between the app wallet and a stranger's pric
     assert.ok(cap < approve, `${route} grants the allowance before checking the cap`);
   }
 });
+
+/* ---- the wait, and what fills it ---------------------------------------- */
+
+/**
+ * Both paths wait for the receipt before they report success — a hash is not an
+ * outcome, and a reverted transaction must never come back as a green tick. The
+ * cost is a five-to-twenty-second wait on a paced RPC, and the panel used to
+ * spend all of it showing nothing at all: a disabled button and an empty
+ * message line, which reads as the app having hung.
+ *
+ * Then it spent another few seconds re-reading every token's owner, drop and
+ * URI before the change appeared. By that point the receipt had already proved
+ * it, so the redraw does not need to wait for the read.
+ */
+test("an operator write says what it is waiting for", () => {
+  const body = (() => {
+    const start = app.indexOf("      async function nftPost(");
+    assert.notEqual(start, -1, "nftPost is not a shared helper");
+    return app.slice(start, app.indexOf("\n      }\n", start));
+  })();
+  assert.match(body, /class="spin"/, "nothing is shown while the chain is being waited on");
+  assert.ok(
+    body.indexOf('class="spin"') < body.indexOf("await postJson"),
+    "the spinner appears after the request rather than before it",
+  );
+});
+
+test("every action that changes what is on screen redraws before the re-read", () => {
+  /*
+   * The receipt is proof enough to redraw. The refetch still runs, and still
+   * wins if the chain disagrees — this only moves the same change forward in
+   * time, it does not invent one.
+   */
+  for (const name of ["nftDoList", "nftDoRepriceListing", "nftDoCancel", "nftDoBuy", "nftDoTransfer"]) {
+    assert.match(
+      bodyOf(name), /nftPatchLocal\(|nftForgetToken\(/,
+      `${name} leaves the panel stale until a full re-read lands`,
+    );
+  }
+});
+
+test("the viewer sits above the app's own header", () => {
+  /*
+   * It was at z-index 60, under the fixed header (90) and the sub-nav (70). On
+   * a phone the picture filled the screen and the bar holding Close was painted
+   * over by the header — an opened NFT had no visible way out.
+   */
+  const css = readFileSync(new URL("../../dashboard/public/index.html", import.meta.url), "utf8");
+  const lb = /#nftLightbox \{[^}]*z-index:\s*(\d+)/.exec(css);
+  assert.ok(lb, "the viewer's z-index is gone");
+  const header = /position:\s*fixed;\s*top:\s*0;\s*left:\s*0;\s*right:\s*0;\s*z-index:\s*(\d+)/.exec(css);
+  assert.ok(header, "the header's z-index is gone");
+  assert.ok(
+    Number(lb![1]) > Number(header![1]),
+    `the viewer (${lb![1]}) is below the header (${header![1]}) again`,
+  );
+  assert.match(css, /id="nftLbClose"/, "the viewer has no close button");
+});

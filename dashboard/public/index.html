@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v180" />
+    <meta name="tessera-shell" content="tessera-v181" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -682,11 +682,24 @@
       .nftTile .meta .acts { display:flex; gap:5px; flex-wrap:wrap; margin-top:7px; }
       .nftTile .meta .acts .btn { padding:3px 8px; font-size:11px; }
       /* The viewer. Fixed, not a popup: a new window is blocked as often as it
-         is opened, and this has to work on a phone. */
-      #nftLightbox { position:fixed; inset:0; z-index:60; display:none; background:rgba(0,0,0,.86); }
+         is opened, and this has to work on a phone.
+
+         z-index above the app header (90) and the sub-nav (70/75). At 60 it sat
+         *under* both: on a phone the picture filled the screen and the bar
+         holding Close was painted over by the header, so an opened NFT had no
+         visible way out. Below the config modal (120) and the confirm dialog
+         (140), which must still be able to appear over it. */
+      #nftLightbox { position:fixed; inset:0; z-index:110; display:none; background:rgba(0,0,0,.9); }
       #nftLightbox[data-open="1"] { display:grid; grid-template-rows:auto 1fr auto; }
+      /* Its own ground, so the bar stays readable over a bright photograph. */
       #nftLightbox .lbBar { display:flex; justify-content:space-between; align-items:center; gap:12px;
-                            padding:12px 16px; color:#fff; font-size:13px; }
+                            padding:12px 16px; color:#fff; font-size:13px;
+                            background:rgba(0,0,0,.55); backdrop-filter:blur(6px); }
+      /* Comfortably tappable, and unmistakably the way out. */
+      #nftLightbox .lbClose {
+        flex:0 0 auto; min-width:44px; min-height:44px; font-size:15px; font-weight:600;
+        display:inline-flex; align-items:center; justify-content:center; gap:6px;
+      }
       #nftLightbox .lbBody { display:grid; place-items:center; padding:0 16px; min-height:0; }
       #nftLightbox img { max-width:100%; max-height:100%; object-fit:contain; border-radius:12px; }
       #nftLightbox .lbFoot { display:flex; justify-content:center; gap:10px; padding:14px 16px 20px; }
@@ -3595,7 +3608,7 @@
           <div id="nftLightbox" role="dialog" aria-modal="true" aria-label="NFT viewer">
             <div class="lbBar">
               <div id="nftLbTitle" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
-              <button class="btn" id="nftLbClose" aria-label="Close">Close</button>
+              <button class="btn lbClose" id="nftLbClose" aria-label="Close the viewer">✕ Close</button>
             </div>
             <div class="lbBody" id="nftLbBody"></div>
             <div class="lbFoot">

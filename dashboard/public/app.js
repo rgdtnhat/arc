@@ -8991,11 +8991,25 @@ const $ = (id) => document.getElementById(id);
         if (!box || !items.length) return;
         nftLb = { items, at: Math.max(0, Math.min(items.length - 1, at || 0)) };
         box.dataset.open = "1";
+        /*
+         * Freeze the page behind it. The viewer is `position:fixed`, so the
+         * document keeps scrolling under it — on a phone that means closing the
+         * viewer can leave you somewhere you never scrolled to, and any stray
+         * drag on the picture moves the page rather than doing nothing.
+         */
+        document.body.dataset.lbScroll = document.body.style.overflow || "";
+        document.body.style.overflow = "hidden";
+        // Focus the way out, so the hardware back-equivalent — Escape, or a tap
+        // on the first thing the reader lands on — is the exit.
+        try { $("nftLbClose").focus({ preventScroll: true }); } catch {}
         nftLbRender();
       }
       function nftLbClose() {
         const box = $("nftLightbox");
-        if (box) box.dataset.open = "0";
+        if (!box) return;
+        box.dataset.open = "0";
+        document.body.style.overflow = document.body.dataset.lbScroll || "";
+        delete document.body.dataset.lbScroll;
       }
       function nftLbStep(by) {
         if (nftLb.items.length < 2) return;
@@ -9194,8 +9208,26 @@ const $ = (id) => document.getElementById(id);
         return r.raw;
       }
 
-      /** Post to an operator route and report the outcome into `msgId`. */
+      /**
+       * Post to an operator route and report the outcome into `msgId`.
+       *
+       * The server signs and then **waits for the receipt** before it answers,
+       * which is right — a hash is not an outcome, and a reverted transaction
+       * must not come back as a green tick. But on a paced RPC that wait is
+       * five to twenty seconds, and this said nothing at all for the whole of
+       * it: a disabled button and an empty message area, which reads as the app
+       * having hung rather than as the chain taking its time.
+       *
+       * So it says what it is doing, in the same spinner-then-result shape the
+       * self-custody path already used.
+       */
       async function nftPost(url, body, msgId, done) {
+        const m = $(msgId);
+        if (m) {
+          m.style.display = "block";
+          m.style.color = "var(--muted)";
+          m.innerHTML = `<span class="spin" aria-hidden="true"></span>Sending, then waiting for the block that confirms it…`;
+        }
         try {
           const r = await (await postJson(url, body)).json();
           if (r.ok) { nftSay(msgId, `${done} ${txLink(r.txHash)}`, true); return true; }
@@ -9204,6 +9236,34 @@ const $ = (id) => document.getElementById(id);
           nftSay(msgId, "The request failed.");
         }
         return false;
+      }
+
+      /* ---- Showing the result before the chain is read again ---------------
+       *
+       * Both paths wait for the receipt, so by the time an action returns the
+       * change is *already* on chain. What took another handful of seconds was
+       * the re-read: a full rescan of every token's owner, drop and URI, plus
+       * every listing, through a rate-limited RPC. Until it landed the panel
+       * still showed the old price, or a token that had just been sent away.
+       *
+       * The receipt is proof enough to redraw. So the local copy is patched and
+       * rendered at once, and the refetch runs behind it as reconciliation
+       * rather than as the thing the reader is waiting on. If the chain
+       * disagrees, the refetch wins — this only ever moves the same change
+       * forward in time.
+       */
+      function nftPatchLocal(fn) {
+        try { fn(); } catch { /* a redraw is not worth throwing over */ }
+        if (typeof renderNftGallery === "function") renderNftGallery();
+        if (typeof renderNftMarketRows === "function") renderNftMarketRows();
+      }
+
+      /** Drop a token from the held list — it has just left this wallet. */
+      function nftForgetToken(tokenId) {
+        nftPatchLocal(() => {
+          nftMine.tokens = (nftMine.tokens || []).filter((t) => t.tokenId !== tokenId);
+          nftMine.listed = (nftMine.listed || []).filter((t) => t.tokenId !== tokenId);
+        });
       }
 
       /** Mint one from a drop. `maxPrice` is the figure the reader was shown. */
@@ -9234,8 +9294,24 @@ const $ = (id) => document.getElementById(id);
         let raw;
         try { raw = nftRaw(price); } catch (e) { nftSay(msgId, esc(e.message)); return false; }
         if (raw === "0") { nftSay(msgId, "A listing needs a price above zero."); return false; }
-        if (via === "operator") return nftPost("/api/nft/market/list", { tokenId, price }, msgId, "Listed.");
-        return selfCustody(msgId, `list NFT #${tokenId}`, async (from, cfg) => {
+        const listed = (ok) => {
+          if (!ok) return ok;
+          /*
+           * The listing id is only known once the market has assigned it, so the
+           * tile shows the sale without the buttons that need it. The refetch
+           * behind this fills it in a moment later.
+           */
+          nftPatchLocal(() => {
+            const t = (nftMine.tokens || []).find((x) => x.tokenId === tokenId);
+            nftMine.tokens = (nftMine.tokens || []).filter((x) => x.tokenId !== tokenId);
+            if (t) nftMine.listed = [...(nftMine.listed || []), { ...t, listingId: null, price }];
+          });
+          return ok;
+        };
+        if (via === "operator") {
+          return listed(await nftPost("/api/nft/market/list", { tokenId, price }, msgId, "Listed."));
+        }
+        return listed(await selfCustody(msgId, `list NFT #${tokenId}`, async (from, cfg) => {
           if (!cfg.launchpad || !cfg.nftMarket) throw new Error("The launchpad or the market is not recorded on this network.");
           /*
            * `approve(market, tokenId)` — one token, not `setApprovalForAll`.
@@ -9256,7 +9332,7 @@ const $ = (id) => document.getElementById(id);
           return sendTx(from, cfg.nftMarket, callData(
             cfg.selectors.nftList, encAddr(cfg.launchpad), encUint(tokenId), encUint(raw),
           ));
-        });
+        }));
       }
 
       /** Change what a live listing is asking. */
@@ -9269,18 +9345,49 @@ const $ = (id) => document.getElementById(id);
           nftSay(msgId, "A listing needs a price above zero. To stop selling it, take it back.");
           return false;
         }
-        if (via === "operator") return nftPost("/api/nft/market/price", { id, price }, msgId, "Re-priced.");
-        return selfCustody(msgId, `re-price listing #${id}`, async (from, cfg) =>
-          sendTx(from, cfg.nftMarket, callData(cfg.selectors.nftSetPrice, encUint(id), encUint(raw))));
+        const repriced = (ok) => {
+          if (ok) {
+            nftPatchLocal(() => {
+              const l = nftMarketState && (nftMarketState.listings || []).find((x) => x.id === id);
+              if (l) { l.price = price; l.priceRaw = raw; }
+              const mine = (nftMine.listed || []).find((x) => x.listingId === id);
+              if (mine) mine.price = price;
+            });
+          }
+          return ok;
+        };
+        if (via === "operator") {
+          return repriced(await nftPost("/api/nft/market/price", { id, price }, msgId, "Re-priced."));
+        }
+        return repriced(await selfCustody(msgId, `re-price listing #${id}`, async (from, cfg) =>
+          sendTx(from, cfg.nftMarket, callData(cfg.selectors.nftSetPrice, encUint(id), encUint(raw)))));
       }
 
       /** Take a listing back. Always the seller's to do. */
       async function nftDoCancel(id, msgId) {
         const via = nftSignVia(nftMine.canAct);
         if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
-        if (via === "operator") return nftPost("/api/nft/market/cancel", { id }, msgId, "Taken back.");
-        return selfCustody(msgId, `take listing #${id} back`, async (from, cfg) =>
-          sendTx(from, cfg.nftMarket, callData(cfg.selectors.nftCancel, encUint(id))));
+        const cancelled = (ok) => {
+          if (ok) {
+            nftPatchLocal(() => {
+              if (nftMarketState) {
+                nftMarketState.listings = (nftMarketState.listings || []).filter((x) => x.id !== id);
+              }
+              // Back in the wallet, so it moves from the listed side to the held one.
+              const mine = (nftMine.listed || []).find((x) => x.listingId === id);
+              if (mine) {
+                nftMine.listed = (nftMine.listed || []).filter((x) => x.listingId !== id);
+                nftMine.tokens = [...(nftMine.tokens || []), { ...mine, listingId: undefined, price: undefined }];
+              }
+            });
+          }
+          return ok;
+        };
+        if (via === "operator") {
+          return cancelled(await nftPost("/api/nft/market/cancel", { id }, msgId, "Taken back."));
+        }
+        return cancelled(await selfCustody(msgId, `take listing #${id} back`, async (from, cfg) =>
+          sendTx(from, cfg.nftMarket, callData(cfg.selectors.nftCancel, encUint(id)))));
       }
 
       /** Buy a listing at the price the row was showing. */
@@ -9288,14 +9395,27 @@ const $ = (id) => document.getElementById(id);
         const via = nftSignVia(nftMine.canAct);
         if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
         if (!confirm(`Buy listing #${id} for ${shownPrice} USDC?`)) return false;
-        if (via === "operator") return nftPost("/api/nft/market/buy", { id, maxPrice: shownPrice }, msgId, "Bought.");
+        const bought = (ok) => {
+          // Off the board immediately: the receipt has already confirmed it.
+          if (ok) {
+            nftPatchLocal(() => {
+              if (nftMarketState) {
+                nftMarketState.listings = (nftMarketState.listings || []).filter((x) => x.id !== id);
+              }
+            });
+          }
+          return ok;
+        };
+        if (via === "operator") {
+          return bought(await nftPost("/api/nft/market/buy", { id, maxPrice: shownPrice }, msgId, "Bought."));
+        }
         let raw;
         try { raw = nftRaw(shownPrice); } catch (e) { nftSay(msgId, esc(e.message)); return false; }
-        return selfCustody(msgId, `buy listing #${id}`, async (from, cfg) => {
+        return bought(await selfCustody(msgId, `buy listing #${id}`, async (from, cfg) => {
           if (!cfg.nftMarket) throw new Error("No market is recorded on this network.");
           if (raw !== "0") await ensureAllowance(from, cfg.usdc, cfg.nftMarket, raw);
           return sendTx(from, cfg.nftMarket, callData(cfg.selectors.nftBuy, encUint(id), encUint(raw)));
-        });
+        }));
       }
 
       /** Send a token to somebody. Irreversible, so it asks first. */
@@ -9304,13 +9424,21 @@ const $ = (id) => document.getElementById(id);
         if (!via) { nftSay(msgId, NFT_NO_SIGNER); return false; }
         if (!/^0x[0-9a-fA-F]{40}$/.test(to)) { nftSay(msgId, "That is not an address."); return false; }
         if (!confirm(`Send NFT #${tokenId} to ${to}?\n\nA transfer cannot be undone.`)) return false;
-        if (via === "operator") return nftPost("/api/nft/transfer", { tokenId, to }, msgId, "Sent.");
-        return selfCustody(msgId, `send NFT #${tokenId}`, async (from, cfg) =>
+        const sent = (ok) => {
+          // It has left this wallet, and the receipt says so — there is nothing
+          // to wait for before taking it off the shelf.
+          if (ok) nftForgetToken(tokenId);
+          return ok;
+        };
+        if (via === "operator") {
+          return sent(await nftPost("/api/nft/transfer", { tokenId, to }, msgId, "Sent."));
+        }
+        return sent(await selfCustody(msgId, `send NFT #${tokenId}`, async (from, cfg) =>
           // `safeTransferFrom`, so a contract that cannot hold an ERC-721
           // refuses it rather than swallowing the token.
           sendTx(from, cfg.launchpad, callData(
             cfg.selectors.nftTransfer, encAddr(from), encAddr(to), encUint(tokenId),
-          )));
+          ))));
       }
 
       /** Submit a drop for review. */
@@ -9425,8 +9553,16 @@ const $ = (id) => document.getElementById(id);
           const acts = [];
           if (signer) {
             if (t.listing) {
-              acts.push(`<button class="btn" data-gal="price" data-id="${t.listing.id}" data-price="${esc(t.listing.price)}">Change price</button>`);
-              acts.push(`<button class="btn" data-gal="cancel" data-id="${t.listing.id}">Take back</button>`);
+              /*
+               * A listing drawn straight after the sale went through has no id
+               * yet — the market assigns it, and this row is showing the
+               * confirmed receipt rather than a re-read. Both buttons need that
+               * id, so they wait for the refetch instead of failing on `null`.
+               */
+              if (t.listing.id != null) {
+                acts.push(`<button class="btn" data-gal="price" data-id="${t.listing.id}" data-price="${esc(t.listing.price)}">Change price</button>`);
+                acts.push(`<button class="btn" data-gal="cancel" data-id="${t.listing.id}">Take back</button>`);
+              }
             } else {
               acts.push(`<button class="btn" data-gal="list" data-token="${t.tokenId}">Sell</button>`);
               acts.push(`<button class="btn" data-gal="send" data-token="${t.tokenId}">Send</button>`);
@@ -9438,7 +9574,9 @@ const $ = (id) => document.getElementById(id);
             `<div class="sub">${esc(nftSubLabel(t))}</div>` +
             `<div class="sub">${esc(basis === "mintedAt" ? "Minted" : "Received")} ${esc(nftWhen(t[basis]))}</div>` +
             (t.listing
-              ? `<div class="sub" style="color:var(--good)">Listed at ${esc(t.listing.price)} USDC</div>`
+              ? `<div class="sub" style="color:var(--good)">Listed at ${esc(t.listing.price)} USDC` +
+                (t.listing.id == null ? ` <span style="color:var(--muted)">· confirming</span>` : "") +
+                `</div>`
               : "") +
             (acts.length ? `<div class="acts">${acts.join("")}</div>` : "") +
             `</div></div>`;
@@ -9516,6 +9654,9 @@ const $ = (id) => document.getElementById(id);
         });
       }
 
+      /** The last answer from `/api/nft/market`, so a row can be redrawn without one. */
+      let nftMarketState = null;
+
       window.loadNftMarket = async function loadNftMarket() {
         const card = $("nftMarketCard");
         if (!card) return;
@@ -9523,6 +9664,7 @@ const $ = (id) => document.getElementById(id);
         await loadNftHeld();
         try {
           const r = await (await fetch("/api/nft/market", { headers: authHeaders() })).json();
+          nftMarketState = r && r.ok && r.deployed ? r : null;
           if (!r || !r.ok || !r.deployed) {
             if (notReady) {
               notReady.style.display = "block";
@@ -9537,6 +9679,21 @@ const $ = (id) => document.getElementById(id);
             nftMetric("On sale", String(r.listings.length)) +
             nftMetric("Market fee", (Number(r.feeBps) / 100).toFixed(2) + "%") +
             nftMetric("Contract", short(r.address));
+          renderNftMarketRows();
+        } catch {
+          if (notReady) {
+            notReady.style.display = "block";
+            notReady.textContent = "Could not read the market just now.";
+          }
+        }
+      };
+
+      /** Draw the listing rows from whatever the last read said. */
+      function renderNftMarketRows() {
+        const body = $("nftMarketRows");
+        const r = nftMarketState;
+        if (!body || !r) return;
+        {
           const me = String(window.__myAddress || "").toLowerCase();
           /*
            * Buying, listing and taking back all spend or move the app wallet's
@@ -9575,14 +9732,13 @@ const $ = (id) => document.getElementById(id);
                   `<td class="num">${action}</td></tr>`;
               }).join("")
             : emptyRow(5, "Nothing is listed yet.");
+          $("nftMarketMeta").innerHTML =
+            nftMetric("On sale", String(r.listings.length)) +
+            nftMetric("Market fee", (Number(r.feeBps) / 100).toFixed(2) + "%") +
+            nftMetric("Contract", short(r.address));
           hydrateNftArt($("nftMarketRows"));
-        } catch {
-          if (notReady) {
-            notReady.style.display = "block";
-            notReady.textContent = "Could not read the market just now.";
-          }
         }
-      };
+      }
 
       if ($("nftListGo")) {
         $("nftListGo").addEventListener("click", async () => {
