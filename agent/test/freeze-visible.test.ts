@@ -70,3 +70,78 @@ test("withdraw and repay survive a supply-and-borrow freeze", () => {
   assert.equal(usable(1_000n, fz.withdraw), 1_000n);
   assert.equal(usable(1_000n, fz.repay), 1_000n);
 });
+
+/* ---- who may decide a drop -------------------------------------------- */
+
+import { canDecideDrops } from "../src/pool.ts";
+
+/**
+ * The launchpad's Approve and Reject buttons never appeared for the one person
+ * who could press them.
+ *
+ * The page decided by comparing the launchpad's owner against the address it
+ * was acting as. In an operator session that is the **app wallet**; the
+ * launchpad is owned by the **deployer**, because that is the key that deployed
+ * it. Two different addresses, so the comparison was false, always — while
+ * `/api/nft/decide` signed with the deployer key and worked the whole time. The
+ * feature was there and only the buttons were missing, which is the shape of
+ * bug that reads as "the admin can't decide anything".
+ */
+
+const APP_WALLET = "0xA005fE9726335b49F9Cc23653Bc6a9490a7faDc4";
+const DEPLOYER = "0x309e08cA592eCC41F1341d9e7A215f471479D68A";
+
+test("an operator whose owner key owns the launchpad may decide", () => {
+  const r = canDecideDrops({ operator: true, signer: DEPLOYER, launchpadOwner: DEPLOYER });
+  assert.equal(r.ok, true);
+  assert.equal(r.why, null);
+});
+
+test("the app wallet is not the launchpad's owner, and that is the whole bug", () => {
+  /*
+   * The exact live pairing: acting as the app wallet, launchpad owned by the
+   * deployer. The old comparison asked this question and answered "no"; the
+   * right question is what the *server* signs with, which is the deployer.
+   */
+  const wrong = canDecideDrops({ operator: true, signer: APP_WALLET, launchpadOwner: DEPLOYER });
+  assert.equal(wrong.ok, false);
+  assert.match(wrong.why ?? "", /owned by 0x309e08cA/);
+
+  const right = canDecideDrops({ operator: true, signer: DEPLOYER, launchpadOwner: DEPLOYER });
+  assert.equal(right.ok, true);
+});
+
+test("checksum casing does not decide who is admin", () => {
+  const r = canDecideDrops({
+    operator: true, signer: DEPLOYER.toLowerCase(), launchpadOwner: DEPLOYER.toUpperCase(),
+  });
+  assert.equal(r.ok, true, "a checksummed address failed to match itself");
+});
+
+test("each refusal says which of the three parts is missing", () => {
+  // Not signed in.
+  const anon = canDecideDrops({ operator: false, signer: DEPLOYER, launchpadOwner: DEPLOYER });
+  assert.equal(anon.ok, false);
+  assert.match(anon.why ?? "", /Sign in as operator/);
+
+  // Signed in, but this process cannot sign an owner action.
+  const noKey = canDecideDrops({ operator: true, signer: null, launchpadOwner: DEPLOYER });
+  assert.equal(noKey.ok, false);
+  assert.match(noKey.why ?? "", /DEPLOYER_PRIVATE_KEY/);
+
+  // Signed in, holding a key, wrong key.
+  const wrongKey = canDecideDrops({ operator: true, signer: APP_WALLET, launchpadOwner: DEPLOYER });
+  assert.match(wrongKey.why ?? "", /Decisions have to come from the owner/);
+
+  /*
+   * Every refusal names something to do about it. "The buttons are gone" is
+   * what this replaced, and it is the one answer nobody can act on.
+   */
+  for (const r of [anon, noKey, wrongKey]) assert.ok((r.why ?? "").length > 30);
+});
+
+test("an unreadable owner is a refusal, not an approval", () => {
+  // Failing open here would show Approve to anybody the moment a read failed.
+  const r = canDecideDrops({ operator: true, signer: DEPLOYER, launchpadOwner: null });
+  assert.equal(r.ok, false);
+});

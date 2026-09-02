@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="icon-192.png" />
     <!-- Ticket mark, matching the Tessera logo -->
     <!-- Bumped with the service worker cache by scripts/stamp-shell.mjs. -->
-    <meta name="tessera-shell" content="tessera-v167" />
+    <meta name="tessera-shell" content="tessera-v182" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="icon-192.png" type="image/png" />
     <style>
@@ -646,6 +646,70 @@
 
 
       /* ---- App Config panel ---------------------------------------------- */
+      /* Tabs, because one scroll of forty settings is a place things get lost.
+         Same shape as the wallet and DeFi tab strips. */
+      /* ---- NFT artwork: thumbnails, the gallery grid, and the viewer -------
+         A launchpad that shows only a token id and a URI is asking people to
+         recognise their own pictures by number. Every list that names a token
+         now shows it, and every thumbnail opens.
+
+         `object-fit:cover` in a fixed square, because the alternative is rows
+         whose height depends on whoever uploaded the tallest image. */
+      .nftThumb {
+        width:46px; height:46px; flex:0 0 46px; padding:0; border-radius:9px; overflow:hidden;
+        border:1px solid var(--line); background:var(--bg-soft); cursor:zoom-in; display:block;
+      }
+      .nftThumb img { width:100%; height:100%; object-fit:cover; display:block; }
+      .nftThumb.empty { display:grid; place-items:center; font-size:15px; color:var(--muted); cursor:default; }
+      /* Hosted somewhere this page's CSP will not fetch from. Openable, not drawable. */
+      .nftThumb.offsite, .nftTile .art.offsite {
+        display:grid; place-items:center; color:var(--muted); cursor:zoom-in;
+        border-style:dashed;
+      }
+      .nftThumb.offsite { font-size:15px; }
+      .nftTile .art.offsite { font-size:26px; }
+      .nftGrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(132px, 1fr)); gap:13px; }
+      .nftTile { border:1px solid var(--line); border-radius:13px; overflow:hidden; background:var(--bg-soft); }
+      .nftTile .art {
+        width:100%; aspect-ratio:1/1; display:block; padding:0; border:0; background:var(--bg);
+        cursor:zoom-in; overflow:hidden;
+      }
+      .nftTile .art img { width:100%; height:100%; object-fit:cover; display:block; }
+      .nftTile .art.empty { display:grid; place-items:center; font-size:26px; color:var(--muted); cursor:default; }
+      .nftTile .meta { padding:8px 10px 10px; font-size:12px; }
+      .nftTile .meta b { display:block; font-size:12.5px; }
+      .nftTile .meta .sub { color:var(--muted); font-size:11px; margin-top:2px; }
+      .nftTile .meta .acts { display:flex; gap:5px; flex-wrap:wrap; margin-top:7px; }
+      .nftTile .meta .acts .btn { padding:3px 8px; font-size:11px; }
+      /* The viewer. Fixed, not a popup: a new window is blocked as often as it
+         is opened, and this has to work on a phone.
+
+         z-index above the app header (90) and the sub-nav (70/75). At 60 it sat
+         *under* both: on a phone the picture filled the screen and the bar
+         holding Close was painted over by the header, so an opened NFT had no
+         visible way out. Below the config modal (120) and the confirm dialog
+         (140), which must still be able to appear over it. */
+      #nftLightbox { position:fixed; inset:0; z-index:110; display:none; background:rgba(0,0,0,.9); }
+      #nftLightbox[data-open="1"] { display:grid; grid-template-rows:auto 1fr auto; }
+      /* Its own ground, so the bar stays readable over a bright photograph. */
+      #nftLightbox .lbBar { display:flex; justify-content:space-between; align-items:center; gap:12px;
+                            padding:12px 16px; color:#fff; font-size:13px;
+                            background:rgba(0,0,0,.55); backdrop-filter:blur(6px); }
+      /* Comfortably tappable, and unmistakably the way out. */
+      #nftLightbox .lbClose {
+        flex:0 0 auto; min-width:44px; min-height:44px; font-size:15px; font-weight:600;
+        display:inline-flex; align-items:center; justify-content:center; gap:6px;
+      }
+      #nftLightbox .lbBody { display:grid; place-items:center; padding:0 16px; min-height:0; }
+      #nftLightbox img { max-width:100%; max-height:100%; object-fit:contain; border-radius:12px; }
+      #nftLightbox .lbFoot { display:flex; justify-content:center; gap:10px; padding:14px 16px 20px; }
+      #nftLightbox .btn { background:rgba(255,255,255,.12); border-color:rgba(255,255,255,.3); color:#fff; }
+      #nftLightbox .lbNone { color:rgba(255,255,255,.72); font-size:13px; text-align:center; padding:40px 16px; }
+      .cfgTabs { display:flex; gap:6px; flex-wrap:wrap; padding:12px 20px 4px; position:sticky; top:0;
+                 background:var(--card, #0d1117); z-index:2; border-bottom:1px solid var(--line); }
+      .cfgTabs .btn { padding:6px 12px; font-size:12.5px; }
+      .cfgTabs .btn.active { border-color:var(--accent, #6f8cff); color:var(--accent, #6f8cff); }
+      .cfgPane[hidden] { display:none; }
       .cfgCard {
         position: relative; display: flex; flex-direction: column;
         width: min(96vw, 720px); max-height: min(88vh, 900px);
@@ -1101,6 +1165,12 @@
               <path d="M12 3.4 4.2 7.2v1.4h15.6V7.2Z"/><path d="M6.4 10.4v6.2M10.1 10.4v6.2M13.9 10.4v6.2M17.6 10.4v6.2"/>
               <path d="M3.8 19.2h16.4"/>
             </svg></span><span class="navLbl">Governance</span>
+          </button>
+          <button class="btn" data-nav="nft" title="NFT" aria-label="NFT">
+            <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3.6" y="3.6" width="16.8" height="16.8" rx="3.2"/>
+              <path d="m6.4 16.2 3.6-4.4 2.6 3.1 2-2.3 3 3.6"/><circle cx="9.1" cy="8.6" r="1.35"/>
+            </svg></span><span class="navLbl">NFT</span>
           </button>
           <button class="btn" data-nav="wallet" title="Wallet" aria-label="Wallet">
             <span class="navIco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1573,6 +1643,15 @@
                 <button class="btn primary" id="lnEmClaim">Claim</button>
               </div>
               <div class="kv" id="lnEmNote" style="margin-top:8px"></div>
+              <!-- "Pot" and "owed" are the two words every line below uses, and
+                   neither is obvious. Saying them once here saves reading the
+                   paragraph twice. -->
+              <p class="feedNote" style="margin-top:6px">
+                <b>Pot</b> is the TSRA this contract is holding. <b>Owed</b> is what people have already
+                earned and not yet claimed — a debt against that pot, not a second pile of tokens. When
+                owed catches up with the pot there is nothing spare, so emission stops until it is topped
+                up; what you have earned stays yours either way.
+              </p>
               <!-- The balance left on the contract this one replaced. Hidden
                    unless there is one, because for most wallets there is not. -->
               <div id="lnEmLegacy" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--line-strong);border-radius:12px">
@@ -3335,6 +3414,211 @@
         </div><!-- /#paneGov -->
 
         <!-- ---------- TREASURY & SYSTEM ---------- -->
+        <!-- ---------- NFT LAUNCHPAD ---------- -->
+        <div class="tabPane" id="paneNft" hidden>
+          <!-- Three jobs on one pane: create a drop, move a token you hold, buy
+               and sell. Sub-tabs rather than one scroll, the same strip the
+               wallet and DeFi panes use. -->
+          <div class="row-actions" id="nftTabs" role="tablist" style="margin-bottom:14px;flex-wrap:wrap">
+            <button class="btn" data-nfttab="pad">Launch pad</button>
+            <button class="btn" data-nfttab="gallery">Gallery</button>
+            <button class="btn" data-nfttab="market">Marketplace</button>
+            <button class="btn" data-nfttab="transfer">Transfer</button>
+          </div>
+
+          <div class="card" id="nftCard">
+            <h2>🖼 NFT launch pad — submit a drop, an admin decides</h2>
+            <div class="notready" id="nftNotReady" style="display:none"></div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Anyone may submit a drop; nothing mints until an admin approves it. An approved drop mints for a
+              price in USDC that goes straight to its creator, minus the protocol fee — the contract never holds
+              the money. You state the price you agreed to when you mint, so a creator who re-prices mid-flight
+              is refused rather than paid.
+            </div>
+            <div class="metrics tight" id="nftMeta" style="margin-bottom:16px"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:4px 0 9px">Submit a drop</div>
+            <div class="row-actions" style="margin-bottom:10px">
+              <select id="nftKind" class="field" style="width:190px">
+                <option value="single">Single NFT — one of one</option>
+                <option value="collection">Collection — many editions</option>
+              </select>
+              <span id="nftKindNote" style="font-size:11.5px;color:var(--muted)"></span>
+            </div>
+            <!-- Labelled, because a placeholder disappears the moment there is a
+                 value in the box. Two fields both reading "1" with no label is
+                 not a form, it is a quiz. -->
+            <div class="row-actions" style="flex-wrap:wrap;align-items:flex-end">
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Name
+                <input id="nftName" class="field" placeholder="What is it called?" style="width:190px" maxlength="300" />
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Price per mint (USDC)
+                <input id="nftPrice" class="field" inputmode="decimal" placeholder="0 for free" style="width:150px" />
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                <span id="nftSupplyLabel">Supply</span>
+                <input id="nftSupply" class="field" inputmode="numeric" placeholder="1" style="width:110px" value="1" />
+              </label>
+            </div>
+            <!-- Artwork: upload it here, or bring a URI you already host. Either
+                 fills the same field, because the contract only ever sees a URI. -->
+            <div class="row-actions" style="flex-wrap:wrap;margin-top:9px">
+              <label class="btn" for="nftFiles" style="cursor:pointer">Choose image<span id="nftFilesPlural"></span></label>
+              <span style="font-size:11px;color:var(--muted)">Large photos are resized to fit before they are sent.
+                Uploads are hosted here, which is convenient rather than permanent — for artwork that must
+                outlive this site, host it yourself and paste the URI instead.</span>
+              <input id="nftFiles" type="file" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none" />
+              <button class="btn" id="nftUpload" disabled>Upload</button>
+              <span id="nftFilesPicked" style="font-size:11.5px;color:var(--muted)"></span>
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap;margin-top:9px">
+              <input id="nftUri" class="field" placeholder="…or a metadata base URI you already host" style="width:330px" maxlength="300" />
+              <button class="btn primary" id="nftSubmit">Submit for review</button>
+            </div>
+            <div id="nftPreview" style="display:none;margin-top:10px;gap:7px;flex-wrap:wrap"></div>
+            <div class="kv" id="nftSubmitMsg" style="margin-top:9px;display:none"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">Drops</div>
+            <div class="row-actions" style="margin-bottom:9px">
+              <select id="nftFilter" class="field">
+                <option value="all">All</option>
+                <option value="pending">Waiting for review</option>
+                <option value="approved">Approved</option>
+                <option value="rejected">Rejected</option>
+              </select>
+              <button class="btn" id="nftRefresh">Refresh</button>
+            </div>
+            <div class="tblWrap auto"><table class="data">
+              <thead><tr>
+                <th style="width:56px"></th>
+                <th>Drop</th><th>Creator</th><th class="num">Price</th><th class="num">Minted</th>
+                <th>Status</th><th></th>
+              </tr></thead>
+              <tbody id="nftRows"></tbody>
+            </table></div>
+            <div class="kv" id="nftMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <!-- ---------- GALLERY ---------- -->
+          <div class="card" id="nftGalleryCard" hidden>
+            <h2>🖼 Your gallery — everything this wallet holds</h2>
+            <div class="notready" id="nftGalleryNotReady" style="display:none"></div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Every token held by the wallet this page is acting as, plus the ones it has listed — those live in
+              the market contract until they sell, so they would otherwise vanish from view. Click any picture to
+              open it; the arrows walk the whole gallery.
+            </div>
+            <div class="metrics tight" id="nftGalleryMeta" style="margin-bottom:16px"></div>
+            <div class="row-actions" style="flex-wrap:wrap;align-items:flex-end;margin-bottom:13px">
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                By date
+                <select id="nftGalBasis" class="field" style="width:150px">
+                  <option value="receivedAt">Received</option>
+                  <option value="mintedAt">Minted</option>
+                </select>
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Within
+                <select id="nftGalRange" class="field" style="width:150px">
+                  <option value="0">Any time</option>
+                  <option value="1">Last 24 hours</option>
+                  <option value="7">Last 7 days</option>
+                  <option value="30">Last 30 days</option>
+                  <option value="90">Last 90 days</option>
+                </select>
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Order
+                <select id="nftGalOrder" class="field" style="width:150px">
+                  <option value="desc">Newest first</option>
+                  <option value="asc">Oldest first</option>
+                </select>
+              </label>
+              <button class="btn" id="nftGalRefresh">Refresh</button>
+            </div>
+            <div class="nftGrid" id="nftGalleryGrid"></div>
+            <div class="kv" id="nftGalleryMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <!-- ---------- MARKETPLACE ---------- -->
+          <div class="card" id="nftMarketCard" hidden>
+            <h2>🏷 NFT marketplace — list what you hold, buy what you want</h2>
+            <div class="notready" id="nftMarketNotReady" style="display:none"></div>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Listing moves the token into the market until it sells or you take it back, so a live listing is
+              something the contract can actually deliver — a buyer never pays gas to discover the seller moved it
+              first. You state the price you agreed to when you buy, so a seller who re-prices mid-flight is
+              refused rather than paid. Cancelling is always open to the seller.
+            </div>
+            <div class="metrics tight" id="nftMarketMeta" style="margin-bottom:16px"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:4px 0 9px">List one you hold</div>
+            <div class="row-actions" style="flex-wrap:wrap;align-items:flex-end">
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Token
+                <select id="nftListToken" class="field" style="width:230px"></select>
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Price (USDC)
+                <input id="nftListPrice" class="field" inputmode="decimal" placeholder="0 for free" style="width:140px" />
+              </label>
+              <button class="btn primary" id="nftListGo">List for sale</button>
+            </div>
+            <div class="kv" id="nftListMsg" style="margin-top:9px;display:none"></div>
+
+            <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">On sale</div>
+            <div class="tblWrap auto"><table class="data">
+              <thead><tr>
+                <th style="width:56px"></th>
+                <th>Token</th><th>Seller</th><th class="num">Price</th><th></th>
+              </tr></thead>
+              <tbody id="nftMarketRows"></tbody>
+            </table></div>
+            <div class="kv" id="nftMarketMsg" style="margin-top:11px;display:none"></div>
+          </div>
+
+          <!-- ---------- TRANSFER ---------- -->
+          <div class="card" id="nftTransferCard" hidden>
+            <h2>➦ Transfer an NFT</h2>
+            <div style="font-size:12.5px;color:var(--muted);margin-bottom:13px">
+              Sends one of the app wallet's tokens to another address. It goes by
+              <span class="mono">safeTransferFrom</span>, so a contract that cannot hold an ERC-721 refuses it
+              rather than swallowing it — a transfer to the wrong address cannot be undone, and this is the field
+              people paste into.
+            </div>
+            <div class="row-actions" style="flex-wrap:wrap;align-items:flex-end">
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                Token
+                <select id="nftXferToken" class="field" style="width:230px"></select>
+              </label>
+              <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)">
+                To
+                <input id="nftXferTo" class="field" placeholder="0x…" style="width:280px" />
+              </label>
+              <button class="btn primary" id="nftXferGo">Send</button>
+            </div>
+            <div class="kv" id="nftXferMsg" style="margin-top:9px;display:none"></div>
+            <div style="font-size:11px;color:var(--muted);margin:18px 0 9px">Held by the app wallet</div>
+            <div id="nftHeld" style="display:flex;gap:9px;flex-wrap:wrap"></div>
+          </div>
+
+          <!-- The viewer. One per pane, shared by every thumbnail on it. -->
+          <div id="nftLightbox" role="dialog" aria-modal="true" aria-label="NFT viewer">
+            <div class="lbBar">
+              <div id="nftLbTitle" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+              <button class="btn lbClose" id="nftLbClose" aria-label="Close the viewer">✕ Close</button>
+            </div>
+            <div class="lbBody" id="nftLbBody"></div>
+            <div class="lbFoot">
+              <button class="btn" id="nftLbPrev" aria-label="Previous">← Previous</button>
+              <span id="nftLbCount" style="color:rgba(255,255,255,.72);font-size:12.5px;align-self:center"></span>
+              <button class="btn" id="nftLbNext" aria-label="Next">Next →</button>
+            </div>
+          </div>
+        </div>
+
         <div class="tabPane" id="paneOther" hidden>
           <div class="card">
             <h2>Treasury &amp; faucet — working capital</h2>
@@ -3391,6 +3675,15 @@
         </div>
         <div class="kv" id="cfgMsg" style="padding:8px 20px;display:none"></div>
         <div class="cfgBody" id="cfgBody">
+          <div class="cfgTabs" id="cfgTabs" role="tablist">
+            <button class="btn" data-cfgtab="vault">Vault &amp; fees</button>
+            <button class="btn" data-cfgtab="guardian">Guardian</button>
+            <button class="btn" data-cfgtab="amm">Liquidity</button>
+            <button class="btn" data-cfgtab="lending">Lending</button>
+            <button class="btn" data-cfgtab="records">Contracts</button>
+            <button class="btn" data-cfgtab="notices">Notices</button>
+          </div>
+          <div class="cfgPane" id="cfgPaneVault" hidden>
           <div class="cfgRow"><span>Vault liquid reserve</span><span><input id="cfgReserve" type="number" min="80" max="100" step="1" />%</span></div>
           <div class="cfgRow"><span>App share of vault yield</span><span><input id="cfgPerfFee" type="number" min="0" max="30" step="1" />%</span></div>
           <div class="menuSep"></div>
@@ -3437,7 +3730,41 @@
             <span>Next run</span><span id="cfgNextRun">—</span>
           </div>
           <div class="menuSep"></div>
+          </div>
+          <div class="cfgPane" id="cfgPaneGuardian" hidden>
+            <div class="menuHead">Guardian — what the agent may spend unattended</div>
+            <p style="padding:2px 20px 10px;font-size:12px;color:var(--muted);margin:0">
+              Every autonomous spend at or under this goes through. Anything above it stops and waits for a
+              human to co-sign. The ceiling on this field is in code, not in this form — one mistyped figure
+              should not be able to hand an unattended agent the balance.
+            </p>
+            <div class="cfgRow"><span>Cap per autonomous call</span>
+              <span><input id="cfgGuardianCap" class="field" inputmode="decimal" style="width:120px" /> USDC</span>
+            </div>
+            <div class="cfgRow" id="cfgGuardianNote" style="color:var(--muted);font-size:12px"><span></span><span></span></div>
 
+            <div class="menuSep"></div>
+            <div class="menuHead">NFT launchpad</div>
+            <div class="cfgRow"><span>Protocol fee per mint</span>
+              <span><input id="cfgLaunchpadFee" type="number" min="0" max="10" step="0.01" style="width:90px" />%</span>
+            </div>
+            <div class="cfgRow" style="color:var(--muted);font-size:12px"><span></span>
+              <span>The rest goes to the drop's creator. The contract refuses more than 10% whatever is set here.</span>
+            </div>
+
+            <div class="menuSep"></div>
+            <div class="menuHead">Lists</div>
+            <div class="cfgRow"><span>Max lending reserves shown</span>
+              <span><input id="cfgMaxReservesG" type="number" min="0" max="50" step="1" style="width:90px" /></span>
+            </div>
+            <div class="cfgRow"><span>Max AMM pools shown</span>
+              <span><input id="cfgMaxPoolsG" type="number" min="0" max="50" step="1" style="width:90px" /></span>
+            </div>
+            <div class="cfgRow" style="color:var(--muted);font-size:12px"><span></span>
+              <span>0 means no limit. Presentational only — a capped list never hides a market you hold a position in.</span>
+            </div>
+          </div>
+          <div class="cfgPane" id="cfgPaneAmm" hidden>
           <div class="menuHead">Liquidity pools (AMM)</div>
           <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
             Providers always keep at least 50% of swap fees — the contract rejects anything lower,
@@ -3471,7 +3798,8 @@
           <div class="cfgRow" id="cfgAmmMsg" style="display:none;font-size:12px"><span></span><span></span></div>
 
           <div class="menuSep"></div>
-
+          </div>
+          <div class="cfgPane" id="cfgPaneLending" hidden>
           <div class="menuHead">Lending reserves</div>
           <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
             Freezing is per action. Leaving <b>withdraw</b> and <b>repay</b> unfrozen lets people reduce
@@ -3535,7 +3863,8 @@
           <div class="cfgRow" id="cfgLnMsg" style="display:none;font-size:12px"><span></span><span></span></div>
 
           <div class="menuSep"></div>
-
+          </div>
+          <div class="cfgPane" id="cfgPaneRecords" hidden>
           <div class="menuHead">Contract history &amp; fund recovery</div>
           <div style="padding:2px 20px 10px;font-size:11.5px;color:var(--muted)">
             Archive a retired contract to keep a record of who still holds funds in it. Balances are
@@ -3610,7 +3939,8 @@
           </div>
 
           <div class="menuSep"></div>
-
+          </div>
+          <div class="cfgPane" id="cfgPaneNotices" hidden>
           <div class="menuHead">Notifications</div>
           <div class="cfgRow"><span>Message</span>
             <span><input id="cfgNoText" class="field" placeholder="What should people see?" style="width:210px" /></span>
@@ -3660,6 +3990,7 @@
 
           <div class="menuSep"></div>
           <div style="padding:6px 20px 10px;font-size:11.5px;color:var(--muted)" id="cfgNote"></div>
+          </div>
         </div>
         <div class="cfgDock">
           <button id="cfgToTop" title="Top of App Config" aria-label="Scroll config to top">↑</button>

@@ -6,6 +6,37 @@ export function usdc(amount: string | number): bigint {
   return parseUnits(String(amount), USDC_DECIMALS);
 }
 
+/**
+ * The same conversion, but refusing anything that is not an amount.
+ *
+ * `usdc()` is `parseUnits` with the decimals filled in, which is right when the
+ * caller already knows the string is a number. Reading one a person typed is a
+ * different job:
+ *
+ *  - `parseUnits("1.0000001", 6)` **truncates** to 1.000000 and says nothing.
+ *    Silently dropping precision from a price is how somebody is charged an
+ *    amount they did not enter.
+ *  - Blank, "abc", "1e6", "-1" and "1.2.3" all have to be refused rather than
+ *    guessed at.
+ *
+ * It exists because the launchpad reached for `baseUnits` — a parser for
+ * integers *already* in the token's smallest unit — to read a human figure. A
+ * drop submitted at "1" USDC was listed at 0.000001, a factor of a million, and
+ * minting it then failed because "0.000001" contains a dot that the integer
+ * parser rejected. One misuse, two symptoms, and neither error mentioned scale.
+ *
+ * Thousands separators are accepted because forms produce them; everything else
+ * is a refusal with a sentence attached.
+ */
+export function parseUsdcAmount(input: unknown): bigint {
+  const raw = String(input ?? "").trim().replace(/,/g, "");
+  if (!raw) return 0n;
+  if (!new RegExp(`^\\d+(\\.\\d{1,${USDC_DECIMALS}})?$`).test(raw)) {
+    throw new Error(`Enter a plain amount of USDC, with at most ${USDC_DECIMALS} decimal places.`);
+  }
+  return parseUnits(raw, USDC_DECIMALS);
+}
+
 /** Format base-unit USDC into a human string. */
 export function formatUsdc(amount: bigint): string {
   return formatUnits(amount, USDC_DECIMALS);

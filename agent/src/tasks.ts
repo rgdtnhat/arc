@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { writeJsonAtomic, readJson, sayCorrupt } from "./state-file.js";
-import { nextRun, parseSchedule, describeSchedule, type Schedule } from "./schedule.js";
+import { nextRun, isDue, parseSchedule, describeSchedule, type Schedule } from "./schedule.js";
 
 /**
  * Standing instructions: what the app should do on its own, and when.
@@ -295,9 +295,21 @@ export class TaskStore {
   due(now = Date.now()): Task[] {
     return this.tasks
       .filter((t) => {
-        if (!t.enabled || t.schedule.kind === "manual") return false;
-        const next = this.nextRunAt(t, now);
-        return next !== null && next <= now;
+        if (!t.enabled) return false;
+        /*
+         * `isDue`, not "is the next run in the past".
+         *
+         * That test was `nextRun(schedule, now) <= now`, which works for an
+         * interval — `nextRun` returns `now` itself for a task that has never
+         * run — and cannot work for anything on a calendar, because `nextRun`
+         * returns the first occurrence *strictly after* the instant it is
+         * given. So it compared a future time against the present and was false
+         * forever: weekly, monthly and yearly schedules never fired on their
+         * own, while the table displayed a next-run time that would never
+         * arrive. The question is whether an occurrence has passed that we have
+         * not run yet, and that needs the previous one.
+         */
+        return isDue(t.schedule, now, t.lastRunAt, t.createdAt);
       })
       .map((t) => ({ ...t }));
   }

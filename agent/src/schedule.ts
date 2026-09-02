@@ -191,6 +191,123 @@ export function nextRun(schedule: Schedule, afterMs: number, lastRunMs: number |
   }
 }
 
+/**
+ * How late a calendar occurrence may be and still fire.
+ *
+ * A scheduler that catches up without limit wakes from a week of downtime and
+ * fires a week of payments at once. One that never catches up silently skips a
+ * 09:00 run because the container restarted at 08:59. Six hours is late enough
+ * to survive a restart, a deploy or a throttled RPC, and short enough that a
+ * run nobody was expecting cannot arrive days after its moment.
+ */
+export const CATCH_UP_MS = Number(process.env.TESSERA_SCHEDULE_CATCHUP_MS ?? 6 * 60 * 60 * 1000);
+
+/**
+ * The most recent time this schedule fired at or before `beforeMs`.
+ *
+ * The mirror of `nextRun`, and the one a runner actually needs.
+ *
+ * ## The bug this exists for
+ * `due()` asked `nextRun(schedule, now) <= now`. For an interval that works,
+ * because `nextRun` returns `now` itself when a task has never run. For every
+ * calendar schedule it cannot: `nextRun` returns the first occurrence
+ * *strictly after* `afterMs`, so the test compares a future instant against the
+ * present and is false forever. Weekly, monthly and yearly tasks and series
+ * never fired on their own — not once, in any deployment — while the row in the
+ * table cheerfully displayed the next run time that would never arrive.
+ *
+ * "Has an occurrence passed that we have not run yet?" is the question, and it
+ * needs the previous occurrence, not the next one.
+ *
+ * `null` means there is no such instant: a manual schedule, or one whose
+ * settings cannot produce a time.
+ */
+export function previousRun(schedule: Schedule, beforeMs: number): number | null {
+  switch (schedule.kind) {
+    case "manual":
+    // Intervals are measured from the last run, not from a calendar, so they
+    // keep their own path in `nextRun` and have no meaningful "previous".
+    case "every":
+      return null;
+
+    case "weekly": {
+      const here = partsAt(beforeMs, schedule.offsetMinutes);
+      // Today back through the last seven days covers every case, including
+      // "earlier today".
+      for (let i = 0; i <= 7; i++) {
+        const probe = new Date(Date.UTC(here.year, here.month - 1, here.day - i));
+        const weekday = probe.getUTCDay() as Weekday;
+        if (!schedule.days.includes(weekday)) continue;
+        const when = instantOf(
+          probe.getUTCFullYear(), probe.getUTCMonth() + 1, probe.getUTCDate(),
+          schedule.hour, schedule.minute, schedule.offsetMinutes,
+        );
+        if (when <= beforeMs) return when;
+      }
+      return null;
+    }
+
+    case "monthly": {
+      const here = partsAt(beforeMs, schedule.offsetMinutes);
+      for (let i = 0; i <= 12; i++) {
+        const total = here.year * 12 + (here.month - 1) - i;
+        const year = Math.floor(total / 12);
+        const month = (total % 12) + 1;
+        // "The 31st" in a 30-day month is the last day of it — the same rule
+        // `nextRun` applies, or the two would disagree about which instant a
+        // monthly schedule means.
+        const day = Math.min(schedule.day, daysInMonth(year, month));
+        const when = instantOf(year, month, day, schedule.hour, schedule.minute, schedule.offsetMinutes);
+        if (when <= beforeMs) return when;
+      }
+      return null;
+    }
+
+    case "yearly": {
+      const here = partsAt(beforeMs, schedule.offsetMinutes);
+      for (const year of [here.year, here.year - 1]) {
+        const day = Math.min(schedule.day, daysInMonth(year, schedule.month));
+        const when = instantOf(year, schedule.month, day, schedule.hour, schedule.minute, schedule.offsetMinutes);
+        if (when <= beforeMs) return when;
+      }
+      return null;
+    }
+  }
+}
+
+/**
+ * Should this schedule fire right now?
+ *
+ * One function, so a task and a series cannot drift apart about what "due"
+ * means — they had two copies of the same wrong test.
+ *
+ * @param createdAt when the task was made, so a schedule cannot fire for an
+ *   occurrence that predates its own existence.
+ */
+export function isDue(
+  schedule: Schedule,
+  now: number,
+  lastRunMs: number | null,
+  createdAt = 0,
+  catchUpMs = CATCH_UP_MS,
+): boolean {
+  if (schedule.kind === "manual") return false;
+  if (schedule.kind === "every") {
+    const next = nextRun(schedule, now, lastRunMs);
+    return next !== null && next <= now;
+  }
+  const prev = previousRun(schedule, now);
+  if (prev === null) return false;
+  // Never fire for an occurrence from before the task existed. Otherwise a
+  // weekly task created on Tuesday would fire immediately for Monday.
+  if (prev < createdAt) return false;
+  // Already ran for this occurrence.
+  if (lastRunMs !== null && lastRunMs >= prev) return false;
+  // Too late to be what anybody meant. The next occurrence fires normally.
+  if (now - prev > catchUpMs) return false;
+  return true;
+}
+
 /** A sentence an operator can check against what they meant. */
 export function describeSchedule(s: Schedule): string {
   const NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];

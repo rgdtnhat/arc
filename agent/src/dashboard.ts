@@ -1,15 +1,16 @@
 import express from "express";
 import path from "node:path";
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, readdirSync, statSync, existsSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
-import { mergeDeployment, explorerFrom, normaliseAssets } from "./deployment.js";
+import { mergeDeployment, combineLocal, explorerFrom, normaliseAssets } from "./deployment.js";
 import { fileURLToPath } from "node:url";
 import { privateKeyToAccount } from "viem/accounts";
-import { verifyMessage, verifyTypedData, formatUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
+import { verifyMessage, verifyTypedData, formatUnits, parseUnits, toFunctionSelector, keccak256, toHex, encodeFunctionData } from "viem";
 import type { Hex, Chain, Account } from "viem";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import {
   formatUsdc,
+  parseUsdcAmount,
   HEADERS,
   PaymentStatus,
   arcTestnet,
@@ -47,6 +48,8 @@ import {
   tesseraRouterBytecode,
   tesseraFeeCollectorBytecode,
   tesseraAmmBytecode,
+  tesseraLaunchpadAbi,
+  tesseraNftMarketAbi,
 } from "@tessera/shared";
 import { buildAccount, type WalletMode } from "./wallet.js";
 import { faucetFromEnv, FAUCET_ASSETS, type FaucetAsset } from "./circle/faucet.js";
@@ -54,7 +57,7 @@ import { createProviderApp, type ProviderEvent } from "@tessera/providers";
 import { CATALOG } from "@tessera/providers/catalog";
 import { TesseraClient } from "./client.js";
 import { TesseraAgent, type AgentEvent, type LedgerEntry } from "./agent.js";
-import { writeJsonAtomic } from "./state-file.js";
+import { writeJsonAtomic, readJson } from "./state-file.js";
 import { quoteMatchesOffer } from "./decide.js";
 import {
   planDeleverage,
@@ -68,7 +71,7 @@ import {
 import { planClaim, planCompound, planVote, mayRun } from "./autopilot.js";
 import { decideEmissionsGuard, DEFAULT_GUARD, type GuardSettings } from "./emissions-guard.js";
 import { matchErrorTable } from "./error-table.js";
-import { gradeUndelivered, gradeLastPoke, gradeEmissionsFunding } from "./health-grade.js";
+import { gradeUndelivered, gradeLastPoke, gradeEmissionsFunding, shadowedRoutes } from "./health-grade.js";
 import { proRataCap, planClaim as planClaimShare } from "./claim-share.js";
 import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
@@ -76,6 +79,9 @@ import { SeriesStore, SERIES_LIMITS, walkSequentially, type TaskSeries, type Ser
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
 import { read as chainRead, valueOr } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
+import { scanNftHistory, tokenDates, loadHistory, EMPTY_HISTORY, type NftHistoryState } from "./nft-history.js";
+import { groupByOwner, heldBy } from "./nft-owners.js";
+import { MediaQuota } from "./media-quota.js";
 import {
   proposeFromSources,
   actionable as actionablePrices,
@@ -108,7 +114,7 @@ interface PoolDeploymentRef {
   assets: PoolAsset[];
 }
 import { TesseraTreasury } from "./treasury.js";
-import { TesseraPoolClient, PRICE_IX, describeFreeze } from "./pool.js";
+import { TesseraPoolClient, PRICE_IX, describeFreeze, canDecideDrops } from "./pool.js";
 import { VaultClient, RouterClient, AmmClient } from "./defi.js";
 import { FeeReader, planHarvest, type HarvestCandidate } from "./fees.js";
 import { HolderReader, type HolderKind } from "./holders.js";
@@ -256,16 +262,17 @@ const liveDeployment = (() => {
    * `deployments/` is a bind mount from the host, so its ownership is the
    * host's whatever the image says. Where the process cannot write there it
    * writes into STATE_DIR instead — its own volume, which it always can — and
-   * this is the other half of that: read both, and let the copy this process
-   * could actually have written win. Preferring the state-dir file is right
-   * because it is the only one a locked-down container can keep current.
+   * this is the other half of that: read both and merge them. Merging rather
+   * than choosing matters, because a host-run deploy script writes the beside
+   * copy while the container writes the state-dir one, and picking either
+   * would drop the addresses in the other.
    */
   const localBeside = read("arc.local.json");
   const localState = STATE_DIR === dir ? null : readFrom(path.join(STATE_DIR, "arc.local.json"));
   if (localState && localBeside) {
-    console.log("[deployment] arc.local.json exists in both deployments/ and STATE_DIR — using the STATE_DIR copy");
+    console.log("[deployment] arc.local.json exists in both deployments/ and STATE_DIR — merging, STATE_DIR wins a clash");
   }
-  const local = localState ?? localBeside;
+  const local = combineLocal(localBeside, localState);
   const { merged, applied, ignored } = mergeDeployment(base, local);
   // A mistyped capital in one asset address used to throw inside every loop
   // that touched the list, taking whole panels down with a 500.
@@ -377,6 +384,30 @@ const CLIENT_SELECTORS = Object.fromEntries(
     ammSwap: "function swap(uint256,address,address,uint256,uint256)",
     ammAdd: "function addLiquidity(uint256,uint256[],uint256)",
     ammRemove: "function removeLiquidity(uint256,uint256,uint256[])",
+    /*
+     * The launchpad and the market, so a visitor submits, mints, sells and buys
+     * from their own wallet rather than asking the operator to spend on their
+     * behalf.
+     *
+     * This is the better path, not merely an alternative one. Every operator
+     * route here signs with `AGENT_PRIVATE_KEY` and so is gated on an admin
+     * session and clamped by the guardian cap — correct, and it means a visitor
+     * either cannot act at all or acts with somebody else's money. Signing in
+     * their own wallet spends their own USDC and needs neither.
+     *
+     * `approve` is not repeated: ERC-721's `approve(address,uint256)` has the
+     * same signature, and therefore the same selector, as ERC-20's.
+     */
+    nftSubmit: "function submit(string,string,uint256,uint32)",
+    nftMint: "function mint(uint256,address,uint256)",
+    nftList: "function list(address,uint256,uint256)",
+    nftSetPrice: "function setPrice(uint256,uint256)",
+    nftCancel: "function cancel(uint256)",
+    nftBuy: "function buy(uint256,uint256)",
+    // `safeTransferFrom`, so a contract that cannot hold an ERC-721 refuses the
+    // token instead of swallowing it. This is the field people paste into.
+    nftTransfer: "function safeTransferFrom(address,address,uint256)",
+    nftOwnerOf: "function ownerOf(uint256)",
     ammShares: "function sharesOf(uint256,address)",
   }).map(([k, sig]) => [k, toFunctionSelector(sig)]),
 );
@@ -580,6 +611,28 @@ async function main() {
   const policy = {
     ...AGENT_POLICY,
     autoApprove: wantsAutoApprove && !live,
+  };
+
+  /**
+   * Apply the configured guardian cap to the running policy.
+   *
+   * `policy` is captured by reference all over this file, so the cap is
+   * *mutated* rather than the object replaced — every existing holder has to
+   * see the new number, or half the app would keep enforcing the old one and
+   * the operator would have no way to tell which.
+   *
+   * Only the cap. `autoApprove` is untouched here and unreachable from the
+   * config on purpose: raising a limit and removing the limiter are different
+   * decisions, and only one of them belongs in a form.
+   */
+  const applyGuardianCap = (from: { guardianCapUsdc?: string }) => {
+    try {
+      const next = parseUsdcAmount(from.guardianCapUsdc ?? "");
+      if (next > 0n) policy.autoApproveMax = next;
+    } catch {
+      // A stored value that will not parse leaves the env default in place —
+      // the safe direction, and the save path refuses bad input anyway.
+    }
   };
   const memory = new TrustMemory(
     statePath(".tessera-memory.json")
@@ -874,7 +927,43 @@ async function main() {
   });
 
   app.use(express.static(dashboardDir));
+  /*
+   * Artwork gets its own parser, and it has to be mounted above the global one.
+   *
+   * `express.json` consumes the request stream, so the first parser to match
+   * wins: a 64kb limit in front of a 48mb route means every real photograph is
+   * refused with a 413 before the route it was addressed to ever runs. Mounting
+   * a larger limit *inside* the route — which is what this did first — is a
+   * no-op for exactly that reason, and it surfaced as "The upload request
+   * failed" on any image a phone had actually taken.
+   *
+   * Scoped to the one path that needs it. Everything else keeps the 64kb
+   * ceiling, because a body limit is a denial-of-service control and widening
+   * it globally to serve one route would be the wrong trade.
+   */
+  app.use("/api/nft/media", express.json({ limit: "48mb" }));
   app.use(express.json({ limit: "64kb" }));
+
+  /**
+   * A body that was too big, said in words.
+   *
+   * `express.json` throws a 413 with an HTML body, which reaches the page as a
+   * failed `res.json()` and reads as "the request failed" — the one explanation
+   * that gives the reader nothing to do about it.
+   */
+  app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const e = err as { type?: string; status?: number };
+    if (e?.type === "entity.too.large" || e?.status === 413) {
+      res.status(413).json({
+        ok: false,
+        error: req.path.startsWith("/api/nft/media")
+          ? "That image is too large to upload. The cap is 4 MB per image — try a smaller one."
+          : "That request body is too large.",
+      });
+      return;
+    }
+    next(err);
+  });
 
   /*
    * A ceiling on how fast one address may ask.
@@ -4740,9 +4829,24 @@ async function main() {
   });
 
   /** Run the split now, without waiting for the cadence. Owner-gated on-chain. */
+  /*
+   * There was a second handler for this exact route further down the file,
+   * unreachable behind this one since whenever it was added. It did the same
+   * thing and said one thing better: `allocateNow()` is `onlyOwner` and the
+   * deployer owns the collector, so a missing owner key is a specific problem
+   * with a specific fix, not "no fee collector, or…". That sentence is kept
+   * here; the dead copy is gone.
+   */
   app.post("/api/fees/allocate", requireOperator, async (req, res) => {
-    if (!owner || !liveDeployment.tesseraFeeCollector) {
-      res.status(404).json({ ok: false, error: "no fee collector, or no deployer key to sign with" });
+    if (!liveDeployment.tesseraFeeCollector) {
+      res.status(404).json({ ok: false, error: "Fee collector isn't deployed yet — run npm run pool:arc." });
+      return;
+    }
+    if (!owner) {
+      res.status(503).json({
+        ok: false,
+        error: "Set DEPLOYER_PRIVATE_KEY on the server to allocate fees — the deployer owns the collector.",
+      });
       return;
     }
     try {
@@ -5265,7 +5369,22 @@ async function main() {
     return list.map((a) => ({ address: a.address as Hex, symbol: a.symbol, decimals: a.decimals }));
   };
 
-  app.get("/api/history", requireOperator, (_req, res) => {
+  /*
+   * Archived contract records.
+   *
+   * This used to be `GET /api/history`, which is also the event indexer's path
+   * — registered earlier, so Express matched that one and this was unreachable
+   * from the day the indexer was added. App Config's history list has been
+   * reading the indexer's answer, finding no `records` in it, and rendering
+   * "Couldn't load history" ever since.
+   *
+   * Two features cannot share a method and a path. The indexer's claim on
+   * "history" is the better one — it is a history of what happened — so the
+   * archive moves to its own name. The `POST /api/history/*` routes below are
+   * untouched: they are distinct paths, and their order relative to
+   * `/api/history/:id` is deliberate.
+   */
+  app.get("/api/archive", requireOperator, (_req, res) => {
     res.json({
       ok: true,
       records: archive.all().map((r) => archive.summary(r)),
@@ -7676,6 +7795,999 @@ async function main() {
     }
   }, GUARD_MS).unref();
 
+  /**
+   * Send from the app wallet, with the same gas margin `OwnerClient` uses.
+   *
+   * These calls are permissionless and self-scoped — a submission, a mint the
+   * agent pays for itself — so they need the agent's key rather than the
+   * owner's. Every route that reaches it is behind `requireOperator`.
+   */
+  const asAgentWrite = async (address: Hex, abi: unknown, fn: string, args: unknown[]): Promise<Hex> => {
+    const est = await client.public
+      .estimateContractGas({ address, abi: abi as never, functionName: fn as never, args: args as never, account: client.account })
+      .catch(() => 500_000n);
+    const hash = await client.wallet.writeContract({
+      address, abi: abi as never, functionName: fn as never, args: args as never,
+      account: client.account, chain: client.wallet.chain,
+      gas: (est * 3n) / 2n + 50_000n,
+    } as never);
+    const receipt = await client.public.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success") throw new Error(`${fn} reverted (${hash})`);
+    return hash;
+  };
+
+  /* ---- The NFT launchpad ------------------------------------------------ */
+
+  /**
+   * A curated drop board: anybody submits, an admin approves or rejects, an
+   * approved drop mints for a price in USDC.
+   *
+   * ## Which of the money rules apply, and how
+   * Minting moves USDC, so this is a spend path and the invariants bite:
+   *
+   *  · **Escrow only what was vetted.** The chain enforces it rather than this
+   *    server: `mint` takes the buyer's `maxPrice` and reverts above it, so a
+   *    creator who re-prices between the quote and the transaction is refused
+   *    by the contract. The route below passes the price the caller was shown,
+   *    never the price it re-reads at send time — re-reading would defeat the
+   *    whole mechanism by agreeing to whatever the creator had just set.
+   *  · **Every spend passes the policy gate.** An operator mint spends
+   *    `AGENT_PRIVATE_KEY`, so it is checked against the same guardian cap as
+   *    any other autonomous spend before anything is signed.
+   *  · **Operator-only for anything that signs.** Reads are public; submitting,
+   *    deciding and minting from the app wallet are all behind
+   *    `requireOperator`. A visitor with their own wallet does not need any of
+   *    them — the browser holds selectors for `submit` and `mint`.
+   *  · **Log what moved.** Every send records what the chain actually charged.
+   */
+  const launchpadAddr = ((liveDeployment as Record<string, unknown>).tesseraLaunchpad as Hex) ?? null;
+  /*
+   * "Not deployed" is a claim this server cannot actually make.
+   *
+   * All it knows is that its deployment record names no launchpad — which is
+   * also exactly what a *deployed* launchpad looks like after `deploy.sh`
+   * discards an uncommitted `deployments/arc.json`. The old wording asserted
+   * the stronger thing and told the operator to run `--execute`, which would
+   * have deployed a second launchpad and stranded every drop and every minted
+   * token on the first. So: say what is actually known, and put the
+   * non-destructive recovery ahead of the destructive one.
+   */
+  const NFT_NOT_DEPLOYED =
+    "No NFT launchpad address is recorded for this network. If one has already been deployed, " +
+    "recover it with `npm run nft:deploy -- --find` and add it to deployments/arc.json — running " +
+    "`--execute` again would deploy a second launchpad and strand every drop and minted token on " +
+    "the first. If there genuinely isn't one, `npm run nft:deploy -- --execute` deploys it.";
+
+  /** One drop, as the page shows it. */
+  const readDrop = async (id: bigint) => {
+    const d = (await client.public.readContract({
+      address: launchpadAddr!, abi: tesseraLaunchpadAbi, functionName: "drops", args: [id],
+    })) as readonly [Hex, bigint, number, number, number, boolean, string, string, string];
+    const [ok, why] = (await client.public.readContract({
+      address: launchpadAddr!, abi: tesseraLaunchpadAbi, functionName: "mintable", args: [id],
+    })) as readonly [boolean, string];
+    const status = ["pending", "approved", "rejected"][Number(d[4])] ?? "pending";
+    return {
+      id: Number(id),
+      creator: d[0],
+      priceRaw: d[1].toString(),
+      price: fmtUnits(d[1], 6),
+      supply: Number(d[2]),
+      minted: Number(d[3]),
+      status,
+      paused: d[5],
+      name: d[6],
+      uri: d[7],
+      reason: d[8],
+      mintable: ok,
+      why,
+    };
+  };
+
+  /* ---- Drop media: images in, ERC-721 metadata out ----------------------
+   *
+   * A launchpad that only accepts a URI asks every creator to have solved
+   * hosting before they arrive, which for most of them means IPFS, a pinning
+   * service and an account. This takes the images instead and serves the
+   * metadata a wallet actually asks for.
+   *
+   * `tokenURI` is `<base>/<index within the drop>`, so a collection of a
+   * hundred images is one upload and one base URI, and item 7 of that drop
+   * resolves to item 7 of that upload — which is why the contract numbers
+   * tokens per drop rather than globally.
+   *
+   * ## What is refused, and why
+   *  · **SVG.** It is a document, and this is served from the app's own origin,
+   *    so an SVG with a script tag in it is stored XSS against every visitor who
+   *    opens the drop. PNG, JPEG, GIF and WebP are pixels.
+   *  · **Anything whose bytes disagree with its type.** The declared MIME is
+   *    the uploader's word; the magic number is the file's. They have to match,
+   *    or a `.png` that is really HTML gets served as an image and sniffed as a
+   *    document by somebody's browser.
+   *  · **Anything over the size cap, or more than the item cap.** A drop board
+   *    anybody can post to is a disk-filling primitive otherwise.
+   */
+  const MEDIA_DIR = statePath("nft-media");
+  const MEDIA_MAX_BYTES = 4 * 1024 * 1024;
+  const MEDIA_MAX_ITEMS = 200;
+  /*
+   * How much of the disk this is allowed to become.
+   *
+   * The caps above bound one image and one request; nothing bounded the sum.
+   * At 200 images of 4 MB a request, and a session that anybody can mint by
+   * signing a message, "as many requests as the per-IP limiter allows, for
+   * ever" is a way to fill the volume the state files and the logs live on —
+   * and a full disk is not an NFT problem, it is the whole app stopping.
+   *
+   * So: a ceiling on the store, and a daily allowance per session so one
+   * uploader cannot be the reason the ceiling is reached. Both are env-tunable
+   * because the right number is a property of the host, not of the code. See
+   * agent/src/media-quota.ts for the accounting and docs/SECURITY.md for why
+   * these two and not a third.
+   */
+  const MEDIA_MAX_TOTAL_BYTES = Number(process.env.TESSERA_MEDIA_MAX_TOTAL_BYTES ?? 2 * 1024 * 1024 * 1024);
+  const MEDIA_DAILY_QUOTA_BYTES = Number(process.env.TESSERA_MEDIA_DAILY_QUOTA_BYTES ?? 256 * 1024 * 1024);
+  const mediaQuota = new MediaQuota({ maxTotal: MEDIA_MAX_TOTAL_BYTES, daily: MEDIA_DAILY_QUOTA_BYTES });
+  /**
+   * What is already there, counted once at boot.
+   *
+   * Synchronous on purpose: it runs while the server is still wiring routes, it
+   * is a `readdir` of a directory of small folders, and the alternative is a
+   * window during which the store reports itself empty and the ceiling does not
+   * exist. A missing directory is the ordinary first-run case, not an error.
+   */
+  const mediaBytesOnDisk = (dir: string): number => {
+    let sum = 0;
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return 0; }
+    for (const name of names) {
+      const full = path.join(dir, name);
+      try {
+        const st = statSync(full);
+        sum += st.isDirectory() ? mediaBytesOnDisk(full) : st.size;
+      } catch { /* deleted under us, so it is not stored */ }
+    }
+    return sum;
+  };
+  mediaQuota.seedTotal(mediaBytesOnDisk(MEDIA_DIR));
+  /** Declared type -> extension and the bytes a real file of that type starts with. */
+  const MEDIA_TYPES: Record<string, { ext: string; magic: number[][] }> = {
+    "image/png": { ext: "png", magic: [[0x89, 0x50, 0x4e, 0x47]] },
+    "image/jpeg": { ext: "jpg", magic: [[0xff, 0xd8, 0xff]] },
+    "image/gif": { ext: "gif", magic: [[0x47, 0x49, 0x46, 0x38]] },
+    "image/webp": { ext: "webp", magic: [[0x52, 0x49, 0x46, 0x46]] },
+  };
+  const looksLike = (buf: Buffer, magic: number[][]) =>
+    magic.some((m) => m.every((b, i) => buf[i] === b));
+
+  /**
+   * Upload one image or a whole collection.
+   *
+   * Behind `requireAuth` rather than `requireOperator`: submitting a drop is
+   * something a visitor does, and it would be strange to let them submit and
+   * not to let them bring the artwork. It is still a gate — an unauthenticated
+   * write that puts bytes on disk is a disk-filling primitive.
+   */
+  app.post("/api/nft/media", requireAuth, async (req, res) => {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) { res.status(400).json({ ok: false, error: "No images were sent." }); return; }
+    if (items.length > MEDIA_MAX_ITEMS) {
+      res.status(400).json({ ok: false, error: `A collection tops out at ${MEDIA_MAX_ITEMS} images.` });
+      return;
+    }
+    const collectionName = String(req.body?.name ?? "").slice(0, 120);
+    const description = String(req.body?.description ?? "").slice(0, 600);
+
+    const decoded: { ext: string; type: string; bytes: Buffer }[] = [];
+    for (const [i, raw] of items.entries()) {
+      const dataUrl = String((raw as { dataUrl?: unknown })?.dataUrl ?? "");
+      const m = /^data:([a-z/+-]+);base64,(.+)$/i.exec(dataUrl);
+      if (!m) { res.status(400).json({ ok: false, error: `Image ${i + 1} is not a base64 data URL.` }); return; }
+      const type = m[1].toLowerCase();
+      const spec = MEDIA_TYPES[type];
+      if (!spec) {
+        res.status(400).json({
+          ok: false,
+          error: `Image ${i + 1} is ${type}. PNG, JPEG, GIF and WebP only — SVG is a document, not a picture, and this serves from the app's own origin.`,
+        });
+        return;
+      }
+      let bytes: Buffer;
+      try { bytes = Buffer.from(m[2], "base64"); }
+      catch { res.status(400).json({ ok: false, error: `Image ${i + 1} is not valid base64.` }); return; }
+      if (!bytes.length || bytes.length > MEDIA_MAX_BYTES) {
+        res.status(400).json({ ok: false, error: `Image ${i + 1} is ${(bytes.length / 1e6).toFixed(1)} MB; the cap is 4 MB.` });
+        return;
+      }
+      // The declared type is the uploader's word; the magic number is the file's.
+      if (!looksLike(bytes, spec.magic)) {
+        res.status(400).json({ ok: false, error: `Image ${i + 1} says it is ${type} but its bytes are not.` });
+        return;
+      }
+      decoded.push({ ext: spec.ext, type, bytes });
+    }
+
+    // Content-addressed, so the same upload twice is the same folder and a
+    // creator re-submitting does not double the disk.
+    const digest = createHash("sha256");
+    for (const d of decoded) digest.update(d.bytes);
+    digest.update(collectionName);
+    const id = digest.digest("hex").slice(0, 32);
+    const dir = path.join(MEDIA_DIR, id);
+
+    /*
+     * The ceilings, checked after decoding and before a single byte is written.
+     * Decoding first is what makes the answer honest — the size that matters is
+     * the size on disk, not the third-longer base64 the request carried — and
+     * writing first would mean the refusal arrives after the damage.
+     *
+     * A folder that already exists is the same bytes under the same hash, so it
+     * is admitted free: re-submitting a drop costs no new disk.
+     */
+    const verdict = mediaQuota.admit(
+      bearer(req) || String(req.ip ?? "unknown"),
+      decoded.reduce((n, d) => n + d.bytes.length, 0),
+      Date.now(),
+      existsSync(dir),
+    );
+    if (!verdict.ok) { res.status(verdict.status).json({ ok: false, error: verdict.error }); return; }
+
+    try {
+      mkdirSync(dir, { recursive: true });
+      decoded.forEach((d, i) => writeFileSync(path.join(dir, `${i + 1}.${d.ext}`), d.bytes));
+      writeFileSync(
+        path.join(dir, "meta.json"),
+        JSON.stringify({
+          name: collectionName,
+          description,
+          items: decoded.map((d, i) => ({ file: `${i + 1}.${d.ext}`, type: d.type })),
+          at: Date.now(),
+        }, null, 2),
+      );
+    } catch (e) {
+      res.status(500).json({ ok: false, error: `Could not store the images: ${String(e).slice(0, 120)}` });
+      return;
+    }
+
+    /*
+     * An absolute URI, because this ends up in `tokenURI` and is read by
+     * wallets and marketplaces that have no idea what host the page came from.
+     * A relative path would resolve against whoever is asking.
+     */
+    const base = `${req.protocol}://${req.get("host")}/nft/media/${id}`;
+    res.json({ ok: true, id, base, count: decoded.length });
+  });
+
+  /** The metadata a wallet asks for: `<base>/<n>`, one per item in the drop. */
+  app.get("/nft/media/:id/:n", (req, res) => {
+    const id = String(req.params.id);
+    const n = Number(req.params.n);
+    if (!/^[0-9a-f]{32}$/.test(id) || !Number.isInteger(n) || n < 1) { res.status(404).json({ error: "not found" }); return; }
+    try {
+      const meta = JSON.parse(readFileSync(path.join(MEDIA_DIR, id, "meta.json"), "utf8")) as {
+        name?: string; description?: string; items: { file: string }[];
+      };
+      /*
+       * A drop may have a larger supply than it has images — a hundred editions
+       * of one picture is an ordinary thing to sell. Wrapping is the reading
+       * that never 404s a token somebody legitimately owns.
+       */
+      const item = meta.items[(n - 1) % meta.items.length];
+      if (!item) { res.status(404).json({ error: "not found" }); return; }
+      res.set("cache-control", "public, max-age=300");
+      res.json({
+        name: `${meta.name || "Tessera drop"} #${n}`,
+        description: meta.description || "",
+        image: `${req.protocol}://${req.get("host")}/nft/media/${id}/file/${item.file}`,
+      });
+    } catch {
+      res.status(404).json({ error: "not found" });
+    }
+  });
+
+  /** The bytes themselves. */
+  app.get("/nft/media/:id/file/:file", (req, res) => {
+    const id = String(req.params.id);
+    const file = String(req.params.file);
+    // Names this route generated, and nothing else — no traversal, no dotfiles.
+    if (!/^[0-9a-f]{32}$/.test(id) || !/^[0-9]{1,4}\.(png|jpg|gif|webp)$/.test(file)) {
+      res.status(404).end();
+      return;
+    }
+    const full = path.join(MEDIA_DIR, id, file);
+    const type = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" }[
+      file.split(".").pop() as string
+    ]!;
+    try {
+      const bytes = readFileSync(full);
+      // Never sniffed as anything but the type we checked on the way in.
+      res.set("content-type", type);
+      res.set("x-content-type-options", "nosniff");
+      res.set("cache-control", "public, max-age=31536000, immutable");
+      res.send(bytes);
+    } catch {
+      res.status(404).end();
+    }
+  });
+
+  app.get("/api/nft", async (req, res) => {
+    if (!launchpadAddr) {
+      res.json({ ok: true, deployed: false, error: NFT_NOT_DEPLOYED, drops: [] });
+      return;
+    }
+    try {
+      const [count, feeBps, treasury, padOwner] = await Promise.all([
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropCount" }) as Promise<bigint>,
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "feeBps" }) as Promise<number>,
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "treasury" }) as Promise<Hex>,
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "owner" }) as Promise<Hex>,
+      ]);
+      // Newest first, and bounded: a launchpad with ten thousand drops must not
+      // make the panel a log scan.
+      const total = Number(count);
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 60)));
+      const ids: bigint[] = [];
+      for (let i = total - 1; i >= 0 && ids.length < limit; i--) ids.push(BigInt(i));
+      const drops = await Promise.all(ids.map(readDrop));
+      /*
+       * Whether *this session* can decide, answered by the server.
+       *
+       * The page was working it out by comparing the launchpad's owner against
+       * `window.__myAddress`, which in an operator session is the **app
+       * wallet** — and the launchpad is owned by the **deployer**, because that
+       * is the key that deployed it. Two different addresses, so the comparison
+       * was false for the one person who can actually decide, and Approve and
+       * Reject never appeared. The routes themselves worked the whole time:
+       * `/api/nft/decide` signs with `owner`, the deployer key.
+       *
+       * Three things have to be true, and only the server knows all three: the
+       * caller is signed in as operator, this process holds an owner key, and
+       * that key is the launchpad's owner. A connected wallet that *is* the
+       * owner is handled separately, in the page, because there the address
+       * comparison is the right question.
+       */
+      const decide = canDecideDrops({
+        operator: Boolean(admin?.session(bearer(req))),
+        signer: owner?.account.address ?? null,
+        launchpadOwner: String(padOwner),
+      });
+      res.json({
+        ok: true, deployed: true, address: launchpadAddr, feeBps: Number(feeBps), treasury,
+        admin: padOwner, total, drops,
+        // Same question as the market's: minting from the app wallet spends it.
+        canAct: Boolean(admin?.session(bearer(req))),
+        canDecide: decide.ok,
+        // When it is false, say which half is missing — "the buttons are gone"
+        // is not something anybody can act on, and the causes differ.
+        cannotDecideWhy: decide.why,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), drops: [] });
+    }
+  });
+
+  /** Submit a drop from the app wallet. A visitor signs their own instead. */
+  app.post("/api/nft/submit", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    const name = String(req.body?.name ?? "").trim().slice(0, 300);
+    const uri = String(req.body?.uri ?? "").trim().slice(0, 300);
+    const supply = Math.floor(Number(req.body?.supply ?? 0));
+    if (!name || !uri) { res.status(400).json({ ok: false, error: "A drop needs a name and a metadata URI." }); return; }
+    if (!Number.isFinite(supply) || supply < 1 || supply > 4_294_967_295) {
+      res.status(400).json({ ok: false, error: "Supply must be a whole number of at least 1." });
+      return;
+    }
+    let priceRaw: bigint;
+    try { priceRaw = usdcUnits(req.body?.price ?? "0"); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+    try {
+      const txHash = await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "submit", [name, uri, priceRaw, supply]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "submit",
+        status: "success", txHash, detail: `${name} — ${supply} at ${fmtUnits(priceRaw, 6)} USDC`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Approve or reject a pending drop. The admin's decision, and it is final. */
+  app.post("/api/nft/decide", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    const verdict = String(req.body?.verdict ?? "");
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
+    if (verdict !== "approve" && verdict !== "reject") {
+      res.status(400).json({ ok: false, error: "verdict must be approve or reject" });
+      return;
+    }
+    const reason = String(req.body?.reason ?? "").slice(0, 300);
+    try {
+      const txHash = verdict === "approve"
+        ? await owner.write(launchpadAddr, tesseraLaunchpadAbi, "approveDrop", [BigInt(id)])
+        : await owner.write(launchpadAddr, tesseraLaunchpadAbi, "rejectDrop", [BigInt(id), reason]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: `drop ${verdict}`,
+        status: "success", txHash, detail: `drop #${id}${reason ? ` — ${reason}` : ""}`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Pause or restart a drop. The admin's kill switch over any drop. */
+  app.post("/api/nft/pause", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    if (!owner) { res.status(400).json({ ok: false, error: OWNER_HINT }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
+    try {
+      const txHash = await owner.write(launchpadAddr, tesseraLaunchpadAbi, "setDropPaused", [BigInt(id), Boolean(req.body?.paused)]);
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Re-price a drop the app wallet created.
+   *
+   * `setDropPrice` is the creator's, not the admin's — the contract enforces
+   * that — so this only ever works for drops this wallet submitted. It exists
+   * because a price is the one field a submission can get wrong and cannot
+   * otherwise fix: the drop is on chain, and there was no way to correct it
+   * from the app. A re-price is safe against buyers because `mint` takes their
+   * own `maxPrice`, so it cannot reach into a transaction already signed at the
+   * old figure.
+   */
+  app.post("/api/nft/price", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
+    let priceRaw: bigint;
+    try { priceRaw = usdcUnits(req.body?.price ?? "0"); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+    try {
+      const txHash = await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "setDropPrice", [BigInt(id), priceRaw]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "reprice",
+        status: "success", txHash, detail: `drop #${id} → ${fmtUnits(priceRaw, 6)} USDC`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({
+        ok: false,
+        // The contract's own rule, said plainly: only the creator re-prices.
+        error: /NotCreator/i.test(String(e))
+          ? "Only the wallet that submitted this drop can change its price."
+          : friendlyError(e),
+      });
+    }
+  });
+
+  /**
+   * Mint from the app wallet.
+   *
+   * `maxPrice` is the price the caller was shown, passed through untouched. It
+   * is deliberately *not* re-read here: re-reading and sending the fresh price
+   * would agree to whatever the creator had set a block earlier, which is the
+   * exact substitution the contract's `maxPrice` exists to refuse.
+   */
+  app.post("/api/nft/mint", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which drop?" }); return; }
+    let maxPrice: bigint;
+    try { maxPrice = usdcUnits(req.body?.maxPrice ?? ""); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+
+    /*
+     * The guardian cap, at the choke point for this path.
+     *
+     * A mint spends the operator's USDC on a stranger's drop, so it is exactly
+     * the kind of autonomous spend the cap exists for. Checked before the
+     * allowance is granted, not after — an approval left standing over a cap
+     * this refused would be a spend waiting to happen.
+     */
+    const cap = policy.autoApproveMax;
+    if (maxPrice > cap) {
+      res.status(400).json({
+        ok: false,
+        error:
+          `That mint costs ${fmtUnits(maxPrice, 6)} USDC, over the guardian cap of ${fmtUnits(cap, 6)} USDC ` +
+          `per autonomous spend. Raise the cap in App Config, or mint it from your own wallet.`,
+      });
+      return;
+    }
+
+    try {
+      const to = /^0x[0-9a-fA-F]{40}$/.test(String(req.body?.to ?? ""))
+        ? (String(req.body.to) as Hex)
+        : (agentAccount.address as Hex);
+      if (maxPrice > 0n) {
+        // Exactly what this mint may cost, and no more: an allowance is a
+        // standing permission, so it is sized to the one call that needs it.
+        await asAgentWrite(usdcAddress as Hex, erc20Abi, "approve", [launchpadAddr, maxPrice]);
+      }
+      /*
+       * What the drop charges at the moment of the send, read once for the
+       * ledger. `maxPrice` is the ceiling the caller agreed to and the contract
+       * charges the drop's own price, which can be lower — writing the ceiling
+       * into the log would report a spend that did not happen. The contract
+       * still refuses anything above `maxPrice`, so this read is for the record
+       * and never for the decision.
+       */
+      const priced = (await client.public.readContract({
+        address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "drops", args: [BigInt(id)],
+      })) as readonly [Hex, bigint, number, number, number, boolean, string, string, string];
+      const paid = priced[1] <= maxPrice ? priced[1] : maxPrice;
+      const txHash = await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "mint", [BigInt(id), to, maxPrice]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "mint",
+        // What actually moved, not what was budgeted: `maxPrice` is a ceiling,
+        // and the contract charges the drop's price. Read the receipt's own
+        // figure so the ledger cannot overstate a spend.
+        status: "success", txHash, asset: "USDC",
+        amount: `${fmtUnits(paid, 6)} USDC`, valueRaw: paid.toString(),
+        detail: `drop #${id} → ${to.slice(0, 10)}…`,
+      });
+      res.json({ ok: true, txHash, to });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /* ---- NFTs you hold, transfers, and the market ------------------------- */
+
+  const marketAddr = ((liveDeployment as Record<string, unknown>).tesseraNftMarket as Hex) ?? null;
+  /* Same reasoning as NFT_NOT_DEPLOYED above — and the same bug, one week later. */
+  const MARKET_NOT_DEPLOYED =
+    "No NFT market address is recorded for this network. If one has already been deployed, " +
+    "recover it with `npm run nft:market -- --find` and add it to deployments/arc.json — running " +
+    "`--execute` again would deploy a second market and strand the listings, and the tokens held " +
+    "against them, in the first. If there genuinely isn't one, `npm run nft:market -- --execute` deploys it.";
+
+  /* ---- When each token was minted, and when its holder got it ------------
+   *
+   * `ownerOf` is a snapshot with no dates in it, and the gallery filters on
+   * dates. They exist only in the `Transfer` logs, so those are tailed into a
+   * small file and folded — see agent/src/nft-history.ts for why this does not
+   * ride on `EventIndex`.
+   *
+   * Deliberately advisory. Every ownership answer still comes from `ownerOf`;
+   * this only supplies "when", and a token whose mint predates the scan gets a
+   * null date rather than a wrong one. A history the gallery *depended* on
+   * would turn a lagging tail into a token that has vanished.
+   */
+  const NFT_HISTORY_FILE = statePath("nft-history.json");
+  let nftHistory: NftHistoryState = (() => {
+    const loaded = loadHistory(readJson<unknown>(NFT_HISTORY_FILE, EMPTY_HISTORY).value);
+    if (loaded.reset) {
+      console.log("🖼  NFT history was written by an older shape — rescanning from the launchpad's creation block");
+    }
+    return loaded.state;
+  })();
+  const NFT_SCAN_SPAN = Math.max(1, Number(process.env.TESSERA_NFT_SCAN_SPAN ?? 20_000));
+  const NFT_SCAN_WINDOWS = Math.max(1, Number(process.env.TESSERA_NFT_SCAN_WINDOWS ?? 3));
+  const NFT_SCAN_MS = Math.max(10_000, Number(process.env.TESSERA_NFT_SCAN_MS ?? 60_000));
+  /** Sooner when a full budget was spent, because that means more chain behind us. */
+  const NFT_SCAN_CATCHUP_MS = Math.max(1_000, Number(process.env.TESSERA_NFT_SCAN_CATCHUP_MS ?? 3_000));
+
+  if (launchpadAddr && process.env.TESSERA_NFT_SCAN !== "off") {
+    const tick = async (): Promise<number> => {
+      try {
+        /*
+         * The creation block, not block 0. This chain is at 59 million; seeding
+         * from zero is three thousand windows of provably empty history, and
+         * every one of them a request the RPC counts.
+         */
+        const start = nftHistory.lastBlock > 0
+          ? nftHistory.lastBlock
+          : Number(await findDeploymentBlock(client.public, launchpadAddr));
+        const r = await scanNftHistory({
+          client: client.public as never, address: launchpadAddr, state: nftHistory,
+          startBlock: start, span: NFT_SCAN_SPAN, windows: NFT_SCAN_WINDOWS,
+        });
+        if (r.state !== nftHistory) {
+          nftHistory = r.state;
+          // Written every tick that moved, so a restart resumes rather than
+          // rescanning the week it already read.
+          try { writeJsonAtomic(NFT_HISTORY_FILE, nftHistory); } catch { /* a cache, not state */ }
+        }
+        if (r.found) console.log(`🖼  NFT history: ${r.found} transfer(s), through block ${r.state.lastBlock}`);
+        return r.caughtUp ? NFT_SCAN_MS : NFT_SCAN_CATCHUP_MS;
+      } catch (e) {
+        // A failed window is retried; progress only advances on success, so a
+        // throttled RPC costs a delay rather than a gap.
+        console.warn(`🖼  NFT history tick failed: ${String((e as Error).message).slice(0, 120)}`);
+        return NFT_SCAN_MS;
+      }
+    };
+    const loop = () => { void tick().then((ms) => setTimeout(loop, ms).unref?.()); };
+    setTimeout(loop, 4_000).unref?.();
+  }
+
+  /**
+   * What a drop is called.
+   *
+   * Every list of tokens said "#1 · drop 0". The token id identifies it and the
+   * drop id says nothing at all — the drop had a name the whole time, sitting
+   * on chain in `drops(id).name`, and nothing ever read it. Somebody who minted
+   * "Matcha" then had to recognise their own picture by an ordinal.
+   *
+   * Cached without expiry because a drop cannot be renamed: the contract has no
+   * function for it. That matters here, because the alternative is one extra
+   * `drops()` read per token per request on a page that polls.
+   */
+  const dropNames = new Map<number, string>();
+  const dropNameOf = async (dropId: number): Promise<string> => {
+    if (!launchpadAddr) return "";
+    const known = dropNames.get(dropId);
+    if (known !== undefined) return known;
+    try {
+      const d = (await client.public.readContract({
+        address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "drops", args: [BigInt(dropId)],
+      })) as readonly [Hex, bigint, number, number, number, boolean, string, string, string];
+      const name = String(d[6] ?? "");
+      dropNames.set(dropId, name);
+      return name;
+    } catch {
+      // A read that failed is not an answer, so it is not cached — the next
+      // request tries again rather than showing a blank name for ever.
+      return "";
+    }
+  };
+
+  /**
+   * Who holds every launchpad token, in one pass.
+   *
+   * The launchpad is a minimal ERC-721 with no enumeration — deliberately, it
+   * is the extension that costs gas on every transfer to serve a question only
+   * a reader ever asks. So the scan happens here, off chain, where it is free:
+   * `ownerOf` for each id, batched into one multicall by the client.
+   *
+   * One pass rather than one per address asked about. The gallery needs two
+   * sets — what the reader holds, and what the market holds on their behalf
+   * while it is listed — and asking the question twice read every owner twice,
+   * through an RPC that paces requests, for an answer the first pass already
+   * had. That doubling was most of what made the pane slow to draw.
+   *
+   * Bounded by `totalSupply`, which is the whole collection rather than a page
+   * of it. That is fine at this size and would not be at a hundred thousand; if
+   * it ever is, the answer is an index, not an on-chain loop.
+   */
+  const scanOwners = async (): Promise<Map<string, bigint[]>> => {
+    if (!launchpadAddr) return new Map();
+    const supply = Number(await client.public.readContract({
+      address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "totalSupply",
+    }));
+    const ids = Array.from({ length: Math.min(supply, 2000) }, (_, i) => BigInt(i + 1));
+    const owners = await Promise.all(ids.map((id) =>
+      client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "ownerOf", args: [id] })
+        .catch(() => null) as Promise<Hex | null>));
+    return groupByOwner(ids, owners);
+  };
+
+  /**
+   * Fill token ids out into the rows a pane draws.
+   *
+   * `forOwner` is the wallet the rows are being drawn for, which is not always
+   * the address that holds them: a listed token is escrowed in the market, and
+   * the date to show its seller is when *they* received it rather than the
+   * moment they put it up for sale. See `tokenDates`.
+   */
+  const hydrateTokens = async (
+    ids: readonly bigint[],
+    forOwner: string,
+  ): Promise<{
+    tokenId: number; dropId: number; name: string; uri: string;
+    mintedAt: number | null; receivedAt: number | null;
+  }[]> => {
+    if (!launchpadAddr) return [];
+    return Promise.all(ids.map(async (id) => {
+      const [dropId, uri] = await Promise.all([
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropOf", args: [id] })
+          .catch(() => 0n) as Promise<bigint>,
+        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [id] })
+          .catch(() => "") as Promise<string>,
+      ]);
+      // The dates come from the folded `Transfer` log, and are null until the
+      // scan has reached that block — the gallery sorts nulls last rather than
+      // inventing a date.
+      return {
+        tokenId: Number(id), dropId: Number(dropId), name: await dropNameOf(Number(dropId)), uri,
+        ...tokenDates(nftHistory, Number(id), forOwner),
+      };
+    }));
+  };
+
+  /** The tokens an address holds, plus whether each is currently listed. */
+  app.get("/api/nft/mine", async (req, res) => {
+    const who = String(req.query.user ?? "");
+    if (!/^0x[0-9a-fA-F]{40}$/.test(who)) {
+      res.status(400).json({ ok: false, error: "a wallet address is required" });
+      return;
+    }
+    if (!launchpadAddr) { res.json({ ok: true, tokens: [], collection: null }); return; }
+    try {
+      // One `ownerOf` sweep answers both halves of this route: what the reader
+      // holds, and what the market is holding for them. See `scanOwners`.
+      const byOwner = await scanOwners();
+      const tokens = await hydrateTokens(heldBy(byOwner, who), who);
+      // Anything this wallet has listed is escrowed by the market, so it no
+      // longer shows as theirs — read those back or a seller loses sight of it.
+      let listedByMe: {
+        tokenId: number; listingId: number; price: string; uri: string; dropId: number; name: string;
+        mintedAt: number | null; receivedAt: number | null;
+      }[] = [];
+      if (marketAddr) {
+        const escrowed = await hydrateTokens(heldBy(byOwner, marketAddr), marketAddr);
+        const found = await Promise.all(escrowed.map(async (t) => {
+          const [ok, id] = (await client.public.readContract({
+            address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listingOf",
+            args: [launchpadAddr, BigInt(t.tokenId)],
+          }).catch(() => [false, 0n])) as readonly [boolean, bigint];
+          if (!ok) return null;
+          const l = (await client.public.readContract({
+            address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listings", args: [id],
+          })) as readonly [Hex, Hex, bigint, bigint, boolean];
+          if (String(l[0]).toLowerCase() !== who.toLowerCase()) return null;
+          /*
+           * The dates on `t` were read for the market, which is the current
+           * holder — listing escrows the token there. The seller's own
+           * "received" is one hop back, which is what the gallery is asking
+           * about when it draws this row under their name.
+           */
+          return {
+            ...t, listingId: Number(id), price: fmtUnits(l[3], 6),
+            ...tokenDates(nftHistory, t.tokenId, who),
+          };
+        }));
+        listedByMe = found.filter((x): x is NonNullable<typeof x> => x !== null);
+      }
+      res.json({
+        ok: true, collection: launchpadAddr, market: marketAddr, tokens, listed: listedByMe,
+        canAct: Boolean(admin?.session(bearer(req))),
+        /*
+         * How far the date scan has got. The gallery says "still reading the
+         * chain" rather than showing a token with no date and letting somebody
+         * conclude the app lost it.
+         */
+        historyThrough: nftHistory.lastBlock,
+        historyKnown: Object.keys(nftHistory.tokens).length,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), tokens: [] });
+    }
+  });
+
+  /** Send an NFT the app wallet holds to somebody. */
+  app.post("/api/nft/transfer", requireOperator, async (req, res) => {
+    if (!launchpadAddr) { res.status(404).json({ ok: false, error: NFT_NOT_DEPLOYED }); return; }
+    const to = String(req.body?.to ?? "");
+    const tokenId = Math.floor(Number(req.body?.tokenId));
+    if (!/^0x[0-9a-fA-F]{40}$/.test(to)) { res.status(400).json({ ok: false, error: "Where should it go? That is not an address." }); return; }
+    if (!Number.isFinite(tokenId) || tokenId < 1) { res.status(400).json({ ok: false, error: "which token?" }); return; }
+    try {
+      /*
+       * `safeTransferFrom`, so a contract that cannot receive an ERC-721 refuses
+       * the transfer instead of swallowing the token. A plain `transferFrom` to
+       * the wrong address is unrecoverable, and this is exactly the field
+       * somebody pastes into.
+       */
+      const txHash = await asAgentWrite(
+        launchpadAddr, tesseraLaunchpadAbi, "safeTransferFrom",
+        [agentAccount.address as Hex, to as Hex, BigInt(tokenId)],
+      );
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "transfer",
+        status: "success", txHash, detail: `#${tokenId} → ${to.slice(0, 10)}…`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /** Every live listing, newest first. */
+  app.get("/api/nft/market", async (req, res) => {
+    if (!marketAddr) { res.json({ ok: true, deployed: false, error: MARKET_NOT_DEPLOYED, listings: [] }); return; }
+    try {
+      const [count, feeBps] = await Promise.all([
+        client.public.readContract({ address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listingCount" }) as Promise<bigint>,
+        client.public.readContract({ address: marketAddr, abi: tesseraNftMarketAbi, functionName: "feeBps" }) as Promise<number>,
+      ]);
+      const total = Number(count);
+      const ids = Array.from({ length: Math.min(total, 200) }, (_, i) => BigInt(total - 1 - i));
+      const rows = await Promise.all(ids.map(async (id) => {
+        const l = (await client.public.readContract({
+          address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listings", args: [id],
+        })) as readonly [Hex, Hex, bigint, bigint, boolean];
+        if (!l[4]) return null;
+        let uri = "";
+        let name = "";
+        let dropId: number | null = null;
+        // Only for tokens from the launchpad this app knows. The market takes
+        // any ERC-721, and a foreign collection has no drop to name.
+        if (launchpadAddr && String(l[1]).toLowerCase() === launchpadAddr.toLowerCase()) {
+          const [tokenUri, drop] = await Promise.all([
+            client.public.readContract({
+              address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [l[2]],
+            }).catch(() => "") as Promise<string>,
+            client.public.readContract({
+              address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropOf", args: [l[2]],
+            }).catch(() => null) as Promise<bigint | null>,
+          ]);
+          uri = tokenUri;
+          if (drop !== null) {
+            dropId = Number(drop);
+            name = await dropNameOf(dropId);
+          }
+        }
+        return {
+          id: Number(id), seller: l[0], collection: l[1], tokenId: Number(l[2]),
+          priceRaw: l[3].toString(), price: fmtUnits(l[3], 6), uri, name, dropId,
+        };
+      }));
+      res.json({
+        ok: true, deployed: true, address: marketAddr, feeBps: Number(feeBps),
+        listings: rows.filter((x): x is NonNullable<typeof x> => x !== null),
+        /*
+         * Whether this session can sign at all. Buying, listing and taking a
+         * listing back all spend or move the app wallet's property, so they are
+         * `requireOperator` — and a button that always answers 403 is worse
+         * than no button, because it reads as the feature being broken rather
+         * than as not being yours to press.
+         */
+        canAct: Boolean(admin?.session(bearer(req))),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e), listings: [] });
+    }
+  });
+
+  /** List a token the app wallet holds. Approves the market for that one token. */
+  app.post("/api/nft/market/list", requireOperator, async (req, res) => {
+    if (!marketAddr || !launchpadAddr) { res.status(404).json({ ok: false, error: MARKET_NOT_DEPLOYED }); return; }
+    const tokenId = Math.floor(Number(req.body?.tokenId));
+    if (!Number.isFinite(tokenId) || tokenId < 1) { res.status(400).json({ ok: false, error: "which token?" }); return; }
+    let priceRaw: bigint;
+    try { priceRaw = usdcUnits(req.body?.price ?? "0"); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+    try {
+      // One token, not the whole collection: `setApprovalForAll` would leave the
+      // market able to move every NFT this wallet will ever hold.
+      await asAgentWrite(launchpadAddr, tesseraLaunchpadAbi, "approve", [marketAddr, BigInt(tokenId)]);
+      const txHash = await asAgentWrite(
+        marketAddr, tesseraNftMarketAbi, "list", [launchpadAddr, BigInt(tokenId), priceRaw],
+      );
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "list",
+        status: "success", txHash, asset: "USDC", amount: `${fmtUnits(priceRaw, 6)} USDC`,
+        detail: `#${tokenId} listed`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Re-price a listing the app wallet owns.
+   *
+   * A price is the one thing about a listing that is worth changing, and the
+   * only alternative was cancel-and-relist: two transactions, a new listing id,
+   * and a window in between where the token is back in the wallet and the
+   * listing anybody had open 404s. `setPrice` is the seller's alone — the
+   * contract enforces that — so this only ever works for listings this wallet
+   * made.
+   *
+   * Safe against a buyer mid-flight because `buy` takes their own `maxPrice`:
+   * a raise cannot reach into a transaction already signed at the old figure,
+   * it just makes it revert. That is the correct outcome, and the reason a
+   * re-price does not need to be a two-step dance.
+   */
+  app.post("/api/nft/market/price", requireOperator, async (req, res) => {
+    if (!marketAddr) { res.status(404).json({ ok: false, error: MARKET_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which listing?" }); return; }
+    let priceRaw: bigint;
+    try { priceRaw = usdcUnits(req.body?.price ?? "0"); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+    if (priceRaw <= 0n) {
+      // The contract refuses it too; saying so here costs nothing and saves gas.
+      res.status(400).json({ ok: false, error: "A listing needs a price above zero. To stop selling it, cancel the listing." });
+      return;
+    }
+    try {
+      /*
+       * `setPrice` does not check that the listing is still live — a sold or
+       * cancelled one would take the new price and mean nothing by it, and the
+       * caller would get a green tick for a no-op. Read it back to refuse, not
+       * to decide: the price that goes on chain is the one that was typed.
+       */
+      const cur = (await client.public.readContract({
+        address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listings", args: [BigInt(id)],
+      })) as readonly [Hex, Hex, bigint, bigint, boolean];
+      if (!cur[4]) {
+        res.status(400).json({ ok: false, error: `Listing #${id} is no longer live — it has been sold or taken back.` });
+        return;
+      }
+      const txHash = await asAgentWrite(marketAddr, tesseraNftMarketAbi, "setPrice", [BigInt(id), priceRaw]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "reprice",
+        status: "success", txHash, asset: "USDC", amount: `${fmtUnits(priceRaw, 6)} USDC`,
+        detail: `listing #${id} → ${fmtUnits(priceRaw, 6)} USDC`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({
+        ok: false,
+        error: /NotSeller/i.test(String(e))
+          ? "Only the wallet that listed this token can change its price."
+          : friendlyError(e),
+      });
+    }
+  });
+
+  /** Take a listing back. */
+  app.post("/api/nft/market/cancel", requireOperator, async (req, res) => {
+    if (!marketAddr) { res.status(404).json({ ok: false, error: MARKET_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which listing?" }); return; }
+    try {
+      const txHash = await asAgentWrite(marketAddr, tesseraNftMarketAbi, "cancel", [BigInt(id)]);
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
+  /**
+   * Buy a listing from the app wallet.
+   *
+   * `maxPrice` is the figure the caller was shown, passed through untouched —
+   * re-reading it here would agree to whatever the seller had set a block
+   * earlier, which is the substitution the contract's `maxPrice` refuses.
+   */
+  app.post("/api/nft/market/buy", requireOperator, async (req, res) => {
+    if (!marketAddr) { res.status(404).json({ ok: false, error: MARKET_NOT_DEPLOYED }); return; }
+    const id = Math.floor(Number(req.body?.id));
+    if (!Number.isFinite(id) || id < 0) { res.status(400).json({ ok: false, error: "which listing?" }); return; }
+    let maxPrice: bigint;
+    try { maxPrice = usdcUnits(req.body?.maxPrice ?? ""); }
+    catch (e) { res.status(400).json({ ok: false, error: String((e as Error).message) }); return; }
+
+    // The same choke point every other autonomous spend goes through.
+    if (maxPrice > policy.autoApproveMax) {
+      res.status(400).json({
+        ok: false,
+        error:
+          `That purchase costs ${fmtUnits(maxPrice, 6)} USDC, over the guardian cap of ` +
+          `${fmtUnits(policy.autoApproveMax, 6)} USDC per autonomous spend. Raise the cap in App Config, ` +
+          "or buy it from your own wallet.",
+      });
+      return;
+    }
+    try {
+      if (maxPrice > 0n) {
+        await asAgentWrite(usdcAddress as Hex, erc20Abi, "approve", [marketAddr, maxPrice]);
+      }
+      const txHash = await asAgentWrite(marketAddr, tesseraNftMarketAbi, "buy", [BigInt(id), maxPrice]);
+      txlog.record({
+        actor: agentAccount.address as string, category: "nft", action: "buy",
+        status: "success", txHash, asset: "USDC", amount: `${fmtUnits(maxPrice, 6)} USDC`,
+        valueRaw: maxPrice.toString(), detail: `listing #${id}`,
+      });
+      res.json({ ok: true, txHash });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: friendlyError(e) });
+    }
+  });
+
   /* ---- The wallet, and standing instructions --------------------------- */
 
   /**
@@ -7782,9 +8894,24 @@ async function main() {
 
   async function readSessionFresh(id: Hex) {
     if (!sessionKeysAddr) return null;
-    const s = (await client.public.readContract({
+    /*
+     * Retried, because one dropped call here costs a save.
+     *
+     * Saving a scheduled task validates it against the session it spends from,
+     * and that validation runs under a form deadline. Four reads went out with
+     * no retry at all, so a public RPC dropping any one of them surfaced as
+     * "reading that session took too long — the chain is not answering", and
+     * the operator pressed Create two or three times until a run got lucky.
+     * The list endpoint beside this has retried since it was written; this path
+     * simply never did.
+     *
+     * Nothing is written before this succeeds, so retrying is free of
+     * consequence — the only cost of a dropped read was making somebody click
+     * again, which is also the worst thing to do to a throttled endpoint.
+     */
+    const s = (await retryRead(() => client.public.readContract({
       address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "sessions", args: [id],
-    })) as readonly [Hex, Hex, Hex, bigint, bigint, bigint, bigint, boolean, boolean];
+    }))) as readonly [Hex, Hex, Hex, bigint, bigint, bigint, bigint, boolean, boolean];
     if (s[0] === "0x0000000000000000000000000000000000000000") return null;
     /*
      * Three ceilings, and the page has to be able to name the one that binds.
@@ -7798,15 +8925,15 @@ async function main() {
      * rather than adding to it.
      */
     const [spendable, allowance, balance] = await Promise.all([
-      client.public.readContract({
+      retryRead(() => client.public.readContract({
         address: sessionKeysAddr, abi: tesseraSessionKeysAbi, functionName: "spendable", args: [id],
-      }) as Promise<bigint>,
-      client.public.readContract({
+      }) as Promise<bigint>),
+      retryRead(() => client.public.readContract({
         address: s[2], abi: erc20Abi, functionName: "allowance", args: [s[0], sessionKeysAddr],
-      }) as Promise<bigint>,
-      client.public.readContract({
+      }) as Promise<bigint>),
+      retryRead(() => client.public.readContract({
         address: s[2], abi: erc20Abi, functionName: "balanceOf", args: [s[0]],
-      }) as Promise<bigint>,
+      }) as Promise<bigint>),
     ]);
     const meta = assetMeta(s[2]);
     const capLeft = s[3] > s[4] ? s[3] - s[4] : 0n;
@@ -7939,8 +9066,17 @@ async function main() {
     });
     return Promise.race([p, bell]).finally(() => clearTimeout(timer)) as Promise<T>;
   }
-  /** How long a form may wait on the chain before it is told to give up. */
-  const FORM_DEADLINE = 12_000;
+  /**
+   * How long a form may wait on the chain before it is told to give up.
+   *
+   * Raised from 12s once the reads underneath started retrying: three attempts
+   * with backoff, behind a transport that also backs off, can legitimately take
+   * longer than twelve seconds on a throttled endpoint. A deadline shorter than
+   * the work it is timing turns a slow save into a failed one, which is what
+   * had operators pressing Create three times — and pressing again is the worst
+   * thing to do to an endpoint that is already refusing calls.
+   */
+  const FORM_DEADLINE = Number(process.env.TESSERA_FORM_DEADLINE_MS ?? 25_000);
 
   async function retryRead<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
     let last: unknown;
@@ -8279,6 +9415,16 @@ async function main() {
    * hex string gets a number they did not mean rather than the refusal every
    * other malformed amount receives.
    */
+  /*
+   * A price a person typed. `parseUsdcAmount` lives in @tessera/shared beside
+   * `usdc()`; see there for why reading a human figure is not the same job as
+   * scaling a known number, and for the launchpad bug that proved it.
+   *
+   * Deliberately not `baseUnits`, which sits directly below and does the
+   * opposite: it takes an integer already in the token's smallest unit.
+   */
+  const usdcUnits = (v: unknown): bigint => parseUsdcAmount(v);
+
   function baseUnits(v: unknown): bigint {
     const raw = String(v ?? "0").trim();
     if (!/^\d+$/.test(raw)) throw new Error("not base units");
@@ -13663,6 +14809,9 @@ async function main() {
   const appConfig = new AppConfigStore(
     statePath(".tessera-config.json"),
   );
+  // The stored cap takes effect at boot, not only after the next save.
+  applyGuardianCap(appConfig.get());
+  console.log(`🛡  Guardian cap: ${formatUsdc(policy.autoApproveMax)} USDC per autonomous call`);
 
   /**
    * Fee-allocation scheduler for the "weekly at a specific time" cadence.
@@ -13750,6 +14899,10 @@ async function main() {
     if (!r.ok) { res.status(400).json({ ok: false, error: r.error }); return; }
     const cfg = r.config;
 
+    // Takes effect on the running policy immediately — a cap that only applies
+    // after a restart is a cap the operator cannot trust they have set.
+    applyGuardianCap(cfg);
+
     const onchain: { target: string; ok: boolean; txHash?: string; error?: string }[] = [];
     if (!owner) {
       onchain.push({
@@ -13766,6 +14919,26 @@ async function main() {
           onchain.push({ target: "vault", ok: true, txHash: tx });
         } catch (e) {
           onchain.push({ target: "vault", ok: false, error: friendlyError(e) });
+        }
+      }
+      /*
+       * The launchpad fee, pushed like the vault's parameters.
+       *
+       * Skipped when it already matches, because `setFeeBps` costs gas and a
+       * save that touches an unrelated field should not spend any. The contract
+       * caps it at `MAX_FEE_BPS` regardless of what is stored here.
+       */
+      if (launchpadAddr) {
+        try {
+          const nowBps = Number(await client.public.readContract({
+            address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "feeBps",
+          }));
+          if (nowBps !== cfg.launchpadFeeBps) {
+            const tx = await owner.write(launchpadAddr, tesseraLaunchpadAbi, "setFeeBps", [cfg.launchpadFeeBps]);
+            onchain.push({ target: "launchpadFee", ok: true, txHash: tx });
+          }
+        } catch (e) {
+          onchain.push({ target: "launchpadFee", ok: false, error: friendlyError(e) });
         }
       }
       if (collector) {
@@ -13799,30 +14972,6 @@ async function main() {
    * `allocateNow()`, which ignores the scheduled interval. Operator-gated
    * because it moves the app's own fee balance.
    */
-  app.post("/api/fees/allocate", requireOperator, async (_req, res) => {
-    const collector = liveDeployment.tesseraFeeCollector as Hex | undefined;
-    if (!collector) {
-      res.status(404).json({ ok: false, error: "Fee collector isn't deployed yet — run npm run pool:arc." });
-      return;
-    }
-    // allocateNow() is onlyOwner and the deployer owns the collector, so this
-    // must be signed by the owner key — the agent account would revert.
-    if (!owner) {
-      res.status(503).json({
-        ok: false,
-        error: "Set DEPLOYER_PRIVATE_KEY on the server to allocate fees (the deployer owns the collector).",
-      });
-      return;
-    }
-    try {
-      const hash = await owner.allocateNow(collector);
-      invalidateAll(); // the allocation touches the agent, pool, vault and swap
-      res.json({ ok: true, txHash: hash });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: friendlyError(e), detail: String(e).slice(0, 300) });
-    }
-  });
-
   app.get("/api/defi/config", (_req, res) => {
     res.json({
       chainId: liveDeployment.chainId,
@@ -13847,6 +14996,11 @@ async function main() {
       serviceFees: (liveDeployment.tesseraServiceFees as Hex) ?? null,
       assetRegistry: (liveDeployment.tesseraAssetRegistry as Hex) ?? null,
       sessionKeys: (liveDeployment.tesseraSessionKeys as Hex) ?? null,
+      // Both, because listing is a two-contract action: approve the market on
+      // the launchpad, then list. A page that only knew one of them would have
+      // to guess the other.
+      launchpad: ((liveDeployment as Record<string, unknown>).tesseraLaunchpad as Hex) ?? null,
+      nftMarket: ((liveDeployment as Record<string, unknown>).tesseraNftMarket as Hex) ?? null,
       assets: poolDeployment?.assets ?? [],
       // 4-byte selectors, derived from the signatures at runtime so they can
       // never drift from the contracts. The browser appends 32-byte-padded
@@ -14139,6 +15293,35 @@ async function main() {
     console.log("\n✅ Scenario complete (one-shot mode). Exiting.");
     node?.kill();
     process.exit(0);
+  }
+
+  /*
+   * Refuse to start with a route nothing can reach.
+   *
+   * Express matches in registration order, so a duplicate path is silent: the
+   * second registration is dead code that reads exactly like live code. That is
+   * how the archive's record list sat unreachable behind the event indexer,
+   * with App Config rendering "Couldn't load history" and neither file looking
+   * wrong. A startup check costs nothing and turns a silent class of bug into a
+   * boot failure.
+   */
+  {
+    const stack = (app as unknown as { _router?: { stack: unknown[] } })._router?.stack ?? [];
+    const routes: { method: string; path: string }[] = [];
+    for (const layer of stack as { route?: { path: unknown; methods?: Record<string, boolean> } }[]) {
+      const path = layer.route?.path;
+      if (typeof path !== "string") continue;
+      for (const [method, on] of Object.entries(layer.route?.methods ?? {})) {
+        if (on) routes.push({ method, path });
+      }
+    }
+    const clashes = shadowedRoutes(routes);
+    if (clashes.length) {
+      console.error("\n✗ Two handlers claim the same route. The later one can never run:\n");
+      for (const c of clashes) console.error(`    ${c.method} ${c.path}`);
+      console.error("\n  Give one of them a different path.\n");
+      process.exit(1);
+    }
   }
 
   await new Promise<void>((r) => app.listen(DASHBOARD_PORT, DASHBOARD_HOST, r));

@@ -84,6 +84,14 @@ if [ -n "$dirty" ]; then
     warn "$f had local changes — copied to $backup/, taking the committed version"
   done
   printf '%s\n' "$dirty" | xargs -r git checkout --
+  # The deploy scripts write newly deployed addresses into deployments/arc.json,
+  # so a discard here can destroy the only copy of a contract that exists
+  # on-chain and holds tokens. That is not hypothetical: the NFT launchpad and
+  # then the NFT marketplace were both lost to this exact line, and each came
+  # back as "not deployed on this network yet" while sitting on-chain. Rescued
+  # further down, once the pull has landed and there is something to compare
+  # against.
+  if [ -f "$backup/arc.json" ]; then carry_from="$backup/arc.json"; fi
 fi
 ok "working tree is clean"
 
@@ -94,6 +102,22 @@ git checkout "$BRANCH"
 # nobody asked for in a non-interactive shell.
 git merge --ff-only "origin/$BRANCH"
 ok "at $(git rev-parse --short HEAD) — $(git log -1 --format=%s | cut -c1-60)"
+
+# Now that the committed record is the pulled one, see whether the copy we threw
+# away held an address it does not. Only additions are carried, into the
+# gitignored deployments/arc.local.json; a genuine disagreement is named and
+# left for a person, because deciding it silently is how a stale address gets
+# resurrected.
+if [ -n "${carry_from:-}" ]; then
+  say "Addresses in the record that was replaced"
+  if command -v node >/dev/null 2>&1; then
+    node scripts/carry-addresses.mjs "$carry_from" deployments || \
+      warn "the carry-over check failed; $carry_from still has everything it had."
+  else
+    warn "node is not on this host, so nothing was compared."
+    warn "The old record is at $carry_from — diff it against deployments/arc.json by hand."
+  fi
+fi
 
 want=$(grep -o 'const CACHE = "[^"]*"' dashboard/public/sw.js | cut -d'"' -f2)
 ok "this commit's shell is $want"

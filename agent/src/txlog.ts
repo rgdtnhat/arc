@@ -19,7 +19,13 @@ import { randomUUID } from "node:crypto";
  * in the browser.
  */
 
-export type TxCategory = "defi" | "agentic" | "admin";
+/**
+ * `nft` joined these when the launchpad did. It is its own category rather than
+ * `defi` because the activity filter is how an operator answers "what has this
+ * wallet been doing", and a mint is not a lending or swap action — folding it
+ * into `defi` would make that filter quietly wrong about both.
+ */
+export type TxCategory = "defi" | "agentic" | "admin" | "nft";
 export type TxStatus = "success" | "failed" | "pending" | "declined" | "approved";
 
 export interface TxRecord {

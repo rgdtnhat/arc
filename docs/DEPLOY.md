@@ -158,6 +158,48 @@ are overruled and its host-only keys are kept — which is the right answer for
 every host that has ever been patched by hand. Deleting `arc.local.json`
 entirely is also safe on a host that has never deployed from the dashboard.
 
+Both files are read and **merged**, not chosen between. There are two places the
+local record can live — beside the committed one, and in `STATE_DIR` for a
+container that cannot write into that bind mount — and a host that has used both
+paths would otherwise lose every address in whichever file lost the coin toss.
+
+### Deploying a contract, and not losing it again
+
+`scripts/deploy.sh` discards local edits to `deployments/` before it pulls,
+because a stale tracked record there blocks every future update. The deploy
+scripts write new addresses into that same tracked file. Put those together and
+a routine update destroys the only copy of a contract that is live and holding
+tokens; the app reverts to reporting it as not deployed, and the obvious
+response — run the deploy again — deploys a *second* contract and strands the
+first. That is precisely what happened to the NFT launchpad and then, unchanged,
+to the NFT marketplace.
+
+Three things now stand between that and a repeat:
+
+- **The deploy scripts write twice.** `deployments/arc.json` for the commit, and
+  a gitignored local record for right now — `STATE_DIR/arc.local.json` inside
+  the container, `deployments/arc.local.json` on the host, whichever this run
+  can reach. `deploy.sh` never checks out the second, so the address survives
+  the next update rather than the next commit. Earlier this only wrote to
+  `STATE_DIR`, which is set by compose *inside the container* — so a script run
+  on the host printed "STATE_DIR is unset" and the address was lost anyway.
+- **`deploy.sh` rescues what it discards.** After the pull it compares the
+  superseded record with the one that arrived. A key the committed record does
+  not have is carried into `deployments/arc.local.json`; a key both name with
+  different values is printed and left alone, because deciding that silently is
+  how a migrated contract gets resurrected.
+- **The app says what it actually knows.** "No NFT market address is recorded
+  for this network" is the truth; "not deployed yet" was a guess, and the fix it
+  suggested was destructive. Recover a lost address without deploying anything:
+
+```bash
+npm run nft:market -- --find      # or nft:deploy --find, for the launchpad
+```
+
+It walks the deployer's recent nonces, recomputes each contract address, and
+reports the ones that answer like a market. Put the result in
+`deployments/arc.json`, commit, and redeploy.
+
 ## Reading a `pool:arc` run
 
 `pool:arc` is re-runnable. It adopts contracts that are already live rather than

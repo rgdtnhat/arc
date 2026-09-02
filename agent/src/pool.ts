@@ -557,3 +557,48 @@ export function describeFreeze(mask: number | bigint | null | undefined): Freeze
     : `${on.slice(0, -1).join(", ")} and ${on[on.length - 1]}`;
   return { supply, withdraw, borrow, repay, any: on.length > 0, label };
 }
+
+
+/**
+ * May this session decide a launchpad drop?
+ *
+ * Three things have to be true, and only the server knows all three: the caller
+ * is signed in as operator, this process holds an owner key, and that key is
+ * the launchpad's owner.
+ *
+ * The page used to answer this itself by comparing the launchpad's owner
+ * against the address it was acting as — which in an operator session is the
+ * **app wallet**, while the launchpad is owned by the **deployer**, the key that
+ * deployed it. Two different addresses, so the comparison was false for the one
+ * person who could actually decide, and Approve and Reject never rendered. The
+ * routes worked the whole time; only the buttons were missing.
+ *
+ * The reason travels with the answer, because "the buttons are gone" is not
+ * something anybody can act on and the three causes have three different fixes.
+ */
+export function canDecideDrops(input: {
+  operator: boolean;
+  /** The address this process signs owner actions with, or null if it holds no owner key. */
+  signer: string | null;
+  /** The launchpad's on-chain owner. */
+  launchpadOwner: string | null;
+}): { ok: boolean; why: string | null } {
+  const { operator, signer, launchpadOwner } = input;
+  if (!operator) return { ok: false, why: "Sign in as operator to approve or reject drops." };
+  if (!signer) {
+    return {
+      ok: false,
+      why: "This server holds no owner key (DEPLOYER_PRIVATE_KEY), so it cannot sign a decision.",
+    };
+  }
+  if (!launchpadOwner) return { ok: false, why: "The launchpad's owner could not be read." };
+  if (signer.toLowerCase() !== launchpadOwner.toLowerCase()) {
+    return {
+      ok: false,
+      why:
+        `This server signs as ${signer}, but the launchpad is owned by ${launchpadOwner}. ` +
+        "Decisions have to come from the owner.",
+    };
+  }
+  return { ok: true, why: null };
+}

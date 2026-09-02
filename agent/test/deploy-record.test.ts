@@ -119,10 +119,25 @@ test("no record anywhere reads as no override, not as a fault", () => {
 });
 
 test("the source wires both halves", () => {
+  /*
+   * The last line used to demand `localState ?? localBeside`, which was the
+   * right shape while the question was "does the fallback win". It is not the
+   * question any more.
+   *
+   * A host can hold both files: a deploy script run on the host writes the copy
+   * beside the committed record, and a container that cannot write into that
+   * bind mount writes the STATE_DIR one. Choosing either discards every address
+   * in the other, so the loader merges them — see `combineLocal`, and the cases
+   * in deployment.test.ts. The STATE_DIR copy still wins a genuine clash, which
+   * is all the old assertion was really protecting.
+   */
   const src = readFileSync(new URL("../src/dashboard.ts", import.meta.url), "utf8");
   assert.match(src, /statePath\("arc\.local\.json"\)/, "the write has no fallback");
   assert.match(src, /readFrom\(path\.join\(STATE_DIR, "arc\.local\.json"\)\)/, "the loader ignores the fallback");
-  assert.match(src, /const local = localState \?\? localBeside;/, "the fallback does not win");
+  assert.match(
+    src, /const local = combineLocal\(localBeside, localState\);/,
+    "the loader is back to picking one local record instead of merging both",
+  );
 });
 
 test("the image does not drop privileges without the volume being prepared for it", () => {

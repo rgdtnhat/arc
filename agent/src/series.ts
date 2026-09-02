@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { writeJsonAtomic, readJson, sayCorrupt } from "./state-file.js";
-import { nextRun, parseSchedule, describeSchedule, type Schedule } from "./schedule.js";
+import { nextRun, isDue, parseSchedule, describeSchedule, type Schedule } from "./schedule.js";
 import { TASK_ACTIONS, type TaskVenue } from "./tasks.js";
 
 /**
@@ -394,9 +394,11 @@ export class SeriesStore {
   due(now = Date.now()): TaskSeries[] {
     return this.series
       .filter((s) => {
-        if (!s.enabled || s.schedule.kind === "manual" || !s.steps.some((x) => x.enabled)) return false;
-        const next = this.nextRunAt(s, now);
-        return next !== null && next <= now;
+        if (!s.enabled || !s.steps.some((x) => x.enabled)) return false;
+        // Same fix as `TaskStore.due`, and the same reason it has to be the same
+        // function: the two carried copies of a test that could only ever be
+        // true for an interval. See `isDue`.
+        return isDue(s.schedule, now, s.lastRunAt, s.createdAt);
       })
       .map((s) => this.copy(s));
   }
