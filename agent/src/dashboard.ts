@@ -1,6 +1,6 @@
 import express from "express";
 import path from "node:path";
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, readdirSync, statSync, existsSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { mergeDeployment, combineLocal, explorerFrom, normaliseAssets } from "./deployment.js";
 import { fileURLToPath } from "node:url";
@@ -80,6 +80,8 @@ import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
 import { read as chainRead } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import { scanNftHistory, tokenDates, loadHistory, EMPTY_HISTORY, type NftHistoryState } from "./nft-history.js";
+import { groupByOwner, heldBy } from "./nft-owners.js";
+import { MediaQuota } from "./media-quota.js";
 import {
   proposeFromSources,
   actionable as actionablePrices,
@@ -7905,6 +7907,46 @@ async function main() {
   const MEDIA_DIR = statePath("nft-media");
   const MEDIA_MAX_BYTES = 4 * 1024 * 1024;
   const MEDIA_MAX_ITEMS = 200;
+  /*
+   * How much of the disk this is allowed to become.
+   *
+   * The caps above bound one image and one request; nothing bounded the sum.
+   * At 200 images of 4 MB a request, and a session that anybody can mint by
+   * signing a message, "as many requests as the per-IP limiter allows, for
+   * ever" is a way to fill the volume the state files and the logs live on —
+   * and a full disk is not an NFT problem, it is the whole app stopping.
+   *
+   * So: a ceiling on the store, and a daily allowance per session so one
+   * uploader cannot be the reason the ceiling is reached. Both are env-tunable
+   * because the right number is a property of the host, not of the code. See
+   * agent/src/media-quota.ts for the accounting and docs/SECURITY.md for why
+   * these two and not a third.
+   */
+  const MEDIA_MAX_TOTAL_BYTES = Number(process.env.TESSERA_MEDIA_MAX_TOTAL_BYTES ?? 2 * 1024 * 1024 * 1024);
+  const MEDIA_DAILY_QUOTA_BYTES = Number(process.env.TESSERA_MEDIA_DAILY_QUOTA_BYTES ?? 256 * 1024 * 1024);
+  const mediaQuota = new MediaQuota({ maxTotal: MEDIA_MAX_TOTAL_BYTES, daily: MEDIA_DAILY_QUOTA_BYTES });
+  /**
+   * What is already there, counted once at boot.
+   *
+   * Synchronous on purpose: it runs while the server is still wiring routes, it
+   * is a `readdir` of a directory of small folders, and the alternative is a
+   * window during which the store reports itself empty and the ceiling does not
+   * exist. A missing directory is the ordinary first-run case, not an error.
+   */
+  const mediaBytesOnDisk = (dir: string): number => {
+    let sum = 0;
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return 0; }
+    for (const name of names) {
+      const full = path.join(dir, name);
+      try {
+        const st = statSync(full);
+        sum += st.isDirectory() ? mediaBytesOnDisk(full) : st.size;
+      } catch { /* deleted under us, so it is not stored */ }
+    }
+    return sum;
+  };
+  mediaQuota.seedTotal(mediaBytesOnDisk(MEDIA_DIR));
   /** Declared type -> extension and the bytes a real file of that type starts with. */
   const MEDIA_TYPES: Record<string, { ext: string; magic: number[][] }> = {
     "image/png": { ext: "png", magic: [[0x89, 0x50, 0x4e, 0x47]] },
@@ -7969,6 +8011,24 @@ async function main() {
     digest.update(collectionName);
     const id = digest.digest("hex").slice(0, 32);
     const dir = path.join(MEDIA_DIR, id);
+
+    /*
+     * The ceilings, checked after decoding and before a single byte is written.
+     * Decoding first is what makes the answer honest — the size that matters is
+     * the size on disk, not the third-longer base64 the request carried — and
+     * writing first would mean the refusal arrives after the damage.
+     *
+     * A folder that already exists is the same bytes under the same hash, so it
+     * is admitted free: re-submitting a drop costs no new disk.
+     */
+    const verdict = mediaQuota.admit(
+      bearer(req) || String(req.ip ?? "unknown"),
+      decoded.reduce((n, d) => n + d.bytes.length, 0),
+      Date.now(),
+      existsSync(dir),
+    );
+    if (!verdict.ok) { res.status(verdict.status).json({ ok: false, error: verdict.error }); return; }
+
     try {
       mkdirSync(dir, { recursive: true });
       decoded.forEach((d, i) => writeFileSync(path.join(dir, `${i + 1}.${d.ext}`), d.bytes));
@@ -8379,24 +8439,25 @@ async function main() {
   };
 
   /**
-   * Which launchpad tokens an address holds.
+   * Who holds every launchpad token, in one pass.
    *
    * The launchpad is a minimal ERC-721 with no enumeration — deliberately, it
    * is the extension that costs gas on every transfer to serve a question only
    * a reader ever asks. So the scan happens here, off chain, where it is free:
    * `ownerOf` for each id, batched into one multicall by the client.
    *
+   * One pass rather than one per address asked about. The gallery needs two
+   * sets — what the reader holds, and what the market holds on their behalf
+   * while it is listed — and asking the question twice read every owner twice,
+   * through an RPC that paces requests, for an answer the first pass already
+   * had. That doubling was most of what made the pane slow to draw.
+   *
    * Bounded by `totalSupply`, which is the whole collection rather than a page
    * of it. That is fine at this size and would not be at a hundred thousand; if
    * it ever is, the answer is an index, not an on-chain loop.
    */
-  const tokensOwnedBy = async (
-    who: Hex,
-  ): Promise<{
-    tokenId: number; dropId: number; name: string; uri: string;
-    mintedAt: number | null; receivedAt: number | null;
-  }[]> => {
-    if (!launchpadAddr) return [];
+  const scanOwners = async (): Promise<Map<string, bigint[]>> => {
+    if (!launchpadAddr) return new Map();
     const supply = Number(await client.public.readContract({
       address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "totalSupply",
     }));
@@ -8404,8 +8465,26 @@ async function main() {
     const owners = await Promise.all(ids.map((id) =>
       client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "ownerOf", args: [id] })
         .catch(() => null) as Promise<Hex | null>));
-    const mine = ids.filter((_, i) => String(owners[i]).toLowerCase() === who.toLowerCase());
-    return Promise.all(mine.map(async (id) => {
+    return groupByOwner(ids, owners);
+  };
+
+  /**
+   * Fill token ids out into the rows a pane draws.
+   *
+   * `forOwner` is the wallet the rows are being drawn for, which is not always
+   * the address that holds them: a listed token is escrowed in the market, and
+   * the date to show its seller is when *they* received it rather than the
+   * moment they put it up for sale. See `tokenDates`.
+   */
+  const hydrateTokens = async (
+    ids: readonly bigint[],
+    forOwner: string,
+  ): Promise<{
+    tokenId: number; dropId: number; name: string; uri: string;
+    mintedAt: number | null; receivedAt: number | null;
+  }[]> => {
+    if (!launchpadAddr) return [];
+    return Promise.all(ids.map(async (id) => {
       const [dropId, uri] = await Promise.all([
         client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropOf", args: [id] })
           .catch(() => 0n) as Promise<bigint>,
@@ -8417,7 +8496,7 @@ async function main() {
       // inventing a date.
       return {
         tokenId: Number(id), dropId: Number(dropId), name: await dropNameOf(Number(dropId)), uri,
-        ...tokenDates(nftHistory, Number(id), who),
+        ...tokenDates(nftHistory, Number(id), forOwner),
       };
     }));
   };
@@ -8431,7 +8510,10 @@ async function main() {
     }
     if (!launchpadAddr) { res.json({ ok: true, tokens: [], collection: null }); return; }
     try {
-      const tokens = await tokensOwnedBy(who as Hex);
+      // One `ownerOf` sweep answers both halves of this route: what the reader
+      // holds, and what the market is holding for them. See `scanOwners`.
+      const byOwner = await scanOwners();
+      const tokens = await hydrateTokens(heldBy(byOwner, who), who);
       // Anything this wallet has listed is escrowed by the market, so it no
       // longer shows as theirs — read those back or a seller loses sight of it.
       let listedByMe: {
@@ -8439,7 +8521,7 @@ async function main() {
         mintedAt: number | null; receivedAt: number | null;
       }[] = [];
       if (marketAddr) {
-        const escrowed = await tokensOwnedBy(marketAddr);
+        const escrowed = await hydrateTokens(heldBy(byOwner, marketAddr), marketAddr);
         const found = await Promise.all(escrowed.map(async (t) => {
           const [ok, id] = (await client.public.readContract({
             address: marketAddr, abi: tesseraNftMarketAbi, functionName: "listingOf",

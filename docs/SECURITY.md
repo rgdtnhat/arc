@@ -201,6 +201,33 @@ give any injected script somewhere to post a reader's session, which is not a
 trade worth making for a thumbnail — `agent/test/nft-gallery.test.ts` fails if a
 wildcard appears in either directive.
 
+### The artwork store has two ceilings
+
+`POST /api/nft/media` takes images and writes them to `nft-media/` under the
+state directory. It is gated on `requireAuth` rather than `requireOperator`
+because bringing artwork is part of submitting a drop and spends nothing — but a
+SIWE session is a signature away, so that gate bounds who is accountable, not how
+much they may store. The per-IP limiter in front of it counts requests a minute,
+and one request may carry 200 images of 4 MB.
+
+So two limits sum the bytes, both enforced after decoding and before anything is
+written (`agent/src/media-quota.ts`, pinned by `agent/test/media-quota.test.ts`):
+
+| Limit | Default | Env var | Refusal |
+|---|---|---|---|
+| Bytes across the whole store | 2 GiB | `TESSERA_MEDIA_MAX_TOTAL_BYTES` | `507` — the store is full |
+| Bytes per session per day | 256 MiB | `TESSERA_MEDIA_DAILY_QUOTA_BYTES` | `429` — this session's day is spent |
+
+The store total is seeded by a walk of the directory at boot, so a restart does
+not hand the ceiling out again, and it is checked first: when the disk is the
+problem, telling an uploader they have used their daily allowance sends them
+away to wait for a window that will not help. A re-upload of content already
+stored is free of both — the folder is the hash of the bytes, so it costs no new
+disk, and charging for it would refuse the retry that content addressing exists
+to make cheap. The daily quota is keyed by session token, which a determined
+uploader can renew; the store total is what actually bounds the disk, and it is
+per host rather than per anybody.
+
 ## Economic safety model (AMM liquidity pools)
 
 `TesseraAMM` lets anyone provide liquidity and earn swap fees. Its design choices

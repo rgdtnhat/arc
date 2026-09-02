@@ -160,6 +160,15 @@ const $ = (id) => document.getElementById(id);
 
       function showView(route) {
         const isApp = TABS.includes(route);
+        /*
+         * The picture viewer freezes the page behind it — it is `position:fixed`
+         * and the document would otherwise scroll under it. Leaving the pane
+         * hides the viewer along with everything else in it, but the lock is on
+         * `document.body` and survives, so tapping a nav icon with a picture
+         * open left the whole app unscrollable with nothing on screen to
+         * explain why. Guarded because it is declared further down the closure.
+         */
+        if (route !== "nft" && typeof nftLbClose === "function") nftLbClose();
         $("viewLanding").hidden = isApp;
         $("viewApp").hidden = !isApp;
         // The Start button belongs to the landing page only.
@@ -9007,6 +9016,13 @@ const $ = (id) => document.getElementById(id);
       function nftLbClose() {
         const box = $("nftLightbox");
         if (!box) return;
+        /*
+         * Nothing to close, nothing to restore. It matters because this is now
+         * called on every route change: `document.body.style.overflow` is
+         * shared with the sheets, and clearing it when this viewer never locked
+         * it would unlock the page behind somebody else's overlay.
+         */
+        if (box.dataset.open !== "1") return;
         box.dataset.open = "0";
         document.body.style.overflow = document.body.dataset.lbScroll || "";
         delete document.body.dataset.lbScroll;
@@ -9094,6 +9110,15 @@ const $ = (id) => document.getElementById(id);
         return parts.join(" · ");
       }
 
+      /**
+       * The opening of the gallery's "dates are on their way" line.
+       *
+       * Split out because the render reads it back to decide whether the
+       * message line is still its own to clear — an action message must not be
+       * wiped by a redraw that happens to find every date known.
+       */
+      const NFT_DATES_PENDING = "Some dates are still being read back from the chain's transfer log";
+
       /** The one sentence to show when neither path is open. */
       const NFT_NO_SIGNER =
         "Sign in as operator, or switch to My wallet and connect one, to act here.";
@@ -9108,6 +9133,9 @@ const $ = (id) => document.getElementById(id);
 
       function setNftTab(tab) {
         if (!(tab in NFT_TABS)) tab = "pad";
+        // Same reason as the route change: the tab the viewer was opened from
+        // is about to be hidden, and the scroll lock is not.
+        if (tab !== nftTab && typeof nftLbClose === "function") nftLbClose();
         nftTab = tab;
         try { localStorage.setItem(NFT_TAB_KEY, tab); } catch {}
         for (const [name, id] of Object.entries(NFT_TABS)) {
@@ -9265,6 +9293,62 @@ const $ = (id) => document.getElementById(id);
           nftMine.listed = (nftMine.listed || []).filter((t) => t.tokenId !== tokenId);
         });
       }
+
+      /**
+       * Read the chain back until it agrees with the receipt.
+       *
+       * The patch above draws what the receipt already proved. The refetch
+       * behind it is reconciliation — but the RPC is load balanced, and a node
+       * one block behind answers honestly with the state from before the
+       * transaction. That answer overwrites the patch, so a sale that went
+       * through paints itself back as unsold, and the reader has no way to know
+       * which of the two screens they saw was the true one.
+       *
+       * So the refetch is repeated until what came back agrees with what was
+       * confirmed. `agrees` reads the freshly loaded state rather than the
+       * patch, so it is asking the chain, not trusting us. If it never agrees
+       * the last answer stands and nothing is said — the chain wins, and a
+       * re-org or a competing transaction is a real thing that can happen.
+       *
+       * Nobody is waiting on this: the redraw happened before it started.
+       */
+      async function nftReconcile(reload, agrees, tries = 3, waitMs = 2500) {
+        for (let i = 0; i < tries; i++) {
+          // A read that throws is one more reason to try again, not a reason to
+          // stop: the pane keeps whatever it last drew either way.
+          try { await reload(); } catch {}
+          let ok = false;
+          try { ok = Boolean(agrees()); } catch { ok = false; }
+          if (ok) return true;
+          if (i + 1 < tries) await new Promise((r) => setTimeout(r, waitMs));
+        }
+        return false;
+      }
+
+      /* ---- What each action expects to see once the chain has caught up ----
+       *
+       * One predicate per change, written next to the patch that predicted it
+       * so the two cannot drift. Prices are compared as numbers: "1.5" and
+       * "1.50" are the same asking price, and the server formats what it reads
+       * rather than echoing what was typed.
+       *
+       * A listing that has vanished counts as agreement everywhere. It is not
+       * evidence of a stale read — somebody buying it in the meantime is an
+       * ordinary outcome, and demanding it still be there would retry until it
+       * gave up.
+       */
+      const nftHolds = (tokenId) => (nftMine.tokens || []).some((t) => t.tokenId === tokenId);
+      const nftListedByMe = (tokenId) => (nftMine.listed || []).some((t) => t.tokenId === tokenId);
+      const nftListingGone = (id) =>
+        !nftMarketState || !(nftMarketState.listings || []).some((l) => l.id === id);
+      const nftAsking = (id, price) => {
+        const l = nftMarketState && (nftMarketState.listings || []).find((x) => x.id === id);
+        return !l || Number(l.price) === Number(price);
+      };
+      const nftMyAsking = (id, price) => {
+        const l = (nftMine.listed || []).find((x) => x.listingId === id);
+        return !l || Number(l.price) === Number(price);
+      };
 
       /** Mint one from a drop. `maxPrice` is the figure the reader was shown. */
       async function nftDoMint(id, shownPrice, msgId) {
@@ -9537,6 +9621,39 @@ const $ = (id) => document.getElementById(id);
           nftMetric("Listed", String((nftMine.listed || []).length)) +
           nftMetric("Showing", `${rows.length} of ${all.length}`);
 
+        /*
+         * Why a tile can say "date not known yet".
+         *
+         * The dates come from a transfer-log scan that starts at the
+         * launchpad's creation block and takes a few ticks to catch up, so a
+         * token that is genuinely held can have no date at all. On the tile
+         * that reads as the app having lost track of it; said once, above,
+         * it reads as what it is — a read still in progress that will fill in.
+         *
+         * It shares `#nftGalleryMsg` with the action messages, and those are
+         * the more important thing to be looking at. So this writes only when
+         * the line is free or already carrying this same notice, and clears
+         * only its own — which is decided by reading the text back rather than
+         * by a flag, because every other writer of this line sets the text and
+         * none of them would remember to clear a flag.
+         */
+        const galMsg = $("nftGalleryMsg");
+        if (galMsg) {
+          const waiting = rows.some((t) => !t[basis]);
+          const mine = galMsg.textContent.startsWith(NFT_DATES_PENDING);
+          const free = mine || galMsg.style.display === "none" || !galMsg.textContent.trim();
+          if (waiting && free) {
+            galMsg.style.display = "block";
+            galMsg.style.color = "var(--muted)";
+            galMsg.textContent = NFT_DATES_PENDING +
+              (nftMine.historyThrough ? ` (read through block ${nftMine.historyThrough})` : "") +
+              `. Those tokens are held either way — the dates fill in as the scan catches up.`;
+          } else if (!waiting && mine) {
+            galMsg.style.display = "none";
+            galMsg.textContent = "";
+          }
+        }
+
         if (!rows.length) {
           grid.innerHTML =
             `<div style="color:var(--muted);font-size:12.5px;grid-column:1/-1">` +
@@ -9629,28 +9746,46 @@ const $ = (id) => document.getElementById(id);
           if (!btn) return;
           const what = btn.dataset.gal;
           btn.disabled = true;
+          // What the re-read has to show before this pane is settled, or null
+          // when nothing was confirmed and there is nothing to reconcile.
+          let agrees = null;
           try {
             if (what === "price") {
+              const id = Number(btn.dataset.id);
               const next = prompt(
                 `New asking price for listing #${btn.dataset.id}, in USDC.\n\n` +
                   `Buyers are safe either way: a purchase carries the price the buyer was shown, so a re-price ` +
                   `cannot reach a transaction already signed.`,
                 btn.dataset.price,
               );
-              if (next !== null) await nftDoRepriceListing(Number(btn.dataset.id), next.trim(), "nftGalleryMsg");
+              if (next !== null) {
+                const price = next.trim();
+                if (await nftDoRepriceListing(id, price, "nftGalleryMsg")) agrees = () => nftMyAsking(id, price);
+              }
             } else if (what === "cancel") {
-              await nftDoCancel(Number(btn.dataset.id), "nftGalleryMsg");
+              const id = Number(btn.dataset.id);
+              // Which token is coming back, read before it stops being listed.
+              const row = (nftMine.listed || []).find((x) => x.listingId === id);
+              const tokenId = row && row.tokenId;
+              if (await nftDoCancel(id, "nftGalleryMsg") && tokenId != null) agrees = () => nftHolds(tokenId);
             } else if (what === "list") {
+              const tokenId = Number(btn.dataset.token);
               const price = prompt(`Asking price for NFT #${btn.dataset.token}, in USDC.`, "1");
-              if (price !== null) await nftDoList(Number(btn.dataset.token), price.trim(), "nftGalleryMsg");
+              if (price !== null && await nftDoList(tokenId, price.trim(), "nftGalleryMsg")) {
+                agrees = () => nftListedByMe(tokenId);
+              }
             } else if (what === "send") {
+              const tokenId = Number(btn.dataset.token);
               const to = prompt(`Send NFT #${btn.dataset.token} to which address?\n\nA transfer cannot be undone.`, "");
-              if (to !== null) await nftDoTransfer(Number(btn.dataset.token), to.trim(), "nftGalleryMsg");
+              if (to !== null && await nftDoTransfer(tokenId, to.trim(), "nftGalleryMsg")) {
+                agrees = () => !nftHolds(tokenId);
+              }
             }
           } finally {
             btn.disabled = false;
           }
-          loadNftGallery().catch(() => {});
+          if (agrees) nftReconcile(() => loadNftGallery(), agrees).catch(() => {});
+          else loadNftGallery().catch(() => {});
         });
       }
 
@@ -9746,7 +9881,12 @@ const $ = (id) => document.getElementById(id);
           if (!tokenId) { nftSay("nftListMsg", "This wallet holds no NFT to list."); return; }
           $("nftListGo").disabled = true;
           const ok = await nftDoList(tokenId, $("nftListPrice").value.trim() || "0", "nftListMsg");
-          if (ok) { $("nftListPrice").value = ""; loadNftMarket(); }
+          if (ok) {
+            $("nftListPrice").value = "";
+            // Settled once the re-read shows it among this wallet's listings —
+            // a node a block behind would otherwise put it back on the shelf.
+            nftReconcile(() => loadNftMarket(), () => nftListedByMe(tokenId)).catch(() => {});
+          }
           $("nftListGo").disabled = false;
         });
       }
@@ -9758,25 +9898,45 @@ const $ = (id) => document.getElementById(id);
           const id = Number(btn.dataset.id);
           const what = btn.dataset.mkt;
           btn.disabled = true;
+          // The row as it stands, read before the action changes it — a cancel
+          // has to know which token is coming back to this wallet.
+          const row = nftMarketState && (nftMarketState.listings || []).find((l) => l.id === id);
+          let agrees = null;
           try {
             if (what === "buy") {
               // The price the row was showing, not one re-read at send time —
               // see the contract's `maxPrice`.
-              await nftDoBuy(id, btn.dataset.price, "nftMarketMsg");
+              if (await nftDoBuy(id, btn.dataset.price, "nftMarketMsg")) agrees = () => nftListingGone(id);
             } else if (what === "price") {
               const next = prompt(
                 `New asking price for listing #${id}, in USDC.\n\nBuyers are safe either way: a purchase ` +
                   `carries the price the buyer was shown, so a re-price cannot reach a transaction already signed.`,
                 btn.dataset.price,
               );
-              if (next !== null) await nftDoRepriceListing(id, next.trim(), "nftMarketMsg");
-            } else {
-              await nftDoCancel(id, "nftMarketMsg");
+              if (next !== null) {
+                const price = next.trim();
+                if (await nftDoRepriceListing(id, price, "nftMarketMsg")) agrees = () => nftAsking(id, price);
+              }
+            } else if (await nftDoCancel(id, "nftMarketMsg")) {
+              /*
+               * The listing is gone and the token is back. "Back" is only
+               * checkable for this app's own launchpad, though — the market
+               * takes any ERC-721 and the held list is drawn from one
+               * collection, so for a foreign token the listing's absence is the
+               * whole of what can be confirmed.
+               */
+              const ours = row && nftMine.collection &&
+                String(row.collection).toLowerCase() === String(nftMine.collection).toLowerCase();
+              const tokenId = ours ? row.tokenId : null;
+              agrees = tokenId == null
+                ? () => nftListingGone(id)
+                : () => nftListingGone(id) && nftHolds(tokenId);
             }
           } finally {
             btn.disabled = false;
           }
-          loadNftMarket();
+          if (agrees) nftReconcile(() => loadNftMarket(), agrees).catch(() => {});
+          else loadNftMarket();
         });
       }
 
@@ -9788,7 +9948,11 @@ const $ = (id) => document.getElementById(id);
           // `nftDoTransfer` owns the address check, the confirmation and the
           // choice of signer, so the form and the gallery tile cannot drift.
           const ok = await nftDoTransfer(tokenId, $("nftXferTo").value.trim(), "nftXferMsg");
-          if (ok) { $("nftXferTo").value = ""; loadNftHeld(); }
+          if (ok) {
+            $("nftXferTo").value = "";
+            // It has gone; the re-read has to agree before this is settled.
+            nftReconcile(() => loadNftHeld(), () => !nftHolds(tokenId)).catch(() => {});
+          }
           $("nftXferGo").disabled = false;
         });
       }

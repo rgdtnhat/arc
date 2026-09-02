@@ -209,3 +209,83 @@ test("the viewer sits above the app's own header", () => {
   );
   assert.match(css, /id="nftLbClose"/, "the viewer has no close button");
 });
+
+/* ---- the refetch that could undo the redraw ------------------------------ */
+
+/**
+ * The optimistic redraw is only safe if the read behind it cannot revert it.
+ *
+ * Both paths wait for the receipt, so the patch draws something that has
+ * already happened. The refetch then runs against a load-balanced RPC, and a
+ * node one block behind answers honestly with the state from before the
+ * transaction — which overwrites the patch and paints a confirmed sale back as
+ * unsold. `nftReconcile` is what closes that: read again until the answer
+ * agrees with the receipt, then stop.
+ */
+const nftReconcile = new Function(
+  `${bodyOf("nftReconcile")}\n      }\n      return nftReconcile;`,
+)() as (
+  reload: () => Promise<void>,
+  agrees: () => boolean,
+  tries?: number,
+  waitMs?: number,
+) => Promise<boolean>;
+
+test("a read that lands a block behind is asked again", async () => {
+  // The first answer is the pre-transaction one. Accepting it is exactly the
+  // bug: the pane would show the old price and never correct itself.
+  let reads = 0;
+  const ok = await nftReconcile(async () => { reads += 1; }, () => reads >= 2, 3, 1);
+  assert.equal(ok, true);
+  assert.equal(reads, 2, "it did not read again after the stale answer");
+});
+
+test("an answer that already agrees is not read a second time", async () => {
+  // Reconciling is not polling. When the first read agrees there is nothing
+  // left to wait for, and another round trip is a round trip on the RPC the
+  // whole pane shares.
+  let reads = 0;
+  const ok = await nftReconcile(async () => { reads += 1; }, () => true, 3, 1);
+  assert.equal(ok, true);
+  assert.equal(reads, 1);
+});
+
+test("it gives up rather than reading for ever", async () => {
+  /*
+   * A change really can fail to appear — a re-org, or somebody else's
+   * transaction landing first. The chain wins then, so this stops at the
+   * budget, leaves the last answer on screen and says nothing.
+   */
+  let reads = 0;
+  const ok = await nftReconcile(async () => { reads += 1; }, () => false, 3, 1);
+  assert.equal(ok, false);
+  assert.equal(reads, 3, "it read a different number of times than it was budgeted");
+});
+
+test("a read that throws is retried, not treated as agreement", async () => {
+  // A refused RPC is one more reason to look again; treating the failure as
+  // settled would leave the pane trusting a patch nothing confirmed.
+  let reads = 0;
+  const ok = await nftReconcile(
+    async () => { reads += 1; if (reads < 2) throw new Error("rpc said no"); },
+    () => reads >= 2, 3, 1,
+  );
+  assert.equal(ok, true);
+  assert.equal(reads, 2);
+});
+
+test("every NFT action reconciles instead of blindly refetching", () => {
+  /*
+   * The wiring, not just the helper. Each of these handlers patched the pane
+   * and then called `loadNftGallery` / `loadNftMarket` unconditionally, which
+   * is the call that could paint the old state back.
+   */
+  for (const anchor of ['$("nftGalleryGrid").addEventListener', '$("nftMarketRows").addEventListener']) {
+    const at = app.indexOf(anchor);
+    assert.notEqual(at, -1, `${anchor} is gone — this test is looking in the wrong place`);
+    assert.match(
+      app.slice(at, at + 4_000), /nftReconcile\(/,
+      `${anchor} still refetches without checking the answer agrees`,
+    );
+  }
+});
