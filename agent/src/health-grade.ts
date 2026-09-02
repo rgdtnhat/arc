@@ -186,3 +186,34 @@ export function gradeEmissionsFunding(input: {
         : ". No sink with the same label holds the weight, so it has to be set by hand on the emitter"),
   };
 }
+
+/**
+ * Routes that can never be reached, because an earlier one already matched.
+ *
+ * Express matches in registration order, so a second `app.get("/api/history")`
+ * is not an error, an override, or a warning — it is dead code that looks
+ * exactly like live code. The archive's record list was registered that way and
+ * was unreachable from the day the event indexer took the same path; App Config
+ * read the indexer's answer, found no `records` in it, and rendered "Couldn't
+ * load history" for months without anybody being able to see why from either
+ * file.
+ *
+ * Static paths only. A parameterised route legitimately shadows a static
+ * sibling registered after it — `/api/history/:id` after `/api/history/delete`
+ * is how those two are *meant* to be ordered — so flagging that would train
+ * somebody to ignore this.
+ */
+export function shadowedRoutes(
+  routes: { method: string; path: string }[],
+): { method: string; path: string; firstAt: number; againAt: number }[] {
+  const seen = new Map<string, number>();
+  const out: { method: string; path: string; firstAt: number; againAt: number }[] = [];
+  routes.forEach((r, i) => {
+    if (r.path.includes(":") || r.path.includes("*")) return;
+    const key = `${r.method.toUpperCase()} ${r.path}`;
+    const first = seen.get(key);
+    if (first === undefined) seen.set(key, i);
+    else out.push({ method: r.method.toUpperCase(), path: r.path, firstAt: first, againAt: i });
+  });
+  return out;
+}

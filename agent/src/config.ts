@@ -54,6 +54,27 @@ export interface AppConfig {
    */
   maxVisibleReserves: number;
   maxVisibleAmmPools: number;
+  /**
+   * The guardian cap: the most the agent may spend on one autonomous call
+   * before a human has to co-sign, as a plain USDC string.
+   *
+   * Stored as typed rather than as base units, so what an operator reads back
+   * is what they entered. `parseUsdcAmount` converts it, and `LIMITS`
+   * enforces a ceiling that no configuration can exceed.
+   *
+   * Note what is deliberately *not* here: `autoApprove`, the switch that turns
+   * the guardian off entirely. Raising a cap is an operator deciding how much
+   * to risk per call; removing the co-signer is a different thing, it is a
+   * local-demo affordance, and it must not be reachable from a deployed
+   * configuration at all. Setting a limit and removing the limiter do not
+   * belong on the same screen.
+   */
+  guardianCapUsdc: string;
+  /**
+   * Protocol fee on every NFT launchpad mint, in bps. The contract caps this at
+   * `MAX_FEE_BPS` (1000 = 10%) and refuses more whatever is written here.
+   */
+  launchpadFeeBps: number;
 }
 
 export const CADENCES: Record<string, number> = {
@@ -80,6 +101,9 @@ export const DEFAULT_CONFIG: AppConfig = {
   swapAppFeeShareBps: 5_000,
   maxVisibleReserves: 0,
   maxVisibleAmmPools: 0,
+  // The historical default, unchanged: half a cent per autonomous call.
+  guardianCapUsdc: "0.005",
+  launchpadFeeBps: 250,
 };
 
 /** Hard limits mirrored from the contracts so the API rejects bad input early. */
@@ -91,6 +115,18 @@ export const LIMITS = {
   feeIntervalMin: 1,
   feeIntervalMax: 31_536_000,
   maxVisibleMax: 50,
+  /**
+   * The highest guardian cap any configuration may set, in USDC.
+   *
+   * A cap is the only thing standing between an unattended agent and the
+   * operator's balance, and a form is a place where a zero gets added by
+   * accident. This is the ceiling on the ceiling: it lives in code, so no
+   * saved config, no API call and no typo can raise the per-call risk above it.
+   * Somebody who genuinely wants more has to change this line and redeploy,
+   * which is exactly the amount of friction the decision deserves.
+   */
+  guardianCapMaxUsdc: 100,
+  launchpadFeeMaxBps: 1_000,
 };
 
 export class AppConfigStore {
@@ -122,10 +158,29 @@ export class AppConfigStore {
    * the UI can show something specific rather than "invalid".
    */
   update(patch: Partial<AppConfig>): { ok: true; config: AppConfig } | { ok: false; error: string } {
+    /*
+     * Known keys only.
+     *
+     * This used to spread the patch wholesale, so any key at all was persisted
+     * — including `autoApprove`, the switch that turns the guardian off. Nothing
+     * read it, so it did nothing; but a stored setting named after a bypass is
+     * how a bypass gets wired up by accident later, by somebody who finds it in
+     * the file and reasonably assumes it means something. Raising a cap and
+     * removing the co-signer are different decisions, and only one of them
+     * belongs in a saved configuration.
+     *
+     * Unknown keys are dropped in silence rather than refused: a client sending
+     * a field this version does not know about is a version skew, not an
+     * attack, and failing the whole save would make every upgrade a breakage.
+     */
+    const allowed = Object.keys(DEFAULT_CONFIG) as (keyof AppConfig)[];
+    const clean: Partial<AppConfig> = {};
+    for (const k of allowed) if (k in patch) (clean as Record<string, unknown>)[k] = patch[k];
+
     const next: AppConfig = {
       ...this.cfg,
-      ...patch,
-      feeShares: { ...this.cfg.feeShares, ...(patch.feeShares ?? {}) },
+      ...clean,
+      feeShares: { ...this.cfg.feeShares, ...(clean.feeShares ?? {}) },
     };
 
     const r = next.vaultReserveRatioBps;
@@ -144,6 +199,42 @@ export class AppConfigStore {
     ) {
       return { ok: false, error: `The app's share of vault yield cannot exceed ${LIMITS.vaultPerformanceFeeMax / 100}%.` };
     }
+    /*
+     * The guardian cap, validated hard.
+     *
+     * This is the number that decides how much an unattended agent may move
+     * without a human, so every way of getting it wrong is refused rather than
+     * coerced: junk, more precision than USDC holds, a negative, and — the one
+     * that matters — anything above the ceiling compiled into `LIMITS`.
+     */
+    if (typeof next.guardianCapUsdc !== "string") {
+      return { ok: false, error: "The guardian cap must be a plain amount of USDC." };
+    }
+    const capText = next.guardianCapUsdc.trim().replace(/,/g, "");
+    if (!/^\d+(\.\d{1,6})?$/.test(capText)) {
+      return { ok: false, error: "The guardian cap must be a plain amount of USDC, with at most 6 decimal places." };
+    }
+    if (Number(capText) > LIMITS.guardianCapMaxUsdc) {
+      return {
+        ok: false,
+        error:
+          `The guardian cap cannot exceed ${LIMITS.guardianCapMaxUsdc} USDC. That ceiling is in code, not in ` +
+          "this form — it is what stops one mistyped figure handing an unattended agent the whole balance.",
+      };
+    }
+    next.guardianCapUsdc = capText;
+
+    if (
+      !Number.isInteger(next.launchpadFeeBps) ||
+      next.launchpadFeeBps < 0 ||
+      next.launchpadFeeBps > LIMITS.launchpadFeeMaxBps
+    ) {
+      return {
+        ok: false,
+        error: `The launchpad fee must be between 0% and ${LIMITS.launchpadFeeMaxBps / 100}% — the contract refuses more.`,
+      };
+    }
+
     const s = next.feeShares;
     const total = s.agentBps + s.lendingBps + s.vaultBps + s.swapBps + s.retainedBps;
     if ([s.agentBps, s.lendingBps, s.vaultBps, s.swapBps, s.retainedBps].some((v) => !Number.isInteger(v) || v < 0)) {

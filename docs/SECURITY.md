@@ -209,6 +209,80 @@ Because self-custody needs no sign-in, keeping the operator path admin-only
 (Finding 2) costs users nothing: anyone can transact with their own money, while
 only the operator can spend the app's.
 
+### The NFT pane, which had only one of them
+
+Every NFT write — submit, mint, list, re-price, cancel, buy, transfer — signed
+with `AGENT_PRIVATE_KEY`, so every one was `requireOperator` and every spend was
+clamped by the guardian cap. Correct for the app wallet, and useless as the only
+option: a visitor holding their own USDC could not mint at all, and the
+marketplace was a shop only the shopkeeper could use. The buttons were simply
+not drawn for them, which reads as a broken feature rather than as somebody
+else's money.
+
+Both paths now exist, on the same terms as the DeFi ones:
+
+- The operator routes are unchanged. `POST /api/nft/market/price` is new and is
+  `requireOperator` like its siblings; `/api/nft/mint` and `/api/nft/market/buy`
+  still check `policy.autoApproveMax` **before** granting the ERC-20 allowance,
+  so a spend the cap refused cannot leave an approval standing behind it.
+- The browser path assembles the same calls from `GET /api/defi/config`
+  selectors and the connected wallet signs them. The guardian cap deliberately
+  does not apply there: it bounds what the *agent* may spend unattended, and a
+  person signing in their own wallet is the co-signer that cap exists to
+  summon. Clamping them to it would be theatre.
+- `/api/nft/media` remains `requireAuth` rather than `requireOperator`. It
+  spends nothing; the gate is there because an unauthenticated write that puts
+  bytes on disk is a disk-filling primitive.
+
+`agent/test/nft-self-custody.test.ts` holds both halves in place: every action
+must have a self-custody branch *and* an operator branch, the browser's
+selectors must match the shipped ABIs (a wrong selector is four bytes no
+function matches, which lands in the fallback rather than failing loudly), and
+every POST under `/api/nft` except the media upload must be `requireOperator`.
+
+### Artwork is resolved in the browser, never by the server
+
+A drop's metadata URI is written by whoever submitted it. Resolving it
+server-side to find the picture would hand any submitter a request originating
+inside the app's network — an SSRF primitive aimed at whatever else lives there,
+fired with no user present to have chosen it. So the fetch happens in the
+reader's own browser, where an image load belongs.
+
+The page's CSP (`connect-src 'self'`, `img-src 'self' data:`) then decides what
+can actually be drawn. Artwork uploaded through this app is served by this app
+and resolves; a URI the creator brought from elsewhere does not, and gets a
+labelled placeholder that links out. Loosening the CSP to draw it inline would
+give any injected script somewhere to post a reader's session, which is not a
+trade worth making for a thumbnail — `agent/test/nft-gallery.test.ts` fails if a
+wildcard appears in either directive.
+
+### The artwork store has two ceilings
+
+`POST /api/nft/media` takes images and writes them to `nft-media/` under the
+state directory. It is gated on `requireAuth` rather than `requireOperator`
+because bringing artwork is part of submitting a drop and spends nothing — but a
+SIWE session is a signature away, so that gate bounds who is accountable, not how
+much they may store. The per-IP limiter in front of it counts requests a minute,
+and one request may carry 200 images of 4 MB.
+
+So two limits sum the bytes, both enforced after decoding and before anything is
+written (`agent/src/media-quota.ts`, pinned by `agent/test/media-quota.test.ts`):
+
+| Limit | Default | Env var | Refusal |
+|---|---|---|---|
+| Bytes across the whole store | 2 GiB | `TESSERA_MEDIA_MAX_TOTAL_BYTES` | `507` — the store is full |
+| Bytes per session per day | 256 MiB | `TESSERA_MEDIA_DAILY_QUOTA_BYTES` | `429` — this session's day is spent |
+
+The store total is seeded by a walk of the directory at boot, so a restart does
+not hand the ceiling out again, and it is checked first: when the disk is the
+problem, telling an uploader they have used their daily allowance sends them
+away to wait for a window that will not help. A re-upload of content already
+stored is free of both — the folder is the hash of the bytes, so it costs no new
+disk, and charging for it would refuse the retry that content addressing exists
+to make cheap. The daily quota is keyed by session token, which a determined
+uploader can renew; the store total is what actually bounds the disk, and it is
+per host rather than per anybody.
+
 ## Economic safety model (AMM liquidity pools)
 
 `TesseraAMM` lets anyone provide liquidity and earn swap fees. Its design choices
@@ -766,6 +840,116 @@ re-runs ~26 probes per contract into the rate limit it is about to trip.
   LP fee on every swap. Asserted by test against real balances, not just reasoning.
 - **Fee rounding direction**: the app's cut is rounded down and the LP cut takes
   the remainder, so an odd wei always lands with liquidity providers.
+
+## The NFT launchpad
+
+`TesseraLaunchpad` is a curated drop board: `submit` is permissionless and mints
+nothing, `approveDrop` is owner-only and is the only path to a mintable drop,
+and `mint` moves USDC from a buyer to a stranger. That last fact is what makes
+it a spend path rather than a gallery, so the money rules apply to it:
+
+| Rule | How it is kept |
+|---|---|
+| Escrow only what was vetted | `mint(id, to, maxPrice)` reverts above `maxPrice`. A creator may re-price their own drop at any time; without this they could watch a mint in the mempool, raise the price, and be paid the higher one out of a wallet that never agreed to it. The server passes through the price the caller was **shown** and never re-reads it at send time — re-reading would agree to whatever had just been set. |
+| Every spend passes the policy gate | An operator mint spends `AGENT_PRIVATE_KEY`, so `/api/nft/mint` checks the amount against the guardian cap **before** granting any allowance. An approval left standing over a refused cap would be a spend waiting to happen. |
+| Spending endpoints are operator-only | `/api/nft/submit`, `/api/nft/decide`, `/api/nft/pause` and `/api/nft/mint` are all behind `requireOperator`. `GET /api/nft` is public, because reading a drop board is. A visitor with their own wallet needs none of them — the browser holds selectors for `submit` and `mint`. |
+| Log what actually moved | The ledger records the drop's own price, read for the record, not the `maxPrice` ceiling the caller authorised. Writing the ceiling would report a spend that did not happen. |
+| Admin fees capped in code | `MAX_FEE_BPS` is 10% and `setFeeBps` refuses more, at construction and afterwards. A fee an admin can set to 100% makes the creator's share a promise rather than a property. |
+
+### Uploaded artwork
+
+`POST /api/nft/media` takes images and serves ERC-721 metadata from the app's
+own origin, which makes the upload path an XSS surface rather than a storage
+one. Three rules keep it closed:
+
+- **SVG is refused.** It is a document, not a picture, and one with a `<script>`
+  in it served same-origin is stored XSS against every visitor who opens the
+  drop. PNG, JPEG, GIF and WebP only.
+- **The bytes must agree with the declared type.** The MIME type is the
+  uploader's word; the magic number is the file's. A `.png` that is really HTML
+  is refused rather than served as an image and sniffed as a document.
+- **Served with `nosniff` and a fixed content type**, from filenames this server
+  generated — `^[0-9]{1,4}\.(png|jpg|gif|webp)$` under a 32-hex directory, so
+  there is no traversal and no dotfile to reach.
+
+It sits behind `requireAuth` (a connected wallet or an admin session), not
+`requireOperator` — submitting a drop is something a visitor does, and it would
+be odd to let them submit and not bring the artwork. It is still a gate: an
+unauthenticated write that puts bytes on disk is a disk-filling primitive.
+4 MB per image, 200 images per collection, content-addressed so the same upload
+twice is the same folder.
+
+**Where the art actually lives.** Uploaded images sit in `STATE_DIR/nft-media`,
+on the container's volume, and are served from this app's own domain. That is
+convenient and it is not permanence: a drop's `tokenURI` points at this host, so
+if the volume is recreated or the site goes away, the token survives on chain and
+its picture does not. A creator who needs the artwork to outlive the deployment
+should host it themselves — IPFS, Arweave, anywhere content-addressed — and paste
+that URI instead. The form takes either, and says so.
+
+The contract never holds the money: payment splits to creator and treasury
+inside the same call, so there is no balance to sweep and no withdrawal function
+to get wrong. `minted` is incremented before any transfer, so a re-entrant
+receiver cannot mint past the supply, and rejection is final — un-approving a
+drop after somebody minted from it would leave their token a claim on a drop the
+admin had disowned.
+
+## The NFT marketplace
+
+`TesseraNftMarket` is a separate contract rather than more functions on the
+launchpad. Folding listings in would have needed no approval step — same
+contract, same token — but the launchpad is deployed and holds a minted token,
+and adding functions means replacing it, which would strand that token and every
+drop beside it. The separation turns out to be the better shape anyway: a market
+welded to one collection can only sell that collection.
+
+A listing **escrows** the token. The alternative — leave it with the seller and
+pull it on sale — lets a buyer pay gas to discover the seller moved, sold or
+un-approved it a block earlier. Escrow makes a live listing something the
+contract can deliver, and `cancel` stays open to the seller, so nothing is
+trapped.
+
+| Rule | How it is kept |
+|---|---|
+| Escrow only what was vetted | `buy(id, maxPrice)` reverts above `maxPrice`. A seller may re-price at any time; without it they could watch a purchase in the mempool, raise the price, and be paid the higher one out of a wallet that never agreed. The server passes through the price the caller was **shown** and never re-reads it. |
+| Every spend passes the policy gate | An operator purchase spends `AGENT_PRIVATE_KEY`, so `/api/nft/market/buy` checks it against the guardian cap before granting any allowance. |
+| Operator-only for anything that signs | Listing, cancelling, buying and transferring from the app wallet are all behind `requireOperator`. Reads are public. |
+| The contract never holds USDC | Payment splits to seller and treasury in the same call. The only custody is the listed token, until it sells or is taken back. |
+| Fee capped in code | `MAX_FEE_BPS` is 10%, at construction and in `setFeeBps`. |
+| State before value | The listing is cleared before either transfer, so a re-entrant token or recipient finds nothing left to buy. |
+
+Transfers go by `safeTransferFrom`, so a contract that cannot hold an ERC-721
+refuses rather than swallowing the token — a transfer to the wrong address
+cannot be undone, and that field is one people paste into. Listing approves the
+market for **one token**, never `setApprovalForAll`, which would leave it able
+to move every NFT the wallet will ever hold.
+
+## The guardian cap is configurable; the guardian is not
+
+`guardianCapUsdc` in App Config sets how much the agent may spend on one
+autonomous call before a human has to co-sign. Three things bound it:
+
+- **A ceiling in code.** `LIMITS.guardianCapMaxUsdc` (100 USDC) is the ceiling
+  on the ceiling. No saved config, no API call and no typo can raise the
+  per-call risk above it — changing it means editing that line and redeploying,
+  which is the amount of friction the decision deserves.
+- **Strict parsing.** Junk, negatives, exponents and more precision than USDC
+  holds are refused rather than coerced, and a refusal leaves the stored value
+  where it was.
+- **Known keys only.** `AppConfigStore.update` used to spread the patch
+  wholesale, so any key at all was persisted — including `autoApprove`, the
+  switch that turns the guardian off. Nothing read it, so it did nothing; but a
+  stored setting named after a bypass is how a bypass gets wired up later by
+  somebody who finds it in the file and reasonably assumes it means something.
+  Only fields present in `DEFAULT_CONFIG` are accepted now.
+
+`autoApprove` remains what it was: env-only, forced off on a live chain, and
+absent from the config surface entirely. Raising a limit and removing the
+limiter are different decisions and do not belong on the same screen.
+
+The cap is applied by mutating the running policy, so a change takes effect
+immediately rather than at the next restart — a cap an operator cannot tell has
+been applied is one they cannot rely on.
 
 ## Secrets policy
 

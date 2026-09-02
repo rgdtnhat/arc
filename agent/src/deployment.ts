@@ -70,6 +70,39 @@ export function normaliseAssets(
   return out;
 }
 
+/**
+ * The two local records a host might have, read as one.
+ *
+ * There are two places a deploy can leave `arc.local.json`. Beside the
+ * committed record — `deployments/`, which compose bind-mounts from the host —
+ * is the normal one, and the only one a script run on the host can reach.
+ * `STATE_DIR/arc.local.json` is the fallback for a container that cannot write
+ * into that mount, which is a real configuration and not a hypothetical.
+ *
+ * The loader used to pick one: `localState ?? localBeside`. That is fine while
+ * only one exists and quietly wrong the moment both do, because picking is not
+ * merging — a state-dir file written before a key existed would mask a beside
+ * file that names it, and the app would report a contract as undeployed with
+ * the address sitting in a file it had just read. The marketplace lost an
+ * address to a neighbouring version of this, so the resolution is a merge:
+ * every key from both, the state-dir copy winning a genuine collision because
+ * it is the one a locked-down container can keep current, and the claims in
+ * `overrides` unioned rather than replaced.
+ */
+export function combineLocal(
+  beside: Record<string, unknown> | null,
+  state: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!beside) return state;
+  if (!state) return beside;
+  const claims = (d: Record<string, unknown>) => (Array.isArray(d.overrides) ? (d.overrides as string[]) : []);
+  const overrides = [...new Set([...claims(beside), ...claims(state)])];
+  const out: Record<string, unknown> = { ...beside, ...state };
+  if (overrides.length) out.overrides = overrides;
+  else delete out.overrides;
+  return out;
+}
+
 /** Fields that describe the merge itself, not the deployment. */
 const META = new Set(["overrides", "explorer"]);
 

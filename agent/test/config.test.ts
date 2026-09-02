@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { AppConfigStore, DEFAULT_CONFIG, nextWeeklyRun } from "../src/config.ts";
+import { AppConfigStore, DEFAULT_CONFIG, LIMITS, nextWeeklyRun } from "../src/config.ts";
 
 const tmpFile = () => path.join(mkdtempSync(path.join(tmpdir(), "tessera-cfg-")), "config.json");
+/** A store of its own per test, so one refusal cannot leak into the next. */
+const freshStore = () => new AppConfigStore(tmpFile());
 
 test("defaults match the contract floor and the specified fee split", () => {
   const s = new AppConfigStore(tmpFile());
@@ -104,4 +106,63 @@ test("nextWeeklyRun picks the right UTC moment, always in the future", () => {
   for (let d = 0; d < 7; d++) {
     assert.ok(nextWeeklyRun(d, "12:00", from).getTime() > from.getTime(), `weekday ${d} is in the future`);
   }
+});
+
+/* ---- the guardian cap, and its ceiling --------------------------------- */
+
+test("the guardian cap is settable, and bounded by code rather than by the form", () => {
+  /*
+   * The cap is the only thing between an unattended agent and the operator's
+   * balance, and a form is where a zero gets added by accident. `LIMITS` is the
+   * ceiling on the ceiling: no saved config, no API call and no typo can raise
+   * the per-call risk above it.
+   */
+  const store = freshStore();
+  const ok = store.update({ guardianCapUsdc: "2.5" });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.ok && ok.config.guardianCapUsdc, "2.5");
+
+  const tooBig = store.update({ guardianCapUsdc: String(LIMITS.guardianCapMaxUsdc + 1) });
+  assert.equal(tooBig.ok, false);
+  assert.match(tooBig.ok === false ? tooBig.error : "", /ceiling is in code/);
+
+  // The refusal must not have moved the stored value.
+  assert.equal(store.get().guardianCapUsdc, "2.5");
+});
+
+test("a cap that is not an amount is refused rather than coerced", () => {
+  const store = freshStore();
+  for (const bad of ["abc", "-1", "1e6", "1.2.3", "", "0.0000001"]) {
+    const r = store.update({ guardianCapUsdc: bad });
+    assert.equal(r.ok, false, `accepted ${JSON.stringify(bad)}`);
+  }
+  // Separators are fine, and are normalised away.
+  const r = store.update({ guardianCapUsdc: "1,000" });
+  assert.equal(r.ok, false, "1,000 is over the ceiling and must still be refused");
+  const ok = store.update({ guardianCapUsdc: "1,0" });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.ok && ok.config.guardianCapUsdc, "10");
+});
+
+test("the config cannot switch the guardian off", () => {
+  /*
+   * Raising a limit and removing the limiter are different decisions.
+   * `autoApprove` is a local-demo affordance and must not be reachable from a
+   * deployed configuration — so it is not a field here at all, and a patch that
+   * tries to set it changes nothing.
+   */
+  const store = freshStore();
+  const before = JSON.stringify(store.get());
+  store.update({ autoApprove: true, guardianCapUsdc: "1" } as never);
+  const after = store.get() as Record<string, unknown>;
+  assert.equal("autoApprove" in after, false, "autoApprove became a stored setting");
+  assert.notEqual(before, JSON.stringify(after), "the legitimate half of the patch was dropped too");
+});
+
+test("the launchpad fee is bounded by what the contract will accept", () => {
+  const store = freshStore();
+  assert.equal(store.update({ launchpadFeeBps: 500 }).ok, true);
+  assert.equal(store.update({ launchpadFeeBps: LIMITS.launchpadFeeMaxBps + 1 }).ok, false);
+  assert.equal(store.update({ launchpadFeeBps: -1 }).ok, false);
+  assert.equal(store.update({ launchpadFeeBps: 2.5 }).ok, false, "bps must be whole");
 });
