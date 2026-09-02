@@ -663,6 +663,48 @@ export class TesseraAgent {
     }
 
     const deposit = svc.price * BigInt(ticks) * depositMultiple;
+
+    /*
+     * The tab rail moves money exactly as the escrow rail does, so it passes the
+     * same gate. `agentkit`'s `open_tab` action already caps its deposit; this
+     * method reached `client.openTab` directly — the same shortcut past the cap,
+     * the guardian and the blocklist that the kit was fixed for.
+     *
+     * The number checked is the deposit, not the per-tick price. The deposit is
+     * what leaves the wallet and it is `ticks * depositMultiple` times larger,
+     * so capping the tick price would authorise a figure nobody sees. It is also
+     * computed from a catalog price the provider controls, which means without
+     * this gate a large enough listing opens a tab for any amount at all.
+     */
+    if (this.cfg.policy?.blockedProviders?.some((p) => p.toLowerCase() === svc.provider.toLowerCase())) {
+      this.emit({ level: "skip", resource, message: `${svc.name} is blocked by policy — no tab opened` });
+      return null;
+    }
+    if (this.cfg.policy && deposit > this.cfg.policy.autoApproveMax) {
+      const trust = Math.max(
+        0,
+        trustScore(svc.reputation, svc.stakeUsdc) - (this.cfg.memory?.penalty(svc.provider) ?? 0)
+      );
+      const approved = await this.escalate(
+        svc,
+        { buy: true, reason: `tab deposit for ~${ticks} ticks`, trust },
+        deposit
+      );
+      if (!approved) {
+        this.emit({
+          level: "guardian",
+          resource,
+          message: `Guardian declined the ${formatUsdc(deposit)} USDC tab deposit — no tab opened`,
+        });
+        return null;
+      }
+      this.emit({
+        level: "guardian",
+        resource,
+        message: `Guardian approved the ${formatUsdc(deposit)} USDC tab deposit`,
+      });
+    }
+
     this.emit({
       level: "decide",
       resource,
@@ -712,10 +754,30 @@ export class TesseraAgent {
     });
     if (closeRes.ok) {
       const closed = (await closeRes.json()) as { settled: string; txHash: string };
+      /*
+       * Report what the chain says moved, not what the provider says it moved.
+       * `settled` arrives in the provider's own close response, so a provider
+       * that claims the full deposit on-chain can still report zero here and the
+       * activity feed would show the operator a refund that never happened.
+       * The tab's `claimed` field is the settled figure the contract recorded.
+       */
+      let settled: bigint;
+      let verified = true;
+      try {
+        settled = (await this.cfg.client.tabState(tabId)).claimed;
+      } catch {
+        // Falling back keeps the stream's summary useful when the read fails,
+        // but an unverified figure must not look like a verified one.
+        settled = BigInt(closed.settled);
+        verified = false;
+      }
       this.emit({
         level: "settle",
         resource,
-        message: `Tab #${tabId} closed — ${formatUsdc(BigInt(closed.settled))} USDC to provider, ${formatUsdc(deposit - BigInt(closed.settled))} USDC returned`,
+        message:
+          `Tab #${tabId} closed — ${formatUsdc(settled)} USDC to provider, ` +
+          `${formatUsdc(deposit - settled)} USDC returned` +
+          (verified ? "" : " (unverified — reported by the provider, chain read failed)"),
         txHash: closed.txHash as `0x${string}`,
       });
     } else {
