@@ -1,0 +1,62 @@
+{
+  "name": "tessera",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Trustless pay-per-use commerce for AI agents, settled on Arc in USDC.",
+  "workspaces": [
+    "shared",
+    "contracts",
+    "providers",
+    "agent",
+    "dashboard"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspace contracts && npm run test --workspace providers && npm run test --workspace agent",
+    "compile": "npm run compile --workspace contracts",
+    "abi:check": "node scripts/check-abi.mjs",
+    "start": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx agent/src/dashboard.ts",
+    "bootstrap:arc": "NODE_USE_ENV_PROXY=1 tsx scripts/arc-bootstrap.mjs",
+    "pool:arc": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/pool-arc.mjs",
+    "pool:arc:init": "npm run pool:arc -- --deploy-missing",
+    "migrate:pool": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/migrate-pool.mjs",
+    "audit": "npm audit --omit=dev && npm audit --audit-level=moderate",
+    "deck": "node scripts/make-deck.mjs && node scripts/check-deck.mjs",
+    "deck:check": "node scripts/check-deck.mjs",
+    "deck:pdf": "soffice --headless --norestore --convert-to pdf --outdir docs docs/deck.pptx",
+    "router:deploy": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/deploy-router.mjs",
+    "pools:reset": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/reset-pools.mjs",
+    "icon": "node scripts/make-token-icon.mjs",
+    "shell:check": "node scripts/stamp-shell.mjs --check",
+    "shell:bump": "node scripts/stamp-shell.mjs --bump",
+    "smoke": "node scripts/smoke.mjs",
+    "reads:check": "node scripts/check-reads.mjs",
+    "e2e": "node scripts/e2e.mjs",
+    "verify": "npm run compile && npm run abi:check -- --compiled && npm run shell:check && npm run reads:check && npm test --workspace contracts && npm test --workspace agent && npm run e2e && npm run rehearse:redeploy",
+    "redeploy:pool": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/redeploy-pool.mjs",
+    "rehearse:redeploy": "node scripts/redeploy-rehearsal.mjs",
+    "session:key": "node scripts/session-key.mjs",
+    "pool:tune-outflow": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/tune-outflow.mjs",
+    "pool:retire-risk": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/retire-asset-risk.mjs",
+    "pool:clear-debt": "NODE_USE_ENV_PROXY=1 node --env-file=.env --import tsx scripts/clear-agent-debt.mjs",
+    "pool:guard-collateral": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/guard-collateral.mjs",
+    "pool:unblock": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/unblock-migration.mjs",
+    "pool:rollback": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/rollback-pool.mjs",
+    "nft:deploy": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/deploy-launchpad.mjs",
+    "nft:market": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx scripts/deploy-nft-market.mjs"
+  },
+  "overrides": {
+    "adm-zip": "^0.6.0",
+    "brace-expansion": "^5.0.9",
+    "cookie": "^0.7.2",
+    "diff": "^8.0.3",
+    "serialize-javascript": "^7.0.7",
+    "tmp": "^0.2.7",
+    "undici": "^6.28.0",
+    "uuid": "^11.1.1"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}

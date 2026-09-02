@@ -1,0 +1,349 @@
+import { randomUUID } from "node:crypto";
+import { writeJsonAtomic, readJson, sayCorrupt } from "./state-file.js";
+import { nextRun, isDue, parseSchedule, describeSchedule, type Schedule } from "./schedule.js";
+
+/**
+ * Standing instructions: what the app should do on its own, and when.
+ *
+ * Every action here already exists as something an operator can press — supply,
+ * borrow, add liquidity, swap, deposit to the vault, send a transfer. This adds
+ * the only thing missing, which is *later*: the same call, on a schedule, or on
+ * a list of recipients, without somebody sitting at the page.
+ *
+ * ## Why the store is separate from the running of it
+ * A task is a record. Running it spends money. Keeping the two apart means the
+ * bookkeeping — which tasks exist, when each is next due, what happened last
+ * time — can be tested exhaustively without a chain, and the executor stays a
+ * thin thing that takes a due task and calls the endpoint's own helper. It also
+ * means a task that throws cannot corrupt the schedule of the ones beside it.
+ *
+ * ## The rule about catching up
+ * A task records `lastRunAt` only when it actually ran. `nextRun` treats a
+ * missed window as one run rather than one per window, so an app that was off
+ * overnight wakes up and does today's work, not last night's twelve times.
+ */
+
+export type TaskVenue = "lending" | "amm" | "vault" | "swap" | "wallet" | "faucet";
+
+export interface Task {
+  id: string;
+  name: string;
+  venue: TaskVenue;
+  /** The venue's own verb: supply/withdraw/borrow/repay, add/remove/swap, deposit/withdraw, send/bulk. */
+  action: string;
+  /** Whatever that verb needs — asset, amount, poolId, recipients. Validated at run time by the executor. */
+  params: Record<string, unknown>;
+  schedule: Schedule;
+  enabled: boolean;
+  /**
+   * The wallet that owns this task, lower-cased — or null for the operator's.
+   *
+   * A visitor who has delegated a session key can schedule payments out of
+   * their *own* wallet, so tasks stop being one operator's list. This is what
+   * keeps them apart: it is stamped at creation from the authenticated session
+   * and never taken from the request body, and every later action re-checks it.
+   */
+  owner: string | null;
+  createdAt: number;
+  /** When it first ran, so "running since" is answerable without a log. */
+  firstRunAt: number | null;
+  lastRunAt: number | null;
+  lastStatus: "ok" | "failed" | null;
+  lastDetail: string;
+  lastTxHash: string | null;
+  /**
+   * Gas the last run cost, in wei — 18 decimals, even here.
+   *
+   * USDC is the gas token on Arc and its ERC-20 view has six decimals, but the
+   * fee a receipt reports is in the chain's own 18-decimal unit. Storing the
+   * raw figure keeps that conversion in one place instead of every reader
+   * guessing which scale a number is in.
+   */
+  lastFeeWei: string | null;
+  runs: number;
+}
+
+export interface TaskInput {
+  name?: string;
+  venue?: string;
+  action?: string;
+  params?: Record<string, unknown>;
+  schedule?: unknown;
+  enabled?: boolean;
+  /** Set by the server from the caller's session, never read from a request body. */
+  owner?: string | null;
+}
+
+export const TASK_LIMITS = {
+  /** Enough for a busy operator, few enough that the runner stays predictable. */
+  maxTasks: 100,
+  maxName: 80,
+  /** Recipients in one bulk transfer. Past this it is an airdrop tool, not a wallet. */
+  maxRecipients: 200,
+  /** A note against a transfer. Long enough for a reference, short enough to store. */
+  maxMessage: 200,
+};
+
+const VENUES: TaskVenue[] = ["lending", "amm", "vault", "swap", "wallet", "faucet"];
+
+/** What each venue will actually carry out. Anything else is refused at creation. */
+/*
+ * Every verb, and which wallet pays for it.
+ *
+ * The `session…` verbs pay out of a *visitor's* wallet through a session key
+ * they delegated, rather than out of the app wallet: same shape, different
+ * funding address, and a cap the visitor set and can revoke at any moment.
+ *
+ * Most exist because the venue has a `…For` entry point that credits a third
+ * party — `supplyFor`, `repayFor`, `depositFor`, `addLiquidityFor`. Those are
+ * the ones where a visitor's money goes in and the position comes out in
+ * *their* name, with no moment at which it is the app's.
+ *
+ * `sessionSwap` is the exception: nothing in the AMM or the router takes a
+ * recipient, so the proceeds land in the app wallet and are forwarded on in a
+ * third transaction. It is included because a swap consumes what it is given
+ * rather than leaving a position behind, so forwarding is the whole of it.
+ *
+ * There is deliberately no `sessionWithdraw`, `sessionBorrow` or
+ * `sessionRemove`. Each of those pays out of a position the *visitor* holds,
+ * and the contracts credit `msg.sender` with no third-party variant anywhere —
+ * for the same reason the `…For` functions have no counterpart that moves an
+ * existing holder's position. A visitor's own wallet signs those, from the
+ * DeFi tab.
+ */
+export const TASK_ACTIONS: Record<TaskVenue, string[]> = {
+  lending: ["supply", "withdraw", "borrow", "repay", "sessionSupply", "sessionRepay", "sessionWithdraw", "sessionBorrow"],
+  amm: ["add", "remove", "swap", "sessionAdd", "sessionSwap", "sessionRemove"],
+  vault: ["deposit", "withdraw", "sessionDeposit", "sessionWithdraw"],
+  swap: ["swap", "sessionSwap"],
+  /*
+   * `fundFromOwner` tops a wallet up from the *deployer's* balance rather than
+   * the app wallet's — the answer to "keep the agent funded" when there is no
+   * faucet key, since Circle's drip API refuses unauthenticated calls outright
+   * and its web faucet is a captcha-protected page that must stay one.
+   *
+   * Filed with the spends, deliberately, and not beside `faucet.topUp`. That
+   * venue is exempt from the funding checks because a drip moves nobody's
+   * money; this moves the operator's, so it belongs where every other outflow
+   * is — operator-only, and refused for a visitor by the same rule that refuses
+   * them `send`.
+   */
+  wallet: ["send", "bulk", "fundFromOwner", "sessionSend", "sessionBulk"],
+  /*
+   * The one venue that brings money *in* rather than moving it out.
+   *
+   * Worth its own venue rather than a wallet verb, because everything the
+   * scheduler does to a spend — the guardian cap, the session's allowance, the
+   * blocklist — is about limiting an outflow, and none of it has anything to
+   * say about a deposit somebody else is making into your wallet. Filing it
+   * under `wallet` would put it behind checks that would all pass vacuously and
+   * would read, to anyone auditing the list, as a spend that had been waved
+   * through.
+   */
+  faucet: ["topUp"],
+};
+
+export class TaskStore {
+  private tasks: Task[] = [];
+
+  constructor(private readonly file: string) {
+    {
+      const { value: raw, outcome } = readJson<unknown>(file, null);
+      if (outcome === "corrupt") sayCorrupt("tasks", file);
+      /*
+       * Normalise `owner` on the way in.
+       *
+       * Tasks predate the field, and `JSON.stringify` omits an undefined one —
+       * so the app wallet's oldest schedules are on disk with no `owner` key at
+       * all. Every check that asks "whose is this" then has to decide what
+       * `undefined` means, and one of them got it wrong: the operator's
+       * "only mine" filter tested `owner === null`, which is false for a
+       * missing field, so the very tasks the app wallet runs were the ones it
+       * hid. Answering the question once, here, is the fix — not teaching each
+       * reader about a third value.
+       */
+      if (Array.isArray(raw)) {
+        this.tasks = raw
+          .filter((t) => t && typeof t.id === "string")
+          .map((t) => ({ ...t, owner: t.owner ?? null }));
+      }
+    }
+  }
+
+  private persist() {
+    try {
+      writeJsonAtomic(this.file, this.tasks, { pretty: false });
+    } catch (e) {
+      // A task list that cannot be written still works for this process; losing
+      // it on restart is better than refusing to schedule anything.
+      console.error(`[tasks] could not persist: ${String(e).slice(0, 120)}`);
+    }
+  }
+
+  list(): Task[] {
+    return this.tasks.map((t) => ({ ...t }));
+  }
+
+  /** Tasks belonging to one wallet — or, for the operator, all of them. */
+  listFor(owner: string | null): Task[] {
+    if (owner === null) return this.list();
+    const who = owner.toLowerCase();
+    return this.tasks.filter((t) => t.owner === who).map((t) => ({ ...t }));
+  }
+
+  /** May this caller act on this task? Operator (`null`) may act on any. */
+  ownedBy(id: string, owner: string | null): boolean {
+    const t = this.tasks.find((x) => x.id === id);
+    if (!t) return false;
+    return owner === null || t.owner === owner.toLowerCase();
+  }
+
+  get(id: string): Task | null {
+    const t = this.tasks.find((x) => x.id === id);
+    return t ? { ...t } : null;
+  }
+
+  /**
+   * Create a task, or say why not.
+   *
+   * Refusing an unknown venue or verb here rather than at run time means an
+   * operator finds out while they are looking at the form, not at 3am in a log.
+   */
+  create(input: TaskInput): { ok: true; task: Task } | { ok: false; error: string } {
+    if (this.tasks.length >= TASK_LIMITS.maxTasks) {
+      return { ok: false, error: `that is the ${TASK_LIMITS.maxTasks}-task limit; delete one first` };
+    }
+    const venue = String(input.venue ?? "") as TaskVenue;
+    if (!VENUES.includes(venue)) return { ok: false, error: `unknown venue "${input.venue}"` };
+    const action = String(input.action ?? "");
+    if (!TASK_ACTIONS[venue].includes(action)) {
+      return { ok: false, error: `${venue} cannot "${action}" — try ${TASK_ACTIONS[venue].join(", ")}` };
+    }
+    const task: Task = {
+      id: randomUUID(),
+      name: String(input.name ?? `${venue} ${action}`).trim().slice(0, TASK_LIMITS.maxName) || `${venue} ${action}`,
+      venue,
+      action,
+      params: (input.params ?? {}) as Record<string, unknown>,
+      schedule: parseSchedule(input.schedule),
+      enabled: input.enabled !== false,
+      owner: input.owner ? String(input.owner).toLowerCase() : null,
+      createdAt: Date.now(),
+      firstRunAt: null,
+      lastRunAt: null,
+      lastStatus: null,
+      lastDetail: "",
+      lastTxHash: null,
+      lastFeeWei: null,
+      runs: 0,
+    };
+    this.tasks.push(task);
+    this.persist();
+    return { ok: true, task: { ...task } };
+  }
+
+  /**
+   * Change a task in place, keeping its id and its history.
+   *
+   * The venue and the verb are editable too, and validated exactly as they are
+   * at creation. Without that, "edit" meant delete-and-recreate for the two
+   * fields most likely to be the thing somebody got wrong — losing the run
+   * history that says whether the task has ever worked.
+   */
+  update(id: string, input: TaskInput): { ok: true; task: Task } | { ok: false; error: string } {
+    const t = this.tasks.find((x) => x.id === id);
+    if (!t) return { ok: false, error: "no such task" };
+    const venue = input.venue === undefined ? t.venue : (String(input.venue) as TaskVenue);
+    if (!VENUES.includes(venue)) return { ok: false, error: `unknown venue "${input.venue}"` };
+    const action = input.action === undefined ? t.action : String(input.action);
+    if (!TASK_ACTIONS[venue].includes(action)) {
+      return { ok: false, error: `${venue} cannot "${action}" — try ${TASK_ACTIONS[venue].join(", ")}` };
+    }
+    t.venue = venue;
+    t.action = action;
+    if (input.name !== undefined) t.name = String(input.name).trim().slice(0, TASK_LIMITS.maxName) || t.name;
+    if (input.params !== undefined) t.params = input.params as Record<string, unknown>;
+    if (input.schedule !== undefined) t.schedule = parseSchedule(input.schedule);
+    if (input.enabled !== undefined) t.enabled = Boolean(input.enabled);
+    // `owner` is deliberately not editable. Re-homing a task is the one edit
+    // that would let somebody point another wallet's delegation at themselves.
+    this.persist();
+    return { ok: true, task: { ...t } };
+  }
+
+  remove(id: string): boolean {
+    const before = this.tasks.length;
+    this.tasks = this.tasks.filter((t) => t.id !== id);
+    if (this.tasks.length === before) return false;
+    this.persist();
+    return true;
+  }
+
+  /** When this task is next due, or null if it never is. */
+  nextRunAt(t: Task, now = Date.now()): number | null {
+    if (!t.enabled) return null;
+    return nextRun(t.schedule, now, t.lastRunAt);
+  }
+
+  /**
+   * The tasks that should run now.
+   *
+   * A disabled task is never due, and neither is a manual one — pressing Run is
+   * the only thing that fires those, and it goes through the executor directly
+   * rather than through here.
+   */
+  due(now = Date.now()): Task[] {
+    return this.tasks
+      .filter((t) => {
+        if (!t.enabled) return false;
+        /*
+         * `isDue`, not "is the next run in the past".
+         *
+         * That test was `nextRun(schedule, now) <= now`, which works for an
+         * interval — `nextRun` returns `now` itself for a task that has never
+         * run — and cannot work for anything on a calendar, because `nextRun`
+         * returns the first occurrence *strictly after* the instant it is
+         * given. So it compared a future time against the present and was false
+         * forever: weekly, monthly and yearly schedules never fired on their
+         * own, while the table displayed a next-run time that would never
+         * arrive. The question is whether an occurrence has passed that we have
+         * not run yet, and that needs the previous one.
+         */
+        return isDue(t.schedule, now, t.lastRunAt, t.createdAt);
+      })
+      .map((t) => ({ ...t }));
+  }
+
+  /** Record an attempt, whatever came of it. A failed run still counts as run. */
+  markRun(
+    id: string,
+    status: "ok" | "failed",
+    detail: string,
+    txHash: string | null = null,
+    feeWei: bigint | null = null,
+  ) {
+    const t = this.tasks.find((x) => x.id === id);
+    if (!t) return;
+    // Null when the run sent nothing, or when the receipts could not be read —
+    // which is not the same as "it was free", so it is not written as zero.
+    t.lastFeeWei = feeWei === null ? null : feeWei.toString();
+    // Stamped once and never again: "since" is the start of the series, and a
+    // task edited or paused in between is still the same series.
+    t.firstRunAt ??= Date.now();
+    t.lastRunAt = Date.now();
+    t.lastStatus = status;
+    t.lastDetail = detail.slice(0, 300);
+    t.lastTxHash = txHash;
+    t.runs += 1;
+    this.persist();
+  }
+
+  /** The list as the page shows it: with the next time and the schedule in words. */
+  view(now = Date.now(), owner: string | null = null): (Task & { nextRunAt: number | null; scheduleText: string })[] {
+    return this.listFor(owner).map((t) => ({
+      ...t,
+      nextRunAt: this.nextRunAt(t, now),
+      scheduleText: describeSchedule(t.schedule),
+    }));
+  }
+}

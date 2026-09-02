@@ -1,0 +1,67 @@
+{
+  "chainId": 5042002,
+  "rpc": "https://rpc.testnet.arc.network",
+  "usdc": "0x3600000000000000000000000000000000000000",
+  "tesseraEscrow": "0x9776498c2a0661a2d3bbb10c5094d16f835a9a7d",
+  "tesseraTab": "0x5d482c70ac56cdc44414a93446709fee17d78c6d",
+  "provider": "0xa5b42b3Ebe7FDB187c956D310f868960015d2988",
+  "deployedAt": "2026-07-17T06:22:37.721Z",
+  "tesseraPool": "0x6b11ef0b1daed7af08106bc9015cd83bdd963bfc",
+  "tesseraPoolLegacy": "0x4e7d2a132c048a09e561679f41e86fa2e898fdc2",
+  "tesseraEmissions": "0x0830935213349d64bebceeb781ab3c8d41bbc316",
+  "tesseraEmissionsLegacy": "0x49045fb56f86ba901c68ecfe7adb7c236daf2261",
+  "tesseraToken": "0x8bb6bca8cb41147844a58327603eeab433f407b0",
+  "tesseraEmitter": "0x408e0522487aec34a85b97c7a01be920b555d159",
+  "tesseraGovernor": "0x4e38a6ae1ff04f9cd5780f52e35dfec612e32ceb",
+  "tesseraVault": "0x936ed194bf4b1f5d44e60e75e2d7b3655dba652a",
+  "tesseraFeeCollector": "0xf3b00270e785149eb715cada69528c61d210dece",
+  "tesseraRouter": "0x2edb172e3364d167eae1a3b7ba1fa4c8ccdcd5d1",
+  "tesseraAmm": "0x8b3ae0eb103653c4bce4d4dbff062ad7c9c9ada0",
+  "tesseraLpEmissions": "0x3f8a8f7f9612ba42b64f92120f55af0fd28d0d14",
+  "tesseraGauge": "0x27b3a87ded810b159be2e61cf71a0ad62a59c299",
+  "tesseraServiceFees": "0x88b15bdfa20c90e7aa7de00b129aa4d1ed4fb424",
+  "vaultAsset": "0x3600000000000000000000000000000000000000",
+  "poolAssets": [
+    {
+      "symbol": "USDC",
+      "address": "0x3600000000000000000000000000000000000000",
+      "decimals": 6,
+      "borrowable": true
+    },
+    {
+      "symbol": "EURC",
+      "address": "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a",
+      "decimals": 6,
+      "borrowable": true
+    },
+    {
+      "symbol": "cirBTC",
+      "address": "0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF",
+      "decimals": 8,
+      "borrowable": true
+    },
+    {
+      "symbol": "TSRA",
+      "address": "0x8BB6bCa8CB41147844A58327603Eeab433f407b0",
+      "decimals": 18,
+      "borrowable": true
+    }
+  ],
+  "tesseraAssetRegistry": "0x3375b12aa06449e0cc9ec369ac353e5e17f8ce34",
+  "tesseraGaugeLegacy": "0x7aa76a02ae084d947ccdfda27bbf4704993de996",
+  "tesseraGovernorLegacy": "0x5cbd33263935471220a469527f50e47eae1fbb6e",
+  "tesseraKeeper": "0xf43e9057bffd74a933e6cef36c29da3220971889",
+  "tesseraProviderStake": "0xacf4dbcab0bedebfe56234f2e92ff49b794c19bc",
+  "tesseraEmissionsPrior": "0x4574c356a57bf2daccac61e42da4d734865a34c4",
+  "tesseraKeeperLegacy": "0x00b083e1ec66006d21e37be43efa462689da9968",
+  "tesseraTwapOracle": "0xa142f425a678f76690f4e2457d14dcf9ab8adc94",
+  "tesseraTimelock": "0x4b8100876e377cfea66ded7d38c5fc3654dd4c1d",
+  "tesseraPriceGuard": "0x8a73f2967c478a01673744d9291ba8593e0962cb",
+  "tesseraOracle": "0x70F7C48a420EBF6C8eC2E57b2A73EC28A33Ba6F3",
+  "tesseraPriceGuardLegacy": "0x2809b689299974769b8b82e2884f832c986a02c0",
+  "redeployedAt": "2026-08-08T16:13:00.000Z",
+  "tesseraSessionKeys": "0xb072581ce190e11d9d7b7ca482cb9eab90625a19",
+  "emissionsRedeployedAt": "2026-08-15T01:20:24.123Z",
+  "tesseraLaunchpad": "0x3f8fc4e446007c26e40d66bd0de81e51f42cfafd",
+  "tesseraNftMarket": "0x2bc054693446c826ff77085e739b617b3a0d683f"
+}

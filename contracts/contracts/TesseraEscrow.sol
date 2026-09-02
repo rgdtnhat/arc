@@ -1,0 +1,1094 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {ReentrancyGuard} from "./ReentrancyGuard.sol";
+import {Guarded} from "./Guarded.sol";
+
+/// @notice Minimal ERC-20 surface used by the escrow (Arc USDC).
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/// @notice The routing surface used to accept payment in an asset the buyer
+///         holds and deliver the one the provider quoted in.
+interface IEscrowRouter {
+    function estimate(address tokenIn, address tokenOut, uint256 amountIn)
+        external
+        view
+        returns (uint256 amountOut, uint256[] memory poolIds, address[] memory path);
+    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut, uint256 deadline)
+        external
+        returns (uint256 amountOut);
+}
+
+/**
+ * @title TesseraEscrow
+ * @notice Per-call escrow that lets an AI agent pay a service it has never met,
+ *         with an SLA deadline and automatic refund, plus on-chain reputation.
+ *
+ * Lifecycle of one payment:
+ *
+ *   open()      agent escrows USDC, referencing a signed quote and a deadline
+ *   fulfill()   provider marks the resource delivered (records a response hash)
+ *   settle()    agent confirms the SLA was met  -> funds released to provider
+ *   refund()    agent rejects, OR anyone calls after the deadline with no
+ *               fulfillment -> funds returned to the agent
+ *
+ * Reputation is updated on every terminal transition so agents can price the
+ * risk of an unknown provider before spending.
+ */
+contract TesseraEscrow is ReentrancyGuard, Guarded {
+    enum Status {
+        None,
+        Escrowed,
+        Fulfilled,
+        Settled,
+        Refunded,
+        // Appended, never inserted. `Status` is mirrored by off-chain readers
+        // (shared/src/protocol.ts) and written into indexed history; renumbering
+        // the existing four would silently reinterpret every record ever stored.
+        Disputed
+    }
+
+    struct Payment {
+        address agent;
+        address provider;
+        uint256 amount; // USDC base units (6 decimals)
+        uint64 deadline; // unix seconds by which provider must fulfill
+        uint64 fulfilledAt; // unix seconds the provider delivered (starts the dispute window)
+        bytes32 quoteHash; // binds the off-chain price quote
+        bytes32 responseHash; // set on fulfill; commitment to the delivered payload
+        Status status;
+        // Posted by the buyer at `open`, alongside the payment. Returned in every
+        // outcome except one: rejecting work that was actually delivered. See
+        // DISPUTE_BOND_BPS.
+        uint256 bond;
+        // Unix seconds the buyer escalated to arbitration; zero if it never did.
+        // Starts the arbitrator's clock — see ARBITRATION_TIMEOUT.
+        uint64 disputedAt;
+        // The protocol fee in force when this escrow was funded.
+        //
+        // Snapshotted rather than read at payout, because the two are not the
+        // same promise. `protocolFeeBps` is owner-settable, so reading it on
+        // settle let an owner raise the cut *after* a provider had already
+        // delivered — changing the terms of a trade that was agreed, and
+        // already worked, before the change. Both parties commit to the fee
+        // they could see at `open()`; a later change applies to later escrows.
+        uint16 feeBps;
+    }
+
+    /**
+     * A provider's track record.
+     *
+     * `fulfilled` and `failed` on their own are farmable, and cheaply: a provider
+     * funds a second address, opens escrows to itself, fulfills and settles them,
+     * and mints a flawless record for the price of gas. Since the agent's
+     * `trustScore` reads exactly these two numbers to decide what to buy, that is
+     * not a cosmetic problem — it is a way to talk a buyer into a purchase.
+     *
+     * `distinctBuyers` is what makes it visible. A hundred settlements across one
+     * counterparty and a hundred across sixty are the same two numbers and very
+     * different claims, and only the second is expensive to fake: every extra
+     * distinct buyer is another funded address. It does not make farming
+     * impossible, it makes it cost something and show up in the record.
+     *
+     * `lastSettledAt` lets a reader discount a record that stopped moving. A
+     * perfect history from eight months ago says little about a provider today.
+     */
+    struct Reputation {
+        uint128 fulfilled; // settled deliveries
+        uint128 failed; // refunds charged against the provider
+        uint256 earned; // total USDC released to the provider
+        uint64 distinctBuyers; // unique addresses that have settled with them
+        uint64 lastSettledAt; // unix seconds of the most recent settlement
+    }
+
+    /// @dev provider => buyer => have they ever settled together. Backs
+    ///      `Reputation.distinctBuyers`, which cannot be derived without it.
+    mapping(address => mapping(address => bool)) public hasSettledWith;
+
+    /**
+     * The buyer's side of the record.
+     *
+     * This exists because the refund path was a free option. An agent could take
+     * delivery and then, any time inside `DISPUTE_WINDOW`, call `refund`: it got
+     * 100% of the escrow back, the provider's `failed` count went up, and the
+     * provider's stake was slashed. The agent paid nothing. Reputation was
+     * written only for providers, so there was no record anywhere that the buyer
+     * was the problem.
+     *
+     * Making the buyer's behaviour visible does not, on its own, stop a
+     * determined griefer. What it does is let providers price them: an address
+     * that has disputed forty of its last hundred deliveries is one a provider
+     * can decline, or quote higher, before doing the work rather than after.
+     * That is the cheapest correction available, and it needs no new economics.
+     */
+    struct BuyerRecord {
+        uint128 settled; // payments the buyer released to the provider
+        uint128 disputed; // fulfilled payments the buyer reclaimed instead
+        uint256 spent; // total released, gross
+    }
+
+    IERC20 public immutable usdc;
+
+    /// @notice On an SLA breach, this share of the payment is slashed from the
+    ///         provider's stake and paid to the agent as compensation (if staked).
+    uint256 public constant SLASH_BPS = 2_000; // 20%
+
+    /// @notice After a provider fulfills, the agent has this long to dispute
+    ///         (reject a bad response). Once it elapses with no dispute, the
+    ///         provider can claim the escrow itself — so an offline or
+    ///         griefing agent can never lock a delivered payment forever.
+    uint64 public constant DISPUTE_WINDOW = 1 hours;
+
+    /**
+     * The buyer's stake in its own dispute, as a share of the payment.
+     *
+     * `BuyerRecord` made the free option visible. This is what prices it.
+     *
+     * Before this, a buyer could take delivery and then call `refund` inside the
+     * dispute window: full payment back, `failed += 1` against the provider, the
+     * provider's stake slashed, and nothing at all paid by the buyer. Every
+     * purchase was really an option — receive the work, then decide whether to
+     * pay for it. The agent in this repo does not exploit that, because
+     * `passesQuality` gates it honestly, but nothing in the contract required
+     * that of anyone else.
+     *
+     * So the buyer now posts a bond with the payment. It comes back on settle,
+     * on a provider that never showed up, and on a provider claim. It is
+     * forfeited in exactly one case: the buyer rejecting work that *was*
+     * delivered. Disputing is still available and still cheap — it simply is no
+     * longer free.
+     *
+     * ## Where the bond goes, and why not to the provider
+     * To the treasury. Paying it to the provider would have created a worse
+     * problem than the one being fixed: a provider with no stake could deliver
+     * deliberate garbage, bank the forfeited bond, and lose nothing, because
+     * `slashAmount` is capped at what they have staked. The bond is a cost of
+     * disputing, not a transfer to the counterparty, and that distinction is what
+     * keeps it from becoming an attack in the other direction.
+     *
+     * ## The honest cost
+     * A buyer who genuinely receives garbage pays this to reject it. That is the
+     * price of settling disputes with no arbiter: the chain cannot tell a bad
+     * response from a buyer who changed their mind, so it charges for the claim
+     * rather than pretending to judge it. Sized well below `SLASH_BPS` so that
+     * inducing a rejection stays firmly negative for a staked provider.
+     */
+    uint256 public constant DISPUTE_BOND_BPS = 1_000; // 10% of the payment
+
+    uint256 public nextPaymentId = 1;
+    mapping(uint256 => Payment) public payments;
+    mapping(address => Reputation) public reputationOf;
+    /// @notice The buyer-side counterpart to `reputationOf`. See `BuyerRecord`.
+    mapping(address => BuyerRecord) public buyerRecordOf;
+    /// @notice USDC a provider has bonded as skin-in-the-game.
+    mapping(address => uint256) public stakeOf;
+
+    event PaymentOpened(
+        uint256 indexed paymentId,
+        address indexed agent,
+        address indexed provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash
+    );
+    event PaymentFulfilled(uint256 indexed paymentId, bytes32 responseHash);
+    event PaymentSettled(uint256 indexed paymentId, address indexed provider, uint256 amount);
+    event PaymentClaimed(uint256 indexed paymentId, address indexed provider, uint256 amount);
+    event PaymentRefunded(uint256 indexed paymentId, address indexed agent, uint256 amount, bool slaBreach);
+    event Staked(address indexed provider, uint256 amount, uint256 total);
+    event Unstaked(address indexed provider, uint256 amount, uint256 total);
+    event Slashed(address indexed provider, uint256 indexed paymentId, uint256 amount, address indexed to);
+    event PaymentDisputed(uint256 indexed paymentId, address indexed agent, address indexed provider);
+    event BondReleased(uint256 indexed paymentId, address indexed to, uint256 amount);
+    event RouterSet(address router);
+    event PaymentRouted(uint256 indexed paymentId, address indexed tokenIn, uint256 amountIn, uint256 amountOut);
+
+    error NotAgent();
+    error NotProvider();
+    error BadState(Status have, Status want);
+    error ZeroAmount();
+    error DeadlinePassed();
+    error DeadlineNotReached();
+    error DisputeWindowOpen();
+    error TransferFailed();
+    error NoRouter();
+    error RouteShortfall(uint256 got, uint256 wanted);
+    error NoArbiter();
+    error NotArbiter();
+    error DisputeWindowClosed();
+    error ArbitrationPending();
+    error BadSignature();
+    error AuthExpired();
+    error FeeAboveAuthorized(uint256 asked, uint256 max);
+
+    /**
+     * @notice Escrow-as-a-service: a protocol fee on settled payments.
+     *
+     * @dev `open` has always been permissionless — any address can be the agent,
+     *      any address the provider — so this contract was already usable by
+     *      third-party agent pairs for their own trades. What was missing was a
+     *      way for it to earn from that, which is what turns it from an app's
+     *      internal rail into infrastructure other people can build on.
+     *
+     *      Three deliberate constraints:
+     *
+     *      · **Capped in the bytecode.** `MAX_PROTOCOL_FEE` is a constant, so no
+     *        operator key can raise the fee toward confiscating an escrow. 1% is
+     *        the ceiling, whatever a future admin wants.
+     *      · **Defaults to zero.** Turning it on is an explicit act.
+     *      · **Charged on payout only.** A refund returns the full amount — the
+     *        protocol does not take a cut of a failed delivery, because the agent
+     *        got nothing and the fee would be a penalty for being let down.
+     */
+    uint16 public constant MAX_PROTOCOL_FEE = 100; // 1%, hard ceiling
+    uint16 public protocolFeeBps; // starts at 0
+    address public owner;
+    address public treasury;
+    /// @notice Optional TesseraRouter, enabling `openWith`. Zero disables it.
+    address public router;
+
+    /**
+     * @notice Optional TesseraArbiter. Zero disables escalation entirely.
+     *
+     * Without one, a rejected delivery is decided by the buyer alone: it calls
+     * `refund`, forfeits its bond, and the provider eats the loss whether or not
+     * the data was actually bad. The bond makes that expensive, not wrong. An
+     * arbiter is what lets a provider that *did* deliver correctly be paid over
+     * the buyer's objection.
+     */
+    address public arbiter;
+
+    /**
+     * How long the arbitrator has, once a case is opened.
+     *
+     * This is the liveness guard on the whole mechanism. Escalation freezes both
+     * settle and refund, so without a timeout a buyer could park a provider's
+     * money indefinitely simply by escalating into an arbiter that never rules —
+     * a strictly cheaper griefing attack than the one the bond was added to
+     * price, since the buyer's bond comes back if it just waits.
+     *
+     * After this elapses with no ruling, the provider may claim as if the
+     * dispute had never been raised.
+     */
+    uint64 public constant ARBITRATION_TIMEOUT = 24 hours;
+
+    /// @notice The arbitrator's cut of the bond, on either outcome.
+    /// @dev Paid whoever wins. An arbitrator paid only by the winner has a side
+    ///      to prefer, which is the one property a judge must not have.
+    uint16 public constant ARBITER_FEE_BPS = 2_000; // 20% of the bond
+
+    event ArbiterSet(address arbiter);
+    event PaymentEscalated(uint256 indexed paymentId, address indexed agent, address indexed provider);
+    event DisputeResolved(uint256 indexed paymentId, bool forBuyer, address indexed arbitrator, uint256 fee);
+
+    event ProtocolFeeSet(uint16 bps, address treasury);
+    event ProtocolFeeTaken(uint256 indexed paymentId, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    constructor(address usdc_) Guarded(address(0)) {
+        require(usdc_ != address(0), "usdc=0");
+        usdc = IERC20(usdc_);
+        owner = msg.sender;
+        treasury = msg.sender;
+    }
+
+    /// @notice Set the protocol fee and where it goes. Capped by the constant above.
+    function setProtocolFee(uint16 bps, address treasury_) external onlyOwner {
+        require(bps <= MAX_PROTOCOL_FEE, "fee too high");
+        require(treasury_ != address(0), "treasury=0");
+        protocolFeeBps = bps;
+        treasury = treasury_;
+        emit ProtocolFeeSet(bps, treasury_);
+    }
+
+    function transferOwnership(address o) external onlyOwner {
+        require(o != address(0), "owner=0");
+        owner = o;
+    }
+
+    /// @notice Point `openWith` at a router, or clear it with the zero address.
+    function setRouter(address router_) external onlyOwner {
+        router = router_;
+        emit RouterSet(router_);
+    }
+
+    /// @notice Point escalation at an arbiter, or clear it with the zero address.
+    /// @dev Clearing is the escape hatch: an arbiter contract that has gone bad
+    ///      can be unhooked without migrating the escrow. Cases already open
+    ///      still resolve — through ARBITRATION_TIMEOUT rather than a ruling.
+    function setArbiter(address arbiter_) external onlyOwner {
+        arbiter = arbiter_;
+        emit ArbiterSet(arbiter_);
+    }
+
+    /**
+     * @notice What a provider would actually receive for `amount`.
+     * @dev Public so a third party can price a job before committing to it,
+     *      rather than discovering the fee when the money lands.
+     */
+    /// @notice What a payout of `amount` would look like at the *current* fee.
+    /// @dev For quoting a trade that has not been opened yet. A payment already
+    ///      in flight settles on the fee it recorded — see `quotePayoutAt`.
+    function quotePayout(uint256 amount) public view returns (uint256 net, uint256 fee) {
+        return quotePayoutAt(amount, protocolFeeBps);
+    }
+
+    /// @notice The split for an amount at a specific fee, in basis points.
+    function quotePayoutAt(uint256 amount, uint16 bps) public pure returns (uint256 net, uint256 fee) {
+        fee = (amount * bps) / 10_000;
+        net = amount - fee;
+    }
+
+    /// @notice What this specific payment will pay out, at the fee it recorded.
+    function quotePayoutFor(uint256 paymentId) external view returns (uint256 net, uint256 fee) {
+        Payment storage p = payments[paymentId];
+        return quotePayoutAt(p.amount, p.feeBps);
+    }
+
+    /// @dev Pays the provider net of the protocol fee. Shared by both payout
+    ///      paths so they can never disagree about what a provider is owed.
+    function _payProvider(uint256 paymentId, Payment storage p) internal returns (uint256 net) {
+        uint256 fee;
+        // The fee this payment was opened under, never the one in force now.
+        (net, fee) = quotePayoutAt(p.amount, p.feeBps);
+        if (fee > 0) {
+            if (!usdc.transfer(treasury, fee)) revert TransferFailed();
+            emit ProtocolFeeTaken(paymentId, fee);
+        }
+        if (!usdc.transfer(p.provider, net)) revert TransferFailed();
+    }
+
+    /**
+     * @dev `_payProvider` with a slice diverted to a relayer that fronted the
+     *      gas. Returns what the provider actually received, so the caller
+     *      credits reputation with income rather than gross.
+     */
+    function _payProviderSplit(uint256 paymentId, Payment storage p, address relayer, uint256 relayFee)
+        internal
+        returns (uint256 toProvider)
+    {
+        uint256 fee;
+        (toProvider, fee) = quotePayoutAt(p.amount, p.feeBps);
+        if (fee > 0) {
+            if (!usdc.transfer(treasury, fee)) revert TransferFailed();
+            emit ProtocolFeeTaken(paymentId, fee);
+        }
+        if (relayFee > 0) {
+            if (relayFee > toProvider) revert FeeAboveAuthorized(relayFee, toProvider);
+            toProvider -= relayFee;
+            if (!usdc.transfer(relayer, relayFee)) revert TransferFailed();
+        }
+        if (!usdc.transfer(p.provider, toProvider)) revert TransferFailed();
+    }
+
+    /**
+     * @notice Agent escrows `amount` USDC for `provider`, committing to a quote.
+     * @dev Agent must have approved this contract for `amount` USDC first.
+     * @param deadline unix seconds; provider must fulfill before this.
+     * @return paymentId identifier the agent hands to the provider off-chain.
+     */
+    function open(
+        address provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash
+    ) external nonReentrant whenLive returns (uint256 paymentId) {
+        if (amount == 0) revert ZeroAmount();
+        if (deadline <= block.timestamp) revert DeadlinePassed();
+
+        // Payment and bond move together, so a buyer can never end up holding a
+        // funded escrow it has not staked anything against.
+        uint256 bond = bondFor(amount);
+        if (!usdc.transferFrom(msg.sender, address(this), amount + bond)) revert TransferFailed();
+
+        paymentId = _record(msg.sender, provider, amount, deadline, quoteHash, bond);
+    }
+
+    /// @notice What a buyer must post alongside a payment of `amount`.
+    function bondFor(uint256 amount) public pure returns (uint256) {
+        return (amount * DISPUTE_BOND_BPS) / 10_000;
+    }
+
+    /// @notice The bond held against a payment, and whether it is still at risk.
+    function bondOf(uint256 paymentId) external view returns (uint256 bond, bool atRisk) {
+        Payment storage p = payments[paymentId];
+        // Only a live payment can still lose its bond; once settled or refunded
+        // the outcome is decided and the bond has already gone where it goes.
+        return (p.bond, p.status == Status.Escrowed || p.status == Status.Fulfilled);
+    }
+
+    /// @dev The one place a payment comes into existence, so the direct and the
+    ///      routed entry point cannot record one differently.
+    function _record(
+        address agent,
+        address provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash,
+        uint256 bond
+    ) internal returns (uint256 paymentId) {
+        paymentId = nextPaymentId++;
+        payments[paymentId] = Payment({
+            agent: agent,
+            provider: provider,
+            amount: amount,
+            deadline: deadline,
+            fulfilledAt: 0,
+            quoteHash: quoteHash,
+            responseHash: bytes32(0),
+            status: Status.Escrowed,
+            disputedAt: 0,
+            bond: bond,
+            feeBps: protocolFeeBps
+        });
+        emit PaymentOpened(paymentId, agent, provider, amount, deadline, quoteHash);
+    }
+
+    /**
+     * @notice Open a payment funded with an asset the buyer holds rather than
+     *         the one the provider quoted in.
+     *
+     * The escrow settles in one asset — that is what makes a quote a quote. But
+     * a buyer holding only EURC and a provider quoting USDC could not trade at
+     * all, which is a strange limitation on a chain that ships three Circle
+     * assets and a router that connects them.
+     *
+     * So: pull `maxIn` of whatever the buyer has, route it into the escrow
+     * asset, and open the payment for the exact `amount` quoted. Anything the
+     * route did not need goes back in the same transaction, because holding a
+     * buyer's change is not this contract's business.
+     *
+     * @param tokenIn What the buyer is paying with.
+     * @param maxIn   The most of it they will part with — their slippage bound.
+     * @param amount  The quoted price, in the escrow asset. Exact.
+     */
+    function openWith(
+        address tokenIn,
+        uint256 maxIn,
+        address provider,
+        uint256 amount,
+        uint64 deadline,
+        bytes32 quoteHash
+    ) external nonReentrant whenLive returns (uint256 paymentId) {
+        if (amount == 0 || maxIn == 0) revert ZeroAmount();
+        if (deadline <= block.timestamp) revert DeadlinePassed();
+        if (router == address(0)) revert NoRouter();
+
+        if (!IERC20(tokenIn).transferFrom(msg.sender, address(this), maxIn)) revert TransferFailed();
+
+        // The route has to cover the bond as well as the price. Funding one
+        // without the other would let the cross-currency path open a payment the
+        // buyer has staked nothing against — the same free option, reachable by
+        // a different door.
+        uint256 bond = bondFor(amount);
+        uint256 needed = amount + bond;
+
+        uint256 received;
+        if (tokenIn == address(usdc)) {
+            // Nothing to route. Accepting this rather than rejecting it lets a
+            // caller always use `openWith` and leave the decision here.
+            received = maxIn;
+        } else {
+            uint256 heldBefore = usdc.balanceOf(address(this));
+            IERC20(tokenIn).approve(router, 0);
+            if (!IERC20(tokenIn).approve(router, maxIn)) revert TransferFailed();
+            // `needed` as the floor: the route delivers the full quoted price
+            // plus bond or the whole call reverts. A partial fill would open a
+            // payment for less than the provider agreed to.
+            IEscrowRouter(router).swap(tokenIn, address(usdc), maxIn, needed, block.timestamp);
+            IERC20(tokenIn).approve(router, 0);
+            // Measured, not taken from the return value: the balance is what
+            // this contract can actually pay out, and it stays true even if the
+            // router ever behaves differently from its ABI.
+            received = usdc.balanceOf(address(this)) - heldBefore;
+        }
+        if (received < needed) revert RouteShortfall(received, needed);
+
+        paymentId = _record(msg.sender, provider, amount, deadline, quoteHash, bond);
+        emit PaymentRouted(paymentId, tokenIn, maxIn, received);
+
+        uint256 change = received - needed;
+        if (change > 0 && !usdc.transfer(msg.sender, change)) revert TransferFailed();
+    }
+
+    /// @notice What `openWith` would get for `amountIn` of `tokenIn`, and how
+    ///         many hops it would take. Returns 0 when there is no route rather
+    ///         than reverting, so a caller can ask about anything.
+    function quoteOpenWith(address tokenIn, uint256 amountIn)
+        external
+        view
+        returns (uint256 amountOut, uint256 hops)
+    {
+        if (router == address(0) || amountIn == 0) return (0, 0);
+        if (tokenIn == address(usdc)) return (amountIn, 0);
+        try IEscrowRouter(router).estimate(tokenIn, address(usdc), amountIn) returns (
+            uint256 out,
+            uint256[] memory poolIds,
+            address[] memory
+        ) {
+            return (out, poolIds.length);
+        } catch {
+            return (0, 0);
+        }
+    }
+
+    /**
+     * @notice Provider records delivery of the resource before the deadline.
+     * @param responseHash commitment (e.g. keccak256 of the response body).
+     */
+    function fulfill(uint256 paymentId, bytes32 responseHash) external {
+        _fulfill(paymentId, responseHash);
+    }
+
+    /**
+     * @notice Record delivery of many payments at once.
+     * @dev Both arrays must be the same length; each hash belongs to the id at
+     *      its own index. A mismatch reverts rather than truncating — a provider
+     *      marking N deliveries against N-1 hashes has made a mistake, and
+     *      committing to the wrong payload hash is not a recoverable one.
+     */
+    function fulfillMany(uint256[] calldata paymentIds, bytes32[] calldata responseHashes) external {
+        require(paymentIds.length == responseHashes.length, "length mismatch");
+        for (uint256 i = 0; i < paymentIds.length; i++) _fulfill(paymentIds[i], responseHashes[i]);
+    }
+
+    function _fulfill(uint256 paymentId, bytes32 responseHash) internal {
+        Payment storage p = payments[paymentId];
+        if (msg.sender != p.provider) revert NotProvider();
+        if (p.status != Status.Escrowed) revert BadState(p.status, Status.Escrowed);
+        if (block.timestamp > p.deadline) revert DeadlinePassed();
+
+        p.responseHash = responseHash;
+        p.fulfilledAt = uint64(block.timestamp);
+        p.status = Status.Fulfilled;
+        emit PaymentFulfilled(paymentId, responseHash);
+    }
+
+    /**
+     * @notice Agent confirms the SLA was met; releases escrow to the provider.
+     */
+    function settle(uint256 paymentId) external nonReentrant {
+        _settle(paymentId);
+    }
+
+    /**
+     * @notice Settle many payments in one transaction.
+     *
+     * A per-call economy is three transactions per call — open, fulfill,
+     * settle — and at a tenth of a cent per call the gas *is* the economy. This
+     * is the cheap half of fixing that: one transaction, one signature, one base
+     * cost, N settlements. The expensive half (a Merkle root covering N
+     * deliveries, so the per-payment storage goes too) is a different trust
+     * model and is deliberately not in here.
+     *
+     * @dev Reverts the whole batch if any leg is not settleable. That is the
+     *      right default for a settlement run: a batch that silently drops the
+     *      legs it could not do leaves an operator believing they are paid.
+     */
+    function settleMany(uint256[] calldata paymentIds) external nonReentrant {
+        for (uint256 i = 0; i < paymentIds.length; i++) _settle(paymentIds[i]);
+    }
+
+    function _settle(uint256 paymentId) internal {
+        Payment storage p = payments[paymentId];
+        if (msg.sender != p.agent) revert NotAgent();
+        if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+
+        p.status = Status.Settled;
+
+        uint256 net = _payProvider(paymentId, p);
+
+        _creditProvider(p.provider, p.agent, net);
+
+        BuyerRecord storage b = buyerRecordOf[p.agent];
+        b.settled += 1;
+        b.spent += p.amount;
+
+        _releaseBond(paymentId, p, p.agent);
+        emit PaymentSettled(paymentId, p.provider, net);
+    }
+
+    // --- Sponsored provider actions -----------------------------------------
+    //
+    // Arc charges gas in USDC. That is elegant right up until you notice what it
+    // means for a provider on its first sale: to be paid it must call `fulfill`
+    // and then `providerClaim`, both of which cost USDC, and it has none —
+    // because being paid is the thing it is trying to do. A seller cannot earn
+    // its first dollar without already holding one, which quietly makes this a
+    // market only funded participants can enter.
+    //
+    // So the provider signs its intent and anybody may carry it. The relayer
+    // pays the gas and takes a fee out of the payout, capped by a number the
+    // provider itself signed — it can never be charged more than it agreed to,
+    // and if no relayer finds the fee worth taking, the provider is exactly
+    // where it was and can still call the ordinary functions itself.
+
+    /// @dev EIP-712 domain, matching the one the off-chain code signs quotes and
+    ///      receipts under (shared/src/protocol.ts): name "Tessera", version "1".
+    bytes32 private constant EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 public constant FULFILL_TYPEHASH =
+        keccak256("FulfillAuth(uint256 paymentId,bytes32 responseHash,uint256 nonce,uint64 deadline)");
+    bytes32 public constant CLAIM_TYPEHASH =
+        keccak256("ClaimAuth(uint256 paymentId,uint256 maxRelayFee,uint256 nonce,uint64 deadline)");
+
+    /// @notice Per-signer nonce. One counter across both authorization types, so
+    ///         a signature can never be replayed as the other kind either.
+    mapping(address => uint256) public authNonce;
+
+    event Sponsored(uint256 indexed paymentId, address indexed provider, address indexed relayer, uint256 fee);
+
+    function domainSeparator() public view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                EIP712_DOMAIN_TYPEHASH, keccak256("Tessera"), keccak256("1"), block.chainid, address(this)
+            )
+        );
+    }
+
+    function _recover(bytes32 structHash, bytes calldata signature) internal view returns (address) {
+        if (signature.length != 65) revert BadSignature();
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 32))
+            v := byte(0, calldataload(add(signature.offset, 64)))
+        }
+        // Reject the upper half of the curve order. Without this, every
+        // signature has a twin that recovers to the same address, which would
+        // let a relayer burn a nonce twice or replay past a consumed one.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) revert BadSignature();
+        if (v < 27) v += 27;
+        address signer = ecrecover(digest, v, r, s);
+        if (signer == address(0)) revert BadSignature();
+        return signer;
+    }
+
+    /// @notice What a provider signs to let anyone mark a delivery for it.
+    function fulfillAuthHash(uint256 paymentId, bytes32 responseHash, uint256 nonce, uint64 deadline)
+        external
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(FULFILL_TYPEHASH, paymentId, responseHash, nonce, deadline));
+    }
+
+    /// @notice What a provider signs to let anyone claim a payout for it.
+    function claimAuthHash(uint256 paymentId, uint256 maxRelayFee, uint256 nonce, uint64 deadline)
+        external
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(CLAIM_TYPEHASH, paymentId, maxRelayFee, nonce, deadline));
+    }
+
+    /**
+     * @notice Mark a delivery on the provider's behalf, against its signature.
+     * @dev No fee. Fulfilment moves no money, so there is nothing to take a cut
+     *      of; a relayer sponsors this because it intends to relay the claim
+     *      that follows, where it is paid.
+     */
+    function fulfillFor(uint256 paymentId, bytes32 responseHash, uint64 deadline, bytes calldata signature)
+        external
+    {
+        if (block.timestamp > deadline) revert AuthExpired();
+        Payment storage p = payments[paymentId];
+        if (p.status != Status.Escrowed) revert BadState(p.status, Status.Escrowed);
+
+        uint256 n = authNonce[p.provider];
+        address signer = _recover(
+            keccak256(abi.encode(FULFILL_TYPEHASH, paymentId, responseHash, n, deadline)), signature
+        );
+        if (signer != p.provider) revert BadSignature();
+        authNonce[p.provider] = n + 1;
+
+        p.responseHash = responseHash;
+        p.fulfilledAt = uint64(block.timestamp);
+        p.status = Status.Fulfilled;
+        emit PaymentFulfilled(paymentId, responseHash);
+    }
+
+    /**
+     * @notice Claim a matured payout on the provider's behalf, paying the
+     *         relayer `relayFee` out of it.
+     *
+     * @param relayFee what the relayer takes. Bounded by the `maxRelayFee` the
+     *        provider signed — a relayer setting its own price would make the
+     *        authorization a blank cheque.
+     *
+     * @dev Same maturity rules as `providerClaim`: this is a gas sponsorship,
+     *      not a shortcut past the dispute window.
+     */
+    function claimFor(
+        uint256 paymentId,
+        uint256 maxRelayFee,
+        uint256 relayFee,
+        uint64 deadline,
+        bytes calldata signature
+    ) external nonReentrant {
+        if (block.timestamp > deadline) revert AuthExpired();
+        if (relayFee > maxRelayFee) revert FeeAboveAuthorized(relayFee, maxRelayFee);
+
+        Payment storage p = payments[paymentId];
+
+        if (p.status == Status.Disputed) {
+            if (block.timestamp <= uint256(p.disputedAt) + ARBITRATION_TIMEOUT) revert ArbitrationPending();
+        } else {
+            if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+            if (block.timestamp <= uint256(p.fulfilledAt) + DISPUTE_WINDOW) revert DisputeWindowOpen();
+        }
+
+        uint256 n = authNonce[p.provider];
+        address signer =
+            _recover(keccak256(abi.encode(CLAIM_TYPEHASH, paymentId, maxRelayFee, n, deadline)), signature);
+        if (signer != p.provider) revert BadSignature();
+        authNonce[p.provider] = n + 1;
+
+        p.status = Status.Settled;
+
+        // Split at payout, never after it. Paying the provider in full and then
+        // pulling the relayer's fee back would need an ERC-20 approval from the
+        // provider — a transaction, costing gas, which is the exact thing it
+        // cannot afford and the reason this function exists.
+        uint256 net = _payProviderSplit(paymentId, p, msg.sender, relayFee);
+
+        // Reputation counts what the delivery was worth to the provider, so the
+        // relay fee comes off: `earned` stays a record of income received.
+        _creditProvider(p.provider, p.agent, net);
+
+        BuyerRecord storage b = buyerRecordOf[p.agent];
+        b.settled += 1;
+        b.spent += p.amount;
+
+        _releaseBond(paymentId, p, p.agent);
+        emit PaymentClaimed(paymentId, p.provider, net);
+        emit Sponsored(paymentId, p.provider, msg.sender, relayFee);
+    }
+
+    /**
+     * @notice Buyer escalates a delivered response to arbitration instead of
+     *         rejecting it unilaterally.
+     *
+     * `refund` is the buyer's own verdict on its own dispute: it forfeits the
+     * bond and the provider is marked failed, whether or not the data was
+     * actually wrong. That is deliberately cheap to do and deliberately costly
+     * to abuse, but it is not adjudication — a provider that delivered exactly
+     * what was quoted has no way to say so.
+     *
+     * Escalating freezes the payment and hands the decision to a third party.
+     * The buyer still risks its bond; what it gives up is the certainty of
+     * winning. That asymmetry is the point: a buyer with a real complaint loses
+     * nothing by being judged, and a buyer inventing one now can.
+     *
+     * @dev Same window as `refund`, and for the same reason — a provider must
+     *      not be exposed to a dispute raised days after delivery.
+     */
+    function escalate(uint256 paymentId) external nonReentrant {
+        Payment storage p = payments[paymentId];
+        if (arbiter == address(0)) revert NoArbiter();
+        if (msg.sender != p.agent) revert NotAgent();
+        if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+        if (block.timestamp > uint256(p.fulfilledAt) + DISPUTE_WINDOW) revert DisputeWindowClosed();
+
+        p.status = Status.Disputed;
+        p.disputedAt = uint64(block.timestamp);
+        emit PaymentEscalated(paymentId, p.agent, p.provider);
+    }
+
+    /**
+     * @notice The arbiter's ruling. Pays out exactly as the corresponding
+     *         uncontested path would, minus the arbitrator's fee.
+     *
+     * @param forBuyer true if the complaint was upheld (money back to the
+     *        buyer, provider marked failed); false if the delivery stands.
+     * @param arbitrator who to pay the fee to — the individual who ruled, not
+     *        the arbiter contract, so a contract holding no funds can still
+     *        compensate its members.
+     *
+     * @dev Callable only by the arbiter contract. The fee comes out of the bond
+     *      the buyer already posted, so arbitration costs the protocol nothing
+     *      and costs an honest provider nothing.
+     */
+    function resolveDispute(uint256 paymentId, bool forBuyer, address arbitrator) external nonReentrant {
+        if (msg.sender != arbiter) revert NotArbiter();
+        Payment storage p = payments[paymentId];
+        if (p.status != Status.Disputed) revert BadState(p.status, Status.Disputed);
+
+        // Take the arbitrator's cut off the bond before either branch spends it,
+        // so both outcomes pay the judge identically.
+        uint256 fee = (p.bond * ARBITER_FEE_BPS) / 10_000;
+        if (fee > 0) {
+            p.bond -= fee;
+            if (!usdc.transfer(arbitrator, fee)) revert TransferFailed();
+        }
+
+        if (forBuyer) {
+            // Same consequences as a rejected delivery: the provider failed, the
+            // buyer is made whole, and the buyer's bond is forfeit — it lost the
+            // remainder of the bond to the treasury only when *it* was the one
+            // who got it wrong, so here the bond comes back.
+            p.status = Status.Refunded;
+            reputationOf[p.provider].failed += 1;
+            buyerRecordOf[p.agent].disputed += 1;
+
+            uint256 slashAmount = (p.amount * SLASH_BPS) / 10_000;
+            uint256 staked = stakeOf[p.provider];
+            if (slashAmount > staked) slashAmount = staked;
+            if (slashAmount > 0) {
+                stakeOf[p.provider] = staked - slashAmount;
+                emit Slashed(p.provider, paymentId, slashAmount, p.agent);
+            }
+
+            _releaseBond(paymentId, p, p.agent);
+            if (!usdc.transfer(p.agent, p.amount + slashAmount)) revert TransferFailed();
+            emit PaymentRefunded(paymentId, p.agent, p.amount, true);
+        } else {
+            // The delivery stands. Pay the provider exactly as `settle` would,
+            // and the buyer forfeits what is left of its bond — it took a
+            // provider to arbitration and was wrong.
+            p.status = Status.Settled;
+            uint256 net = _payProvider(paymentId, p);
+            _creditProvider(p.provider, p.agent, net);
+
+            BuyerRecord storage b = buyerRecordOf[p.agent];
+            b.settled += 1;
+            b.spent += p.amount;
+            b.disputed += 1;
+
+            _releaseBond(paymentId, p, treasury);
+            emit PaymentSettled(paymentId, p.provider, net);
+        }
+
+        emit DisputeResolved(paymentId, forBuyer, arbitrator, fee);
+    }
+
+    /**
+     * @notice Provider claims a delivered-but-unsettled payment once the
+     *         agent's dispute window has elapsed. This is the liveness guard:
+     *         a provider that delivered in good faith is paid even if the agent
+     *         goes offline or refuses to act, so escrow can never be locked
+     *         forever. The agent can still `settle` (fast path) or `refund`
+     *         (reject) any time before this window closes.
+     */
+    function providerClaim(uint256 paymentId) external nonReentrant {
+        Payment storage p = payments[paymentId];
+        if (msg.sender != p.provider) revert NotProvider();
+
+        if (p.status == Status.Disputed) {
+            // An arbitration that never happened must not become a freeze. Once
+            // the arbitrator's clock runs out the payment reverts to what it
+            // was before escalation — a delivery nobody ruled against — and the
+            // ordinary claim applies.
+            if (block.timestamp <= uint256(p.disputedAt) + ARBITRATION_TIMEOUT) revert ArbitrationPending();
+        } else {
+            if (p.status != Status.Fulfilled) revert BadState(p.status, Status.Fulfilled);
+            if (block.timestamp <= uint256(p.fulfilledAt) + DISPUTE_WINDOW) revert DisputeWindowOpen();
+        }
+
+        p.status = Status.Settled;
+
+        uint256 net = _payProvider(paymentId, p);
+
+        _creditProvider(p.provider, p.agent, net);
+
+        // The buyer went quiet rather than settling, but the payment did land
+        // with the provider — counting it keeps `settled + disputed` equal to
+        // the number of deliveries this buyer has actually received.
+        BuyerRecord storage b = buyerRecordOf[p.agent];
+        b.settled += 1;
+        b.spent += p.amount;
+
+        // The buyer went quiet, which is not the same as disputing. Going quiet
+        // already costs them the payment; taking the bond too would punish an
+        // outage twice.
+        _releaseBond(paymentId, p, p.agent);
+        emit PaymentClaimed(paymentId, p.provider, net);
+    }
+
+    /**
+     * @dev The one place a settlement is written into a provider's record, so
+     *      the fast path and the claim path cannot count it differently.
+     * @param net What the provider actually received, not the gross — `earned`
+     *        is read as a track record of income, and gross would overstate it.
+     */
+    function _creditProvider(address provider, address buyer, uint256 net) internal {
+        Reputation storage r = reputationOf[provider];
+        r.fulfilled += 1;
+        r.earned += net;
+        r.lastSettledAt = uint64(block.timestamp);
+        if (!hasSettledWith[provider][buyer]) {
+            hasSettledWith[provider][buyer] = true;
+            r.distinctBuyers += 1;
+        }
+    }
+
+    /**
+     * @dev Send a payment's bond wherever this outcome sends it, once.
+     *      Zeroed before the transfer so no path can pay the same bond twice.
+     */
+    function _releaseBond(uint256 paymentId, Payment storage p, address to) internal {
+        uint256 bond = p.bond;
+        if (bond == 0) return;
+        p.bond = 0;
+        if (!usdc.transfer(to, bond)) revert TransferFailed();
+        emit BondReleased(paymentId, to, bond);
+    }
+
+    /**
+     * @notice Return escrow to the agent. Two paths:
+     *         - agent rejects a fulfilled-but-bad response (SLA breach), or
+     *         - anyone reclaims after the deadline if the provider never
+     *           fulfilled (also an SLA breach).
+     *         Either way the provider's `failed` count increments.
+     */
+    function refund(uint256 paymentId) external nonReentrant {
+        _refund(paymentId);
+    }
+
+    /// @notice Reclaim many payments at once — typically a sweep of everything
+    ///         that timed out while the agent was offline.
+    function refundMany(uint256[] calldata paymentIds) external nonReentrant {
+        for (uint256 i = 0; i < paymentIds.length; i++) _refund(paymentIds[i]);
+    }
+
+    function _refund(uint256 paymentId) internal {
+        Payment storage p = payments[paymentId];
+
+        bool agentReject = msg.sender == p.agent && p.status == Status.Fulfilled;
+        bool timedOut = p.status == Status.Escrowed && block.timestamp > p.deadline;
+
+        if (!agentReject && !timedOut) {
+            if (p.status != Status.Escrowed && p.status != Status.Fulfilled) {
+                revert BadState(p.status, Status.Escrowed);
+            }
+            // Escrowed but before deadline, or a non-agent caller trying to reject.
+            if (p.status == Status.Fulfilled) revert NotAgent();
+            revert DeadlineNotReached();
+        }
+
+        p.status = Status.Refunded;
+        reputationOf[p.provider].failed += 1;
+
+        // Only an agent rejecting a *delivered* response is a dispute. A refund
+        // after the deadline with nothing delivered is the provider failing to
+        // show up, and holding that against the buyer would punish them for
+        // being let down.
+        if (agentReject) {
+            buyerRecordOf[p.agent].disputed += 1;
+            emit PaymentDisputed(paymentId, p.agent, p.provider);
+        }
+
+        // The one outcome the bond is for. Rejecting delivered work forfeits it;
+        // every other way out of an escrow returns it. To the treasury rather
+        // than to the provider — see DISPUTE_BOND_BPS for why paying the
+        // counterparty would open a worse hole than it closes.
+        _releaseBond(paymentId, p, agentReject ? treasury : p.agent);
+
+        // SLA breach: compensate the agent from the provider's stake (if any).
+        uint256 slashAmount = (p.amount * SLASH_BPS) / 10_000;
+        uint256 staked = stakeOf[p.provider];
+        if (slashAmount > staked) slashAmount = staked;
+        if (slashAmount > 0) {
+            stakeOf[p.provider] = staked - slashAmount;
+            emit Slashed(p.provider, paymentId, slashAmount, p.agent);
+        }
+
+        if (!usdc.transfer(p.agent, p.amount + slashAmount)) revert TransferFailed();
+        emit PaymentRefunded(paymentId, p.agent, p.amount, true);
+    }
+
+    /**
+     * @notice Provider bonds USDC as skin-in-the-game. A staked provider is a
+     *         stronger trust signal for agents; stake is slashed on SLA breaches.
+     */
+    function stake(uint256 amount) external nonReentrant whenLive {
+        if (amount == 0) revert ZeroAmount();
+        if (!usdc.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
+        stakeOf[msg.sender] += amount;
+        emit Staked(msg.sender, amount, stakeOf[msg.sender]);
+    }
+
+    /// @notice Withdraw bonded stake.
+    function unstake(uint256 amount) external nonReentrant {
+        uint256 staked = stakeOf[msg.sender];
+        require(amount > 0 && amount <= staked, "bad amount");
+        stakeOf[msg.sender] = staked - amount;
+        if (!usdc.transfer(msg.sender, amount)) revert TransferFailed();
+        emit Unstaked(msg.sender, amount, stakeOf[msg.sender]);
+    }
+
+    /// @notice Convenience view returning a provider's reputation triple.
+    function reputation(address provider)
+        external
+        view
+        returns (
+            uint128 fulfilled,
+            uint128 failed,
+            uint256 earned,
+            uint64 distinctBuyers,
+            uint64 lastSettledAt
+        )
+    {
+        Reputation storage r = reputationOf[provider];
+        return (r.fulfilled, r.failed, r.earned, r.distinctBuyers, r.lastSettledAt);
+    }
+
+    /**
+     * @notice How concentrated a provider's record is, in bps of settlements per
+     *         distinct buyer.
+     * @dev 10000 means every settlement came from a different address; 100 means
+     *      a hundred settlements from one. A reader does not need this — it is
+     *      `distinctBuyers / fulfilled` — but putting the ratio next to the counts
+     *      is what makes a farmed record obvious at a glance rather than only to
+     *      someone who thought to divide.
+     */
+    function concentrationBps(address provider) external view returns (uint256) {
+        Reputation storage r = reputationOf[provider];
+        if (r.fulfilled == 0) return 0;
+        return (uint256(r.distinctBuyers) * 10_000) / uint256(r.fulfilled);
+    }
+
+    /**
+     * @notice A buyer's track record: deliveries paid for, deliveries disputed.
+     * @dev The mirror of `reputation`. A provider reads this before accepting
+     *      work the same way an agent reads `reputation` before buying.
+     */
+    function buyerRecord(address agent)
+        external
+        view
+        returns (uint128 settled, uint128 disputed, uint256 spent)
+    {
+        BuyerRecord storage b = buyerRecordOf[agent];
+        return (b.settled, b.disputed, b.spent);
+    }
+
+    /// @notice Full payment record (structs aren't auto-exposed with enums cleanly in some tooling).
+    function getPayment(uint256 paymentId)
+        external
+        view
+        returns (
+            address agent,
+            address provider,
+            uint256 amount,
+            uint64 deadline,
+            bytes32 quoteHash,
+            bytes32 responseHash,
+            Status status
+        )
+    {
+        Payment storage p = payments[paymentId];
+        return (p.agent, p.provider, p.amount, p.deadline, p.quoteHash, p.responseHash, p.status);
+    }
+}

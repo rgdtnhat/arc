@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Contract tests (Hardhat)
+        run: npm test --workspace contracts
+
+      # The Docker image ships the committed ABIs and never compiles, so this is
+      # where a drift between contracts/ and shared/src/ has to be caught.
+      - name: Committed ABIs match the contracts
+        run: npm run compile && npm run abi:check -- --compiled
+
+      # The shell version lives in two files; a bump that lands in only one
+      # means a browser either never drops its cache or reports a staleness
+      # that is not real.
+      - name: Shell version agrees across sw.js and index.html
+        run: npm run shell:check
+
+      # A ratchet, not a gate. The most expensive bug in this project is a
+      # failed contract read rendering as a confident zero; this holds the count
+      # of remaining sites and fails in both directions, so converting one and
+      # forgetting to record it is caught too.
+      - name: No new reads collapse a failure into a value
+        run: npm run reads:check
+
+      # The missing middle. Unit tests cover pure functions and the browser smoke
+      # test never signs anything; both of the autopilot's worst bugs lived in
+      # the wiring between a decision and the chain, and only a real transaction
+      # would have found them.
+      - name: End-to-end — the whole loop against a throwaway chain
+        run: npm run e2e
+
+      # A migration script that has never run is not a migration script. This
+      # deploys a small protocol configured away from every default, drives
+      # `redeploy:pool` at it through its real CLI, and reads the chain back:
+      # carried risk parameters, both sides of the price-guard gate, the
+      # emissions chain, an earned balance surviving the move, the freeze mask,
+      # and the `supplyFor` handoff. Without it the script silently rots — it is
+      # only ever run by hand, on the day it matters most.
+      - name: Rehearse the pool redeploy against a throwaway chain
+        run: npm run rehearse:redeploy
+
+      - name: Agent unit tests (decision engine, guardian, memory, agentkit, wallet, treasury, fleet)
+        run: npm test --workspace agent
+
+      # The dashboard and the providers app are plain JS/TS run through tsx, so
+      # nothing else would catch a syntax error in them before a container
+      # rebuild does. Parsing them here is cheap and turns "the site is blank"
+      # into a red build.
+      - name: Dashboard script parses
+        run: node --check dashboard/public/app.js
+
+      - name: Server entry points load
+        run: |
+          node --import tsx --input-type=module -e '
+            await import("./providers/src/app.ts");
+            await import("./providers/src/catalog.ts");
+            await import("./shared/src/index.ts");
+            console.log("modules loaded");
+          '
+
+      # Production dependencies only: dev-tool advisories are tracked separately
+      # and must not be able to fail a build that ships none of them.
+      - name: No vulnerable production dependencies
+        run: npm audit --omit=dev

@@ -1,0 +1,8 @@
+# Caddy reverse proxy for the Tessera dashboard.
+# {$SITE_ADDRESS} is your domain (e.g. tessera.example.com), passed in via the
+# SITE_ADDRESS env var in docker-compose.yml. Caddy provisions a Let's Encrypt
+# certificate automatically, so the site is HTTPS with no extra steps.
+{$SITE_ADDRESS} {
+	reverse_proxy tessera:8787
+	encode gzip
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@tessera/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/agent.ts",
+  "scripts": {
+    "start": "tsx src/dashboard.ts",
+    "run:arc": "NODE_USE_ENV_PROXY=1 tsx src/run-arc.ts",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "@tessera/providers": "*",
+    "@tessera/shared": "*",
+    "express": "^4.21.2",
+    "tsx": "^4.19.2",
+    "viem": "^2.55.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}
