@@ -8499,22 +8499,28 @@ async function main() {
     ids: readonly bigint[],
     forOwner: string,
   ): Promise<{
-    tokenId: number; dropId: number; name: string; uri: string;
+    tokenId: number; dropId: number | null; name: string; uri: string;
     mintedAt: number | null; receivedAt: number | null;
   }[]> => {
     if (!launchpadAddr) return [];
     return Promise.all(ids.map(async (id) => {
-      const [dropId, uri] = await Promise.all([
-        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropOf", args: [id] })
-          .catch(() => 0n) as Promise<bigint>,
+      const [drop, uri] = await Promise.all([
+        chainRead<bigint>(client.public, launchpadAddr, tesseraLaunchpadAbi, "dropOf", [id]),
         client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [id] })
           .catch(() => "") as Promise<string>,
       ]);
-      // The dates come from the folded `Transfer` log, and are null until the
-      // scan has reached that block — the gallery sorts nulls last rather than
-      // inventing a date.
+      /*
+       * A drop that could not be read is unknown, not drop zero. Defaulting to
+       * 0 sent `dropNameOf(0)` after whatever drop zero happens to be and
+       * labelled the token with it, so a failed read rendered as a confident
+       * "drop 0". Null is what the listing path a few lines down already
+       * returns, and what the gallery already checks for before drawing the
+       * label — the same reason the dates below stay null rather than
+       * inventing one.
+       */
+      const dropId = drop.ok ? Number(drop.value) : null;
       return {
-        tokenId: Number(id), dropId: Number(dropId), name: await dropNameOf(Number(dropId)), uri,
+        tokenId: Number(id), dropId, name: dropId === null ? "" : await dropNameOf(dropId), uri,
         ...tokenDates(nftHistory, Number(id), forOwner),
       };
     }));
@@ -8536,7 +8542,7 @@ async function main() {
       // Anything this wallet has listed is escrowed by the market, so it no
       // longer shows as theirs — read those back or a seller loses sight of it.
       let listedByMe: {
-        tokenId: number; listingId: number; price: string; uri: string; dropId: number; name: string;
+        tokenId: number; listingId: number; price: string; uri: string; dropId: number | null; name: string;
         mintedAt: number | null; receivedAt: number | null;
       }[] = [];
       if (marketAddr) {
