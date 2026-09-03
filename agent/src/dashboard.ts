@@ -865,6 +865,22 @@ async function main() {
     } as UiEvent);
     await treasury.topUpIfLow();
 
+    /*
+     * Recover before spending. A tab whose provider never settled holds the
+     * agent's own money until someone calls reclaim, and the run about to start
+     * may open another one — so the sweep goes first, where a failure costs
+     * nothing but a line in the feed.
+     */
+    const swept = await agent.sweepExpiredTabs();
+    if (swept.reclaimed > 0n) {
+      pushEvent({
+        source: "agent",
+        ts: Date.now(),
+        level: "refund",
+        message: `Swept ${swept.txs.length} expired tab(s) — ${formatUsdc(swept.reclaimed)} USDC back in the wallet`,
+      } as UiEvent);
+    }
+
     await agent.run(AGENT_TASK);
     const stream = await agent.streamTicks("ticker:stream", 6);
     if (stream) {
