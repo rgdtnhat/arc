@@ -77,7 +77,7 @@ import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
 import { SeriesStore, SERIES_LIMITS, walkSequentially, type TaskSeries, type SeriesStep } from "./series.js";
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
-import { read as chainRead } from "./chain-read.js";
+import { read as chainRead, valueOr } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import { scanNftHistory, tokenDates, loadHistory, EMPTY_HISTORY, type NftHistoryState } from "./nft-history.js";
 import { groupByOwner, heldBy } from "./nft-owners.js";
@@ -864,6 +864,22 @@ async function main() {
       message: `Treasury: ${pre.balanceUsdc} USDC (${pre.runwayCalls ?? "?"} calls runway) — ${pre.healthy ? "healthy" : "LOW"}`,
     } as UiEvent);
     await treasury.topUpIfLow();
+
+    /*
+     * Recover before spending. A tab whose provider never settled holds the
+     * agent's own money until someone calls reclaim, and the run about to start
+     * may open another one — so the sweep goes first, where a failure costs
+     * nothing but a line in the feed.
+     */
+    const swept = await agent.sweepExpiredTabs();
+    if (swept.reclaimed > 0n) {
+      pushEvent({
+        source: "agent",
+        ts: Date.now(),
+        level: "refund",
+        message: `Swept ${swept.txs.length} expired tab(s) — ${formatUsdc(swept.reclaimed)} USDC back in the wallet`,
+      } as UiEvent);
+    }
 
     await agent.run(AGENT_TASK);
     const stream = await agent.streamTicks("ticker:stream", 6);
@@ -2910,11 +2926,14 @@ async function main() {
              * only way to find out was to sign one and read the revert.
              *
              * A pool that predates `frozenActions` has no such switch, and a
-             * missing function is not a frozen reserve — hence 0 on failure.
+             * missing function is not a frozen reserve — so nothing frozen is
+             * the right answer here. It goes through `valueOr` rather than a
+             * bare catch so that default is written down next to the read it
+             * belongs to, which is what `chain-read` asks for.
              */
-            poolClient.public
-              .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "frozenActions", args: [addr] })
-              .catch(() => 0),
+            chainRead<number>(poolClient.public, poolClient.pool, tesseraPoolAbi, "frozenActions", [addr]).then(
+              (r) => valueOr(r, 0),
+            ),
           ]);
           return { a, addr, stats, capacity, oracleStatus, frozenMask: Number(frozenMask ?? 0) };
         }),
@@ -8480,22 +8499,28 @@ async function main() {
     ids: readonly bigint[],
     forOwner: string,
   ): Promise<{
-    tokenId: number; dropId: number; name: string; uri: string;
+    tokenId: number; dropId: number | null; name: string; uri: string;
     mintedAt: number | null; receivedAt: number | null;
   }[]> => {
     if (!launchpadAddr) return [];
     return Promise.all(ids.map(async (id) => {
-      const [dropId, uri] = await Promise.all([
-        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropOf", args: [id] })
-          .catch(() => 0n) as Promise<bigint>,
+      const [drop, uri] = await Promise.all([
+        chainRead<bigint>(client.public, launchpadAddr, tesseraLaunchpadAbi, "dropOf", [id]),
         client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [id] })
           .catch(() => "") as Promise<string>,
       ]);
-      // The dates come from the folded `Transfer` log, and are null until the
-      // scan has reached that block — the gallery sorts nulls last rather than
-      // inventing a date.
+      /*
+       * A drop that could not be read is unknown, not drop zero. Defaulting to
+       * 0 sent `dropNameOf(0)` after whatever drop zero happens to be and
+       * labelled the token with it, so a failed read rendered as a confident
+       * "drop 0". Null is what the listing path a few lines down already
+       * returns, and what the gallery already checks for before drawing the
+       * label — the same reason the dates below stay null rather than
+       * inventing one.
+       */
+      const dropId = drop.ok ? Number(drop.value) : null;
       return {
-        tokenId: Number(id), dropId: Number(dropId), name: await dropNameOf(Number(dropId)), uri,
+        tokenId: Number(id), dropId, name: dropId === null ? "" : await dropNameOf(dropId), uri,
         ...tokenDates(nftHistory, Number(id), forOwner),
       };
     }));
@@ -8517,7 +8542,7 @@ async function main() {
       // Anything this wallet has listed is escrowed by the market, so it no
       // longer shows as theirs — read those back or a seller loses sight of it.
       let listedByMe: {
-        tokenId: number; listingId: number; price: string; uri: string; dropId: number; name: string;
+        tokenId: number; listingId: number; price: string; uri: string; dropId: number | null; name: string;
         mintedAt: number | null; receivedAt: number | null;
       }[] = [];
       if (marketAddr) {
