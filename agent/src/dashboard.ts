@@ -77,7 +77,7 @@ import { TaskStore, TASK_ACTIONS, TASK_LIMITS, type Task } from "./tasks.js";
 import { memoHex } from "./memo.js";
 import { SeriesStore, SERIES_LIMITS, walkSequentially, type TaskSeries, type SeriesStep } from "./series.js";
 import { describeSchedule, SCHEDULE_LIMITS } from "./schedule.js";
-import { read as chainRead } from "./chain-read.js";
+import { read as chainRead, valueOr } from "./chain-read.js";
 import { EventIndex, indexOnce } from "./indexer.js";
 import { scanNftHistory, tokenDates, loadHistory, EMPTY_HISTORY, type NftHistoryState } from "./nft-history.js";
 import { groupByOwner, heldBy } from "./nft-owners.js";
@@ -941,7 +941,38 @@ async function main() {
    * ceiling, because a body limit is a denial-of-service control and widening
    * it globally to serve one route would be the wrong trade.
    */
-  app.use("/api/nft/media", express.json({ limit: "48mb" }));
+  /*
+   * Who pays for the 48 MB decode.
+   *
+   * Express runs middleware in registration order, and both gates that protect
+   * this route are registered later: the per-IP rate limiter below, and the
+   * route's own `requireAuth`. So an anonymous 48 MB body was read into a
+   * Buffer, decoded to a string and JSON.parsed *before* anything asked who was
+   * sending it — and a 429 cost the server the whole parse too. The route's own
+   * defences (MediaQuota, the 4 MB per-image cap, requireAuth) all sit after
+   * the parse and never ran.
+   *
+   * Two cheap refusals in front of it: content-length over the cap, which needs
+   * no body at all, and the same auth check the route makes, which reads only
+   * the Authorization header. `isAuthed` is declared below and initialised
+   * during setup, long before any request reaches this closure.
+   */
+  const MEDIA_BODY_MAX = 48 * 1024 * 1024;
+  app.use(
+    "/api/nft/media",
+    (req, res, next) => {
+      if (Number(req.headers["content-length"] ?? 0) > MEDIA_BODY_MAX) {
+        res.status(413).json({ ok: false, error: "That request body is too large." });
+        return;
+      }
+      if (!isAuthed(req)) {
+        res.status(401).json({ ok: false, error: "authentication required — connect a wallet or sign in as admin" });
+        return;
+      }
+      next();
+    },
+    express.json({ limit: "48mb" }),
+  );
   app.use(express.json({ limit: "64kb" }));
 
   /**
@@ -2910,11 +2941,14 @@ async function main() {
              * only way to find out was to sign one and read the revert.
              *
              * A pool that predates `frozenActions` has no such switch, and a
-             * missing function is not a frozen reserve — hence 0 on failure.
+             * missing function is not a frozen reserve — so nothing frozen is
+             * the right answer here. It goes through `valueOr` rather than a
+             * bare catch so that default is written down next to the read it
+             * belongs to, which is what `chain-read` asks for.
              */
-            poolClient.public
-              .readContract({ address: poolClient.pool, abi: tesseraPoolAbi, functionName: "frozenActions", args: [addr] })
-              .catch(() => 0),
+            chainRead<number>(poolClient.public, poolClient.pool, tesseraPoolAbi, "frozenActions", [addr]).then(
+              (r) => valueOr(r, 0),
+            ),
           ]);
           return { a, addr, stats, capacity, oracleStatus, frozenMask: Number(frozenMask ?? 0) };
         }),
@@ -5312,6 +5346,14 @@ async function main() {
   );
 
   /** The arguments a holder scan needs, in one place — boot warm-up uses them too. */
+  /**
+   * Upper bound on a caller-supplied pool id.
+   *
+   * Nothing here needs to know the real pool count — the id is a cache-key
+   * component and an argument the contract will reject on its own. This exists
+   * so the set of reachable keys is finite.
+   */
+  const MAX_POOL_ID = 4096;
   const holderOpts = (poolId = 0) => ({
     pool: poolDeployment?.poolAddress,
     vault: vaultClient?.vault,
@@ -5347,9 +5389,24 @@ async function main() {
       return;
     }
     try {
+      /*
+       * `force` skips both the TTL cache and — because the cache key is
+       * `kind:poolId` — the in-flight de-duplication, so each invented poolId
+       * bought its own full `build()`: a multicall of holders x (assets+1),
+       * a getBlockNumber, and a backgrounded eth_getLogs sweep. Anonymous, and
+       * unbounded, since poolId was never checked against the pools that exist.
+       * Authenticating the bypass is the fix that matters; clamping the id
+       * bounds the key space so the cache cannot be grown one entry at a time
+       * by a caller who simply counts upwards.
+       */
+      // Bounded at both ends. Flooring alone still let any large integer mint
+      // its own `kind:poolId` cache entry, so the comment about sharing an
+      // entry was only true downwards. `MAX_POOL_ID` is far above any real
+      // pool count and far below "unbounded".
+      const poolId = Math.min(MAX_POOL_ID, Math.max(0, Math.trunc(Number(req.query.poolId ?? 0)) || 0));
       const report = await holderReader.read(kind, {
-        ...holderOpts(Number(req.query.poolId ?? 0)),
-        force: req.query.refresh === "1",
+        ...holderOpts(poolId),
+        force: req.query.refresh === "1" && isAuthed(req),
       });
       res.json({ ok: true, ...report });
     } catch (e) {
@@ -8480,22 +8537,28 @@ async function main() {
     ids: readonly bigint[],
     forOwner: string,
   ): Promise<{
-    tokenId: number; dropId: number; name: string; uri: string;
+    tokenId: number; dropId: number | null; name: string; uri: string;
     mintedAt: number | null; receivedAt: number | null;
   }[]> => {
     if (!launchpadAddr) return [];
     return Promise.all(ids.map(async (id) => {
-      const [dropId, uri] = await Promise.all([
-        client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "dropOf", args: [id] })
-          .catch(() => 0n) as Promise<bigint>,
+      const [drop, uri] = await Promise.all([
+        chainRead<bigint>(client.public, launchpadAddr, tesseraLaunchpadAbi, "dropOf", [id]),
         client.public.readContract({ address: launchpadAddr, abi: tesseraLaunchpadAbi, functionName: "tokenURI", args: [id] })
           .catch(() => "") as Promise<string>,
       ]);
-      // The dates come from the folded `Transfer` log, and are null until the
-      // scan has reached that block — the gallery sorts nulls last rather than
-      // inventing a date.
+      /*
+       * A drop that could not be read is unknown, not drop zero. Defaulting to
+       * 0 sent `dropNameOf(0)` after whatever drop zero happens to be and
+       * labelled the token with it, so a failed read rendered as a confident
+       * "drop 0". Null is what the listing path a few lines down already
+       * returns, and what the gallery already checks for before drawing the
+       * label — the same reason the dates below stay null rather than
+       * inventing one.
+       */
+      const dropId = drop.ok ? Number(drop.value) : null;
       return {
-        tokenId: Number(id), dropId: Number(dropId), name: await dropNameOf(Number(dropId)), uri,
+        tokenId: Number(id), dropId, name: dropId === null ? "" : await dropNameOf(dropId), uri,
         ...tokenDates(nftHistory, Number(id), forOwner),
       };
     }));
@@ -8517,7 +8580,7 @@ async function main() {
       // Anything this wallet has listed is escrowed by the market, so it no
       // longer shows as theirs — read those back or a seller loses sight of it.
       let listedByMe: {
-        tokenId: number; listingId: number; price: string; uri: string; dropId: number; name: string;
+        tokenId: number; listingId: number; price: string; uri: string; dropId: number | null; name: string;
         mintedAt: number | null; receivedAt: number | null;
       }[] = [];
       if (marketAddr) {
@@ -15069,9 +15132,20 @@ async function main() {
   }
 
   app.get("/api/state", async (req, res) => {
-    // ?fresh=1 — used right after a transaction so the UI shows the new balances
-    // without waiting for the next poll.
-    if (req.query.fresh === "1") await refreshAll();
+    /*
+     * ?fresh=1 — used right after a transaction so the UI shows the new
+     * balances without waiting for the next poll.
+     *
+     * Authenticated only, and that is the point rather than a nicety.
+     * `refreshAll` calls `invalidateAll()` — which clears the holder scan cache
+     * too — and then awaits four snapshot re-reads plus a chain refresh, up to
+     * nine seconds. Anonymous, it is a lever that makes one `curl` cost the
+     * process its whole RPC budget and drops the cache everyone else is served
+     * from. SECURITY.md already states this rule ("`fresh` is honoured only for
+     * an authenticated caller"); it was enforced in three places and not in the
+     * two most expensive ones.
+     */
+    if (req.query.fresh === "1" && isAuthed(req)) await refreshAll();
     const { providers, agentBalance } = ensureChain();
     const settled = ledgerRef.filter((e) => e.status === "settled");
     const refunded = ledgerRef.filter((e) => e.status === "refunded");
