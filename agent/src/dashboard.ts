@@ -941,7 +941,38 @@ async function main() {
    * ceiling, because a body limit is a denial-of-service control and widening
    * it globally to serve one route would be the wrong trade.
    */
-  app.use("/api/nft/media", express.json({ limit: "48mb" }));
+  /*
+   * Who pays for the 48 MB decode.
+   *
+   * Express runs middleware in registration order, and both gates that protect
+   * this route are registered later: the per-IP rate limiter below, and the
+   * route's own `requireAuth`. So an anonymous 48 MB body was read into a
+   * Buffer, decoded to a string and JSON.parsed *before* anything asked who was
+   * sending it — and a 429 cost the server the whole parse too. The route's own
+   * defences (MediaQuota, the 4 MB per-image cap, requireAuth) all sit after
+   * the parse and never ran.
+   *
+   * Two cheap refusals in front of it: content-length over the cap, which needs
+   * no body at all, and the same auth check the route makes, which reads only
+   * the Authorization header. `isAuthed` is declared below and initialised
+   * during setup, long before any request reaches this closure.
+   */
+  const MEDIA_BODY_MAX = 48 * 1024 * 1024;
+  app.use(
+    "/api/nft/media",
+    (req, res, next) => {
+      if (Number(req.headers["content-length"] ?? 0) > MEDIA_BODY_MAX) {
+        res.status(413).json({ ok: false, error: "That request body is too large." });
+        return;
+      }
+      if (!isAuthed(req)) {
+        res.status(401).json({ ok: false, error: "authentication required — connect a wallet or sign in as admin" });
+        return;
+      }
+      next();
+    },
+    express.json({ limit: "48mb" }),
+  );
   app.use(express.json({ limit: "64kb" }));
 
   /**
@@ -5347,9 +5378,19 @@ async function main() {
       return;
     }
     try {
+      /*
+       * `force` skips both the TTL cache and — because the cache key is
+       * `kind:poolId` — the in-flight de-duplication, so each invented poolId
+       * bought its own full `build()`: a multicall of holders x (assets+1),
+       * a getBlockNumber, and a backgrounded eth_getLogs sweep. Anonymous, and
+       * unbounded, since poolId was never checked against the pools that exist.
+       * Authenticate the bypass and floor the id; an out-of-range id now shares
+       * a cache entry instead of minting one.
+       */
+      const poolId = Math.max(0, Math.trunc(Number(req.query.poolId ?? 0)) || 0);
       const report = await holderReader.read(kind, {
-        ...holderOpts(Number(req.query.poolId ?? 0)),
-        force: req.query.refresh === "1",
+        ...holderOpts(poolId),
+        force: req.query.refresh === "1" && isAuthed(req),
       });
       res.json({ ok: true, ...report });
     } catch (e) {
@@ -15069,9 +15110,20 @@ async function main() {
   }
 
   app.get("/api/state", async (req, res) => {
-    // ?fresh=1 — used right after a transaction so the UI shows the new balances
-    // without waiting for the next poll.
-    if (req.query.fresh === "1") await refreshAll();
+    /*
+     * ?fresh=1 — used right after a transaction so the UI shows the new
+     * balances without waiting for the next poll.
+     *
+     * Authenticated only, and that is the point rather than a nicety.
+     * `refreshAll` calls `invalidateAll()` — which clears the holder scan cache
+     * too — and then awaits four snapshot re-reads plus a chain refresh, up to
+     * nine seconds. Anonymous, it is a lever that makes one `curl` cost the
+     * process its whole RPC budget and drops the cache everyone else is served
+     * from. SECURITY.md already states this rule ("`fresh` is honoured only for
+     * an authenticated caller"); it was enforced in three places and not in the
+     * two most expensive ones.
+     */
+    if (req.query.fresh === "1" && isAuthed(req)) await refreshAll();
     const { providers, agentBalance } = ensureChain();
     const settled = ledgerRef.filter((e) => e.status === "settled");
     const refunded = ledgerRef.filter((e) => e.status === "refunded");
