@@ -5346,6 +5346,14 @@ async function main() {
   );
 
   /** The arguments a holder scan needs, in one place — boot warm-up uses them too. */
+  /**
+   * Upper bound on a caller-supplied pool id.
+   *
+   * Nothing here needs to know the real pool count — the id is a cache-key
+   * component and an argument the contract will reject on its own. This exists
+   * so the set of reachable keys is finite.
+   */
+  const MAX_POOL_ID = 4096;
   const holderOpts = (poolId = 0) => ({
     pool: poolDeployment?.poolAddress,
     vault: vaultClient?.vault,
@@ -5387,10 +5395,15 @@ async function main() {
        * bought its own full `build()`: a multicall of holders x (assets+1),
        * a getBlockNumber, and a backgrounded eth_getLogs sweep. Anonymous, and
        * unbounded, since poolId was never checked against the pools that exist.
-       * Authenticate the bypass and floor the id; an out-of-range id now shares
-       * a cache entry instead of minting one.
+       * Authenticating the bypass is the fix that matters; clamping the id
+       * bounds the key space so the cache cannot be grown one entry at a time
+       * by a caller who simply counts upwards.
        */
-      const poolId = Math.max(0, Math.trunc(Number(req.query.poolId ?? 0)) || 0);
+      // Bounded at both ends. Flooring alone still let any large integer mint
+      // its own `kind:poolId` cache entry, so the comment about sharing an
+      // entry was only true downwards. `MAX_POOL_ID` is far above any real
+      // pool count and far below "unbounded".
+      const poolId = Math.min(MAX_POOL_ID, Math.max(0, Math.trunc(Number(req.query.poolId ?? 0)) || 0));
       const report = await holderReader.read(kind, {
         ...holderOpts(poolId),
         force: req.query.refresh === "1" && isAuthed(req),

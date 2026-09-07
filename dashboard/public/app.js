@@ -696,7 +696,13 @@ const $ = (id) => document.getElementById(id);
           const ctl = new AbortController();
           const timer = setTimeout(() => ctl.abort(), 25000);
           const url = opts && opts.fresh ? "/api/state?fresh=1" : "/api/state";
-          const res = await fetch(url, { signal: ctl.signal }).finally(() => clearTimeout(timer));
+          // The token matters here: ?fresh=1 is honoured only for a signed-in
+          // caller, so a poll without it silently gets the cached snapshot —
+          // which is exactly the stale reading the fresh flag exists to avoid.
+          // authHeaders() is {} when nobody is signed in, so the anonymous poll
+          // is unchanged.
+          const res = await fetch(url, { signal: ctl.signal, headers: authHeaders() })
+            .finally(() => clearTimeout(timer));
           if (!res.ok) { showConnError("HTTP " + res.status); return; }
           s = await res.json();
         } catch (e) {
@@ -6307,7 +6313,9 @@ const $ = (id) => document.getElementById(id);
         // which reads as "no holders" rather than "still counting".
         try {
           const url = `/api/holders?kind=${v.kind}${opts && opts.refresh ? "&refresh=1" : ""}`;
-          const r = await (await fetch(url)).json();
+          // Same as the state poll: &refresh=1 needs the token or the server
+          // serves the cached report and the button does nothing.
+          const r = await (await fetch(url, { headers: authHeaders() })).json();
           if (!r.ok) throw new Error(r.error || "unavailable");
           st.report = r;
           st.rows = r.holders || [];

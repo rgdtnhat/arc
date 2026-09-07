@@ -33,12 +33,45 @@ test("every cache bypass is behind the same auth check", () => {
 test("an invented poolId cannot mint its own cache entry", () => {
   // The holder cache key is `kind:poolId`, so an unvalidated id defeated the
   // de-duplication as well as the TTL: every distinct integer bought its own
-  // full build().
+  // full build(). Flooring alone bounded it downwards only — a caller counting
+  // upwards still got an entry each time.
+  assert.match(dashboard, /const MAX_POOL_ID = \d+;/, "there is an upper bound");
   assert.match(
     dashboard,
-    /const poolId = Math\.max\(0, Math\.trunc\(Number\(req\.query\.poolId \?\? 0\)\) \|\| 0\)/,
-    "poolId is floored and coerced before it reaches the cache key",
+    /const poolId = Math\.min\(MAX_POOL_ID, Math\.max\(0, Math\.trunc\(Number\(req\.query\.poolId \?\? 0\)\) \|\| 0\)\)/,
+    "poolId is clamped at both ends before it reaches the cache key",
   );
+});
+
+test("the clamp keeps the key space finite in both directions", () => {
+  // The arithmetic itself, rather than its spelling: whatever a caller sends,
+  // the number that reaches the cache key is a whole number in range.
+  const MAX = Number(dashboard.match(/const MAX_POOL_ID = (\d+);/)![1]);
+  const clamp = (q: unknown) => Math.min(MAX, Math.max(0, Math.trunc(Number(q ?? 0)) || 0));
+
+  for (const [input, expected] of [
+    [undefined, 0], ["0", 0], ["3", 3], ["-1", 0], ["-99999", 0],
+    ["nonsense", 0], ["", 0], ["1e12", MAX], [String(MAX + 1), MAX], ["3.9", 3],
+  ] as [unknown, number][]) {
+    assert.equal(clamp(input), expected, `clamp(${JSON.stringify(input)})`);
+  }
+});
+
+test("the two gated fetches send the token the gate reads", () => {
+  /*
+   * The gates check the Authorization header. The browser's own callers did not
+   * send one: `tick()` fetched /api/state?fresh=1 and `loadHolders` fetched
+   * &refresh=1 with no headers at all, while ~15 other authenticated fetches in
+   * the same file use authHeaders(). Gating the server without this turns
+   * "refresh right after your transaction" into a no-op for everybody,
+   * including the operator — a silent regression, not a security hole.
+   */
+  const app = readFileSync(new URL("../../dashboard/public/app.js", import.meta.url), "utf8");
+  const state = app.slice(app.indexOf('opts && opts.fresh ? "/api/state?fresh=1"'));
+  assert.match(state.slice(0, 900), /headers: authHeaders\(\)/, "the state poll sends the token");
+
+  const holders = app.slice(app.indexOf("`/api/holders?kind=${v.kind}"));
+  assert.match(holders.slice(0, 900), /headers: authHeaders\(\)/, "the holders refresh sends the token");
 });
 
 // --- the 48 MB parse --------------------------------------------------------
