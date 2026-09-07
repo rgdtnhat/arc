@@ -429,6 +429,74 @@ that reads as "done" is the failure mode that actually loses people money — an
 refresh preserves settlement marks so re-reading the chain cannot re-open
 completed work.
 
+## Work an anonymous caller can make the server do
+
+Three routes let someone with no wallet and no session spend the process's
+budget instead of their own. None of them moves money; all of them are the same
+shape, which is why they are grouped.
+
+**The cache bypasses.** §6 above states the rule — `fresh` is honoured only for
+an authenticated caller — and the code enforced it in three places and not in
+the two most expensive ones. `GET /api/state?fresh=1` ran `refreshAll()`, which
+calls `invalidateAll()` (dropping the holder scan cache everyone else is served
+from) and then awaits four snapshot re-reads plus a chain refresh, up to nine
+seconds. `GET /api/holders?refresh=1` set `force`, which skips the TTL cache
+*and* the in-flight de-duplication — and since the cache key is `kind:poolId`
+and `poolId` was never validated, each invented integer bought its own full
+`build()`: a multicall of holders × (assets+1), a `getBlockNumber`, and a
+backgrounded `eth_getLogs` sweep. The transport gives the entire process 6–8
+concurrent slots and roughly 12 requests a second, and halves its own rate under
+push-back; the dashboard's anonymous read allowance is 600 GETs a minute from
+one IP. One client could therefore hold most of the RPC budget and degrade the
+app for everyone. Both now take `&& isAuthed(req)`, and `poolId` is floored, so
+an out-of-range id shares a cache entry rather than minting one.
+
+A fix the document claims is closed but the code only half applies is worse than
+an open finding, because it is the one nobody re-reads.
+
+**The 48 MB parse.** `express.json({ limit: "48mb" })` is scoped to
+`/api/nft/media` — correctly, since a wide body limit is a denial-of-service
+control and widening it globally to serve one route would be the wrong trade.
+But Express runs middleware in registration order, and both gates that protect
+that route come later: the per-IP limiter, and the route's own `requireAuth`. So
+an anonymous 48 MB body was read into a Buffer, decoded to a string and
+`JSON.parse`d *before* anything asked who sent it, and a request the limiter
+refused with 429 still paid for the whole parse. Every defence the route does
+have — `MediaQuota`, the 4 MB per-image cap, `requireAuth` — sits after the
+parse and never ran. Two cheap refusals now sit in front of it: `content-length`
+over the cap, which needs no body at all, and the same auth check the route
+makes, which reads only the `Authorization` header and so is safe to run before
+a parser.
+
+## Values this system published and did not enforce
+
+**The provider's own quote.** The 402 response advertises
+`X-Tessera-Quote-Expiry`, the escrow signs an `expiry` into the typed data, and
+`IssuedQuote.expiresAt` was computed on every challenge — and read nowhere. A
+`quoteHash` stayed spendable for the life of the process. Worse, the paid path
+compared the escrowed amount against `svc.price`, the catalogue constant, while
+the quote it had signed carried the surge-adjusted figure, up to 4× base. That
+made every multiplier optional for everybody: fetch a 402 in a quiet minute,
+keep the hash, pay the floor price whenever you liked. This is the project's own
+money rule pointed at the seller — the number that was agreed is the number that
+is enforced — so the check now reads the issued quote's price, and an expired
+entry is dropped rather than honoured.
+
+The same map grew one entry per unauthenticated 402, forever. Expired entries
+are now swept on write once the map passes a threshold: bounded work, amortised
+against the thing that creates it.
+
+**The transaction export.** `toCsv` quoted every field, which stops a comma
+breaking a column and does nothing about a spreadsheet treating the cell as
+code. Excel and Sheets evaluate a value beginning `=`, `+`, `-` or `@` — inside
+quotes as much as outside. The rows carry `action` and `detail` written through
+`POST /api/history/mine`, which any wallet can reach with a free signature, and
+the export is `requireOperator` and spans every user's rows. So a visitor's
+string ran on the operator's machine with the operator's access, which is the
+whole point of a formula-injection payload. Values that look like formulas now
+take a leading apostrophe — but only when they are not numbers, so a negative
+amount stays the number the column exists for rather than quietly becoming text.
+
 ## Notices
 
 Notice text is stored raw and rendered with `textContent`, never `innerHTML`.
