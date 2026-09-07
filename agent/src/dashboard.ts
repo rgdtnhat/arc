@@ -897,6 +897,49 @@ async function main() {
     } as UiEvent);
   }
 
+  /*
+   * Sweep expired tabs on a clock, not only when somebody presses Run.
+   *
+   * `runScenario` calls the sweep, and on this build `runScenario` is reached
+   * only by `POST /api/run` and `TESSERA_ONCE=1` — `live` is true, so the
+   * startup run is skipped. That made "the whole point is that this keeps
+   * working unattended" false: recovery still needed a person, just a person
+   * pressing a button instead of one remembering a tab id.
+   *
+   * Tabs are opened with a 3600s expiry, so the interval only has to be well
+   * under the rate at which deposits go stale; hourly is ample and keeps the
+   * cost invisible. A pass is two RPC round trips when there is nothing to do
+   * (`tabsAsAgent`, then one batched `tabRows`), and the planner caps it at
+   * five writes and fifty rows besides.
+   *
+   * Same shape as the four keepers below it: env-gated off, skipped while the
+   * previous pass is still running, and a failure is logged and retried rather
+   * than escalated — the money stays reclaimable either way.
+   */
+  const TAB_SWEEP_MS = Math.max(60_000, Number(process.env.TESSERA_TAB_SWEEP_MS ?? 60 * 60_000));
+  let tabSweepBusy = false;
+  setInterval(async () => {
+    if (process.env.TESSERA_TAB_SWEEP === "off") return;
+    if (tabSweepBusy || running) return;
+    tabSweepBusy = true;
+    try {
+      const swept = await agent.sweepExpiredTabs();
+      if (swept.reclaimed > 0n) {
+        pushEvent({
+          source: "agent",
+          ts: Date.now(),
+          level: "refund",
+          message: `Swept ${swept.txs.length} expired tab(s) — ${formatUsdc(swept.reclaimed)} USDC back in the wallet`,
+        } as UiEvent);
+        if (chainCache) chainCache.at = 0;
+      }
+    } catch (e) {
+      console.error(`[tab-sweep] pass failed: ${String(e).slice(0, 160)}`);
+    } finally {
+      tabSweepBusy = false;
+    }
+  }, TAB_SWEEP_MS).unref?.();
+
   // --- Dashboard server ------------------------------------------------------
   const app = express();
   const dashboardDir = path.resolve(
@@ -5162,7 +5205,8 @@ async function main() {
           });
         } catch (e) {
           // The deposit is time-locked to the tab; reclaim only works after it
-          // expires, so say plainly where the money is rather than pretending.
+          // expires. Say where the money is and what will collect it — the
+          // scheduled sweep above, not a person who has to remember this id.
           logTx(req, {
             category: "agentic", action: "service-call", status: "failed",
             assetAddress: usdcAddress, raw: deposit, txHash: openTx,
@@ -5170,7 +5214,7 @@ async function main() {
           });
           res.status(500).json({
             ok: false,
-            error: `${friendlyError(e)} — tab #${tabId} still holds ${fmtUnits(deposit, 6)} USDC; it is reclaimable after the tab expires.`,
+            error: `${friendlyError(e)} — tab #${tabId} still holds ${fmtUnits(deposit, 6)} USDC; the tab sweep reclaims it once the tab expires.`,
           });
         }
         return;
