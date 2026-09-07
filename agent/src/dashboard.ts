@@ -1229,7 +1229,24 @@ async function main() {
   // fast-polling dashboard never hammers the rate-limited public Arc RPC (which
   // 429s after only a few calls). Requests always return instantly from cache.
   const READ_TTL = live ? 20_000 : 800;
-  const READ_PACE = live ? 1_200 : 0; // ms between individual RPC calls
+  /*
+   * No metronome here.
+   *
+   * This used to sleep 1,200ms between every individual RPC call, which is the
+   * exact pattern `shared/src/transport.ts` was written to retire — "spacing
+   * calls out costs latency and buys nothing … the metronome was 87% of the
+   * time on the heaviest read and was never the thing keeping us under the
+   * limit". The transport dropped it; this caller kept its own copy.
+   *
+   * It cost 5.0s per refresh at one provider wallet and 12.5s at three, against
+   * a 9,000ms race in `refreshAll` — so a deployment with three distinct
+   * provider wallets could not finish inside the budget at all, and
+   * `/api/state?fresh=1` silently returned pre-transaction numbers, which is
+   * the one thing `fresh=1` exists to prevent. Measured concurrent: 47ms.
+   *
+   * Concurrency is what the limiter is for, and the reads collapse into one
+   * multicall besides.
+   */
   const POLL_MS = live ? 6_000 : 800;
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   let refreshing = false;
@@ -1259,25 +1276,30 @@ async function main() {
     } catch (e) {
       console.error("[dashboard] agent balance read failed:", e);
     }
-    if (READ_PACE) await sleep(READ_PACE);
-
     // Services often share one on-chain wallet (all of them in live mode), so
-    // read each unique address once, sequentially, with a pace between calls.
+    // read each unique address once. The three reads per address have no
+    // dependency on each other and neither do the addresses, so the whole set
+    // goes out together and the public client's multicall batching collapses
+    // it into a single eth_call.
     const uniqueAddrs = [...new Set(Object.values(providerAddrs))] as Hex[];
     const byAddr = new Map<string, { balance: bigint; rep: any; stake: bigint }>();
-    for (const addr of uniqueAddrs) {
-      try {
-        const balance = await client.usdcBalance(addr);
-        if (READ_PACE) await sleep(READ_PACE);
-        const rep = await client.reputation(addr);
-        if (READ_PACE) await sleep(READ_PACE);
-        const stake = await client.stakeOf(addr);
-        if (READ_PACE) await sleep(READ_PACE);
-        byAddr.set(addr.toLowerCase(), { balance, rep, stake });
-      } catch (e) {
-        console.error(`[dashboard] provider read failed for ${addr}:`, e);
-      }
-    }
+    await Promise.all(
+      uniqueAddrs.map(async (addr) => {
+        try {
+          // Per address, not per read: one provider that will not answer must
+          // not cost the others their row. A missing entry falls through to the
+          // previous snapshot below rather than rendering as zero.
+          const [balance, rep, stake] = await Promise.all([
+            client.usdcBalance(addr),
+            client.reputation(addr),
+            client.stakeOf(addr),
+          ]);
+          byAddr.set(addr.toLowerCase(), { balance, rep, stake });
+        } catch (e) {
+          console.error(`[dashboard] provider read failed for ${addr}:`, e);
+        }
+      }),
+    );
 
     const prior = new Map((chainCache?.providers ?? []).map((p: any) => [String(p.resource), p]));
     const providers = CATALOG.map((s) => {
@@ -6687,31 +6709,68 @@ async function main() {
 
     if (emissionsAddr && poolDeployment) {
       const assets = poolDeployment.assets.map((a) => a.address as Hex);
-      for (const who of targets) {
-        const stale: { asset: Hex; side: number }[] = [];
-        for (const asset of assets) {
+      /*
+       * Every read first, together; the writes after.
+       *
+       * This was three nested loops of `await`, so at the 200-address watch cap
+       * it made 3,600 serial round trips — and because every one was awaited,
+       * the client's `batch: { multicall: true }` never had two calls in flight
+       * to collapse and never once fired. Measured against the repo's own
+       * transport at 40ms latency: 3,600 requests and 165s, versus 300 requests
+       * and 11.4s for exactly the same reads issued together.
+       *
+       * The cost was not local. The limiter is process-global, so for 165s out
+       * of every 900 the keeper owned the entire RPC budget and the state
+       * refresh, holder scans, event indexer and price tracker all queued
+       * behind it. This lesson is already written twice in this file — at the
+       * pool-health endpoint and the claim digest; settleStale predates both.
+       */
+      const probes = targets.flatMap((who) =>
+        assets.flatMap((asset) =>
           // Backstop (side 2) counts here as much as the other two: it carries
           // the highest rate, and a depositor who is never checkpointed against
           // it earns nothing at all from the side that takes the first loss.
-          for (const side of [0, 1, 2]) {
-            try {
-              const [, recorded] = (await client.public.readContract({
-                address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "positions", args: [asset, side, who],
-              })) as readonly [bigint, bigint, bigint];
-              const live = (await client.public.readContract({
+          [0, 1, 2].map((side) => ({ who, asset, side })),
+        ),
+      );
+      const readings = await Promise.all(
+        probes.map(async (probe) => {
+          try {
+            const [positions, live] = await Promise.all([
+              client.public.readContract({
+                address: emissionsAddr, abi: tesseraEmissionsAbi, functionName: "positions",
+                args: [probe.asset, probe.side, probe.who],
+              }) as Promise<readonly [bigint, bigint, bigint]>,
+              client.public.readContract({
                 address: poolDeployment.poolAddress, abi: tesseraPoolAbi,
-                functionName: side === 0 ? "supplyShares" : side === 1 ? "borrowShares" : "backstopShares",
-                args: [asset, who],
-              })) as bigint;
-              // Nothing on either side of the comparison means nothing to do;
-              // a difference means the books and the position disagree.
-              if (live === 0n && recorded === 0n) continue;
-              if (live !== recorded) stale.push({ asset, side });
-            } catch {
-              /* a reserve that will not answer is not worth a transaction */
-            }
+                functionName: probe.side === 0 ? "supplyShares" : probe.side === 1 ? "borrowShares" : "backstopShares",
+                args: [probe.asset, probe.who],
+              }) as Promise<bigint>,
+            ]);
+            return { ...probe, recorded: positions[1], live };
+          } catch {
+            /* a reserve that will not answer is not worth a transaction */
+            return null;
           }
-        }
+        }),
+      );
+
+      // Grouped in the order the probes were built, so the arguments a given
+      // address is checkpointed with do not depend on which read landed first.
+      const staleByWho = new Map<Hex, { asset: Hex; side: number }[]>();
+      for (const r of readings) {
+        if (!r) continue;
+        // Nothing on either side of the comparison means nothing to do;
+        // a difference means the books and the position disagree.
+        if (r.live === 0n && r.recorded === 0n) continue;
+        if (r.live === r.recorded) continue;
+        const rows = staleByWho.get(r.who) ?? [];
+        rows.push({ asset: r.asset, side: r.side });
+        staleByWho.set(r.who, rows);
+      }
+
+      for (const who of targets) {
+        const stale = staleByWho.get(who) ?? [];
         if (!stale.length) continue;
         try {
           const txHash = await owner!.write(emissionsAddr, tesseraEmissionsAbi, "checkpointMany", [
@@ -6728,22 +6787,42 @@ async function main() {
       const poolCount = (await client.public.readContract({
         address: ammClient.amm, abi: tesseraAmmAbi, functionName: "poolCount",
       })) as bigint;
-      for (const who of targets) {
-        const stale: bigint[] = [];
-        for (let id = 0n; id < poolCount; id++) {
+      // Same shape, same reason: targets x poolCount x 2 reads, all independent.
+      const lpProbes = targets.flatMap((who) =>
+        Array.from({ length: Number(poolCount) }, (_, i) => ({ who, id: BigInt(i) })),
+      );
+      const lpReadings = await Promise.all(
+        lpProbes.map(async (probe) => {
           try {
-            const [, recorded] = (await client.public.readContract({
-              address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "positions", args: [id, who],
-            })) as readonly [bigint, bigint, bigint];
-            const live = (await client.public.readContract({
-              address: ammClient.amm, abi: tesseraAmmAbi, functionName: "sharesOf", args: [id, who],
-            })) as bigint;
-            if (live === 0n && recorded === 0n) continue;
-            if (live !== recorded) stale.push(id);
+            const [positions, live] = await Promise.all([
+              client.public.readContract({
+                address: lpEmissionsAddr, abi: tesseraLpEmissionsAbi, functionName: "positions",
+                args: [probe.id, probe.who],
+              }) as Promise<readonly [bigint, bigint, bigint]>,
+              client.public.readContract({
+                address: ammClient.amm, abi: tesseraAmmAbi, functionName: "sharesOf",
+                args: [probe.id, probe.who],
+              }) as Promise<bigint>,
+            ]);
+            return { ...probe, recorded: positions[1], live };
           } catch {
             /* same */
+            return null;
           }
-        }
+        }),
+      );
+      const lpStaleByWho = new Map<Hex, bigint[]>();
+      for (const r of lpReadings) {
+        if (!r) continue;
+        if (r.live === 0n && r.recorded === 0n) continue;
+        if (r.live === r.recorded) continue;
+        const rows = lpStaleByWho.get(r.who) ?? [];
+        rows.push(r.id);
+        lpStaleByWho.set(r.who, rows);
+      }
+
+      for (const who of targets) {
+        const stale = lpStaleByWho.get(who) ?? [];
         if (!stale.length) continue;
         try {
           const txHash = await owner!.write(lpEmissionsAddr, tesseraLpEmissionsAbi, "checkpointMany", [who, stale]);
@@ -7699,35 +7778,57 @@ async function main() {
     const now = BigInt(Math.floor(Date.now() / 1000));
     // An expired stream is not an outflow, so it must not count against runway.
     const live = (s: readonly [bigint, bigint, bigint, bigint]) => (s[3] !== 0n && s[3] <= now ? 0n : s[0]);
-    let total = 0n;
+    /*
+     * Three rounds, not thirteen round trips.
+     *
+     * The count has to come back before the ids can be asked for, and the ids
+     * before the streams — but nothing within a round depends on anything else
+     * in it. Serially this was 1 + n + 3n awaited reads (13 at three assets),
+     * twice per guard tick, for work that is two batched calls. Same class as
+     * settleStale above, an order of magnitude smaller.
+     */
     if (venue === "lending") {
       const n = (await client.public.readContract({
         address: addr, abi: tesseraEmissionsAbi, functionName: "streamedAssetCount",
       })) as bigint;
-      for (let i = 0n; i < n; i++) {
-        const asset = (await client.public.readContract({
-          address: addr, abi: tesseraEmissionsAbi, functionName: "streamedAssets", args: [i],
-        })) as Hex;
-        for (const side of [0, 1, 2]) {
-          total += live((await client.public.readContract({
-            address: addr, abi: tesseraEmissionsAbi, functionName: "streams", args: [asset, side],
-          })) as readonly [bigint, bigint, bigint, bigint]);
-        }
-      }
-      return total;
+      const assets = (await Promise.all(
+        Array.from({ length: Number(n) }, (_, i) =>
+          client.public.readContract({
+            address: addr, abi: tesseraEmissionsAbi, functionName: "streamedAssets", args: [BigInt(i)],
+          }) as Promise<Hex>,
+        ),
+      ));
+      const streams = await Promise.all(
+        assets.flatMap((asset) =>
+          [0, 1, 2].map(
+            (side) =>
+              client.public.readContract({
+                address: addr, abi: tesseraEmissionsAbi, functionName: "streams", args: [asset, side],
+              }) as Promise<readonly [bigint, bigint, bigint, bigint]>,
+          ),
+        ),
+      );
+      return streams.reduce((sum, st) => sum + live(st), 0n);
     }
     const n = (await client.public.readContract({
       address: addr, abi: tesseraLpEmissionsAbi, functionName: "streamedPoolCount",
     })) as bigint;
-    for (let i = 0n; i < n; i++) {
-      const poolId = (await client.public.readContract({
-        address: addr, abi: tesseraLpEmissionsAbi, functionName: "streamedPools", args: [i],
-      })) as bigint;
-      total += live((await client.public.readContract({
-        address: addr, abi: tesseraLpEmissionsAbi, functionName: "streams", args: [poolId],
-      })) as readonly [bigint, bigint, bigint, bigint]);
-    }
-    return total;
+    const poolIds = await Promise.all(
+      Array.from({ length: Number(n) }, (_, i) =>
+        client.public.readContract({
+          address: addr, abi: tesseraLpEmissionsAbi, functionName: "streamedPools", args: [BigInt(i)],
+        }) as Promise<bigint>,
+      ),
+    );
+    const lpStreams = await Promise.all(
+      poolIds.map(
+        (poolId) =>
+          client.public.readContract({
+            address: addr, abi: tesseraLpEmissionsAbi, functionName: "streams", args: [poolId],
+          }) as Promise<readonly [bigint, bigint, bigint, bigint]>,
+      ),
+    );
+    return lpStreams.reduce((sum, st) => sum + live(st), 0n);
   };
 
   const guardSweep = async (venue: GuardVenue, addr: Hex | null) => {
