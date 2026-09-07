@@ -210,7 +210,24 @@ export class TxLog {
 /** CSV for the export button. Quoted so a comma in a detail can't shift columns. */
 export function toCsv(rows: TxRecord[]): string {
   const head = ["time", "actor", "category", "action", "status", "amount", "asset", "valueUsd", "txHash", "detail"];
-  const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  /*
+   * Quoting stops a comma breaking the column. It does not stop a spreadsheet
+   * treating the cell as code: Excel and Sheets evaluate a value beginning
+   * `= + - @` (or a tab/CR) even inside quotes. The rows here carry `action`
+   * and `detail` written by any visitor who can sign in with a wallet
+   * (`POST /api/history/mine`), and the export is the operator's, spanning
+   * every user's rows — so a visitor's string runs on the operator's machine
+   * with the operator's access.
+   *
+   * A leading apostrophe is the standard neutraliser. It is applied only to
+   * values that are not numbers, so a negative amount stays the number it was
+   * rather than becoming text.
+   */
+  const esc = (v: unknown) => {
+    const raw = String(v ?? "");
+    const formula = /^[=+\-@\t\r]/.test(raw) && !Number.isFinite(Number(raw));
+    return `"${(formula ? `'${raw}` : raw).replace(/"/g, '""')}"`;
+  };
   return [
     head.join(","),
     ...rows.map((r) =>

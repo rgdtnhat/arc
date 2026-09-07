@@ -49,6 +49,9 @@ export interface ProviderEvent {
   txHash?: string;
 }
 
+/** Entries above which a write sweeps expired quotes first. Cheap, and rare. */
+const QUOTE_SWEEP_AT = 256;
+
 interface IssuedQuote {
   resource: string;
   price: bigint;
@@ -461,11 +464,21 @@ export function createProviderApp(config: ProviderConfig): Express {
 
       const qh = quoteHash(provider, price, svc.resource, nonce);
       const expiry = BigInt(Math.floor(Date.now() / 1000) + svc.slaSeconds + 60);
+      /*
+       * One entry per 402, on an unauthenticated endpoint, previously never
+       * deleted — a crawler or a retry loop grew this map for the life of the
+       * process. Expired entries are dropped on write, which is bounded work
+       * amortised against the thing that creates them.
+       */
+      const now = Date.now();
+      if (issued.size >= QUOTE_SWEEP_AT) {
+        for (const [k, q] of issued) if (q.expiresAt <= now) issued.delete(k);
+      }
       issued.set(qh, {
         resource: svc.resource,
         price,
         provider,
-        expiresAt: Date.now() + svc.slaSeconds * 1000 + 60_000,
+        expiresAt: now + svc.slaSeconds * 1000 + 60_000,
       });
       // EIP-712 sign the quote so the agent can verify it's authentic.
       const wallet = wallets.get(svc.resource)!;
@@ -520,12 +533,28 @@ export function createProviderApp(config: ProviderConfig): Express {
     }
     const [payAgent, payProvider, amount, , qHash, , status] = payment;
 
+    /*
+     * Enforce the quote that was issued, not the catalogue it was derived from.
+     *
+     * `known.price` is the surge-adjusted figure this server signed and
+     * advertised; `svc.price` is the base constant. Checking against the base
+     * made every multiplier optional: fetch a 402 in a quiet minute, keep the
+     * quoteHash, and pay the floor price whenever you liked. The number that
+     * was agreed is the number that is enforced.
+     *
+     * `expiresAt` was computed on every 402 and read nowhere, while the
+     * response advertised `X-Tessera-Quote-Expiry` and the escrow signed an
+     * expiry into the typed data. The server published an expiry it did not
+     * keep; a quoteHash stayed spendable for the life of the process.
+     */
     const known = issued.get(qHash);
+    if (known && known.expiresAt <= Date.now()) issued.delete(qHash);
+    const live = issued.get(qHash);
     const ok =
       getAddress(payProvider) === getAddress(provider) &&
       status === PaymentStatus.Escrowed &&
-      amount >= svc.price &&
-      known?.resource === svc.resource;
+      amount >= (live?.price ?? svc.price) &&
+      live?.resource === svc.resource;
 
     if (!ok) {
       emit({ kind: "verify", resource: svc.resource, detail: `rejected payment ${paymentId}` });
