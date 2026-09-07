@@ -182,7 +182,12 @@ test("the server sends a name with every token and listing", () => {
   // name costs one cached `drops()` call rather than one per token per poll.
   const server = readFileSync(new URL("../src/dashboard.ts", import.meta.url), "utf8");
   assert.match(server, /const dropNameOf = async/, "the drop name is never read");
-  assert.match(server, /name: await dropNameOf\(Number\(dropId\)\)/, "held tokens carry no name");
+  // A token whose drop could not be read has no name to look up: `dropOf` came
+  // back as a failed `Reading`, and asking `dropNameOf(0)` would label it with
+  // whatever drop zero happens to be. The gallery renders that as "#4" rather
+  // than a wrong drop, which is the case just above.
+  assert.match(server, /name: dropId === null \? "" : await dropNameOf\(dropId\)/,
+    "held tokens carry no name");
   assert.match(server, /priceRaw: l\[3\]\.toString\(\), price: fmtUnits\(l\[3\], 6\), uri, name, dropId/,
     "market listings carry no name");
 });

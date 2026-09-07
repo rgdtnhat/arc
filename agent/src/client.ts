@@ -20,6 +20,7 @@ import {
   withGasMargin,
 } from "@tessera/shared";
 import { confirm } from "./confirm.js";
+import { read } from "./chain-read.js";
 import { encodePacked, keccak256 } from "viem";
 
 export interface TesseraClientConfig {
@@ -40,6 +41,20 @@ export interface PaymentRecord {
   quoteHash: Hex;
   responseHash: Hex;
   status: PaymentStatus;
+}
+
+/** One tab exactly as `TesseraTab.tabs(id)` returns it, with the id kept alongside. */
+export interface TabRowOnChain {
+  tabId: bigint;
+  agent: Hex;
+  provider: Hex;
+  /** USDC escrowed at open, 6 decimals. */
+  deposit: bigint;
+  /** USDC the provider has already redeemed against its vouchers. */
+  claimed: bigint;
+  /** Unix seconds. The contract allows `reclaim` strictly after this. */
+  expiry: bigint;
+  closed: boolean;
 }
 
 /** Thin, typed wrapper over TesseraEscrow + USDC for the agent. */
@@ -170,6 +185,65 @@ export class TesseraClient {
       account: this.account,
       message: { raw: hash },
     });
+  }
+
+  /**
+   * Every tab this agent has opened, in the order it opened them.
+   *
+   * The contract keeps this index for exactly this reason: a tab reachable only
+   * by an id somebody already knows is a tab the app cannot act on, and the ids
+   * the agent learns at run time live in an activity feed that does not survive
+   * a restart. Without it there is no answer to "what have I left locked up?" —
+   * which is how a deposit stays unreclaimed after a provider goes quiet.
+   */
+  async tabsAsAgent(who?: Hex): Promise<bigint[]> {
+    if (!this.tab) throw new Error("tabAddress not configured");
+    return (await this.public.readContract({
+      address: this.tab,
+      abi: tesseraTabAbi,
+      functionName: "tabsAsAgent",
+      args: [who ?? (this.account.address as Hex)],
+    })) as bigint[];
+  }
+
+  /**
+   * Several tabs as the chain has them.
+   *
+   * Reads go through `chain-read`, so a row that could not be read comes back
+   * in `unreadable` with its reason rather than as a plausible-looking zero.
+   * That distinction is load-bearing here: a tab read as `deposit 0, claimed 0`
+   * is one a caller skips as "nothing to reclaim" and never looks at again.
+   *
+   * One read per id, issued together — the public client batches concurrent
+   * reads into a single multicall, so this is one round trip rather than
+   * `ids.length` of them.
+   */
+  async tabRows(
+    ids: bigint[]
+  ): Promise<{ rows: TabRowOnChain[]; unreadable: { tabId: bigint; why: string }[] }> {
+    if (!this.tab) throw new Error("tabAddress not configured");
+    const readings = await Promise.all(
+      ids.map((tabId) =>
+        read<[Hex, Hex, bigint, bigint, bigint, boolean]>(
+          this.public,
+          this.tab,
+          tesseraTabAbi,
+          "tabs",
+          [tabId]
+        ).then((r) => ({ tabId, r }))
+      )
+    );
+    const rows: TabRowOnChain[] = [];
+    const unreadable: { tabId: bigint; why: string }[] = [];
+    for (const { tabId, r } of readings) {
+      if (!r.ok) {
+        unreadable.push({ tabId, why: r.why });
+        continue;
+      }
+      const [agent, provider, deposit, claimed, expiry, closed] = r.value;
+      rows.push({ tabId, agent, provider, deposit, claimed, expiry, closed });
+    }
+    return { rows, unreadable };
   }
 
   /** Reclaim an expired tab's unclaimed funds. */

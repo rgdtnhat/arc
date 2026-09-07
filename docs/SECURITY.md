@@ -429,6 +429,59 @@ that reads as "done" is the failure mode that actually loses people money — an
 refresh preserves settlement marks so re-reading the chain cannot re-open
 completed work.
 
+## Money the agent left on-chain: the tab sweep
+
+The tab rail escrows a deposit up front and settles it off-chain with signed
+vouchers. `closeTab` returns the remainder — but only the provider may call it,
+so a provider that simply stops answering leaves the deposit sitting in the
+contract. `reclaim` exists for exactly that case and had exactly one caller: an
+action in the agent kit that a person had to invoke, with a tab id they could
+only have got from an activity feed that does not survive a restart. Meanwhile
+the run logged that the deposit *"will reclaim after expiry"*, which nothing did.
+
+That is not a stolen-funds bug — the money stays recoverable, and only the agent
+can recover it. It is a leak: an unattended system that keeps making deposits and
+never collects the ones that went unused, while telling its operator otherwise.
+The wording made it worse than the gap, because a line that says the money is
+coming back is a line that stops anyone looking.
+
+`sweepExpiredTabs` closes it. It reads the contract's own `_asAgent` index —
+present since the contract was written and, until now, never read by anything —
+takes the rows off-chain, and reclaims what it should. It runs on an hourly
+interval and again at the top of a scenario run, before the run that may open
+another tab: what makes a deposit unrecoverable is an agent that never looks
+again.
+
+The interval is the half that matters. Wired only into the scenario, the sweep
+was reachable on this build by `POST /api/run` and `TESSERA_ONCE=1` and nothing
+else — `live` is hardcoded true, so the startup run is skipped. That moved
+recovery from "a person who remembers a tab id" to "a person who presses Run",
+which on an unattended deployment is the same person: nobody. Tabs expire in an
+hour, so even a second run inside the hour would have reclaimed nothing.
+`TESSERA_TAB_SWEEP=off` turns it off; `TESSERA_TAB_SWEEP_MS` retimes it, clamped
+to the same 60s floor the other keepers use so a typo cannot make it a spin
+loop.
+
+Four rules keep it from spending more than it recovers, each mirroring a
+condition the contract would revert on: a tab is skipped while `now <= expiry`
+(`NotExpired`), if it was opened by another address (`NotAgent`), if it is
+already closed (`TabIsClosed`), and if the provider has claimed all of it.
+Below 0.01 USDC the remainder is left alone, because gas on Arc is USDC and a
+reclaim that returns less than it costs is a loss recorded as a recovery; that
+dust stays reclaimable by hand. Passes are capped at five writes and fifty rows
+read, largest remainder first, so a first sweep against a long-lived agent
+drains its backlog over a few runs instead of firing dozens of transactions into
+the RPC's rate limiter.
+
+Failures are per-tab, and none of them is silent. An enumeration that fails says
+so rather than returning an empty list, because "could not ask" and "nothing to
+do" must not render the same way. A row that cannot be read is named, and the
+readable ones still run — a tab read as `deposit 0, claimed 0` would otherwise be
+skipped as "nothing to reclaim" and never looked at again, which is the failure
+`chain-read` exists to make unrepresentable. A reclaim that reverts costs that
+tab and no other. The total reported is what actually moved, not what the plan
+hoped would move.
+
 ## Notices
 
 Notice text is stored raw and rendered with `textContent`, never `innerHTML`.

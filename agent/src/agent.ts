@@ -19,6 +19,8 @@ import {
   type Decision,
   type OfferedService,
 } from "./decide.js";
+import { describeError } from "./chain-read.js";
+import { planTabSweep, sweepValue, SWEEP_DEFAULTS } from "./tab-sweep.js";
 import { ApprovalQueue, type SpendingPolicy } from "./policy.js";
 import type { TrustMemory } from "./memory.js";
 import { createTesseraActions, type TesseraActionKit } from "./agentkit.js";
@@ -722,11 +724,126 @@ export class TesseraAgent {
       this.emit({
         level: "refund",
         resource,
-        message: `Provider didn't settle tab #${tabId} — will reclaim after expiry`,
+        message:
+          `Provider didn't settle tab #${tabId} — ${formatUsdc(deposit)} USDC stays locked ` +
+          `until it expires, then the next sweep reclaims what is left`,
       });
     }
 
     return { data, spent: cum, tabId };
+  }
+
+  /**
+   * Reclaim the deposits of tabs that expired without the provider settling.
+   *
+   * A tab is the one place in this system where the agent's money sits on-chain
+   * with nothing scheduled to bring it back. `closeTab` returns the remainder,
+   * but only the provider can call it — so a provider that goes quiet leaves
+   * the deposit locked until someone calls `reclaim`, and until now nobody did.
+   *
+   * Run before opening new tabs rather than after closing one: what makes a
+   * deposit unrecoverable is an agent that never looks again, and the start of
+   * a run is the moment it is certainly looking.
+   *
+   * Failures are per-tab. One unreadable row or one reverting reclaim must not
+   * abandon the other four, because the whole point is that this keeps working
+   * unattended.
+   */
+  async sweepExpiredTabs(opts: { minRemainder?: bigint; maxPerPass?: number; maxScan?: number } = {}): Promise<{
+    reclaimed: bigint;
+    txs: Hex[];
+  }> {
+    // A deployment without a tab contract has no tabs to sweep. Silence rather
+    // than a warning: this is a configuration, not a fault.
+    if (!this.cfg.client.tab) return { reclaimed: 0n, txs: [] };
+
+    let ids: bigint[];
+    try {
+      ids = await this.cfg.client.tabsAsAgent();
+    } catch (e) {
+      // Said out loud, not swallowed. A sweep that cannot enumerate is a sweep
+      // that recovers nothing, and that has to look different from one with
+      // nothing to do.
+      this.emit({
+        level: "skip",
+        message: `Tab sweep skipped — could not list this agent's tabs (${describeError(e)})`,
+      });
+      return { reclaimed: 0n, txs: [] };
+    }
+    if (ids.length === 0) return { reclaimed: 0n, txs: [] };
+
+    /*
+     * Newest first, bounded.
+     *
+     * `_asAgent` is pushed on open and never removed — a closed tab stays in
+     * the array forever — so the index is mostly settled history. Taking the
+     * *oldest* window, as this first did, parks it permanently on that history:
+     * once fifty tabs have closed normally, a newer stuck tab is never examined
+     * and never even reported as skipped. Silent, which is the one thing this
+     * module is not allowed to be.
+     *
+     * Newest is right because the sweep runs on a clock. Tabs expire in an
+     * hour, so a tab is examined many times while it is recent; it does not
+     * need to be reachable years later, it needs to be reachable in the window
+     * where it goes stale. The reasoning that produced the old comment was
+     * about the tab getting more overdue, which is true, and about the window
+     * advancing, which it does not.
+     */
+    const maxScan = opts.maxScan ?? SWEEP_DEFAULTS.maxScan;
+    const scanned = ids.slice(-maxScan);
+    if (ids.length > scanned.length) {
+      // Loud, because an unexamined tab is exactly the thing that goes missing.
+      this.emit({
+        level: "skip",
+        message:
+          `Tab sweep examined the ${scanned.length} most recent of ${ids.length} tabs — ` +
+          `${ids.length - scanned.length} older one(s) not read this pass`,
+      });
+    }
+    const { rows, unreadable } = await this.cfg.client.tabRows(scanned);
+    for (const u of unreadable) {
+      this.emit({ level: "skip", message: `Tab #${u.tabId} could not be read — ${u.why}` });
+    }
+
+    const plan = planTabSweep({
+      now: Math.floor(Date.now() / 1000),
+      me: this.cfg.client.account.address as Hex,
+      tabs: rows,
+      minRemainder: opts.minRemainder,
+      maxPerPass: opts.maxPerPass,
+    });
+    if (plan.reclaim.length === 0) return { reclaimed: 0n, txs: [] };
+
+    this.emit({
+      level: "decide",
+      message:
+        `Sweeping ${plan.reclaim.length} expired tab(s) — ` +
+        `${formatUsdc(sweepValue(plan))} USDC to reclaim`,
+    });
+
+    let reclaimed = 0n;
+    const txs: Hex[] = [];
+    for (const { tabId, remainder } of plan.reclaim) {
+      try {
+        const txHash = await this.cfg.client.reclaimTab(tabId);
+        reclaimed += remainder;
+        txs.push(txHash);
+        this.emit({
+          level: "refund",
+          message: `Tab #${tabId} expired unsettled — reclaimed ${formatUsdc(remainder)} USDC`,
+          txHash,
+        });
+      } catch (e) {
+        // Someone else's close landing first is the benign case and looks
+        // identical to a real fault from here, so it is reported either way and
+        // the next pass re-reads the row rather than assuming.
+        this.emit({
+          level: "skip",
+          message: `Tab #${tabId} could not be reclaimed — ${describeError(e)}`,
+        });
+      }
+    }
+    return { reclaimed, txs };
   }
 
   /**
