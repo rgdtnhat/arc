@@ -772,9 +772,34 @@ export class TesseraAgent {
     }
     if (ids.length === 0) return { reclaimed: 0n, txs: [] };
 
-    // Oldest first, bounded: the index grows for the life of the agent and
-    // never shrinks, and an unreclaimed tab only becomes more overdue.
-    const scanned = ids.slice(0, opts.maxScan ?? SWEEP_DEFAULTS.maxScan);
+    /*
+     * Newest first, bounded.
+     *
+     * `_asAgent` is pushed on open and never removed — a closed tab stays in
+     * the array forever — so the index is mostly settled history. Taking the
+     * *oldest* window, as this first did, parks it permanently on that history:
+     * once fifty tabs have closed normally, a newer stuck tab is never examined
+     * and never even reported as skipped. Silent, which is the one thing this
+     * module is not allowed to be.
+     *
+     * Newest is right because the sweep runs on a clock. Tabs expire in an
+     * hour, so a tab is examined many times while it is recent; it does not
+     * need to be reachable years later, it needs to be reachable in the window
+     * where it goes stale. The reasoning that produced the old comment was
+     * about the tab getting more overdue, which is true, and about the window
+     * advancing, which it does not.
+     */
+    const maxScan = opts.maxScan ?? SWEEP_DEFAULTS.maxScan;
+    const scanned = ids.slice(-maxScan);
+    if (ids.length > scanned.length) {
+      // Loud, because an unexamined tab is exactly the thing that goes missing.
+      this.emit({
+        level: "skip",
+        message:
+          `Tab sweep examined the ${scanned.length} most recent of ${ids.length} tabs — ` +
+          `${ids.length - scanned.length} older one(s) not read this pass`,
+      });
+    }
     const { rows, unreadable } = await this.cfg.client.tabRows(scanned);
     for (const u of unreadable) {
       this.emit({ level: "skip", message: `Tab #${u.tabId} could not be read — ${u.why}` });

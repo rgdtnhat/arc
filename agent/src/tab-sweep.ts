@@ -71,14 +71,22 @@ export const SWEEP_DEFAULTS = {
    */
   maxPerPass: 5,
   /**
-   * Tabs to *examine* in one pass, oldest first.
+   * Tabs to *examine* in one pass, most recent first.
    *
    * `tabsAsAgent` grows for the life of the agent and never shrinks — a closed
-   * tab stays in the array. Reading every row forever is the shape of a job
-   * that works in the demo and times out in the second month. Oldest first
-   * because an unreclaimed tab only becomes more overdue.
+   * tab stays in the array — so the index is mostly settled history and reading
+   * all of it forever is a job that works in the demo and times out later.
+   *
+   * The window takes the newest, not the oldest. Oldest strands exactly the
+   * tabs this exists for: once the cap is full of tabs that closed normally, a
+   * newer stuck one is never read and never reported. Newest is safe because
+   * the sweep is on a clock and tabs expire in an hour, so a tab is examined
+   * repeatedly while it is recent — which is when it goes stale.
+   *
+   * 500 rather than 50 because `tabRows` batches into multicalls: five hundred
+   * rows is a handful of requests, not five hundred.
    */
-  maxScan: 50,
+  maxScan: 500,
 } as const;
 
 /**

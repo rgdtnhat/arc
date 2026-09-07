@@ -50,7 +50,13 @@ function agentWith(opts: {
     tab: "tab" in opts ? opts.tab : TAB,
     account: { address: ME },
     tabsAsAgent: async () => (typeof opts.ids === "function" ? opts.ids() : (opts.ids ?? [])),
-    tabRows: async () => ({ rows: opts.rows ?? [], unreadable: opts.unreadable ?? [] }),
+    // Honours the ids it is handed, like the real client — a stub that returns
+    // every row regardless makes the scan window untestable, and the window is
+    // where the bug was.
+    tabRows: async (ids: bigint[]) => ({
+      rows: (opts.rows ?? []).filter((r) => ids.includes(r.tabId)),
+      unreadable: (opts.unreadable ?? []).filter((u) => ids.includes(u.tabId)),
+    }),
     reclaimTab: async (tabId: bigint) => {
       if (opts.reclaimFails?.has(tabId)) throw new Error("execution reverted: TabIsClosed");
       reclaimed.push(tabId);
@@ -169,4 +175,52 @@ test("the pass is capped, and the cap is what limits the writes", async () => {
 
   assert.deepEqual(s.reclaimed, [9n, 8n, 7n], "most valuable first");
   assert.equal(out.reclaimed, usdc("24"));
+});
+
+/*
+ * The scan window.
+ *
+ * `_asAgent` is pushed on open and never removed, so the index is mostly
+ * settled history. The first version took the oldest slice of it, which parks
+ * the window on that history forever: once the cap is full of tabs that closed
+ * normally, a newer stuck tab is never read — and never reported as skipped
+ * either, which is worse than missing it loudly.
+ */
+
+test("a stuck tab behind a wall of closed ones is still found", async () => {
+  // The reported case: 60 tabs, a 50-row cap, the first 50 all closed. The
+  // oldest-first window read nothing but history and reclaimed nothing.
+  const closed = Array.from({ length: 50 }, (_, i) =>
+    row({ tabId: BigInt(i + 1), closed: true, claimed: usdc("1") }),
+  );
+  const stuck = row({ tabId: 60n, deposit: usdc("7") });
+  const rows = [...closed, stuck];
+
+  const s = agentWith({ ids: rows.map((r) => r.tabId), rows });
+  const out = await s.agent.sweepExpiredTabs({ maxScan: 50 });
+
+  assert.deepEqual(s.reclaimed, [60n], "the newest stuck tab is reclaimed");
+  assert.equal(out.reclaimed, usdc("7"));
+});
+
+test("tabs beyond the scan window are reported, not dropped in silence", async () => {
+  // A bounded scan is fine. A bounded scan nobody is told about is the failure
+  // this module exists to avoid, one level up.
+  const rows = Array.from({ length: 9 }, (_, i) => row({ tabId: BigInt(i + 1), closed: true }));
+  const s = agentWith({ ids: rows.map((r) => r.tabId), rows });
+  await s.agent.sweepExpiredTabs({ maxScan: 4 });
+
+  assert.match(
+    messages(s),
+    /examined the 4 most recent of 9 tabs — 5 older one\(s\) not read this pass/,
+  );
+});
+
+test("a history that fits the window says nothing about truncation", async () => {
+  const rows = [row({ tabId: 1n, closed: true }), row({ tabId: 2n, deposit: usdc("2") })];
+  const s = agentWith({ ids: rows.map((r) => r.tabId), rows });
+  await s.agent.sweepExpiredTabs({ maxScan: 50 });
+
+  assert.doesNotMatch(messages(s), /not read this pass/, "no truncation note when nothing was truncated");
+  assert.deepEqual(s.reclaimed, [2n]);
 });
